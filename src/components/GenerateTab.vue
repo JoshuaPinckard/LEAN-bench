@@ -52,13 +52,23 @@ watch(() => props.conditions, (cs) => {
   }
 }, { immediate: true })
 
-function toggle(set, key) {
-  const s = new Set(set.value)
+// NOTE: Vue 3 auto-unwraps refs in templates, so passing `selectedModels` to a
+// generic helper hands it the inner Set, not the ref — `set.value = ...` then
+// silently no-ops. Use dedicated functions that close over the refs directly.
+function toggleModel(key) {
+  const s = new Set(selectedModels.value)
   s.has(key) ? s.delete(key) : s.add(key)
-  set.value = s
+  selectedModels.value = s
 }
-function selectAll(set, items, key)  { set.value = new Set(items.map(i => i[key])) }
-function selectNone(set)             { set.value = new Set() }
+function toggleCond(key) {
+  const s = new Set(selectedConds.value)
+  s.has(key) ? s.delete(key) : s.add(key)
+  selectedConds.value = s
+}
+function selectAllModels()  { selectedModels.value = new Set(props.models.map(m => m.friendly_name)) }
+function selectNoneModels() { selectedModels.value = new Set() }
+function selectAllConds()   { selectedConds.value = new Set(props.conditions.map(c => c.id)) }
+function selectNoneConds()  { selectedConds.value = new Set() }
 
 const passK = ref(false)
 
@@ -172,14 +182,14 @@ async function onPromptSaved(saved) {
         <div class="header">
           <h3>Models</h3>
           <span class="toggle"
-                @click="selectedModels.size === models.length ? selectNone(selectedModels) : selectAll(selectedModels, models, 'friendly_name')">
+                @click="selectedModels.size === models.length ? selectNoneModels() : selectAllModels()">
             {{ selectedModels.size === models.length ? 'Deselect all' : 'Select all' }}
           </span>
         </div>
         <div v-for="m in models" :key="m.friendly_name" class="checkbox-row">
           <input type="checkbox" :id="'m-' + m.friendly_name"
                  :checked="selectedModels.has(m.friendly_name)"
-                 @change="toggle(selectedModels, m.friendly_name)" />
+                 @change="toggleModel(m.friendly_name)" />
           <label :for="'m-' + m.friendly_name" class="name">{{ m.friendly_name }}</label>
           <span class="badge" :class="m.provider">{{ m.provider }}</span>
         </div>
@@ -190,14 +200,14 @@ async function onPromptSaved(saved) {
         <div class="header">
           <h3>Conditions</h3>
           <span class="toggle"
-                @click="selectedConds.size === conditions.length ? selectNone(selectedConds) : selectAll(selectedConds, conditions, 'id')">
+                @click="selectedConds.size === conditions.length ? selectNoneConds() : selectAllConds()">
             {{ selectedConds.size === conditions.length ? 'Deselect all' : 'Select all' }}
           </span>
         </div>
         <div v-for="c in conditions" :key="c.id" class="checkbox-row" :title="c.semantics">
           <input type="checkbox" :id="'c-' + c.id"
                  :checked="selectedConds.has(c.id)"
-                 @change="toggle(selectedConds, c.id)" />
+                 @change="toggleCond(c.id)" />
           <label :for="'c-' + c.id" class="name">{{ c.id }}</label>
           <span class="desc">{{ c.display_name }}</span>
         </div>

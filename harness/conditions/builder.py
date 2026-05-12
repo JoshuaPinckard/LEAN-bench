@@ -1,20 +1,18 @@
 """Translate a condition_id into the provider-specific tool config that gets
 passed to the LLM API.
 
-For each provider we map the abstract tool flags from CONDITIONS into native
-tool specs:
+Web search is uncapped on all providers — each provider's native tool decides
+how many searches to run, and we log observed counts from
+ProviderResponse.tools_called rather than enforce an asymmetric numeric cap.
+See CONDITIONS docstring in harness/models.py for the methodology rationale.
 
-  - tool_web_search: Anthropic web_search server tool, OpenAI web_search_preview,
-    Gemini google_search.
-  - tool_docs_retrieval: TODO — QC docs RAG is not yet wired up. The condition
-    is recognized in the schema but no tool is emitted today.
-  - tool_agentic_loop: handled by the orchestrator (multi-turn flow), not by
-    a tool spec.
+QC docs retrieval (when wired) is hard-capped at the MCP server we own, so the
+cap is uniform across providers; see cond["qc_docs_max_uses"].
 """
 
 from __future__ import annotations
 
-from harness.models import CONDITIONS, MAX_RETRIEVAL_CALLS_PER_TURN
+from harness.models import CONDITIONS
 
 
 def build_tools(condition_id: str, provider: str) -> list[dict]:
@@ -33,16 +31,15 @@ def build_tools(condition_id: str, provider: str) -> list[dict]:
             tools.append({
                 "type": "web_search_20250305",
                 "name": "web_search",
-                "max_uses": MAX_RETRIEVAL_CALLS_PER_TURN,
             })
         elif provider == "openai":
-            # Note: requires the Responses API path; chat.completions ignores it.
             tools.append({"type": "web_search_preview"})
         elif provider == "google":
             tools.append({"google_search": {}})
 
-    # tool_docs_retrieval: QC docs RAG not yet implemented. Once a vector store
-    # exists, emit a provider-shaped retrieval tool here.
+    # tool_docs_retrieval: QC docs RAG not yet implemented. Once an MCP server
+    # exists, emit a provider-shaped retrieval tool here. The MCP server itself
+    # enforces cond["qc_docs_max_uses"] (5/turn) — uniform across providers.
     # if cond["tool_docs_retrieval"]: ...
 
     return tools

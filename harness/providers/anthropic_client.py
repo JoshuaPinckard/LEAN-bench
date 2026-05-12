@@ -42,9 +42,12 @@ async def call(
     kwargs: dict[str, Any] = {
         "model": model_pinned,
         "max_tokens": max_tokens,
-        "temperature": temperature,
         "messages": messages,
     }
+    # Opus 4.7 rejects non-default sampling params; behavior steering must move
+    # into the prompt. Opus 4.6 and Sonnet 4.6 still accept temperature.
+    if "opus-4-7" not in model_pinned:
+        kwargs["temperature"] = temperature
     if system_prompt:
         kwargs["system"] = system_prompt
     if tools:

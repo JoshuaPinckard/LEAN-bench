@@ -57,11 +57,13 @@ CREATE TABLE IF NOT EXISTS prompts (
 
     -- expected behavior
     trades_expected        INTEGER NOT NULL,      -- bool 0/1
-    expected_indicators    TEXT,                  -- JSON list[str]
+    expected_indicators    TEXT,                  -- JSON list[{name, params}] (legacy: list[str])
     expected_order_types   TEXT,                  -- JSON list[str]
 
-    -- contamination control
-    is_post_cutoff         INTEGER NOT NULL,      -- bool 0/1
+    -- evaluation metadata
+    primary_failure_mode   TEXT,                  -- curator's target failure mode (see FAILURE_MODES in PromptModal)
+    contains_behavioral_ambiguity INTEGER,        -- bool: prompt admits multiple meaningfully different implementations
+    novelty_level          TEXT,                  -- canonical|modified_canonical|original_novel|post_cutoff_reference
 
     -- leak audit
     leak_audit_status      TEXT NOT NULL,         -- clean|flagged|manually_cleared|rejected
@@ -194,14 +196,51 @@ class Store:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.conn = sqlite3.connect(self.db_path, isolation_level=None)
+        # check_same_thread=False: FastAPI runs sync handlers in a thread pool,
+        # so each request arrives on a different thread. WAL mode makes
+        # concurrent reads safe; writes are serialised by SQLite's locking.
+        self.conn = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
 
         self.conn.executescript(SCHEMA)
+        self._migrate_add_columns()
         self._set_meta("schema_version", SCHEMA_VERSION)
+
+    def _migrate_add_columns(self) -> None:
+        """Idempotently add nullable columns introduced after the initial v1.0
+        cut. SQLite's CREATE TABLE IF NOT EXISTS only handles new DBs; existing
+        DBs need explicit ALTER TABLE. All adds are nullable so prior rows
+        receive NULL — no data is mutated.
+        """
+        new_cols: dict[str, dict[str, str]] = {
+            "prompts": {
+                # v1.1 additions (2026-05-12): streamlined evaluation metadata
+                "primary_failure_mode":           "TEXT",
+                "contains_behavioral_ambiguity":  "INTEGER",
+                "novelty_level":                  "TEXT",
+                # Earlier columns that were added and then retired; left in
+                # migration so existing DBs don't re-apply, but not written by
+                # current code. New DBs won't have these at all.
+                "created_after_cutoff":           "INTEGER",
+                "references_post_cutoff_event":   "INTEGER",
+                "references_post_cutoff_api":     "INTEGER",
+                "evaluation_mode":                "TEXT",
+                "secondary_failure_modes":        "TEXT",
+                "determinism_level":              "TEXT",
+                "ambiguity_level":                "TEXT",
+                "underspecified_exit_logic":      "INTEGER",
+                "underspecified_risk_management": "INTEGER",
+                "multiple_valid_implementations": "INTEGER",
+            },
+        }
+        for table, cols in new_cols.items():
+            existing = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, ddl in cols.items():
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     # ---- meta ------------------------------------------------------------
 
@@ -224,10 +263,16 @@ class Store:
         fields.setdefault("version", "1.0.0")
 
         # bool/list normalization
-        for bcol in ("trades_expected", "is_post_cutoff"):
+        bool_cols = (
+            "trades_expected", "is_post_cutoff", "contains_behavioral_ambiguity",
+        )
+        for bcol in bool_cols:
             if bcol in fields:
                 fields[bcol] = _b(fields[bcol])
-        for jcol in ("tickers", "expected_indicators", "expected_order_types"):
+        json_cols = (
+            "tickers", "expected_indicators", "expected_order_types",
+        )
+        for jcol in json_cols:
             if jcol in fields and not isinstance(fields[jcol], (str, type(None))):
                 fields[jcol] = _j(fields[jcol])
 

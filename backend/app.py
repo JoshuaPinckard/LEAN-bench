@@ -126,7 +126,7 @@ def list_prompts(
     rows, total = store.search_prompts(search=search, limit=limit, offset=offset)
     # Decode JSON list columns for the frontend.
     for r in rows:
-        for col in ("tickers", "expected_indicators", "expected_order_types"):
+        for col in ("tickers", "expected_indicators", "expected_order_types", "secondary_failure_modes"):
             if r.get(col):
                 try:
                     r[col] = json.loads(r[col])
@@ -143,7 +143,7 @@ def get_prompt(prompt_id: str) -> dict:
     p = store.get_prompt(prompt_id)
     if p is None:
         raise HTTPException(status_code=404, detail=f"Prompt {prompt_id} not found")
-    for col in ("tickers", "expected_indicators", "expected_order_types"):
+    for col in ("tickers", "expected_indicators", "expected_order_types", "secondary_failure_modes"):
         if p.get(col):
             try:
                 p[col] = json.loads(p[col])
@@ -154,24 +154,19 @@ def get_prompt(prompt_id: str) -> dict:
     return p
 
 
-@app.post("/api/prompts")
-def create_prompt(prompt_in: PromptIn) -> dict:
-    store = get_store()
-    prompt_id = store.next_prompt_id()
-    store.add_prompt(
-        prompt_id=prompt_id,
+def _prompt_fields(prompt_in: PromptIn) -> dict:
+    """Map a PromptIn to the column kwargs add_prompt expects."""
+    return dict(
         version="1.0.0",
         original_text=prompt_in.text,
+        original_url=prompt_in.source_url,
         reformulated_text=prompt_in.text,
         source=prompt_in.source,
-        source_creation_date=prompt_in.source_creation_date,
-        source_license=prompt_in.source_license,
         difficulty=prompt_in.difficulty,
         strategy_type=prompt_in.strategy_type,
         qc_securities_type=prompt_in.qc_securities_type,
         qc_universe_type=prompt_in.qc_universe_type,
         qc_data_resolution=prompt_in.qc_data_resolution,
-        qc_brokerage_model=prompt_in.qc_brokerage_model,
         tickers=prompt_in.tickers,
         start_date=prompt_in.start_date,
         end_date=prompt_in.end_date,
@@ -179,10 +174,20 @@ def create_prompt(prompt_in: PromptIn) -> dict:
         trades_expected=prompt_in.trades_expected,
         expected_indicators=prompt_in.expected_indicators,
         expected_order_types=prompt_in.expected_order_types,
-        is_post_cutoff=prompt_in.is_post_cutoff,
+        is_post_cutoff=False,       # legacy NOT NULL column; derived from novelty_level downstream
+        primary_failure_mode=prompt_in.primary_failure_mode,
+        contains_behavioral_ambiguity=prompt_in.contains_behavioral_ambiguity,
+        novelty_level=prompt_in.novelty_level,
         leak_audit_status=prompt_in.leak_audit_status,
         leak_audit_notes=prompt_in.curator_notes,
     )
+
+
+@app.post("/api/prompts")
+def create_prompt(prompt_in: PromptIn) -> dict:
+    store = get_store()
+    prompt_id = store.next_prompt_id()
+    store.add_prompt(prompt_id=prompt_id, **_prompt_fields(prompt_in))
     return get_prompt(prompt_id)
 
 
@@ -191,31 +196,7 @@ def update_prompt(prompt_id: str, prompt_in: PromptIn) -> dict:
     store = get_store()
     if store.get_prompt(prompt_id) is None:
         raise HTTPException(status_code=404, detail=f"Prompt {prompt_id} not found")
-    store.add_prompt(  # idempotent upsert
-        prompt_id=prompt_id,
-        version="1.0.0",
-        original_text=prompt_in.text,
-        reformulated_text=prompt_in.text,
-        source=prompt_in.source,
-        source_creation_date=prompt_in.source_creation_date,
-        source_license=prompt_in.source_license,
-        difficulty=prompt_in.difficulty,
-        strategy_type=prompt_in.strategy_type,
-        qc_securities_type=prompt_in.qc_securities_type,
-        qc_universe_type=prompt_in.qc_universe_type,
-        qc_data_resolution=prompt_in.qc_data_resolution,
-        qc_brokerage_model=prompt_in.qc_brokerage_model,
-        tickers=prompt_in.tickers,
-        start_date=prompt_in.start_date,
-        end_date=prompt_in.end_date,
-        cash=prompt_in.cash,
-        trades_expected=prompt_in.trades_expected,
-        expected_indicators=prompt_in.expected_indicators,
-        expected_order_types=prompt_in.expected_order_types,
-        is_post_cutoff=prompt_in.is_post_cutoff,
-        leak_audit_status=prompt_in.leak_audit_status,
-        leak_audit_notes=prompt_in.curator_notes,
-    )
+    store.add_prompt(prompt_id=prompt_id, **_prompt_fields(prompt_in))  # idempotent upsert
     return get_prompt(prompt_id)
 
 

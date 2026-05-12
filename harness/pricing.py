@@ -16,12 +16,15 @@ from __future__ import annotations
 #   cache_read: cached prompt tokens (Anthropic prompt caching, Gemini cached
 #               content). Set to None to fall back to input rate.
 PRICING: dict[str, dict[str, float | None]] = {
-    "claude-opus-4-7":        {"input": None, "output": None, "cache_read": None},
-    "claude-opus-4-6":        {"input": None, "output": None, "cache_read": None},
-    "claude-sonnet-4-6":      {"input": None, "output": None, "cache_read": None},
-    "gpt-5.5-2026-04-23":     {"input": None, "output": None, "cache_read": None},
-    "gpt-5.4-2026-03-05":     {"input": None, "output": None, "cache_read": None},
-    "gemini-3.1-pro-preview": {"input": None, "output": None, "cache_read": None},
+    # Anthropic — verified May 2026
+    "claude-opus-4-7":        {"input": 5.00,  "output": 25.00, "cache_read": None},
+    "claude-opus-4-6":        {"input": 5.00,  "output": 25.00, "cache_read": None},
+    "claude-sonnet-4-6":      {"input": 3.00,  "output": 15.00, "cache_read": None},
+    # OpenAI — verified May 2026
+    "gpt-5.5-2026-04-23":     {"input": 5.00,  "output": 30.00, "cache_read": None},
+    "gpt-5.4-2026-03-05":     {"input": 2.50,  "output": 15.00, "cache_read": None},
+    # Google — verified May 2026
+    "gemini-3.1-pro-preview": {"input": 2.00,  "output": 12.00, "cache_read": None},
 }
 
 

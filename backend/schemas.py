@@ -43,20 +43,23 @@ class PromptIn(BaseModel):
     qc_securities_type: str | None = None
     qc_universe_type: str | None = None
     qc_data_resolution: str | None = None
-    qc_brokerage_model: str | None = None
     tickers: list[str] = Field(default_factory=list)
     start_date: str | None = None
     end_date: str | None = None
     cash: int = 100_000
-    expected_indicators: list[str] = Field(default_factory=list)
+    # Structured indicators: each entry is {"name": "SMA", "params": [50]}.
+    # Legacy string entries are still accepted on read-back from old rows.
+    expected_indicators: list[Any] = Field(default_factory=list)
     expected_order_types: list[str] = Field(default_factory=list)
     trades_expected: bool = True
     curator_notes: str | None = None
-    # provenance / control
+    # evaluation metadata
+    primary_failure_mode: str | None = None
+    contains_behavioral_ambiguity: bool = False
+    novelty_level: str = "original_novel"  # canonical|modified_canonical|original_novel|post_cutoff_reference
+    # provenance
     source: str = "original"
-    source_creation_date: str | None = None
-    source_license: str | None = None
-    is_post_cutoff: bool = False
+    source_url: str | None = None        # populated when source != "original"
     leak_audit_status: str = "clean"
 
 
