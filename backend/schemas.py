@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import date
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ---- Models / Conditions metadata -------------------------------------
@@ -38,29 +39,55 @@ class ConditionsResponse(BaseModel):
 class PromptIn(BaseModel):
     """Fields a curator submits via the Prompts tab."""
     text: str
-    difficulty: str = "medium"           # easy | medium | hard
-    strategy_type: str | None = None
-    qc_securities_type: str | None = None
-    qc_universe_type: str | None = None
-    qc_data_resolution: str | None = None
+    strategy_type: str = "directional"    # directional|mean_reversion|derivatives|portfolio|execution|relative_value|other
+    strategy_complexity: int = 2          # 1=easy|2=medium|3=hard
+    api_complexity: int = 2               # 1=basic|2=intermediate|3=advanced
+    # LEAN configuration
+    securities_type: str = "equity"       # equity|option|multi_asset
+    securities_type_detailed: str | None = None
+    resolution: str = "daily"             # high_frequency|intraday|daily
+    implementation_type: Literal[
+        "lean_native", "custom_implementation", "external_data_required", "mixed"
+    ] = "lean_native"
+    indicators: list[str] = Field(default_factory=list)
+    # universe
+    universe_type: Literal[
+        "single_asset", "multi_asset_specific", "index_components",
+        "screened_universe", "custom_universe_logic"
+    ] = "single_asset"
+    universe_index: str | None = None       # SP500|NASDAQ100|RUSSELL2000|DOW30|SP400_MIDCAP|RUSSELL1000|other
+    universe_index_other: str | None = None # freetext when universe_index="other"
     tickers: list[str] = Field(default_factory=list)
     start_date: str | None = None
     end_date: str | None = None
-    cash: int = 100_000
-    # Structured indicators: each entry is {"name": "SMA", "params": [50]}.
-    # Legacy string entries are still accepted on read-back from old rows.
-    expected_indicators: list[Any] = Field(default_factory=list)
-    expected_order_types: list[str] = Field(default_factory=list)
-    trades_expected: bool = True
+    # evaluation
+    evaluation_mode: Literal[
+        "trade_required", "signal_required", "code_only", "metric_threshold_required"
+    ] = "trade_required"
+    interpretation_strictness: int = 0    # 0=unambiguous|1=mild|2=broad|3=exclude
+    underspecification_notes: str | None = None
+    failure_mode: list[str] = Field(default_factory=list)  # post-hoc, filled after eval
+    failure_notes: str | None = None       # post-hoc freetext
     curator_notes: str | None = None
-    # evaluation metadata
-    primary_failure_mode: str | None = None
-    contains_behavioral_ambiguity: bool = False
-    novelty_level: str = "original_novel"  # canonical|modified_canonical|original_novel|post_cutoff_reference
     # provenance
     source: str = "original"
-    source_url: str | None = None        # populated when source != "original"
+    source_url: str | None = None
+    source_date: date | None = None
     leak_audit_status: str = "clean"
+
+    @field_validator("strategy_complexity", "api_complexity")
+    @classmethod
+    def check_1_to_3(cls, v: int) -> int:
+        if v not in (1, 2, 3):
+            raise ValueError("must be 1, 2, or 3")
+        return v
+
+    @field_validator("interpretation_strictness")
+    @classmethod
+    def check_0_to_3(cls, v: int) -> int:
+        if v not in (0, 1, 2, 3):
+            raise ValueError("must be 0, 1, 2, or 3")
+        return v
 
 
 class PromptOut(PromptIn):
@@ -74,6 +101,32 @@ class PromptOut(PromptIn):
 class PromptList(BaseModel):
     prompts: list[dict[str, Any]]
     total: int
+
+
+# ---- Runs ---------------------------------------------------------------
+
+class Run(BaseModel):
+    """One evaluated run of generated code against the LEAN backtest engine."""
+    run_id: str
+    prompt_id: str | None = None
+    model_id: str | None = None
+    model_version: str | None = None
+    lean_engine_version: str | None = None
+    lean_data_snapshot_hash: str | None = None
+    generated_code: str | None = None
+    compile_ok: bool | None = None
+    backtest_ok: bool | None = None
+    trades_count: int | None = None
+    sharpe: float | None = None
+    max_drawdown: float | None = None
+    cagr: float | None = None
+    judge_score: float | None = None
+    judge_reasoning: str | None = None
+    judge_replication_index: int | None = None
+    failure_mode: str | None = None        # populated post-evaluation
+    market_regime: str | None = None       # populated post-enrichment
+    human_validated: bool = False
+    created_at: str | None = None
 
 
 # ---- Generate ---------------------------------------------------------

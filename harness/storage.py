@@ -11,7 +11,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 SCHEMA_VERSION = "1.0"
 
@@ -36,45 +36,70 @@ CREATE TABLE IF NOT EXISTS prompts (
     reformulation_notes    TEXT,
 
     -- provenance
-    source                 TEXT NOT NULL,         -- qc_forum|qc_docs|reddit|stackexchange|github|tradingview|original
-    source_creation_date   TEXT,                  -- ISO date, NULL for synthetic
-    source_license         TEXT,                  -- SPDX identifier
+    source                 TEXT NOT NULL,         -- original|quantconnect_forum|qc_docs_example|textbook|paper_reference|other
+    is_post_cutoff         INTEGER NOT NULL DEFAULT 0,  -- bool: prompt references post-cutoff LEAN API / market events
 
-    -- difficulty & categorization
-    difficulty             TEXT NOT NULL,         -- easy|medium|hard
-    difficulty_rubric_match TEXT,
-    strategy_type          TEXT,                  -- trend_following|mean_reversion|momentum|...
+    -- categorization
+    strategy_type          TEXT,                  -- directional|mean_reversion|derivatives|portfolio|execution|relative_value|other
+    strategy_complexity    INTEGER NOT NULL DEFAULT 2,  -- 1=easy|2=medium|3=hard (structural complexity of the strategy logic)
+    api_complexity         INTEGER NOT NULL DEFAULT 2,  -- 1=basic|2=intermediate|3=advanced (LEAN API surface required)
 
-    -- LEAN-specific eval metadata
-    qc_securities_type     TEXT,                  -- equity|forex|crypto|future|option|...
-    qc_universe_type       TEXT,                  -- manual|dynamic_coarse|dynamic_coarse_fine
-    qc_data_resolution     TEXT,                  -- tick|second|minute|hour|daily
-    qc_brokerage_model     TEXT,                  -- default|interactivebrokers|alpaca|...
+    -- LEAN configuration (compressed for analysis)
+    securities_type        TEXT,                  -- equity|option|multi_asset
+    securities_type_detailed TEXT,               -- equity|forex|crypto|future|option|cfd|mixed (optional detail)
+    resolution             TEXT,                  -- high_frequency|intraday|daily
+    implementation_type    TEXT,                  -- lean_native|custom_implementation|external_data_required|mixed
+    indicators             TEXT,                  -- JSON list[str] of technical indicators referenced
+    universe_type          TEXT,                  -- single_asset|multi_asset_specific|index_components|screened_universe|custom_universe_logic
+    universe_index         TEXT,                  -- SP500|NASDAQ100|... (when universe_type = index_components)
+    universe_index_other   TEXT,                  -- freetext when universe_index = other
     tickers                TEXT,                  -- JSON list[str]
     start_date             TEXT,                  -- ISO date
     end_date               TEXT,
     cash                   INTEGER DEFAULT 100000,
 
-    -- expected behavior
-    trades_expected        INTEGER NOT NULL,      -- bool 0/1
-    expected_indicators    TEXT,                  -- JSON list[{name, params}] (legacy: list[str])
-    expected_order_types   TEXT,                  -- JSON list[str]
+    -- expected behavior / evaluation
+    evaluation_mode        TEXT NOT NULL DEFAULT 'trade_required',  -- trade_required|signal_required|code_only|metric_threshold_required
+    interpretation_strictness INTEGER NOT NULL DEFAULT 0,           -- 0=unambiguous|1=mild|2=broad|3=exclude
+    implementation_underspecified INTEGER DEFAULT 0,                -- legacy bool; derived from interpretation_strictness > 0
+    underspecification_notes TEXT,
+    failure_mode           TEXT,                  -- JSON list[str], populated post-evaluation
+    failure_notes          TEXT,                  -- freetext, optional post-evaluation note
 
-    -- evaluation metadata
-    primary_failure_mode   TEXT,                  -- curator's target failure mode (see FAILURE_MODES in PromptModal)
-    contains_behavioral_ambiguity INTEGER,        -- bool: prompt admits multiple meaningfully different implementations
-    novelty_level          TEXT,                  -- canonical|modified_canonical|original_novel|post_cutoff_reference
+    -- provenance
+    source_date            DATE,                  -- when the strategy idea was first publicly described; NULL if synthetic
 
     -- leak audit
-    leak_audit_status      TEXT NOT NULL,         -- clean|flagged|manually_cleared|rejected
+    leak_audit_status      TEXT NOT NULL DEFAULT 'clean',
     leak_audit_notes       TEXT,
 
     created_at             TEXT NOT NULL          -- ISO datetime UTC
 );
 
-CREATE INDEX IF NOT EXISTS ix_prompts_source     ON prompts(source);
-CREATE INDEX IF NOT EXISTS ix_prompts_difficulty ON prompts(difficulty);
-CREATE INDEX IF NOT EXISTS ix_prompts_post_cutoff ON prompts(is_post_cutoff);
+CREATE INDEX IF NOT EXISTS ix_prompts_source ON prompts(source);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id                   TEXT PRIMARY KEY,
+    prompt_id                TEXT REFERENCES prompts(prompt_id),
+    model_id                 TEXT,
+    model_version            TEXT,
+    lean_engine_version      TEXT,
+    lean_data_snapshot_hash  TEXT,
+    generated_code           TEXT,
+    compile_ok               INTEGER,             -- bool 0/1
+    backtest_ok              INTEGER,             -- bool 0/1
+    trades_count             INTEGER,
+    sharpe                   REAL,
+    max_drawdown             REAL,
+    cagr                     REAL,
+    judge_score              REAL,
+    judge_reasoning          TEXT,
+    judge_replication_index  INTEGER,
+    failure_mode             TEXT,                -- NULL until evaluated
+    market_regime            TEXT,                -- NULL until enriched
+    human_validated          INTEGER DEFAULT 0,  -- bool 0/1
+    created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 CREATE TABLE IF NOT EXISTS calls (
     -- identifiers
@@ -210,37 +235,84 @@ class Store:
         self._set_meta("schema_version", SCHEMA_VERSION)
 
     def _migrate_add_columns(self) -> None:
-        """Idempotently add nullable columns introduced after the initial v1.0
-        cut. SQLite's CREATE TABLE IF NOT EXISTS only handles new DBs; existing
-        DBs need explicit ALTER TABLE. All adds are nullable so prior rows
-        receive NULL — no data is mutated.
+        """Idempotently evolve the prompts table for existing DBs.
+
+        Handles two operations:
+        - DROP: remove columns that no longer have meaning (difficulty,
+          trades_expected). The ix_prompts_difficulty index must be dropped
+          first because SQLite won't drop an indexed column.
+        - ADD: add new NOT NULL (with defaults) and nullable columns introduced
+          in v1.3. All additions are idempotent (skip if column already exists).
         """
-        new_cols: dict[str, dict[str, str]] = {
-            "prompts": {
-                # v1.1 additions (2026-05-12): streamlined evaluation metadata
-                "primary_failure_mode":           "TEXT",
-                "contains_behavioral_ambiguity":  "INTEGER",
-                "novelty_level":                  "TEXT",
-                # Earlier columns that were added and then retired; left in
-                # migration so existing DBs don't re-apply, but not written by
-                # current code. New DBs won't have these at all.
-                "created_after_cutoff":           "INTEGER",
-                "references_post_cutoff_event":   "INTEGER",
-                "references_post_cutoff_api":     "INTEGER",
-                "evaluation_mode":                "TEXT",
-                "secondary_failure_modes":        "TEXT",
-                "determinism_level":              "TEXT",
-                "ambiguity_level":                "TEXT",
-                "underspecified_exit_logic":      "INTEGER",
-                "underspecified_risk_management": "INTEGER",
-                "multiple_valid_implementations": "INTEGER",
-            },
+        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(prompts)").fetchall()}
+
+        # --- drops ---
+        # difficulty has an index; drop the index first.
+        if "difficulty" in existing:
+            self.conn.execute("DROP INDEX IF EXISTS ix_prompts_difficulty")
+            self.conn.execute("ALTER TABLE prompts DROP COLUMN difficulty")
+        if "trades_expected" in existing:
+            self.conn.execute("ALTER TABLE prompts DROP COLUMN trades_expected")
+
+        # Re-read after drops.
+        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(prompts)").fetchall()}
+
+        # --- adds (format: name -> full DDL fragment appended to ALTER TABLE ADD COLUMN) ---
+        add_cols = {
+            # v1.3 new fields
+            "strategy_complexity":      "INTEGER NOT NULL DEFAULT 2",
+            "api_complexity":           "INTEGER NOT NULL DEFAULT 2",
+            "evaluation_mode":          "TEXT NOT NULL DEFAULT 'trade_required'",
+            "interpretation_strictness": "INTEGER NOT NULL DEFAULT 0",
+            "source_date":              "DATE",
+            "implementation_type":      "TEXT",
+            "indicators":               "TEXT",
+            "universe_type":            "TEXT",
+            "universe_index":           "TEXT",
+            "universe_index_other":     "TEXT",
+            "failure_mode":             "TEXT",
+            "failure_notes":            "TEXT",
+            # v1.2 fields (kept for existing DBs that don't have them yet)
+            "securities_type":          "TEXT",
+            "securities_type_detailed": "TEXT",
+            "resolution":               "TEXT",
+            "implementation_underspecified": "INTEGER",
+            "underspecification_notes": "TEXT",
+            # Retired columns — kept in migration list so re-runs are no-ops
+            # on DBs that already have them; new DBs don't get these.
+            "primary_failure_mode":            "TEXT",
+            "contains_behavioral_ambiguity":   "INTEGER",
+            "novelty_level":                   "TEXT",
+            "created_after_cutoff":            "INTEGER",
+            "references_post_cutoff_event":    "INTEGER",
+            "references_post_cutoff_api":      "INTEGER",
+            "secondary_failure_modes":         "TEXT",
+            "determinism_level":               "TEXT",
+            "ambiguity_level":                 "TEXT",
+            "underspecified_exit_logic":       "INTEGER",
+            "underspecified_risk_management":  "INTEGER",
+            "multiple_valid_implementations":  "INTEGER",
         }
-        for table, cols in new_cols.items():
-            existing = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for name, ddl in cols.items():
-                if name not in existing:
-                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        for name, ddl in add_cols.items():
+            if name not in existing:
+                self.conn.execute(f"ALTER TABLE prompts ADD COLUMN {name} {ddl}")
+
+        # --- deferred indexes (must exist after the columns do) ---
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_prompts_securities_type "
+            "ON prompts(securities_type)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_prompts_resolution ON prompts(resolution)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_prompts_strategy_complexity "
+            "ON prompts(strategy_complexity)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_prompts_api_complexity "
+            "ON prompts(api_complexity)"
+        )
 
     # ---- meta ------------------------------------------------------------
 
@@ -264,13 +336,14 @@ class Store:
 
         # bool/list normalization
         bool_cols = (
-            "trades_expected", "is_post_cutoff", "contains_behavioral_ambiguity",
+            "is_post_cutoff", "implementation_underspecified",
         )
         for bcol in bool_cols:
             if bcol in fields:
                 fields[bcol] = _b(fields[bcol])
         json_cols = (
             "tickers", "expected_indicators", "expected_order_types",
+            "indicators", "failure_mode",
         )
         for jcol in json_cols:
             if jcol in fields and not isinstance(fields[jcol], (str, type(None))):
@@ -517,5 +590,5 @@ class Store:
     def __enter__(self) -> "Store":
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *_) -> None:
         self.close()

@@ -126,7 +126,7 @@ def list_prompts(
     rows, total = store.search_prompts(search=search, limit=limit, offset=offset)
     # Decode JSON list columns for the frontend.
     for r in rows:
-        for col in ("tickers", "expected_indicators", "expected_order_types", "secondary_failure_modes"):
+        for col in ("tickers", "indicators", "failure_mode"):
             if r.get(col):
                 try:
                     r[col] = json.loads(r[col])
@@ -143,7 +143,7 @@ def get_prompt(prompt_id: str) -> dict:
     p = store.get_prompt(prompt_id)
     if p is None:
         raise HTTPException(status_code=404, detail=f"Prompt {prompt_id} not found")
-    for col in ("tickers", "expected_indicators", "expected_order_types", "secondary_failure_modes"):
+    for col in ("tickers", "indicators", "failure_mode"):
         if p.get(col):
             try:
                 p[col] = json.loads(p[col])
@@ -162,22 +162,29 @@ def _prompt_fields(prompt_in: PromptIn) -> dict:
         original_url=prompt_in.source_url,
         reformulated_text=prompt_in.text,
         source=prompt_in.source,
-        difficulty=prompt_in.difficulty,
         strategy_type=prompt_in.strategy_type,
-        qc_securities_type=prompt_in.qc_securities_type,
-        qc_universe_type=prompt_in.qc_universe_type,
-        qc_data_resolution=prompt_in.qc_data_resolution,
+        strategy_complexity=prompt_in.strategy_complexity,
+        api_complexity=prompt_in.api_complexity,
+        securities_type=prompt_in.securities_type,
+        securities_type_detailed=prompt_in.securities_type_detailed,
+        resolution=prompt_in.resolution,
+        implementation_type=prompt_in.implementation_type,
+        indicators=prompt_in.indicators,
+        universe_type=prompt_in.universe_type,
+        universe_index=prompt_in.universe_index,
+        universe_index_other=prompt_in.universe_index_other,
         tickers=prompt_in.tickers,
         start_date=prompt_in.start_date,
         end_date=prompt_in.end_date,
-        cash=prompt_in.cash,
-        trades_expected=prompt_in.trades_expected,
-        expected_indicators=prompt_in.expected_indicators,
-        expected_order_types=prompt_in.expected_order_types,
-        is_post_cutoff=False,       # legacy NOT NULL column; derived from novelty_level downstream
-        primary_failure_mode=prompt_in.primary_failure_mode,
-        contains_behavioral_ambiguity=prompt_in.contains_behavioral_ambiguity,
-        novelty_level=prompt_in.novelty_level,
+        evaluation_mode=prompt_in.evaluation_mode,
+        interpretation_strictness=prompt_in.interpretation_strictness,
+        # derive legacy bool from the new int field
+        implementation_underspecified=prompt_in.interpretation_strictness > 0,
+        underspecification_notes=prompt_in.underspecification_notes,
+        failure_mode=prompt_in.failure_mode,
+        failure_notes=prompt_in.failure_notes,
+        source_date=str(prompt_in.source_date) if prompt_in.source_date else None,
+        is_post_cutoff=False,    # legacy NOT NULL column; UI no longer surfaces this
         leak_audit_status=prompt_in.leak_audit_status,
         leak_audit_notes=prompt_in.curator_notes,
     )
