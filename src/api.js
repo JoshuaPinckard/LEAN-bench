@@ -36,4 +36,6 @@ export const api = {
 
   generate:     (body)                           => req('POST',   '/api/generate', body),
   getCall:      (id)                             => req('GET',    `/api/calls/${id}`),
+
+  schemaAutofill: (promptText)                   => req('POST',   '/api/schema/autofill', { prompt_text: promptText }),
 }

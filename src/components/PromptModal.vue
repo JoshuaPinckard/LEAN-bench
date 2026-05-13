@@ -111,6 +111,64 @@ const showDetailedSec = ref(false)
 const saving          = ref(false)
 const apiError        = ref(null)
 
+// --- AI schema autofill ----------------------------------------------
+const aiPopulating  = ref(false)
+const aiError       = ref(null)
+// Snapshot of the AI-suggested values right after a successful autofill.
+// Used at save-time to compute curator_modified_fields. null = AI never ran.
+const aiSnapshot    = ref(null)
+
+const AI_TRACKED_FIELDS = [
+  'strategy_type', 'strategy_complexity', 'api_complexity',
+  'securities_type', 'securities_type_detailed', 'resolution',
+  'implementation_type', 'indicators',
+  'universe_type', 'universe_index', 'tickers',
+  'start_date', 'end_date',
+  'evaluation_mode', 'interpretation_strictness',
+  'curator_notes',
+]
+
+const canAutofill = computed(() => form.text.trim().length >= 20 && !aiPopulating.value)
+
+async function populateWithAi() {
+  if (!canAutofill.value) return
+  aiPopulating.value = true
+  aiError.value = null
+  try {
+    const result = await api.schemaAutofill(form.text)
+    // Apply suggestions to the form.
+    for (const k of AI_TRACKED_FIELDS) {
+      if (result[k] !== undefined && result[k] !== null) {
+        form[k] = result[k]
+      } else if (k === 'securities_type_detailed' || k === 'universe_index') {
+        form[k] = ''
+      }
+    }
+    if (form.securities_type_detailed) showDetailedSec.value = true
+    // Snapshot for diffing on save.
+    aiSnapshot.value = AI_TRACKED_FIELDS.reduce((acc, k) => {
+      acc[k] = JSON.parse(JSON.stringify(form[k]))  // deep copy
+      return acc
+    }, {})
+  } catch (e) {
+    aiError.value = 'AI population failed, please fill in manually.'
+    console.error('schema autofill error:', e)
+  } finally {
+    aiPopulating.value = false
+  }
+}
+
+function computeModifiedFields() {
+  if (!aiSnapshot.value) return []
+  const modified = []
+  for (const k of AI_TRACKED_FIELDS) {
+    const a = JSON.stringify(aiSnapshot.value[k])
+    const b = JSON.stringify(form[k])
+    if (a !== b) modified.push(k)
+  }
+  return modified
+}
+
 const tickerVisible   = computed(() => ['single_asset', 'multi_asset_specific'].includes(form.universe_type))
 const indexVisible    = computed(() => form.universe_type === 'index_components')
 
@@ -228,6 +286,9 @@ async function save(addAnother = false) {
   payload.strategy_complexity = parseInt(form.strategy_complexity)
   payload.api_complexity       = parseInt(form.api_complexity)
   payload.interpretation_strictness = parseInt(form.interpretation_strictness)
+  // AI autofill telemetry
+  payload.ai_prepopulated = aiSnapshot.value !== null
+  payload.curator_modified_fields = computeModifiedFields()
   try {
     let saved
     if (props.promptId) saved = await api.updatePrompt(props.promptId, payload)
@@ -245,6 +306,8 @@ async function save(addAnother = false) {
       tickerDraft.value = ''
       indicatorDraft.value = ''
       showDetailedSec.value = false
+      aiSnapshot.value = null
+      aiError.value = null
     }
   } catch (e) {
     apiError.value = e.message
@@ -264,6 +327,21 @@ async function save(addAnother = false) {
 
       <div class="modal-body">
         <div v-if="apiError" class="error-box">{{ apiError }}</div>
+
+        <!-- AI autofill bar -->
+        <div class="ai-autofill-bar">
+          <button class="ai-autofill-btn"
+                  :disabled="!canAutofill"
+                  @click="populateWithAi"
+                  :title="canAutofill ? 'Use Sonnet to suggest values for every field below' : 'Type at least 20 characters of prompt text first'">
+            <span v-if="aiPopulating"><span class="spinner"></span> Populating…</span>
+            <span v-else>✨ Populate Schema with AI</span>
+          </button>
+          <span v-if="aiSnapshot && !aiError && !aiPopulating" class="ai-hint">
+            AI suggestions applied — feel free to edit any field
+          </span>
+        </div>
+        <div v-if="aiError" class="error-box ai-error-box">{{ aiError }}</div>
 
         <!-- 1: Prompt text -->
         <div class="form-grid">
@@ -507,4 +585,20 @@ async function save(addAnother = false) {
   background: rgba(0,0,0,0.02);
 }
 .failure-notes-input { margin-top: 8px; width: 100%; }
+.ai-autofill-bar {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 16px; padding: 10px 12px;
+  background: rgba(99, 102, 241, 0.06);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  border-radius: 6px;
+}
+.ai-autofill-btn {
+  padding: 6px 14px; font-size: 13px; font-weight: 500;
+  background: #4f46e5; color: #fff; border: none; border-radius: 4px;
+  cursor: pointer;
+}
+.ai-autofill-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ai-autofill-btn:hover:not(:disabled) { background: #4338ca; }
+.ai-hint { font-size: 12px; color: var(--text-muted, #666); }
+.ai-error-box { margin-bottom: 12px; }
 </style>

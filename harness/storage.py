@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS prompts (
     -- provenance
     source_date            DATE,                  -- when the strategy idea was first publicly described; NULL if synthetic
 
+    -- AI-assisted curation telemetry (for paper methodology section)
+    ai_prepopulated        INTEGER DEFAULT 0,     -- bool: curator used the AI autofill button
+    curator_modified_fields TEXT,                 -- JSON list[str]: fields edited after AI fill
+
     -- leak audit
     leak_audit_status      TEXT NOT NULL DEFAULT 'clean',
     leak_audit_notes       TEXT,
@@ -147,6 +151,10 @@ CREATE TABLE IF NOT EXISTS calls (
     -- raw trajectory pointer (full transcript lives in JSON next to DB)
     trajectory_path        TEXT,
 
+    -- snapshot of the documentation snippet appended to the prompt for tool-using
+    -- conditions (S2_docs / S3_web / A1_agentic_full); NULL for S1_base.
+    retrieval_snippet      TEXT,
+
     -- error state (NULL on success)
     error                  TEXT,
 
@@ -158,6 +166,17 @@ CREATE INDEX IF NOT EXISTS ix_calls_model_id      ON calls(model_id);
 CREATE INDEX IF NOT EXISTS ix_calls_condition     ON calls(condition_id);
 -- composite for already_done resumability checks
 CREATE UNIQUE INDEX IF NOT EXISTS ux_calls_cell ON calls(prompt_id, model_id, condition_id, trial_index);
+
+-- Retrieval preprocessor cache. Keyed by SHA256 of the raw prompt so the same
+-- prompt produces the identical snippet across all 6 models under tool-using
+-- conditions, without re-running the Sonnet retrieval calls each time.
+CREATE TABLE IF NOT EXISTS retrieval_cache (
+    prompt_hash    TEXT PRIMARY KEY,
+    prompt_text    TEXT NOT NULL,
+    snippet        TEXT NOT NULL,
+    model_used     TEXT,
+    created_at     TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS turns (
     turn_id                TEXT PRIMARY KEY,      -- UUIDv4
@@ -272,6 +291,8 @@ class Store:
             "universe_index_other":     "TEXT",
             "failure_mode":             "TEXT",
             "failure_notes":            "TEXT",
+            "ai_prepopulated":          "INTEGER DEFAULT 0",
+            "curator_modified_fields":  "TEXT",
             # v1.2 fields (kept for existing DBs that don't have them yet)
             "securities_type":          "TEXT",
             "securities_type_detailed": "TEXT",
@@ -296,6 +317,11 @@ class Store:
         for name, ddl in add_cols.items():
             if name not in existing:
                 self.conn.execute(f"ALTER TABLE prompts ADD COLUMN {name} {ddl}")
+
+        # --- calls table additions (v1.3) ---
+        call_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(calls)").fetchall()}
+        if "retrieval_snippet" not in call_cols:
+            self.conn.execute("ALTER TABLE calls ADD COLUMN retrieval_snippet TEXT")
 
         # --- deferred indexes (must exist after the columns do) ---
         self.conn.execute(
@@ -336,14 +362,14 @@ class Store:
 
         # bool/list normalization
         bool_cols = (
-            "is_post_cutoff", "implementation_underspecified",
+            "is_post_cutoff", "implementation_underspecified", "ai_prepopulated",
         )
         for bcol in bool_cols:
             if bcol in fields:
                 fields[bcol] = _b(fields[bcol])
         json_cols = (
             "tickers", "expected_indicators", "expected_order_types",
-            "indicators", "failure_mode",
+            "indicators", "failure_mode", "curator_modified_fields",
         )
         for jcol in json_cols:
             if jcol in fields and not isinstance(fields[jcol], (str, type(None))):
@@ -478,6 +504,35 @@ class Store:
                 "pass_rate": float(pr) if pr is not None else None,
             })
         return out
+
+    # ---- retrieval cache -------------------------------------------------
+
+    def get_cached_retrieval(self, prompt_hash: str) -> str | None:
+        """Return cached snippet for this prompt hash, or None if not cached.
+        Empty string is a valid cached value (means "no relevant docs found")."""
+        row = self.conn.execute(
+            "SELECT snippet FROM retrieval_cache WHERE prompt_hash=?",
+            (prompt_hash,),
+        ).fetchone()
+        return row["snippet"] if row is not None else None
+
+    def set_cached_retrieval(
+        self,
+        prompt_hash: str,
+        prompt_text: str,
+        snippet: str,
+        model_used: str | None = None,
+    ) -> None:
+        """Store the snippet (idempotent upsert)."""
+        self.conn.execute(
+            "INSERT INTO retrieval_cache(prompt_hash, prompt_text, snippet, model_used, created_at) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(prompt_hash) DO UPDATE SET "
+            "snippet=excluded.snippet, model_used=excluded.model_used, created_at=excluded.created_at",
+            (prompt_hash, prompt_text, snippet, model_used, _now_utc_iso()),
+        )
+
+    # ---- calls -----------------------------------------------------------
 
     def record_call(self, **fields) -> str:
         """Append-only insert. Returns call_id (generated if not provided)."""

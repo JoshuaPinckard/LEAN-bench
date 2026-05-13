@@ -45,10 +45,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.schemas import (
     CallResult, CellStat, ConditionInfo, ConditionsResponse,
     GenerateRequest, GenerateResponse, ModelInfo, ModelsResponse,
-    PromptIn, StatsResponse,
+    PromptIn, SchemaAutofillRequest, SchemaAutofillResponse, StatsResponse,
 )
 from harness.models import CONDITIONS, FROZEN_DATE, MODELS_FROZEN
 from harness.orchestrator import run_grid
+from harness.schema_fill import SchemaAutofillError, fill_schema
 from harness.storage import Store
 
 
@@ -126,7 +127,7 @@ def list_prompts(
     rows, total = store.search_prompts(search=search, limit=limit, offset=offset)
     # Decode JSON list columns for the frontend.
     for r in rows:
-        for col in ("tickers", "indicators", "failure_mode"):
+        for col in ("tickers", "indicators", "failure_mode", "curator_modified_fields"):
             if r.get(col):
                 try:
                     r[col] = json.loads(r[col])
@@ -143,7 +144,7 @@ def get_prompt(prompt_id: str) -> dict:
     p = store.get_prompt(prompt_id)
     if p is None:
         raise HTTPException(status_code=404, detail=f"Prompt {prompt_id} not found")
-    for col in ("tickers", "indicators", "failure_mode"):
+    for col in ("tickers", "indicators", "failure_mode", "curator_modified_fields"):
         if p.get(col):
             try:
                 p[col] = json.loads(p[col])
@@ -185,6 +186,8 @@ def _prompt_fields(prompt_in: PromptIn) -> dict:
         failure_notes=prompt_in.failure_notes,
         source_date=str(prompt_in.source_date) if prompt_in.source_date else None,
         is_post_cutoff=False,    # legacy NOT NULL column; UI no longer surfaces this
+        ai_prepopulated=prompt_in.ai_prepopulated,
+        curator_modified_fields=prompt_in.curator_modified_fields,
         leak_audit_status=prompt_in.leak_audit_status,
         leak_audit_notes=prompt_in.curator_notes,
     )
@@ -214,6 +217,25 @@ def delete_prompt(prompt_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Prompt {prompt_id} not found")
     n_calls = store.delete_prompt(prompt_id)
     return {"deleted": prompt_id, "deleted_calls": n_calls}
+
+
+# ---- Schema autofill --------------------------------------------------
+
+@app.post("/api/schema/autofill", response_model=SchemaAutofillResponse)
+async def schema_autofill(req: SchemaAutofillRequest) -> SchemaAutofillResponse:
+    text = req.prompt_text.strip()
+    if len(text) < 20:
+        raise HTTPException(
+            status_code=400,
+            detail="prompt_text must be at least 20 characters to autofill.",
+        )
+    try:
+        data = await fill_schema(text)
+    except SchemaAutofillError as exc:
+        # Log server-side, return 500 with the parse error per the spec.
+        print(f"[schema_autofill] {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Autofill failed: {exc}") from exc
+    return SchemaAutofillResponse(**data)
 
 
 # ---- Generate ----------------------------------------------------------

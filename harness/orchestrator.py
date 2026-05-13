@@ -35,6 +35,7 @@ from harness.models import (
 )
 from harness.pricing import PricingNotSetError, cost_usd
 from harness.providers import anthropic_client, gemini_client, openai_client
+from harness.retrieval import get_retrieval_snippet
 from harness.storage import Store
 
 
@@ -43,6 +44,14 @@ PROVIDER_CALL = {
     "openai":    openai_client.call,
     "google":    gemini_client.call,
 }
+
+# Conditions where the retrieval preprocessor injects a shared LEAN docs snippet
+# into the prompt before any model call. Goal: every model in these conditions
+# sees identical baseline API info, eliminating retrieval-bias between providers.
+# S1_base remains untouched (pure parametric baseline).
+CONDITIONS_WITH_RETRIEVAL: frozenset[str] = frozenset(
+    {"S2_docs", "A1_agentic_full"}
+)
 
 # TODO: replace with the real ~2K-token LEAN API description per the design memo.
 SYSTEM_PROMPT = (
@@ -101,7 +110,26 @@ async def run_cell(
         temperature=DEFAULT_TEMPERATURE,
     )
 
-    messages: list[dict] = [{"role": "user", "content": prompt_text}]
+    # Retrieval preprocessor: enrich the prompt with a shared LEAN docs snippet
+    # for tool-using conditions. Cached per-prompt so all six models see the
+    # identical snippet. Empty snippet => no augmentation.
+    retrieval_snippet: str | None = None
+    enriched_prompt = prompt_text
+    if condition_id in CONDITIONS_WITH_RETRIEVAL:
+        try:
+            retrieval_snippet = await get_retrieval_snippet(prompt_text, store)
+        except Exception as exc:
+            retrieval_snippet = None
+            # Retrieval failures must not kill the call.
+            print(f"[retrieval] failed for call {call_id}: {type(exc).__name__}: {exc}")
+        if retrieval_snippet:
+            enriched_prompt = (
+                f"{prompt_text}\n\n"
+                f"--- RELEVANT QUANTCONNECT LEAN DOCUMENTATION ---\n\n"
+                f"{retrieval_snippet}"
+            )
+
+    messages: list[dict] = [{"role": "user", "content": enriched_prompt}]
     total_input = 0
     total_output = 0
     total_cached = 0
@@ -209,6 +237,7 @@ async def run_cell(
         total_output_tokens=total_output,
         total_cost_usd=total_cost,
         wall_clock_seconds=overall_wall,
+        retrieval_snippet=retrieval_snippet,
         trajectory_path=None,
         error=error_text,
     )

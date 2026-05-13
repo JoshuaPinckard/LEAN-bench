@@ -74,6 +74,34 @@ class PromptIn(BaseModel):
     source_url: str | None = None
     source_date: date | None = None
     leak_audit_status: str = "clean"
+    # AI-assisted curation telemetry
+    ai_prepopulated: bool = False
+    curator_modified_fields: list[str] = Field(default_factory=list)
+
+
+class SchemaAutofillRequest(BaseModel):
+    prompt_text: str
+
+
+class SchemaAutofillResponse(BaseModel):
+    """All fields the AI populates on autofill. Frontend uses this as the
+    snapshot to diff against on save (curator_modified_fields)."""
+    strategy_type: str
+    strategy_complexity: int
+    api_complexity: int
+    securities_type: str
+    securities_type_detailed: str | None = None
+    resolution: str
+    implementation_type: str
+    indicators: list[str] = Field(default_factory=list)
+    universe_type: str
+    universe_index: str | None = None
+    tickers: list[str] = Field(default_factory=list)
+    start_date: str
+    end_date: str
+    evaluation_mode: str
+    interpretation_strictness: int
+    curator_notes: str
 
     @field_validator("strategy_complexity", "api_complexity")
     @classmethod
