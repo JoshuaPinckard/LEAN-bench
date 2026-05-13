@@ -64,11 +64,12 @@ class PromptIn(BaseModel):
     evaluation_mode: Literal[
         "trade_required", "signal_required", "code_only", "metric_threshold_required"
     ] = "trade_required"
-    interpretation_strictness: int = 0    # 0=unambiguous|1=mild|2=broad|3=exclude
+    interpretation_strictness: Literal[
+        "unambiguous", "mild_variation", "broad_interpretation"
+    ] = "unambiguous"
     underspecification_notes: str | None = None
-    failure_mode: list[str] = Field(default_factory=list)  # post-hoc, filled after eval
-    failure_notes: str | None = None       # post-hoc freetext
     curator_notes: str | None = None
+    excluded_from_benchmark: bool = False
     # provenance
     source: str = "original"
     source_url: str | None = None
@@ -100,7 +101,7 @@ class SchemaAutofillResponse(BaseModel):
     start_date: str
     end_date: str
     evaluation_mode: str
-    interpretation_strictness: int
+    interpretation_strictness: str   # unambiguous|mild_variation|broad_interpretation
     curator_notes: str
 
     @field_validator("strategy_complexity", "api_complexity")
@@ -108,13 +109,6 @@ class SchemaAutofillResponse(BaseModel):
     def check_1_to_3(cls, v: int) -> int:
         if v not in (1, 2, 3):
             raise ValueError("must be 1, 2, or 3")
-        return v
-
-    @field_validator("interpretation_strictness")
-    @classmethod
-    def check_0_to_3(cls, v: int) -> int:
-        if v not in (0, 1, 2, 3):
-            raise ValueError("must be 0, 1, 2, or 3")
         return v
 
 

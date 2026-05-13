@@ -52,7 +52,8 @@ Field definitions (use exactly these keys and these allowed values):
 - start_date: string "YYYY-MM-DD". Default "2020-01-01" unless the prompt specifies otherwise.
 - end_date: string "YYYY-MM-DD". Default "2024-12-31" unless the prompt specifies otherwise.
 - evaluation_mode: one of "trade_required" | "signal_required" | "code_only" | "metric_threshold_required". Default "trade_required" unless the prompt is about pure signal generation or pure code structure.
-- interpretation_strictness: integer 0, 1, 2, or 3. (0=fully unambiguous; 1=mild gaps; 2=multiple valid implementations; 3=too ambiguous to evaluate.)
+- interpretation_strictness: one of "unambiguous" | "mild_variation" | "broad_interpretation".
+  unambiguous = a single correct interpretation; mild_variation = minor implementation gaps; broad_interpretation = multiple meaningfully different valid implementations.
 - curator_notes: a substantive string (MINIMUM 80 characters) describing what the prompt tests, the LEAN-specific failure modes a model might hit, and any ambiguities. Be specific and useful — this is for benchmark curators reviewing the prompt later.
 
 Output: a single JSON object containing all fields above, nothing else."""

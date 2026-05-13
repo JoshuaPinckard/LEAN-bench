@@ -23,7 +23,6 @@ import asyncio
 import hashlib
 import json
 import time
-import traceback
 import uuid
 from typing import Any
 
@@ -35,6 +34,7 @@ from harness.models import (
 )
 from harness.pricing import PricingNotSetError, cost_usd
 from harness.providers import anthropic_client, gemini_client, openai_client
+from harness.judge import JUDGE_VERSION, JudgeError, judge_call
 from harness.retrieval import get_retrieval_snippet
 from harness.storage import Store
 
@@ -207,6 +207,36 @@ async def run_cell(
         "judge_pass": None, "overall_pass": None, "failure_l1": None, "failure_l2": None,
     }
 
+    # Judge stage: score implementation correctness against the prompt's stated
+    # intent. The backtest stage (Stages 2-4 in the design memo) hasn't been
+    # built yet, so we hand the judge what we DO have — compile result and any
+    # provider/eval error — under the same `backtest_result` schema the future
+    # backtest stage will produce. The judge is robust to compile-only context.
+    judge_result: dict | None = None
+    if final_code and not error_text:
+        try:
+            prompt_record = store.get_prompt(prompt_id) or {
+                "reformulated_text": prompt_text,
+                "original_text": prompt_text,
+            }
+            backtest_result = {
+                "compile_success": bool(eval_for_call.get("compile_pass")),
+                "runtime_success": None,   # backtest stage not implemented yet
+                "runtime_error":   eval_for_call.get("feedback"),
+                "lean_results":    None,
+            }
+            judge_result = await judge_call(
+                prompt_record=prompt_record,
+                generated_code=final_code,
+                backtest_result=backtest_result,
+                judge_version=JUDGE_VERSION,
+            )
+        except JudgeError as exc:
+            # Judge failure must not kill the call; record the call without judge fields.
+            print(f"[judge] {type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[judge] unexpected: {type(exc).__name__}: {exc}")
+
     store.record_call(
         call_id=call_id,
         prompt_id=prompt_id,
@@ -222,9 +252,23 @@ async def run_cell(
         temperature=DEFAULT_TEMPERATURE,
         top_p=DEFAULT_TOP_P,
         max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-        system_prompt_sha256=SYSTEM_PROMPT_SHA256,
+        system_prompt_sha=SYSTEM_PROMPT_SHA256,    # mirrored to legacy system_prompt_sha256
         turns_used=turns_used,
         final_code_sha256=final_code_sha,
+        # v1.4 locked fields
+        condition=condition_id,                    # mirrored to legacy condition_id
+        pass_number=trial_index,                   # mirrored to legacy trial_index
+        generated_code=final_code,
+        code_hash=final_code_sha,
+        raw_model_response=last_response["response_text"] if last_response else None,
+        finish_reason=last_response["finish_reason"] if last_response else None,
+        tokens_in=total_input,
+        tokens_out=total_output,
+        cost_usd=total_cost,
+        latency_ms=int(sum(
+            r["latency_ms"] for r in [last_response] if r
+        )) if last_response else None,
+        # Legacy pipeline outcomes (kept for back-compat queries)
         compile_pass=eval_for_call["compile_pass"],
         backtest_pass=eval_for_call["backtest_pass"],
         trade_pass=eval_for_call["trade_pass"],
@@ -240,6 +284,13 @@ async def run_cell(
         retrieval_snippet=retrieval_snippet,
         trajectory_path=None,
         error=error_text,
+        # Judge outputs (None if the judge stage was skipped or failed)
+        judge_score=judge_result["judge_score"] if judge_result else None,
+        judge_reasoning=judge_result["judge_reasoning"] if judge_result else None,
+        judge_version=judge_result["judge_version"] if judge_result else None,
+        failure_mode=judge_result["failure_mode"] if judge_result else None,
+        failure_notes=judge_result["failure_notes"] if judge_result else None,
+        matches_prompt_intent=judge_result["matches_prompt_intent"] if judge_result else None,
     )
 
     return {

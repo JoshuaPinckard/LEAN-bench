@@ -38,4 +38,6 @@ export const api = {
   getCall:      (id)                             => req('GET',    `/api/calls/${id}`),
 
   schemaAutofill: (promptText)                   => req('POST',   '/api/schema/autofill', { prompt_text: promptText }),
+
+  distribution: ()                               => req('GET',    '/api/stats/distribution'),
 }

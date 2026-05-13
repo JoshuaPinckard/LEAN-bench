@@ -127,7 +127,7 @@ def list_prompts(
     rows, total = store.search_prompts(search=search, limit=limit, offset=offset)
     # Decode JSON list columns for the frontend.
     for r in rows:
-        for col in ("tickers", "indicators", "failure_mode", "curator_modified_fields"):
+        for col in ("tickers", "indicators", "curator_modified_fields"):
             if r.get(col):
                 try:
                     r[col] = json.loads(r[col])
@@ -144,7 +144,7 @@ def get_prompt(prompt_id: str) -> dict:
     p = store.get_prompt(prompt_id)
     if p is None:
         raise HTTPException(status_code=404, detail=f"Prompt {prompt_id} not found")
-    for col in ("tickers", "indicators", "failure_mode", "curator_modified_fields"):
+    for col in ("tickers", "indicators", "curator_modified_fields"):
         if p.get(col):
             try:
                 p[col] = json.loads(p[col])
@@ -179,11 +179,10 @@ def _prompt_fields(prompt_in: PromptIn) -> dict:
         end_date=prompt_in.end_date,
         evaluation_mode=prompt_in.evaluation_mode,
         interpretation_strictness=prompt_in.interpretation_strictness,
-        # derive legacy bool from the new int field
-        implementation_underspecified=prompt_in.interpretation_strictness > 0,
+        # derive legacy bool: any non-"unambiguous" value implies underspecification
+        implementation_underspecified=prompt_in.interpretation_strictness != "unambiguous",
         underspecification_notes=prompt_in.underspecification_notes,
-        failure_mode=prompt_in.failure_mode,
-        failure_notes=prompt_in.failure_notes,
+        excluded_from_benchmark=prompt_in.excluded_from_benchmark,
         source_date=str(prompt_in.source_date) if prompt_in.source_date else None,
         is_post_cutoff=False,    # legacy NOT NULL column; UI no longer surfaces this
         ai_prepopulated=prompt_in.ai_prepopulated,
@@ -217,6 +216,15 @@ def delete_prompt(prompt_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Prompt {prompt_id} not found")
     n_calls = store.delete_prompt(prompt_id)
     return {"deleted": prompt_id, "deleted_calls": n_calls}
+
+
+# ---- Distribution dashboard -------------------------------------------
+
+@app.get("/api/stats/distribution")
+def stats_distribution() -> dict:
+    """Live count breakdowns across all curated prompts (excluding adhoc and
+    excluded_from_benchmark rows). Used by the Distribution dashboard tab."""
+    return get_store().compute_distribution_stats()
 
 
 # ---- Schema autofill --------------------------------------------------

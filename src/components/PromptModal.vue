@@ -70,12 +70,11 @@ const FAILURE_MODE_OPTIONS = [
 
 const COMPLEXITY_LABELS = { 1: '1 — easy', 2: '2 — medium', 3: '3 — hard' }
 const API_LABELS = { 1: '1 — basic', 2: '2 — intermediate', 3: '3 — advanced' }
-const STRICTNESS_LABELS = {
-  0: '0 — unambiguous',
-  1: '1 — mild (minor gaps)',
-  2: '2 — broad (multiple valid implementations)',
-  3: '3 — exclude (too ambiguous to evaluate)',
-}
+const STRICTNESS_OPTIONS = [
+  { value: 'unambiguous',          desc: 'Prompt has a single correct interpretation' },
+  { value: 'mild_variation',       desc: 'Minor implementation gaps; small set of acceptable variants' },
+  { value: 'broad_interpretation', desc: 'Multiple meaningfully different valid implementations' },
+]
 
 const form = reactive({
   text: '',
@@ -94,10 +93,9 @@ const form = reactive({
   start_date: '2020-01-01',
   end_date: '2024-12-31',
   evaluation_mode: 'trade_required',
-  interpretation_strictness: 0,
+  interpretation_strictness: 'unambiguous',
   underspecification_notes: '',
-  failure_mode: [],
-  failure_notes: '',
+  excluded_from_benchmark: false,
   source: 'original',
   source_url: '',
   source_date: '',
@@ -193,10 +191,9 @@ onMounted(async () => {
         start_date: p.start_date || '2020-01-01',
         end_date: p.end_date || '2024-12-31',
         evaluation_mode: p.evaluation_mode || 'trade_required',
-        interpretation_strictness: p.interpretation_strictness ?? 0,
+        interpretation_strictness: p.interpretation_strictness || 'unambiguous',
         underspecification_notes: p.underspecification_notes || '',
-        failure_mode: p.failure_mode || [],
-        failure_notes: p.failure_notes || '',
+        excluded_from_benchmark: !!p.excluded_from_benchmark,
         source: p.source || 'original',
         source_url: p.original_url || '',
         source_date: p.source_date || '',
@@ -226,11 +223,6 @@ function addIndicator() {
 }
 function removeIndicator(i) { form.indicators.splice(i, 1) }
 
-function toggleFailureMode(v) {
-  const i = form.failure_mode.indexOf(v)
-  if (i >= 0) form.failure_mode.splice(i, 1)
-  else form.failure_mode.push(v)
-}
 
 const errors = computed(() => {
   const e = {}
@@ -255,7 +247,8 @@ const errors = computed(() => {
   if (form.start_date && form.end_date && form.end_date <= form.start_date)
     e.end_date = 'End date must be after start date.'
   if (!form.evaluation_mode) e.evaluation_mode = 'Required.'
-  if (![0,1,2,3].includes(form.interpretation_strictness)) e.interpretation_strictness = '0–3 required.'
+  if (!['unambiguous','mild_variation','broad_interpretation'].includes(form.interpretation_strictness))
+    e.interpretation_strictness = 'Required.'
   if (!form.source) e.source = 'Required.'
   if (form.source !== 'original' && !form.source_url.trim())
     e.source_url = 'Required when source is not "original".'
@@ -277,7 +270,6 @@ async function save(addAnother = false) {
   if (!form.securities_type_detailed) payload.securities_type_detailed = null
   if (!form.underspecification_notes) payload.underspecification_notes = null
   if (!form.source_date) payload.source_date = null
-  if (!form.failure_notes) payload.failure_notes = null
   // Drop tickers / index fields that don't apply to the chosen universe_type
   if (!tickerVisible.value) payload.tickers = []
   if (!indexVisible.value)  { payload.universe_index = null; payload.universe_index_other = null }
@@ -285,7 +277,6 @@ async function save(addAnother = false) {
   // Cast to int in case reactive coerced to string
   payload.strategy_complexity = parseInt(form.strategy_complexity)
   payload.api_complexity       = parseInt(form.api_complexity)
-  payload.interpretation_strictness = parseInt(form.interpretation_strictness)
   // AI autofill telemetry
   payload.ai_prepopulated = aiSnapshot.value !== null
   payload.curator_modified_fields = computeModifiedFields()
@@ -298,8 +289,8 @@ async function save(addAnother = false) {
       Object.assign(form, {
         text: '', tickers: [], indicators: [],
         strategy_complexity: 2, api_complexity: 2,
-        interpretation_strictness: 0, underspecification_notes: '',
-        failure_mode: [], failure_notes: '',
+        interpretation_strictness: 'unambiguous', underspecification_notes: '',
+        excluded_from_benchmark: false,
         universe_index: '', universe_index_other: '',
         source_url: '', source_date: '', curator_notes: '',
       })
@@ -495,27 +486,15 @@ async function save(addAnother = false) {
           </div>
           <div class="form-row">
             <label>Interpretation strictness *</label>
-            <select v-model.number="form.interpretation_strictness">
-              <option v-for="(label, val) in STRICTNESS_LABELS" :key="val" :value="parseInt(val)">{{ label }}</option>
+            <select v-model="form.interpretation_strictness">
+              <option v-for="s in STRICTNESS_OPTIONS" :key="s.value" :value="s.value">{{ s.value }}</option>
             </select>
+            <div class="helper">{{ STRICTNESS_OPTIONS.find(s => s.value === form.interpretation_strictness)?.desc }}</div>
           </div>
-          <div v-if="form.interpretation_strictness > 0" class="form-row full">
+          <div v-if="form.interpretation_strictness !== 'unambiguous'" class="form-row full">
             <label>Underspecification notes</label>
             <input type="text" v-model="form.underspecification_notes"
                    placeholder="e.g. 'goes LONG' doesn't specify exit condition" />
-          </div>
-          <div class="form-row full posthoc-block">
-            <label>Failure mode(s) <span class="hint">— filled in after model evaluation</span></label>
-            <div style="display:flex;gap:14px;flex-wrap:wrap;">
-              <label v-for="f in FAILURE_MODE_OPTIONS" :key="f.value" style="font-weight:normal;" :title="f.desc">
-                <input type="checkbox"
-                       :checked="form.failure_mode.includes(f.value)"
-                       @change="toggleFailureMode(f.value)" />
-                {{ f.value }}
-              </label>
-            </div>
-            <input type="text" v-model="form.failure_notes" class="failure-notes-input"
-                   placeholder="Failure notes (optional, for edge cases not captured above)" />
           </div>
         </div>
 
@@ -551,6 +530,17 @@ async function save(addAnother = false) {
             <div class="helper">
               <span :class="{ error: errors.curator_notes }">{{ errors.curator_notes || `${notesCount} / 80 min` }}</span>
             </div>
+          </div>
+        </div>
+
+        <!-- 9: Curator filtering -->
+        <div class="form-grid">
+          <div class="form-row full">
+            <label class="toggle-switch" style="font-weight:normal;"
+                   title="Curator-flagged: this prompt should not be counted in the benchmark dataset (distribution stats, runs).">
+              <input type="checkbox" v-model="form.excluded_from_benchmark" />
+              {{ form.excluded_from_benchmark ? 'Excluded from benchmark' : 'Include in benchmark' }}
+            </label>
           </div>
         </div>
       </div>

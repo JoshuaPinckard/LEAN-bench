@@ -60,11 +60,10 @@ CREATE TABLE IF NOT EXISTS prompts (
 
     -- expected behavior / evaluation
     evaluation_mode        TEXT NOT NULL DEFAULT 'trade_required',  -- trade_required|signal_required|code_only|metric_threshold_required
-    interpretation_strictness INTEGER NOT NULL DEFAULT 0,           -- 0=unambiguous|1=mild|2=broad|3=exclude
-    implementation_underspecified INTEGER DEFAULT 0,                -- legacy bool; derived from interpretation_strictness > 0
+    interpretation_strictness TEXT NOT NULL DEFAULT 'unambiguous',  -- unambiguous|mild_variation|broad_interpretation
+    implementation_underspecified INTEGER DEFAULT 0,                -- legacy bool; derived from strictness != 'unambiguous'
     underspecification_notes TEXT,
-    failure_mode           TEXT,                  -- JSON list[str], populated post-evaluation
-    failure_notes          TEXT,                  -- freetext, optional post-evaluation note
+    excluded_from_benchmark INTEGER NOT NULL DEFAULT 0,  -- bool: curator-flagged out of the benchmark dataset
 
     -- provenance
     source_date            DATE,                  -- when the strategy idea was first publicly described; NULL if synthetic
@@ -272,17 +271,29 @@ class Store:
             self.conn.execute("ALTER TABLE prompts DROP COLUMN difficulty")
         if "trades_expected" in existing:
             self.conn.execute("ALTER TABLE prompts DROP COLUMN trades_expected")
+        # interpretation_strictness changed from INTEGER -> TEXT enum (v1.4 lock).
+        # Drop the integer column so the ADD COLUMN below installs the new TEXT
+        # version with the right type and default. Existing prompt rows lose the
+        # pre-lock value (they were test data only).
+        if "interpretation_strictness" in existing:
+            info = self.conn.execute(
+                "SELECT type FROM pragma_table_info('prompts') WHERE name='interpretation_strictness'"
+            ).fetchone()
+            if info and info["type"].upper().startswith("INT"):
+                self.conn.execute("ALTER TABLE prompts DROP COLUMN interpretation_strictness")
 
         # Re-read after drops.
         existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(prompts)").fetchall()}
 
         # --- adds (format: name -> full DDL fragment appended to ALTER TABLE ADD COLUMN) ---
         add_cols = {
+            # v1.4 lock-in (2026-05-13)
+            "interpretation_strictness": "TEXT NOT NULL DEFAULT 'unambiguous'",
+            "excluded_from_benchmark":  "INTEGER NOT NULL DEFAULT 0",
             # v1.3 new fields
             "strategy_complexity":      "INTEGER NOT NULL DEFAULT 2",
             "api_complexity":           "INTEGER NOT NULL DEFAULT 2",
             "evaluation_mode":          "TEXT NOT NULL DEFAULT 'trade_required'",
-            "interpretation_strictness": "INTEGER NOT NULL DEFAULT 0",
             "source_date":              "DATE",
             "implementation_type":      "TEXT",
             "indicators":               "TEXT",
@@ -318,10 +329,48 @@ class Store:
             if name not in existing:
                 self.conn.execute(f"ALTER TABLE prompts ADD COLUMN {name} {ddl}")
 
-        # --- calls table additions (v1.3) ---
+        # --- calls table additions ---
         call_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(calls)").fetchall()}
-        if "retrieval_snippet" not in call_cols:
-            self.conn.execute("ALTER TABLE calls ADD COLUMN retrieval_snippet TEXT")
+        new_call_cols = {
+            # v1.3
+            "retrieval_snippet":       "TEXT",
+            # v1.4 — locked 35-field calls schema
+            "condition":               "TEXT",
+            "pass_number":             "INTEGER",
+            "retrieval_snippet_hash":  "TEXT",
+            "system_prompt_sha":       "TEXT",
+            "generated_code":          "TEXT",
+            "code_hash":               "TEXT",
+            "raw_model_response":      "TEXT",
+            "finish_reason":           "TEXT",
+            "tokens_in":               "INTEGER",
+            "tokens_out":              "INTEGER",
+            "cost_usd":                "REAL",
+            "latency_ms":              "INTEGER",
+            "compile_success":         "INTEGER",
+            "runtime_success":         "INTEGER",
+            "runtime_error":           "TEXT",
+            "lean_results_json":       "TEXT",
+            "total_return_pct":        "REAL",
+            "sharpe_ratio":            "REAL",
+            "max_drawdown_pct":        "REAL",
+            "num_trades":              "INTEGER",
+            "win_rate":                "REAL",
+            "final_portfolio_value":   "REAL",
+            "benchmark_return_pct":    "REAL",
+            "judge_score":             "REAL",
+            "judge_reasoning":         "TEXT",
+            "judge_version":           "TEXT",
+            "failure_mode":            "TEXT",     # JSON list[str]
+            "failure_notes":           "TEXT",
+            "matches_prompt_intent":   "INTEGER",
+            "harness_sha":             "TEXT",
+            "frozen_date":             "TEXT",
+            "created_at":              "TEXT",
+        }
+        for col, ddl in new_call_cols.items():
+            if col not in call_cols:
+                self.conn.execute(f"ALTER TABLE calls ADD COLUMN {col} {ddl}")
 
         # --- deferred indexes (must exist after the columns do) ---
         self.conn.execute(
@@ -363,6 +412,7 @@ class Store:
         # bool/list normalization
         bool_cols = (
             "is_post_cutoff", "implementation_underspecified", "ai_prepopulated",
+            "excluded_from_benchmark",
         )
         for bcol in bool_cols:
             if bcol in fields:
@@ -534,18 +584,43 @@ class Store:
 
     # ---- calls -----------------------------------------------------------
 
+    # All bool/JSON columns on `calls` that need normalization on insert/update.
+    _CALL_BOOL_COLS = (
+        "tool_docs_retrieval", "tool_web_search", "tool_agentic_loop",
+        "compile_pass", "backtest_pass", "trade_pass", "judge_pass", "overall_pass",
+        "compile_success", "runtime_success", "matches_prompt_intent",
+    )
+    _CALL_JSON_COLS = ("failure_mode",)
+
+    def _normalize_call_fields(self, fields: dict) -> dict:
+        # Mirror condition <-> condition_id so callers can use either name.
+        if "condition" in fields and "condition_id" not in fields:
+            fields["condition_id"] = fields["condition"]
+        if "condition_id" in fields and "condition" not in fields:
+            fields["condition"] = fields["condition_id"]
+        # Mirror pass_number <-> trial_index.
+        if "pass_number" in fields and "trial_index" not in fields:
+            fields["trial_index"] = fields["pass_number"]
+        if "trial_index" in fields and "pass_number" not in fields:
+            fields["pass_number"] = fields["trial_index"]
+        # Mirror system_prompt_sha <-> system_prompt_sha256 (old name).
+        if "system_prompt_sha" in fields and "system_prompt_sha256" not in fields:
+            fields["system_prompt_sha256"] = fields["system_prompt_sha"]
+        for bcol in self._CALL_BOOL_COLS:
+            if bcol in fields:
+                fields[bcol] = _b(fields[bcol])
+        for jcol in self._CALL_JSON_COLS:
+            if jcol in fields and not isinstance(fields[jcol], (str, type(None))):
+                fields[jcol] = _j(fields[jcol])
+        return fields
+
     def record_call(self, **fields) -> str:
         """Append-only insert. Returns call_id (generated if not provided)."""
         fields.setdefault("call_id", str(uuid.uuid4()))
         fields.setdefault("trial_index", 0)
         fields.setdefault("request_timestamp", _now_utc_iso())
-
-        for bcol in (
-            "tool_docs_retrieval", "tool_web_search", "tool_agentic_loop",
-            "compile_pass", "backtest_pass", "trade_pass", "judge_pass", "overall_pass",
-        ):
-            if bcol in fields:
-                fields[bcol] = _b(fields[bcol])
+        fields.setdefault("created_at", _now_utc_iso())
+        self._normalize_call_fields(fields)
 
         cols = list(fields.keys())
         placeholders = ",".join("?" * len(cols))
@@ -555,20 +630,178 @@ class Store:
         return fields["call_id"]
 
     def update_call(self, call_id: str, **fields) -> None:
-        """Update evaluation columns after the fact (eval is separate from generation)."""
-        for bcol in (
-            "compile_pass", "backtest_pass", "trade_pass", "judge_pass", "overall_pass",
-        ):
-            if bcol in fields:
-                fields[bcol] = _b(fields[bcol])
-
+        """Update arbitrary call columns after the fact."""
         if not fields:
             return
+        self._normalize_call_fields(fields)
         set_clause = ",".join(f"{c}=?" for c in fields)
         self.conn.execute(
             f"UPDATE calls SET {set_clause} WHERE call_id=?",
             [*fields.values(), call_id],
         )
+
+    # ---- v1.4 staged helpers ---------------------------------------------
+    #
+    # Three-stage call lifecycle (replaces the single-shot record_call as the
+    # canonical path for the locked schema):
+    #   create_call                — at generation start (identity + inputs)
+    #   update_call_with_backtest  — after LEAN executes (success/metrics)
+    #   update_call_with_judge     — after judge scores (overwrites on rejudge)
+
+    def create_call(self, **fields) -> str:
+        """Insert a calls row at generation start. Required: prompt_id,
+        model_id, condition. Other fields are optional and filled later by
+        update_call_with_backtest / update_call_with_judge."""
+        fields.setdefault("call_id", str(uuid.uuid4()))
+        fields.setdefault("pass_number", 1)
+        fields.setdefault("request_timestamp", _now_utc_iso())
+        fields.setdefault("created_at", _now_utc_iso())
+        # NOT NULL legacy fields need sensible defaults.
+        fields.setdefault("tool_docs_retrieval", 0)
+        fields.setdefault("tool_web_search", 0)
+        fields.setdefault("tool_agentic_loop", 0)
+        fields.setdefault("max_turns_allowed", 1)
+        fields.setdefault("max_output_tokens", 4096)
+        fields.setdefault("system_prompt_sha256", fields.get("system_prompt_sha", ""))
+        if "model_version" not in fields:
+            fields["model_version"] = fields.get("model_id", "")
+        if "model_family" not in fields:
+            fields["model_family"] = ""
+        self._normalize_call_fields(fields)
+        cols = list(fields.keys())
+        sql = (
+            f"INSERT INTO calls({','.join(cols)}) "
+            f"VALUES({','.join('?' * len(cols))})"
+        )
+        self.conn.execute(sql, [fields[c] for c in cols])
+        return fields["call_id"]
+
+    def update_call_with_backtest(
+        self,
+        call_id: str,
+        *,
+        compile_success: bool,
+        runtime_success: bool,
+        runtime_error: str | None = None,
+        lean_results_json: str | None = None,
+        total_return_pct: float | None = None,
+        sharpe_ratio: float | None = None,
+        max_drawdown_pct: float | None = None,
+        num_trades: int | None = None,
+        win_rate: float | None = None,
+        final_portfolio_value: float | None = None,
+        benchmark_return_pct: float | None = None,
+    ) -> None:
+        self.update_call(
+            call_id,
+            compile_success=compile_success,
+            runtime_success=runtime_success,
+            runtime_error=runtime_error,
+            lean_results_json=lean_results_json,
+            total_return_pct=total_return_pct,
+            sharpe_ratio=sharpe_ratio,
+            max_drawdown_pct=max_drawdown_pct,
+            num_trades=num_trades,
+            win_rate=win_rate,
+            final_portfolio_value=final_portfolio_value,
+            benchmark_return_pct=benchmark_return_pct,
+        )
+
+    def update_call_with_judge(
+        self,
+        call_id: str,
+        *,
+        judge_score: float,
+        judge_reasoning: str,
+        judge_version: str,
+        failure_mode: list[str],
+        failure_notes: str | None = None,
+        matches_prompt_intent: bool,
+    ) -> None:
+        """Write judge fields. Overwrites any prior judge values on re-judge."""
+        self.update_call(
+            call_id,
+            judge_score=judge_score,
+            judge_reasoning=judge_reasoning,
+            judge_version=judge_version,
+            failure_mode=failure_mode,
+            failure_notes=failure_notes,
+            matches_prompt_intent=matches_prompt_intent,
+        )
+
+    def get_calls_by_prompt(self, prompt_id: str) -> list[dict]:
+        """All calls for a prompt, ordered by pass_number then created_at."""
+        rows = self.conn.execute(
+            "SELECT * FROM calls WHERE prompt_id=? "
+            "ORDER BY COALESCE(pass_number, trial_index, 0), COALESCE(created_at, request_timestamp)",
+            (prompt_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def compute_distribution_stats(self) -> dict:
+        """Count prompts (excluding excluded_from_benchmark) along every
+        categorical / ordinal field used by the Distribution dashboard.
+
+        Returns a dict shaped:
+            {
+              "total": int,
+              "by_strategy_type": {value: count, ...},
+              "by_strategy_complexity": {1: count, ...},
+              ...
+              "indicator_frequency": {name: count, ...},
+            }
+        """
+        where = "WHERE COALESCE(excluded_from_benchmark, 0) = 0 AND source != 'adhoc'"
+
+        def _count_by(col: str) -> dict:
+            rows = self.conn.execute(
+                f"SELECT {col} AS k, COUNT(*) AS n FROM prompts {where} GROUP BY {col}"
+            ).fetchall()
+            out: dict = {}
+            for r in rows:
+                key = r["k"]
+                if key is None:
+                    key = "__null__"
+                out[str(key)] = int(r["n"])
+            return out
+
+        total = int(self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM prompts {where}"
+        ).fetchone()["n"])
+
+        # Indicator frequency: JSON array column needs row-level decode.
+        indicator_freq: dict[str, int] = {}
+        for r in self.conn.execute(
+            f"SELECT indicators FROM prompts {where} AND indicators IS NOT NULL"
+        ).fetchall():
+            raw = r["indicators"]
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(parsed, list):
+                continue
+            for item in parsed:
+                # accept {name, params} or bare string
+                name = item.get("name") if isinstance(item, dict) else str(item)
+                if name:
+                    indicator_freq[name] = indicator_freq.get(name, 0) + 1
+
+        return {
+            "total":                    total,
+            "by_strategy_type":         _count_by("strategy_type"),
+            "by_strategy_complexity":   _count_by("strategy_complexity"),
+            "by_api_complexity":        _count_by("api_complexity"),
+            "by_implementation_type":   _count_by("implementation_type"),
+            "by_universe_type":         _count_by("universe_type"),
+            "by_securities_type":       _count_by("securities_type"),
+            "by_resolution":            _count_by("resolution"),
+            "by_evaluation_mode":       _count_by("evaluation_mode"),
+            "by_interpretation_strictness": _count_by("interpretation_strictness"),
+            "indicator_frequency":      indicator_freq,
+        }
 
     def get_call(self, call_id: str) -> dict | None:
         row = self.conn.execute("SELECT * FROM calls WHERE call_id=?", (call_id,)).fetchone()

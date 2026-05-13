@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { api } from './api.js'
 import GenerateTab from './components/GenerateTab.vue'
 import PromptsTab from './components/PromptsTab.vue'
+import DistributionTab from './components/DistributionTab.vue'
 import StatsTab from './components/StatsTab.vue'
 
 const tab = ref('generate')
@@ -40,17 +41,19 @@ onMounted(async () => {
     <nav class="app-nav">
       <h1>LEAN-Bench</h1>
       <div class="tabs">
-        <button class="tab" :class="{ active: tab === 'generate' }" @click="tab = 'generate'">Generate</button>
-        <button class="tab" :class="{ active: tab === 'prompts'  }" @click="tab = 'prompts'">Prompts</button>
-        <button class="tab" :class="{ active: tab === 'stats'    }" @click="tab = 'stats'">Stats</button>
+        <button class="tab" :class="{ active: tab === 'generate'    }" @click="tab = 'generate'">Generate</button>
+        <button class="tab" :class="{ active: tab === 'prompts'     }" @click="tab = 'prompts'">Prompts</button>
+        <button class="tab" :class="{ active: tab === 'distribution'}" @click="tab = 'distribution'">Distribution</button>
+        <button class="tab" :class="{ active: tab === 'stats'       }" @click="tab = 'stats'">Stats</button>
       </div>
       <div class="frozen">frozen: {{ frozenDate }}</div>
     </nav>
 
     <main class="app-body">
       <GenerateTab v-if="tab === 'generate'" :models="models" :conditions="conditions" @error="showError" />
-      <PromptsTab  v-if="tab === 'prompts'"  @error="showError" />
-      <StatsTab    v-if="tab === 'stats'"    :models="models"   :conditions="conditions" @error="showError" />
+      <PromptsTab     v-if="tab === 'prompts'"      @error="showError" />
+      <DistributionTab v-if="tab === 'distribution'" @error="showError" />
+      <StatsTab       v-if="tab === 'stats'"        :models="models" :conditions="conditions" @error="showError" />
     </main>
 
     <div v-if="toast" class="toast">
