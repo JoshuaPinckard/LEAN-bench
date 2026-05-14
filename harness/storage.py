@@ -356,6 +356,7 @@ class Store:
             "max_drawdown_pct":        "REAL",
             "num_trades":              "INTEGER",
             "win_rate":                "REAL",
+            "starting_portfolio_value": "REAL",
             "final_portfolio_value":   "REAL",
             "benchmark_return_pct":    "REAL",
             "judge_score":             "REAL",
@@ -689,6 +690,7 @@ class Store:
         max_drawdown_pct: float | None = None,
         num_trades: int | None = None,
         win_rate: float | None = None,
+        starting_portfolio_value: float | None = None,
         final_portfolio_value: float | None = None,
         benchmark_return_pct: float | None = None,
     ) -> dict:
@@ -721,6 +723,7 @@ class Store:
             max_drawdown_pct=max_drawdown_pct,
             num_trades=num_trades,
             win_rate=win_rate,
+            starting_portfolio_value=starting_portfolio_value,
             final_portfolio_value=final_portfolio_value,
             benchmark_return_pct=benchmark_return_pct,
             backtest_pass=backtest_pass,

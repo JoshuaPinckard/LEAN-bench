@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -103,7 +104,8 @@ def _ensure_workspace_initialized() -> str | None:
 _RESULT_KEYS = (
     "compile_success", "runtime_success", "runtime_error", "lean_results_json",
     "total_return_pct", "sharpe_ratio", "max_drawdown_pct",
-    "num_trades", "win_rate", "final_portfolio_value", "benchmark_return_pct",
+    "num_trades", "win_rate", "starting_portfolio_value",
+    "final_portfolio_value", "benchmark_return_pct",
 )
 
 
@@ -111,17 +113,28 @@ _RESULT_KEYS = (
 
 def _find_lean_bin() -> str | None:
     """Locate the LEAN CLI binary. Honors $LEAN_BIN; then checks the active
-    venv's Scripts dir (so subprocesses find it even when PATH omits the venv);
+    venv's Scripts dir; then checks `venv/` and `.venv/` under the repo root
+    (so the backend can find it even when launched outside its venv); finally
     falls back to PATH."""
     import sys
     override = os.environ.get("LEAN_BIN")
     if override:
         return shutil.which(override) or (override if Path(override).is_file() else None)
-    scripts_dir = Path(sys.executable).parent
-    for name in ("lean", "lean.exe"):
-        candidate = scripts_dir / name
-        if candidate.is_file():
-            return str(candidate)
+
+    candidates: list[Path] = []
+    # 1. Active interpreter's Scripts/bin dir
+    candidates.append(Path(sys.executable).parent)
+    # 2. Repo-root venvs — let the executor work regardless of which Python
+    # launched the backend.
+    repo_root = Path(__file__).resolve().parent.parent
+    for venv_name in ("venv", ".venv"):
+        candidates.append(repo_root / venv_name / "Scripts")  # Windows
+        candidates.append(repo_root / venv_name / "bin")      # POSIX
+    for d in candidates:
+        for name in ("lean", "lean.exe"):
+            candidate = d / name
+            if candidate.is_file():
+                return str(candidate)
     return shutil.which("lean")
 
 
@@ -134,17 +147,18 @@ def is_lean_available() -> bool:
 def _skipped_result(reason: str) -> dict[str, Any]:
     """Result shape for cases where the backtest never executed."""
     return {
-        "compile_success":       None,
-        "runtime_success":       None,
-        "runtime_error":         reason,
-        "lean_results_json":     None,
-        "total_return_pct":      None,
-        "sharpe_ratio":          None,
-        "max_drawdown_pct":      None,
-        "num_trades":            None,
-        "win_rate":              None,
-        "final_portfolio_value": None,
-        "benchmark_return_pct":  None,
+        "compile_success":          None,
+        "runtime_success":          None,
+        "runtime_error":            reason,
+        "lean_results_json":        None,
+        "total_return_pct":         None,
+        "sharpe_ratio":             None,
+        "max_drawdown_pct":         None,
+        "num_trades":               None,
+        "win_rate":                 None,
+        "starting_portfolio_value": None,
+        "final_portfolio_value":    None,
+        "benchmark_return_pct":     None,
     }
 
 
@@ -182,13 +196,14 @@ def _extract_metrics(stats: dict) -> dict[str, Any]:
         return None
 
     return {
-        "total_return_pct":      _coerce_float(pick("Net Profit", "Total Return", "Compounding Annual Return")),
-        "sharpe_ratio":          _coerce_float(pick("Sharpe Ratio")),
-        "max_drawdown_pct":      _coerce_float(pick("Drawdown", "Max Drawdown")),
-        "num_trades":            _coerce_int(pick("Total Trades", "Total Orders")),
-        "win_rate":              _coerce_float(pick("Win Rate")),
-        "final_portfolio_value": _coerce_float(pick("End Equity", "Final Portfolio Value")),
-        "benchmark_return_pct":  _coerce_float(pick("Benchmark Return")),
+        "total_return_pct":         _coerce_float(pick("Net Profit", "Total Return", "Compounding Annual Return")),
+        "sharpe_ratio":             _coerce_float(pick("Sharpe Ratio")),
+        "max_drawdown_pct":         _coerce_float(pick("Drawdown", "Max Drawdown")),
+        "num_trades":               _coerce_int(pick("Total Trades", "Total Orders")),
+        "win_rate":                 _coerce_float(pick("Win Rate")),
+        "starting_portfolio_value": _coerce_float(pick("Start Equity", "Starting Portfolio Value")),
+        "final_portfolio_value":    _coerce_float(pick("End Equity", "Final Portfolio Value")),
+        "benchmark_return_pct":     _coerce_float(pick("Benchmark Return")),
     }
 
 
@@ -293,30 +308,29 @@ async def run_backtest(
 
         # 2. Run `lean backtest <project_name>` from the workspace root so the
         # CLI picks up the workspace lean.json (data folder, credentials).
+        # asyncio.to_thread + subprocess.run (instead of create_subprocess_exec)
+        # avoids the Windows asyncio quirk where create_subprocess_exec raises
+        # NotImplementedError when uvicorn's reload mode installs a
+        # SelectorEventLoop (subprocess transport is ProactorEventLoop-only).
         try:
-            proc = await asyncio.create_subprocess_exec(
-                lean_bin, "backtest", project_dir.name,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                [lean_bin, "backtest", project_dir.name],
                 cwd=str(LEAN_WORKSPACE),
+                capture_output=True,
+                timeout=timeout_s,
             )
+            stdout = completed.stdout.decode("utf-8", errors="replace")
+            stderr = completed.stderr.decode("utf-8", errors="replace")
+            exit_code = completed.returncode
+        except subprocess.TimeoutExpired:
+            result = _skipped_result(f"backtest timed out after {timeout_s}s")
+            _persist(store, call_id, result)
+            return result
         except (OSError, FileNotFoundError) as exc:
             result = _skipped_result(f"failed to launch lean: {exc}")
             _persist(store, call_id, result)
             return result
-
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-            exit_code = proc.returncode or 0
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            result = _skipped_result(f"backtest timed out after {timeout_s}s")
-            _persist(store, call_id, result)
-            return result
-
-        stdout = stdout_b.decode("utf-8", errors="replace")
-        stderr = stderr_b.decode("utf-8", errors="replace")
 
         # 3. Classify and parse.
         compile_ok, runtime_ok, err_msg = _classify_outcome(stdout, stderr, exit_code)
@@ -324,8 +338,8 @@ async def run_backtest(
         lean_results_json: str | None = None
         metrics: dict[str, Any] = {
             "total_return_pct": None, "sharpe_ratio": None, "max_drawdown_pct": None,
-            "num_trades": None, "win_rate": None, "final_portfolio_value": None,
-            "benchmark_return_pct": None,
+            "num_trades": None, "win_rate": None, "starting_portfolio_value": None,
+            "final_portfolio_value": None, "benchmark_return_pct": None,
         }
         result_path = _find_latest_result_json(project_dir)
         if result_path is not None:
@@ -369,6 +383,7 @@ def _persist(store: "Store", call_id: str, result: dict[str, Any]) -> None:
         max_drawdown_pct=result["max_drawdown_pct"],
         num_trades=result["num_trades"],
         win_rate=result["win_rate"],
+        starting_portfolio_value=result["starting_portfolio_value"],
         final_portfolio_value=result["final_portfolio_value"],
         benchmark_return_pct=result["benchmark_return_pct"],
     )

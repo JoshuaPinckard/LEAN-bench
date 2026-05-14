@@ -84,7 +84,13 @@ function copy(text) {
                 <tr><th>first_failed_stage</th><td>{{ data.first_failed_stage || '—' }}</td></tr>
                 <tr><th>failure_category</th><td>{{ data.failure_category_l1 ? `${data.failure_category_l1}.${data.failure_category_l2 || ''}` : '—' }}</td></tr>
                 <tr><th>total_return_pct</th><td>{{ data.total_return_pct != null ? data.total_return_pct.toFixed(2) + '%' : '—' }}</td></tr>
-                <tr><th>profit_loss_usd</th><td>{{ data.final_portfolio_value != null ? (data.final_portfolio_value - 100000 >= 0 ? '+$' : '-$') + Math.abs(data.final_portfolio_value - 100000).toFixed(2) : '—' }}</td></tr>
+                <tr><th>profit_loss_usd</th><td>{{
+                  data.final_portfolio_value != null && data.starting_portfolio_value != null
+                    ? (data.final_portfolio_value - data.starting_portfolio_value >= 0 ? '+$' : '-$')
+                      + Math.abs(data.final_portfolio_value - data.starting_portfolio_value).toFixed(2)
+                    : '—'
+                }}</td></tr>
+                <tr><th>starting_portfolio_value</th><td>{{ data.starting_portfolio_value != null ? '$' + data.starting_portfolio_value.toFixed(2) : '—' }}</td></tr>
                 <tr><th>final_portfolio_value</th><td>{{ data.final_portfolio_value != null ? '$' + data.final_portfolio_value.toFixed(2) : '—' }}</td></tr>
                 <tr><th>benchmark_return_pct</th><td>{{ data.benchmark_return_pct != null ? data.benchmark_return_pct.toFixed(2) + '%' : '—' }}</td></tr>
                 <tr><th>sharpe_ratio</th><td>{{ data.sharpe_ratio != null ? data.sharpe_ratio.toFixed(2) : '—' }}</td></tr>

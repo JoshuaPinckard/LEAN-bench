@@ -270,7 +270,20 @@ async def run_cell(
         try:
             backtest_result = await run_backtest(final_code, store, call_id)
         except Exception as exc:  # noqa: BLE001
-            print(f"[backtest] unexpected: {type(exc).__name__}: {exc}")
+            # An unhandled exception inside run_backtest leaves the calls row
+            # with NULL backtest fields and no signal to the UI. Persist a
+            # synthetic skipped result so the row reflects what happened.
+            err_text = f"{type(exc).__name__}: {exc}"
+            print(f"[backtest] unexpected: {err_text}")
+            try:
+                backtest_result = store.update_call_with_backtest(
+                    call_id,
+                    compile_success=None,
+                    runtime_success=None,
+                    runtime_error=f"backtest crashed: {err_text}",
+                )
+            except Exception as persist_exc:  # noqa: BLE001
+                print(f"[backtest] failed to persist crash: {persist_exc}")
 
     # ==== STAGE 4: judge ====
     # Score implementation correctness against the prompt's stated intent,
