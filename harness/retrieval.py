@@ -1,23 +1,26 @@
-"""Retrieval preprocessor: enriches a user prompt with a focused QuantConnect
-LEAN documentation snippet before it hits any benchmarked model.
+"""Retrieval preprocessor: enriches a user prompt with verbatim QuantConnect
+LEAN documentation excerpts before it hits any benchmarked model.
 
 Applied only under tool-using conditions (CONDITIONS_WITH_RETRIEVAL — currently
 S2_docs, S3_web, A1_agentic_full); S1_base is the unaugmented baseline.
 
-Two Sonnet calls per uncached prompt:
+One Sonnet call per uncached prompt:
   1. Index selection: Sonnet sees the prompt plus an index of available doc
      files under qc_docs/ and returns a JSON array of relevant filenames.
-  2. Summarization: Sonnet sees the prompt plus the contents of those files
-     (HTML stripped, total content capped) and returns a focused snippet.
+
+The selected files are then concatenated verbatim (HTML stripped, per-file +
+total caps) and cached. **No LLM rewrites the content** — earlier versions had
+Sonnet "summarize" the docs in stage 2, which hallucinated plausible-but-wrong
+API (e.g. casing/parameter errors) that the gen models then copied, dropping
+S2_docs/S3_web pass rates below S1_base. Pasting raw excerpts is deterministic
+and zero-hallucination.
 
 The output is cached in `retrieval_cache` keyed by SHA256(prompt) so the same
 prompt under any condition for any of the 6 benchmarked models receives the
 identical snippet — preserving the "all models see the same docs" invariant.
 
-Deterministic per Sonnet version (temperature=0). Snippet is empty when
-qc_docs/ has no scannable files or both Sonnet calls fail; in that case the
-orchestrator appends nothing and the call proceeds as if the prompt were
-unaugmented.
+Snippet is empty when qc_docs/ has no scannable files, Sonnet selects nothing,
+or stage 1 fails; the orchestrator treats empty as "do not augment".
 """
 
 from __future__ import annotations
@@ -51,14 +54,14 @@ RELEVANT_DOC_ROOTS: tuple[str, ...] = (
 # Cap on the index size sent to Sonnet for stage 1. Files past the cap are
 # truncated alphabetically; raise if the docs grow and you want full coverage.
 MAX_INDEX_FILES = 800
-# Stage 1 picks up to this many files for stage 2.
-MAX_FILES_PER_RETRIEVAL = 6
-# Hard ceiling on the concatenated content sent to stage 2 (rough char limit).
-MAX_TOTAL_CONTENT_CHARS = 80_000
-# Per-file content cap (truncate long HTML files).
-MAX_PER_FILE_CHARS = 20_000
-# Max tokens Sonnet may produce for the final snippet.
-MAX_SNIPPET_TOKENS = 2048
+# Stage 1 picks up to this many files; their cleaned content is concatenated.
+MAX_FILES_PER_RETRIEVAL = 4
+# Final snippet cap (chars). Sized to fit comfortably in a single context turn
+# alongside the user's prompt without crowding out their request.
+MAX_SNIPPET_CHARS = 12_000
+# Per-file content cap (truncate long HTML files). 3K chars ≈ 750 tokens — fits
+# a focused doc section without bloat.
+MAX_PER_FILE_CHARS = 3_000
 
 # --- Anthropic client (lazy) ---------------------------------------------
 
@@ -149,38 +152,28 @@ async def _select_relevant_files(prompt: str, file_paths: list[Path]) -> list[Pa
     return [valid[s] for s in picked if isinstance(s, str) and s in valid][:MAX_FILES_PER_RETRIEVAL]
 
 
-async def _summarize_for_prompt(prompt: str, file_contents: dict[str, str]) -> str:
-    """Stage 2: Sonnet writes a focused docs snippet from the selected files."""
+def _assemble_snippet(file_contents: dict[str, str]) -> str:
+    """Deterministically concatenate selected files into a single excerpt.
+
+    Replaces the old LLM-summarization stage: Sonnet was hallucinating
+    plausible-but-wrong API (wrong casing, wrong parameter names) in the
+    rewritten snippet, which the gen models then copied. Pasting raw cleaned
+    HTML preserves ground truth.
+    """
     if not file_contents:
         return ""
     parts: list[str] = []
     total = 0
     for name, content in file_contents.items():
         clean = _strip_html(content)[:MAX_PER_FILE_CHARS]
+        if not clean:
+            continue
         block = f"### {name}\n{clean}"
-        if total + len(block) > MAX_TOTAL_CONTENT_CHARS:
+        if total + len(block) + 2 > MAX_SNIPPET_CHARS:
             break
         parts.append(block)
-        total += len(block)
-    combined = "\n\n".join(parts)
-    instruction = (
-        "You are preparing a documentation excerpt for an AI engineer "
-        "implementing a QuantConnect LEAN algorithm in Python. Keep it under "
-        "800 words and cover only the LEAN API surface the engineer will need: "
-        "relevant method signatures, indicator names, data subscription patterns, "
-        "and order placement calls. No fluff, no preamble. Return ONLY the "
-        "snippet text.\n\n"
-        f"User's algorithm request:\n{prompt}\n\n"
-        f"Relevant LEAN documentation:\n{combined}"
-    )
-    client = _get_client()
-    resp = await client.messages.create(
-        model=RETRIEVAL_MODEL,
-        max_tokens=MAX_SNIPPET_TOKENS,
-        temperature=0,
-        messages=[{"role": "user", "content": instruction}],
-    )
-    return "".join(b.text for b in resp.content if b.type == "text").strip()
+        total += len(block) + 2  # +2 for the joining "\n\n"
+    return "\n\n".join(parts)
 
 
 # --- Public entry point ---------------------------------------------------
@@ -210,7 +203,7 @@ async def get_retrieval_snippet(prompt: str, store: "Store") -> str:
                 contents[_file_label(path)] = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-        snippet = await _summarize_for_prompt(prompt, contents) if contents else ""
+        snippet = _assemble_snippet(contents)
     except Exception:
         snippet = ""
 

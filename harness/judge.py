@@ -21,6 +21,7 @@ constants.py also requires a version bump.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -32,7 +33,14 @@ from harness.constants import FAILURE_MODES, FAILURE_MODE_DESCRIPTIONS
 JUDGE_MODEL = "claude-sonnet-4-6"
 JUDGE_TEMPERATURE = 0
 JUDGE_MAX_TOKENS = 1024
-JUDGE_VERSION = "v1"
+JUDGE_VERSION = "v2"
+
+# Anthropic's claude-sonnet-4-6 input-token-per-minute quota is easily exceeded
+# when a grid run fires 18+ judges at once. Cap concurrent in-flight judge
+# requests so we stay under the rate limit without dropping calls. 3 is
+# empirically safe at the standard tier; tune up if the org's TPM grows.
+_JUDGE_CONCURRENCY = 3
+_JUDGE_SEMAPHORE: asyncio.Semaphore | None = None
 
 
 class JudgeError(RuntimeError):
@@ -43,10 +51,21 @@ _client: AsyncAnthropic | None = None
 
 
 def _get_client() -> AsyncAnthropic:
+    """Lazy-init AsyncAnthropic with retries enabled. The SDK's max_retries
+    handles transient 429/5xx with exponential backoff — pairs with the
+    concurrency semaphore so a temporary spike doesn't drop calls."""
     global _client
     if _client is None:
-        _client = AsyncAnthropic()
+        _client = AsyncAnthropic(max_retries=4)
     return _client
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazy-init to avoid binding to a loop at import time."""
+    global _JUDGE_SEMAPHORE
+    if _JUDGE_SEMAPHORE is None:
+        _JUDGE_SEMAPHORE = asyncio.Semaphore(_JUDGE_CONCURRENCY)
+    return _JUDGE_SEMAPHORE
 
 
 def _failure_mode_block() -> str:
@@ -157,8 +176,21 @@ def _build_user_message(
     parts.append(generated_code or "(empty)")
     parts.append("```")
     parts.append("")
-    parts.append("# Backtest result")
-    parts.append(json.dumps(backtest_result, indent=2, default=str))
+    parts.append("# Execution summary")
+    compact = {
+        "compile_success":          backtest_result.get("compile_success"),
+        "runtime_success":          backtest_result.get("runtime_success"),
+        "runtime_error":            (backtest_result.get("runtime_error") or "")[:300] or None,
+        "total_return_pct":         backtest_result.get("total_return_pct"),
+        "sharpe_ratio":             backtest_result.get("sharpe_ratio"),
+        "max_drawdown_pct":         backtest_result.get("max_drawdown_pct"),
+        "num_trades":               backtest_result.get("num_trades"),
+        "win_rate":                 backtest_result.get("win_rate"),
+        "starting_portfolio_value": backtest_result.get("starting_portfolio_value"),
+        "final_portfolio_value":    backtest_result.get("final_portfolio_value"),
+        "benchmark_return_pct":     backtest_result.get("benchmark_return_pct"),
+    }
+    parts.append(json.dumps(compact, indent=2))
     return "\n".join(parts)
 
 
@@ -204,13 +236,14 @@ async def judge_call(
     """
     user = _build_user_message(prompt_record, generated_code, backtest_result)
     client = _get_client()
-    resp = await client.messages.create(
-        model=JUDGE_MODEL,
-        max_tokens=JUDGE_MAX_TOKENS,
-        temperature=JUDGE_TEMPERATURE,
-        system=JUDGE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user}],
-    )
+    async with _get_semaphore():
+        resp = await client.messages.create(
+            model=JUDGE_MODEL,
+            max_tokens=JUDGE_MAX_TOKENS,
+            temperature=JUDGE_TEMPERATURE,
+            system=JUDGE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user}],
+        )
     raw = "".join(b.text for b in resp.content if b.type == "text").strip()
     parsed = _extract_json(raw)
 

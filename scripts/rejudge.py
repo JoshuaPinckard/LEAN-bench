@@ -64,17 +64,34 @@ def _select_calls(store: Store, target_version: str, include_equal: bool, prompt
 
 
 def _reconstruct_backtest_result(row: dict) -> dict:
-    """Build the backtest_result dict from whatever's been written to the call row."""
+    """Build the backtest_result dict from whatever's been written to the call row.
+
+    `lean_results_json` is intentionally NOT included — the judge sees only the
+    compact metrics (see harness/judge.py:_build_user_message). Including the raw
+    LEAN JSON here saturates the 30K input-tokens-per-minute rate limit (median
+    ~452K tokens/call).
+    """
     return {
-        "compile_success":         row.get("compile_success") if row.get("compile_success") is not None else row.get("compile_pass"),
-        "runtime_success":         row.get("runtime_success") if row.get("runtime_success") is not None else row.get("backtest_pass"),
-        "runtime_error":           row.get("runtime_error"),
-        "lean_results_json":       row.get("lean_results_json"),
-        "total_return_pct":        row.get("total_return_pct"),
-        "sharpe_ratio":            row.get("sharpe_ratio"),
-        "max_drawdown_pct":        row.get("max_drawdown_pct"),
-        "num_trades":              row.get("num_trades"),
+        "compile_success":          row.get("compile_success") if row.get("compile_success") is not None else row.get("compile_pass"),
+        "runtime_success":          row.get("runtime_success") if row.get("runtime_success") is not None else row.get("backtest_pass"),
+        "runtime_error":            row.get("runtime_error"),
+        "total_return_pct":         row.get("total_return_pct"),
+        "sharpe_ratio":             row.get("sharpe_ratio"),
+        "max_drawdown_pct":         row.get("max_drawdown_pct"),
+        "num_trades":               row.get("num_trades"),
+        "win_rate":                 row.get("win_rate"),
+        "starting_portfolio_value": row.get("starting_portfolio_value"),
+        "final_portfolio_value":    row.get("final_portfolio_value"),
+        "benchmark_return_pct":     row.get("benchmark_return_pct"),
     }
+
+
+# Sleep between rejudge calls so a long backfill stays under Anthropic's
+# claude-sonnet-4-6 input-token-per-minute cap (~30K at the standard tier).
+# Each judge call is ~6-10K input tokens — at 8s/call we average ~60K/min
+# which is over, but the SDK's max_retries=4 absorbs short overshoots; in
+# practice 8s gives a clean backfill without piling up 429s.
+_REJUDGE_DELAY_S = 8.0
 
 
 async def main(target_version: str, limit: int | None, dry_run: bool, prompt_id: str | None, include_equal: bool) -> int:
@@ -106,7 +123,18 @@ async def main(target_version: str, limit: int | None, dry_run: bool, prompt_id:
             )
         except JudgeError as exc:
             print(f"  [{i}/{len(rows)}] {call_id[:8]} FAIL: {exc}")
+            if not dry_run:
+                store.update_call(call_id, judge_error=f"JudgeError: {exc}")
             failed += 1
+            continue
+        except Exception as exc:  # noqa: BLE001 — rate limits, network, etc.
+            err_text = f"{type(exc).__name__}: {exc}"
+            print(f"  [{i}/{len(rows)}] {call_id[:8]} FAIL: {err_text[:200]}")
+            if not dry_run:
+                store.update_call(call_id, judge_error=err_text)
+            failed += 1
+            # Brief cooldown after a rate-limit hit before continuing.
+            await asyncio.sleep(_REJUDGE_DELAY_S * 2)
             continue
 
         prev_score = row.get("judge_score")
@@ -126,7 +154,12 @@ async def main(target_version: str, limit: int | None, dry_run: bool, prompt_id:
                 failure_notes=result["failure_notes"],
                 matches_prompt_intent=result["matches_prompt_intent"],
             )
+            # Clear any prior judge_error so a successful rejudge looks clean.
+            store.update_call(call_id, judge_error=None)
         ok += 1
+        # Throttle to stay under the model's TPM cap when backfilling many rows.
+        if i < len(rows):
+            await asyncio.sleep(_REJUDGE_DELAY_S)
 
     print()
     print(f"Done. updated={ok}  skipped={skipped}  failed={failed}"

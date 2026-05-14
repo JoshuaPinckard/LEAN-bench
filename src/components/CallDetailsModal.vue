@@ -74,12 +74,18 @@ function copy(text) {
           </div>
 
           <div v-if="tab === 'eval'">
+            <div v-if="data.judge_error" class="error-box" style="margin-bottom: 12px;">
+              <strong>Judge failed:</strong> {{ data.judge_error }}
+              <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
+                Run <code>scripts/rejudge.py</code> to retry.
+              </div>
+            </div>
             <table class="data" style="margin-bottom: 16px;">
               <tbody>
                 <tr><th style="width: 200px;">compile_pass</th><td>{{ data.compile_pass }}</td></tr>
                 <tr><th>backtest_pass</th><td>{{ data.backtest_pass }}</td></tr>
                 <tr><th>trade_pass</th><td>{{ data.trade_pass }}</td></tr>
-                <tr><th>judge_pass</th><td>{{ data.judge_pass }}</td></tr>
+                <tr><th>judge_pass</th><td>{{ data.judge_pass != null ? data.judge_pass : (data.judge_error ? 'failed' : '—') }}</td></tr>
                 <tr><th>overall_pass</th><td>{{ data.overall_pass }}</td></tr>
                 <tr><th>first_failed_stage</th><td>{{ data.first_failed_stage || '—' }}</td></tr>
                 <tr><th>failure_category</th><td>{{ data.failure_category_l1 ? `${data.failure_category_l1}.${data.failure_category_l2 || ''}` : '—' }}</td></tr>

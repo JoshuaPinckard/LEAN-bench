@@ -362,6 +362,7 @@ class Store:
             "judge_score":             "REAL",
             "judge_reasoning":         "TEXT",
             "judge_version":           "TEXT",
+            "judge_error":             "TEXT",     # exception text when judge fails; NULL on success
             "failure_mode":            "TEXT",     # JSON list[str]
             "failure_notes":           "TEXT",
             "matches_prompt_intent":   "INTEGER",

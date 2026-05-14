@@ -289,7 +289,12 @@ async def run_cell(
     # Score implementation correctness against the prompt's stated intent,
     # using the real backtest result from stage 3. The judge is robust to
     # cases where the backtest was skipped (LEAN CLI absent / timed out).
+    #
+    # On failure (rate limit, malformed response, network), persist the error
+    # text to calls.judge_error so the UI can surface "judge failed" instead of
+    # silently leaving judge_pass NULL (which looks identical to "pending").
     judge_outcome: dict[str, Any] = {}
+    judge_error: str | None = None
     if final_code and not error_text:
         try:
             prompt_record = store.get_prompt(prompt_id) or {
@@ -311,10 +316,20 @@ async def run_cell(
                 failure_notes=judge_result["failure_notes"],
                 matches_prompt_intent=judge_result["matches_prompt_intent"],
             )
+            # Clear any prior judge_error on success (so a successful rejudge
+            # overwrites a previously failed attempt cleanly).
+            store.update_call(call_id, judge_error=None)
         except JudgeError as exc:
-            print(f"[judge] {type(exc).__name__}: {exc}")
+            judge_error = f"{type(exc).__name__}: {exc}"
+            print(f"[judge] {judge_error}")
         except Exception as exc:  # noqa: BLE001
-            print(f"[judge] unexpected: {type(exc).__name__}: {exc}")
+            judge_error = f"{type(exc).__name__}: {exc}"
+            print(f"[judge] unexpected: {judge_error}")
+        if judge_error:
+            try:
+                store.update_call(call_id, judge_error=judge_error)
+            except Exception as persist_exc:  # noqa: BLE001
+                print(f"[judge] failed to persist error: {persist_exc}")
 
     return {
         "call_id": call_id,
@@ -337,6 +352,7 @@ async def run_cell(
         "output_tokens": total_output,
         "turns_used": turns_used,
         "error": error_text,
+        "judge_error": judge_error,
     }
 
 
