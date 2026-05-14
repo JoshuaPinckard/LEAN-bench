@@ -48,3 +48,10 @@ INTERPRETATION_STRICTNESS_VALUES: tuple[str, ...] = (
     "mild_variation",
     "broad_interpretation",
 )
+
+# Minimum judge_score that counts as a pass. The judge rubric in harness/judge.py
+# anchors 0.7 as "mostly correct, core logic intact"; calls at/above this become
+# judge_pass=True. Pass/fail thresholds feed pass_rate_matrix and the UI's
+# headline metric, so changes here are a methodology change — bump JUDGE_VERSION
+# in harness/judge.py and re-judge.
+JUDGE_PASS_THRESHOLD: float = 0.7

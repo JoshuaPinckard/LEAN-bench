@@ -680,8 +680,8 @@ class Store:
         self,
         call_id: str,
         *,
-        compile_success: bool,
-        runtime_success: bool,
+        compile_success: bool | None,
+        runtime_success: bool | None,
         runtime_error: str | None = None,
         lean_results_json: str | None = None,
         total_return_pct: float | None = None,
@@ -691,7 +691,25 @@ class Store:
         win_rate: float | None = None,
         final_portfolio_value: float | None = None,
         benchmark_return_pct: float | None = None,
-    ) -> None:
+    ) -> dict:
+        """Write backtest fields and derive backtest_pass / trade_pass.
+
+        backtest_pass: True iff the backtest ran end-to-end with no compile
+        or runtime error. None when the backtest was skipped (CLI missing,
+        timeout, etc.).
+        trade_pass: True iff num_trades > 0. Informational only — whether
+        no-trades is acceptable depends on prompt.evaluation_mode, which the
+        judge already accounts for. None when num_trades is unknown.
+
+        Returns the derived {backtest_pass, trade_pass} so the orchestrator
+        can echo them in its response payload."""
+        if compile_success is None and runtime_success is None:
+            backtest_pass: bool | None = None
+        else:
+            backtest_pass = bool(compile_success) and bool(runtime_success)
+
+        trade_pass: bool | None = None if num_trades is None else num_trades > 0
+
         self.update_call(
             call_id,
             compile_success=compile_success,
@@ -705,7 +723,10 @@ class Store:
             win_rate=win_rate,
             final_portfolio_value=final_portfolio_value,
             benchmark_return_pct=benchmark_return_pct,
+            backtest_pass=backtest_pass,
+            trade_pass=trade_pass,
         )
+        return {"backtest_pass": backtest_pass, "trade_pass": trade_pass}
 
     def update_call_with_judge(
         self,
@@ -717,8 +738,39 @@ class Store:
         failure_mode: list[str],
         failure_notes: str | None = None,
         matches_prompt_intent: bool,
-    ) -> None:
-        """Write judge fields. Overwrites any prior judge values on re-judge."""
+    ) -> dict:
+        """Write judge fields and derive pass_rate inputs. Overwrites any prior
+        judge values on re-judge. Returns the derived {judge_pass, overall_pass}
+        so callers can echo them back in their response payloads."""
+        from harness.constants import JUDGE_PASS_THRESHOLD
+
+        judge_pass = bool(judge_score >= JUDGE_PASS_THRESHOLD)
+
+        # overall_pass also requires the code to compile and (when the backtest
+        # ran) to not crash at runtime. When the backtest was skipped — LEAN CLI
+        # missing, timeout, etc. — compile_success/runtime_success are NULL and
+        # we fall back to the evaluator's AST compile_pass.
+        row = self.conn.execute(
+            "SELECT compile_pass, compile_success, runtime_success "
+            "FROM calls WHERE call_id=?",
+            (call_id,),
+        ).fetchone()
+        compile_pass     = row["compile_pass"]     if row else None
+        compile_success  = row["compile_success"]  if row else None
+        runtime_success  = row["runtime_success"]  if row else None
+
+        # SQLite stores booleans as integers (0/1), so `is False` would miss them.
+        # Use a None-aware falsy check: None means "unknown, fall through".
+        def _explicit_fail(v: Any) -> bool:
+            return v is not None and not v
+
+        if _explicit_fail(compile_success) or _explicit_fail(runtime_success):
+            overall_pass = False
+        elif _explicit_fail(compile_pass):
+            overall_pass = False
+        else:
+            overall_pass = judge_pass
+
         self.update_call(
             call_id,
             judge_score=judge_score,
@@ -727,7 +779,10 @@ class Store:
             failure_mode=failure_mode,
             failure_notes=failure_notes,
             matches_prompt_intent=matches_prompt_intent,
+            judge_pass=judge_pass,
+            overall_pass=overall_pass,
         )
+        return {"judge_pass": judge_pass, "overall_pass": overall_pass}
 
     def get_calls_by_prompt(self, prompt_id: str) -> list[dict]:
         """All calls for a prompt, ordered by pass_number then created_at."""

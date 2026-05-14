@@ -83,6 +83,14 @@ function copy(text) {
                 <tr><th>overall_pass</th><td>{{ data.overall_pass }}</td></tr>
                 <tr><th>first_failed_stage</th><td>{{ data.first_failed_stage || '—' }}</td></tr>
                 <tr><th>failure_category</th><td>{{ data.failure_category_l1 ? `${data.failure_category_l1}.${data.failure_category_l2 || ''}` : '—' }}</td></tr>
+                <tr><th>total_return_pct</th><td>{{ data.total_return_pct != null ? data.total_return_pct.toFixed(2) + '%' : '—' }}</td></tr>
+                <tr><th>profit_loss_usd</th><td>{{ data.final_portfolio_value != null ? (data.final_portfolio_value - 100000 >= 0 ? '+$' : '-$') + Math.abs(data.final_portfolio_value - 100000).toFixed(2) : '—' }}</td></tr>
+                <tr><th>final_portfolio_value</th><td>{{ data.final_portfolio_value != null ? '$' + data.final_portfolio_value.toFixed(2) : '—' }}</td></tr>
+                <tr><th>benchmark_return_pct</th><td>{{ data.benchmark_return_pct != null ? data.benchmark_return_pct.toFixed(2) + '%' : '—' }}</td></tr>
+                <tr><th>sharpe_ratio</th><td>{{ data.sharpe_ratio != null ? data.sharpe_ratio.toFixed(2) : '—' }}</td></tr>
+                <tr><th>max_drawdown_pct</th><td>{{ data.max_drawdown_pct != null ? data.max_drawdown_pct.toFixed(2) + '%' : '—' }}</td></tr>
+                <tr><th>num_trades</th><td>{{ data.num_trades != null ? data.num_trades : '—' }}</td></tr>
+                <tr><th>win_rate</th><td>{{ data.win_rate != null ? data.win_rate.toFixed(1) + '%' : '—' }}</td></tr>
                 <tr><th>cost_usd</th><td>{{ data.total_cost_usd != null ? '$' + data.total_cost_usd.toFixed(4) : '—' }}</td></tr>
                 <tr><th>tokens (in / out)</th><td>{{ data.total_input_tokens }} / {{ data.total_output_tokens }}</td></tr>
                 <tr><th>turns_used</th><td>{{ data.turns_used }} / {{ data.max_turns_allowed }}</td></tr>

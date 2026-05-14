@@ -276,8 +276,6 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             original_text=req.prompt_text,
             reformulated_text=req.prompt_text,
             source="adhoc",
-            difficulty="medium",
-            trades_expected=True,
             is_post_cutoff=False,
             leak_audit_status="adhoc",
         )

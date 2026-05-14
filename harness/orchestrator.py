@@ -35,6 +35,7 @@ from harness.models import (
 from harness.pricing import PricingNotSetError, cost_usd
 from harness.providers import anthropic_client, gemini_client, openai_client
 from harness.judge import JUDGE_VERSION, JudgeError, judge_call
+from harness.lean_executor import run_backtest
 from harness.retrieval import get_retrieval_snippet
 from harness.storage import Store
 
@@ -129,6 +130,28 @@ async def run_cell(
                 f"{retrieval_snippet}"
             )
 
+    # ==== STAGE 1: create_call ====
+    # Insert the row up front so the staged update_call_with_backtest /
+    # update_call_with_judge helpers have a row to UPDATE against.
+    store.create_call(
+        call_id=call_id,
+        prompt_id=prompt_id,
+        model_family=model_family,
+        model_id=model_friendly,
+        model_version=model_pinned,
+        condition=condition_id,                # mirrored to legacy condition_id
+        pass_number=trial_index,               # mirrored to legacy trial_index
+        tool_docs_retrieval=cond["tool_docs_retrieval"],
+        tool_web_search=cond["tool_web_search"],
+        tool_agentic_loop=cond["tool_agentic_loop"],
+        max_turns_allowed=max_turns,
+        temperature=DEFAULT_TEMPERATURE,
+        top_p=DEFAULT_TOP_P,
+        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+        system_prompt_sha=SYSTEM_PROMPT_SHA256,
+        retrieval_snippet=retrieval_snippet,
+    )
+
     messages: list[dict] = [{"role": "user", "content": enriched_prompt}]
     total_input = 0
     total_output = 0
@@ -207,67 +230,24 @@ async def run_cell(
         "judge_pass": None, "overall_pass": None, "failure_l1": None, "failure_l2": None,
     }
 
-    # Judge stage: score implementation correctness against the prompt's stated
-    # intent. The backtest stage (Stages 2-4 in the design memo) hasn't been
-    # built yet, so we hand the judge what we DO have — compile result and any
-    # provider/eval error — under the same `backtest_result` schema the future
-    # backtest stage will produce. The judge is robust to compile-only context.
-    judge_result: dict | None = None
-    if final_code and not error_text:
-        try:
-            prompt_record = store.get_prompt(prompt_id) or {
-                "reformulated_text": prompt_text,
-                "original_text": prompt_text,
-            }
-            backtest_result = {
-                "compile_success": bool(eval_for_call.get("compile_pass")),
-                "runtime_success": None,   # backtest stage not implemented yet
-                "runtime_error":   eval_for_call.get("feedback"),
-                "lean_results":    None,
-            }
-            judge_result = await judge_call(
-                prompt_record=prompt_record,
-                generated_code=final_code,
-                backtest_result=backtest_result,
-                judge_version=JUDGE_VERSION,
-            )
-        except JudgeError as exc:
-            # Judge failure must not kill the call; record the call without judge fields.
-            print(f"[judge] {type(exc).__name__}: {exc}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[judge] unexpected: {type(exc).__name__}: {exc}")
-
-    store.record_call(
-        call_id=call_id,
-        prompt_id=prompt_id,
-        model_family=model_family,
-        model_id=model_friendly,
-        model_version=model_pinned,
-        condition_id=condition_id,
-        trial_index=trial_index,
-        tool_docs_retrieval=cond["tool_docs_retrieval"],
-        tool_web_search=cond["tool_web_search"],
-        tool_agentic_loop=cond["tool_agentic_loop"],
-        max_turns_allowed=max_turns,
-        temperature=DEFAULT_TEMPERATURE,
-        top_p=DEFAULT_TOP_P,
-        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-        system_prompt_sha=SYSTEM_PROMPT_SHA256,    # mirrored to legacy system_prompt_sha256
+    # ==== STAGE 2: update with generation outputs ====
+    # Fold model loop results plus legacy pipeline fields onto the row.
+    store.update_call(
+        call_id,
         turns_used=turns_used,
-        final_code_sha256=final_code_sha,
-        # v1.4 locked fields
-        condition=condition_id,                    # mirrored to legacy condition_id
-        pass_number=trial_index,                   # mirrored to legacy trial_index
         generated_code=final_code,
         code_hash=final_code_sha,
+        final_code_sha256=final_code_sha,
         raw_model_response=last_response["response_text"] if last_response else None,
         finish_reason=last_response["finish_reason"] if last_response else None,
         tokens_in=total_input,
         tokens_out=total_output,
         cost_usd=total_cost,
-        latency_ms=int(sum(
-            r["latency_ms"] for r in [last_response] if r
-        )) if last_response else None,
+        latency_ms=last_response["latency_ms"] if last_response else None,
+        total_input_tokens=total_input,
+        total_output_tokens=total_output,
+        total_cost_usd=total_cost,
+        wall_clock_seconds=overall_wall,
         # Legacy pipeline outcomes (kept for back-compat queries)
         compile_pass=eval_for_call["compile_pass"],
         backtest_pass=eval_for_call["backtest_pass"],
@@ -277,21 +257,51 @@ async def run_cell(
         first_failed_stage=None,
         failure_category_l1=eval_for_call["failure_l1"],
         failure_category_l2=eval_for_call["failure_l2"],
-        total_input_tokens=total_input,
-        total_output_tokens=total_output,
-        total_cost_usd=total_cost,
-        wall_clock_seconds=overall_wall,
-        retrieval_snippet=retrieval_snippet,
         trajectory_path=None,
         error=error_text,
-        # Judge outputs (None if the judge stage was skipped or failed)
-        judge_score=judge_result["judge_score"] if judge_result else None,
-        judge_reasoning=judge_result["judge_reasoning"] if judge_result else None,
-        judge_version=judge_result["judge_version"] if judge_result else None,
-        failure_mode=judge_result["failure_mode"] if judge_result else None,
-        failure_notes=judge_result["failure_notes"] if judge_result else None,
-        matches_prompt_intent=judge_result["matches_prompt_intent"] if judge_result else None,
     )
+
+    # ==== STAGE 3: backtest ====
+    # lean_executor materializes a temp project, runs `lean backtest`, parses
+    # the results JSON, and writes the metrics via update_call_with_backtest.
+    # Returns the result dict so the judge can score against real numbers.
+    backtest_result: dict[str, Any] = {}
+    if final_code and not error_text:
+        try:
+            backtest_result = await run_backtest(final_code, store, call_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[backtest] unexpected: {type(exc).__name__}: {exc}")
+
+    # ==== STAGE 4: judge ====
+    # Score implementation correctness against the prompt's stated intent,
+    # using the real backtest result from stage 3. The judge is robust to
+    # cases where the backtest was skipped (LEAN CLI absent / timed out).
+    judge_outcome: dict[str, Any] = {}
+    if final_code and not error_text:
+        try:
+            prompt_record = store.get_prompt(prompt_id) or {
+                "reformulated_text": prompt_text,
+                "original_text": prompt_text,
+            }
+            judge_result = await judge_call(
+                prompt_record=prompt_record,
+                generated_code=final_code,
+                backtest_result=backtest_result,
+                judge_version=JUDGE_VERSION,
+            )
+            judge_outcome = store.update_call_with_judge(
+                call_id,
+                judge_score=judge_result["judge_score"],
+                judge_reasoning=judge_result["judge_reasoning"],
+                judge_version=judge_result["judge_version"],
+                failure_mode=judge_result["failure_mode"],
+                failure_notes=judge_result["failure_notes"],
+                matches_prompt_intent=judge_result["matches_prompt_intent"],
+            )
+        except JudgeError as exc:
+            print(f"[judge] {type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[judge] unexpected: {type(exc).__name__}: {exc}")
 
     return {
         "call_id": call_id,
@@ -302,10 +312,10 @@ async def run_cell(
         "generated_code": final_code,
         "response_text": last_response["response_text"] if last_response else None,
         "compile_pass": eval_for_call["compile_pass"],
-        "backtest_pass": eval_for_call["backtest_pass"],
-        "trade_pass": eval_for_call["trade_pass"],
-        "judge_pass": eval_for_call["judge_pass"],
-        "overall_pass": eval_for_call["overall_pass"],
+        "backtest_pass": backtest_result.get("backtest_pass", eval_for_call["backtest_pass"]),
+        "trade_pass": backtest_result.get("trade_pass", eval_for_call["trade_pass"]),
+        "judge_pass": judge_outcome.get("judge_pass", eval_for_call["judge_pass"]),
+        "overall_pass": judge_outcome.get("overall_pass", eval_for_call["overall_pass"]),
         "failure_category_l1": eval_for_call["failure_l1"],
         "failure_category_l2": eval_for_call["failure_l2"],
         "cost_usd": total_cost,
