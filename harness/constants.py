@@ -68,6 +68,27 @@ JUDGE_PASS_THRESHOLD: float = 0.7
 BENCHMARK_VERSION: str = "LEAN-Bench-v1.0"
 
 
+# --- LEAN execution pin --------------------------------------------------
+
+# Pinned LEAN CLI package version. Mirrors the `lean==...` line in
+# requirements.txt and is stamped into results .meta.json so every result row
+# is traceable to the CLI that produced it.
+LEAN_CLI_VERSION: str = "1.0.225"
+
+# Pinned LEAN engine Docker image, by manifest digest (immutable — a tag like
+# `latest` can move, a digest cannot). This is the actual executor: same code
+# under a different image yields different Sharpe / trades / drawdown, which
+# would disqualify a published benchmark.
+#
+# To change: pull the new image, capture its `quantconnect/lean@sha256:...`
+# repo digest, update this constant AND run
+# `lean config set engine-image <new-digest>` so local backtests match.
+LEAN_ENGINE_IMAGE: str = (
+    "quantconnect/lean@sha256:"
+    "dc84a683464681b2e6c9579bc7655e16d4802380367c77004e40a6a504088bd7"
+)
+
+
 # --- Call status enum ----------------------------------------------------
 
 # Persisted on calls.status. Lifecycle:

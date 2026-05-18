@@ -22,6 +22,7 @@ docs/benchmark_decision_log.md for the methodology rationale.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from harness.constants import BENCHMARK_VERSION
+from harness.constants import BENCHMARK_VERSION, LEAN_CLI_VERSION, LEAN_ENGINE_IMAGE
 from harness.prompt_freeze import canonicalize, is_eligible, load_frozen, sha256_of
 from harness.storage import Store
 
@@ -71,17 +72,20 @@ def main(out_path: Path, db_path: Path, check_only: bool) -> int:
     out_path.write_bytes(canonical)
 
     # Drop a sidecar metadata file so it's obvious when the freeze was taken
-    # without affecting the canonical bytes.
+    # without affecting the canonical bytes. Stamping the LEAN execution pins
+    # makes every freeze traceable to the exact CLI + engine image that
+    # benchmark runs against this artifact will use; mirrors the canonical
+    # discipline the RAG datastore uses for its embedding stack.
     meta_path = out_path.with_suffix(out_path.suffix + ".meta.json")
-    meta_path.write_text(
-        '{\n'
-        f'  "benchmark_version": "{BENCHMARK_VERSION}",\n'
-        f'  "prompt_set_sha256": "{live_hash}",\n'
-        f'  "count":              {len(eligible)},\n'
-        f'  "frozen_at_utc":      "{datetime.now(timezone.utc).isoformat()}"\n'
-        '}\n',
-        encoding="utf-8",
-    )
+    meta = {
+        "benchmark_version": BENCHMARK_VERSION,
+        "prompt_set_sha256": live_hash,
+        "count":             len(eligible),
+        "frozen_at_utc":     datetime.now(timezone.utc).isoformat(),
+        "lean_cli_version":  LEAN_CLI_VERSION,
+        "lean_engine_image": LEAN_ENGINE_IMAGE,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(f"\nWrote frozen artifact -> {out_path}")
     print(f"Wrote freeze metadata -> {meta_path}")
     return 0
