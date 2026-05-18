@@ -369,6 +369,21 @@ class Store:
             "harness_sha":             "TEXT",
             "frozen_date":             "TEXT",
             "created_at":              "TEXT",
+            # v1.5 pre-run hardening (2026-05-13)
+            # status: lifecycle enum; default 'completed' keeps legacy rows valid.
+            "status":                  "TEXT NOT NULL DEFAULT 'completed'",
+            # Reason a cell was excluded by design (e.g., 'tooling_parity').
+            "excluded_reason":         "TEXT",
+            # Benchmark identity stamped at call creation.
+            "benchmark_version":       "TEXT",
+            # SHA256 of the frozen prompt-set artifact in effect at call time.
+            "prompt_set_sha256":       "TEXT",
+            # Sidecar artifact written to results/artifacts/{call_id}.json.
+            "artifact_path":           "TEXT",
+            "artifact_sha256":         "TEXT",
+            # Threshold used to derive judge_pass for THIS row. Lets future
+            # threshold changes coexist with old rows for audit.
+            "judge_threshold":         "REAL",
         }
         for col, ddl in new_call_cols.items():
             if col not in call_cols:
@@ -536,12 +551,27 @@ class Store:
         return f"{prefix}-{n + 1:04d}"
 
     def pass_rate_matrix(self) -> list[dict]:
-        """Per-cell judge_pass rate. Returns rows of {model_id, condition_id, n, pass_rate}.
-        pass_rate is None when no calls have judge_pass populated yet."""
+        """Per-cell judge_pass rate plus the exclusion-aware accounting needed
+        by the UI/stats endpoint.
+
+        Returned rows have:
+          model_id, condition_id  — cell coordinates
+          n                       — count of NON-excluded rows (the denominator)
+          excluded                — count of status='excluded' rows
+          pass_rate               — AVG(judge_pass) over non-excluded rows; None
+                                    when n=0 OR no judge_pass is populated yet
+          status                  — 'excluded' iff every row in the cell is
+                                    excluded by design; else None
+
+        Excluded rows are surfaced separately so the UI can render the cell as
+        'excluded' rather than as a missing/failed measurement.
+        """
         rows = self.conn.execute("""
             SELECT model_id, condition_id,
-                   COUNT(*) AS n,
-                   AVG(CASE WHEN judge_pass IS NULL THEN NULL
+                   SUM(CASE WHEN COALESCE(status, 'completed') = 'excluded' THEN 1 ELSE 0 END) AS excluded,
+                   SUM(CASE WHEN COALESCE(status, 'completed') = 'excluded' THEN 0 ELSE 1 END) AS n_active,
+                   AVG(CASE WHEN COALESCE(status, 'completed') = 'excluded' THEN NULL
+                            WHEN judge_pass IS NULL THEN NULL
                             ELSE judge_pass END) AS pass_rate
             FROM calls
             GROUP BY model_id, condition_id
@@ -549,11 +579,16 @@ class Store:
         out = []
         for r in rows:
             pr = r["pass_rate"]
+            n_active = int(r["n_active"] or 0)
+            excluded = int(r["excluded"] or 0)
             out.append({
-                "model_id": r["model_id"],
+                "model_id":     r["model_id"],
                 "condition_id": r["condition_id"],
-                "n": int(r["n"]),
-                "pass_rate": float(pr) if pr is not None else None,
+                "n":            n_active,
+                "excluded":     excluded,
+                "pass_rate":    float(pr) if pr is not None else None,
+                # 'excluded' iff every row in this cell is excluded by design.
+                "status":       "excluded" if (excluded > 0 and n_active == 0) else None,
             })
         return out
 
@@ -780,6 +815,7 @@ class Store:
             judge_score=judge_score,
             judge_reasoning=judge_reasoning,
             judge_version=judge_version,
+            judge_threshold=JUDGE_PASS_THRESHOLD,
             failure_mode=failure_mode,
             failure_notes=failure_notes,
             matches_prompt_intent=matches_prompt_intent,
@@ -900,25 +936,40 @@ class Store:
 
     # ---- aggregations ----------------------------------------------------
 
+    # Excluded rows never fired a provider call and don't count toward
+    # attempted-call totals. COALESCE handles legacy rows without a status.
+    _NOT_EXCLUDED = "COALESCE(status, 'completed') != 'excluded'"
+
     def total_cost_usd(self) -> float:
-        row = self.conn.execute("SELECT COALESCE(SUM(total_cost_usd), 0.0) AS s FROM calls").fetchone()
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(total_cost_usd), 0.0) AS s FROM calls WHERE {self._NOT_EXCLUDED}"
+        ).fetchone()
         return float(row["s"])
 
     def call_count(self) -> int:
-        row = self.conn.execute("SELECT COUNT(*) AS n FROM calls").fetchone()
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM calls WHERE {self._NOT_EXCLUDED}"
+        ).fetchone()
+        return int(row["n"])
+
+    def excluded_count(self) -> int:
+        """Number of design-time excluded rows (auditable but not attempted)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM calls WHERE COALESCE(status, 'completed') = 'excluded'"
+        ).fetchone()
         return int(row["n"])
 
     def cost_by_model(self) -> dict[str, float]:
         rows = self.conn.execute(
-            "SELECT model_id, COALESCE(SUM(total_cost_usd), 0.0) AS s "
-            "FROM calls GROUP BY model_id"
+            f"SELECT model_id, COALESCE(SUM(total_cost_usd), 0.0) AS s "
+            f"FROM calls WHERE {self._NOT_EXCLUDED} GROUP BY model_id"
         ).fetchall()
         return {r["model_id"]: float(r["s"]) for r in rows}
 
     def cost_by_condition(self) -> dict[str, float]:
         rows = self.conn.execute(
-            "SELECT condition_id, COALESCE(SUM(total_cost_usd), 0.0) AS s "
-            "FROM calls GROUP BY condition_id"
+            f"SELECT condition_id, COALESCE(SUM(total_cost_usd), 0.0) AS s "
+            f"FROM calls WHERE {self._NOT_EXCLUDED} GROUP BY condition_id"
         ).fetchall()
         return {r["condition_id"]: float(r["s"]) for r in rows}
 

@@ -74,12 +74,30 @@ function copy(text) {
           </div>
 
           <div v-if="tab === 'eval'">
+            <div v-if="data.status === 'excluded'" class="error-box"
+                 style="margin-bottom: 12px; background: #f5f5f7; border-color: #ccc; color: #444;">
+              <strong>Excluded by design.</strong>
+              Reason: <code>{{ data.excluded_reason || 'unspecified' }}</code>.
+              No provider, backtest, or judge call was made.
+              See <code>docs/benchmark_decision_log.md</code>.
+            </div>
             <div v-if="data.judge_error" class="error-box" style="margin-bottom: 12px;">
               <strong>Judge failed:</strong> {{ data.judge_error }}
               <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
                 Run <code>scripts/rejudge.py</code> to retry.
               </div>
             </div>
+            <table class="data" style="margin-bottom: 12px;">
+              <tbody>
+                <tr><th style="width: 200px;">status</th><td>{{ data.status || '—' }}</td></tr>
+                <tr><th>benchmark_version</th><td><code>{{ data.benchmark_version || '—' }}</code></td></tr>
+                <tr><th>prompt_set_sha256</th><td><code style="font-size: 11px;">{{ data.prompt_set_sha256 || '—' }}</code></td></tr>
+                <tr><th>judge_version</th><td><code>{{ data.judge_version || '—' }}</code></td></tr>
+                <tr><th>judge_threshold</th><td><code>{{ data.judge_threshold ?? '—' }}</code></td></tr>
+                <tr><th>artifact_sha256</th><td><code style="font-size: 11px;">{{ data.artifact_sha256 || '—' }}</code></td></tr>
+                <tr><th>artifact_path</th><td><code style="font-size: 11px;">{{ data.artifact_path || '—' }}</code></td></tr>
+              </tbody>
+            </table>
             <table class="data" style="margin-bottom: 16px;">
               <tbody>
                 <tr><th style="width: 200px;">compile_pass</th><td>{{ data.compile_pass }}</td></tr>

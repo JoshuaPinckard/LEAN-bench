@@ -22,22 +22,32 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
+from harness.artifacts import build_artifact, write_artifact
 from harness.conditions.builder import build_tools, is_agentic, max_turns_for
+from harness.constants import (
+    BENCHMARK_VERSION, JUDGE_PASS_THRESHOLD, excluded_reason_for,
+)
 from harness.evaluator import evaluate
 from harness.models import (
     CONDITIONS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P,
     MODELS_FROZEN,
 )
 from harness.pricing import PricingNotSetError, cost_usd
+from harness.prompt_freeze import canonicalize, is_eligible, load_frozen, sha256_of
 from harness.providers import anthropic_client, gemini_client, openai_client
 from harness.judge import JUDGE_VERSION, JudgeError, judge_call
 from harness.lean_executor import run_backtest
 from harness.retrieval import get_retrieval_snippet
 from harness.storage import Store
+
+
+FROZEN_PROMPT_SET_PATH = Path("results/frozen/prompt_set_v1.json")
 
 
 PROVIDER_CALL = {
@@ -83,14 +93,25 @@ async def run_cell(
     model_friendly: str,
     condition_id: str,
     trial_index: int,
+    *,
+    prompt_set_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Run one (prompt × model × condition × trial_index) cell. Always writes
-    one `calls` row (even on provider error) and the appropriate `turns`
-    rows. Returns a result dict matching the CallResult Pydantic schema.
+    one `calls` row (even on provider error or excluded cell) and the
+    appropriate `turns` rows. Returns a result dict matching the CallResult
+    Pydantic schema.
+
+    Excluded cells (e.g. Gemini × S3/A1) short-circuit BEFORE any provider
+    call: a row is created with status='excluded', excluded_reason='...' and
+    no provider/judge/artifact work runs. They appear in the grid for
+    transparency but are dropped from pass-rate denominators.
 
     trial_index must be pre-allocated by the caller (run_grid) so concurrent
     cells with the same (prompt, model, condition) don't collide on the
     UNIQUE(prompt_id, model_id, condition_id, trial_index) index.
+
+    prompt_set_sha256 is stamped on every row. The caller (run_grid) computes
+    it once per batch from the frozen artifact and passes it through.
     """
     cond = CONDITIONS[condition_id]
     model_info = MODELS_FROZEN[model_friendly]
@@ -102,6 +123,59 @@ async def run_cell(
     tools = build_tools(condition_id, provider) or None
     provider_call = PROVIDER_CALL[provider]
     max_turns = max_turns_for(condition_id)
+
+    # ==== Pre-flight: design-time cell exclusion ====
+    # Some (model, condition) cells are excluded by design — e.g. Gemini under
+    # S3_web/A1_agentic_full lacks the tooling parity we have for Anthropic/
+    # OpenAI. Persist a status='excluded' row so the grid stays auditable, but
+    # never fire a provider call, never judge, never write an artifact.
+    excl_reason = excluded_reason_for(model_friendly, condition_id)
+    if excl_reason is not None:
+        store.create_call(
+            call_id=call_id,
+            prompt_id=prompt_id,
+            model_family=model_family,
+            model_id=model_friendly,
+            model_version=model_pinned,
+            condition=condition_id,
+            pass_number=trial_index,
+            tool_docs_retrieval=cond["tool_docs_retrieval"],
+            tool_web_search=cond["tool_web_search"],
+            tool_agentic_loop=cond["tool_agentic_loop"],
+            max_turns_allowed=max_turns,
+            temperature=DEFAULT_TEMPERATURE,
+            top_p=DEFAULT_TOP_P,
+            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+            system_prompt_sha=SYSTEM_PROMPT_SHA256,
+            status="excluded",
+            excluded_reason=excl_reason,
+            benchmark_version=BENCHMARK_VERSION,
+            prompt_set_sha256=prompt_set_sha256,
+        )
+        return {
+            "call_id":             call_id,
+            "model":               model_friendly,
+            "condition":           condition_id,
+            "attempt":             trial_index,
+            "status":              "excluded",
+            "excluded_reason":     excl_reason,
+            "generated_code":      None,
+            "response_text":       None,
+            "compile_pass":        None,
+            "backtest_pass":       None,
+            "trade_pass":          None,
+            "judge_pass":          None,
+            "overall_pass":        None,
+            "failure_category_l1": None,
+            "failure_category_l2": None,
+            "cost_usd":            None,
+            "latency_ms":          0,
+            "input_tokens":        0,
+            "output_tokens":       0,
+            "turns_used":          0,
+            "error":               None,
+            "judge_error":         None,
+        }
 
     base_kwargs = dict(
         model_pinned=model_pinned,
@@ -150,6 +224,12 @@ async def run_cell(
         max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
         system_prompt_sha=SYSTEM_PROMPT_SHA256,
         retrieval_snippet=retrieval_snippet,
+        # Pre-run hardening v1.5: identity stamping happens at row creation
+        # so even a row that later errors carries the benchmark context.
+        status="started",
+        benchmark_version=BENCHMARK_VERSION,
+        prompt_set_sha256=prompt_set_sha256,
+        judge_threshold=JUDGE_PASS_THRESHOLD,
     )
 
     messages: list[dict] = [{"role": "user", "content": enriched_prompt}]
@@ -331,12 +411,74 @@ async def run_cell(
             except Exception as persist_exc:  # noqa: BLE001
                 print(f"[judge] failed to persist error: {persist_exc}")
 
+    # ==== STAGE 5: sidecar artifact ====
+    # Write a per-call JSON artifact with everything a reviewer needs to
+    # audit this row offline (provider response, retrieval snippet, web
+    # citations, prompt hashes, judge/benchmark provenance). Hash and path
+    # are persisted on the row so DB <-> file system can be cross-checked.
+    #
+    # Strict mode: when LEANBENCH_REQUIRE_ARTIFACTS=1 is set (paper / publish
+    # runs), an artifact write failure flips the call to status='error' so
+    # we never publish a completed row that's missing its audit sidecar.
+    # In dev mode (default) the failure is logged and the call still
+    # completes — useful so a transient disk issue doesn't waste a generation.
+    final_status = "error" if error_text else "completed"
+    artifact_path_str: str | None = None
+    artifact_hash: str | None = None
+    artifact_error: str | None = None
+    try:
+        artifact = build_artifact(
+            call_id=call_id,
+            prompt_id=prompt_id,
+            model_friendly=model_friendly,
+            model_pinned=model_pinned,
+            condition_id=condition_id,
+            trial_index=trial_index,
+            benchmark_version=BENCHMARK_VERSION,
+            prompt_set_sha256=prompt_set_sha256,
+            judge_version=JUDGE_VERSION,
+            judge_threshold=JUDGE_PASS_THRESHOLD,
+            original_prompt=prompt_text,
+            enriched_prompt=enriched_prompt,
+            retrieval_snippet=retrieval_snippet,
+            response_text=last_response["response_text"] if last_response else None,
+            generated_code=final_code,
+            raw_response=last_response["raw_response"] if last_response else None,
+            finish_reason=last_response["finish_reason"] if last_response else None,
+            tools_called=last_response["tools_called"] if last_response else None,
+            turns_used=turns_used,
+            error=error_text,
+        )
+        artifact_path, artifact_hash = write_artifact(artifact)
+        artifact_path_str = str(artifact_path)
+    except Exception as persist_exc:  # noqa: BLE001
+        artifact_error = f"{type(persist_exc).__name__}: {persist_exc}"
+        print(f"[artifact] failed for call {call_id}: {artifact_error}")
+        if os.environ.get("LEANBENCH_REQUIRE_ARTIFACTS") == "1":
+            # Treat missing artifact as a call failure in strict mode.
+            final_status = "error"
+            if not error_text:
+                error_text = f"artifact_write_failed: {artifact_error}"
+
+    # Final status / artifact provenance stamp.
+    try:
+        store.update_call(
+            call_id,
+            status=final_status,
+            artifact_path=artifact_path_str,
+            artifact_sha256=artifact_hash,
+            trajectory_path=artifact_path_str,    # legacy column kept in sync
+            error=error_text,
+        )
+    except Exception as persist_exc:  # noqa: BLE001
+        print(f"[status] failed to persist final status for {call_id}: {persist_exc}")
+
     return {
         "call_id": call_id,
         "model": model_friendly,
         "condition": condition_id,
         "attempt": trial_index,
-        "status": "error" if error_text else "completed",
+        "status": final_status,
         "generated_code": final_code,
         "response_text": last_response["response_text"] if last_response else None,
         "compile_pass": eval_for_call["compile_pass"],
@@ -356,6 +498,46 @@ async def run_cell(
     }
 
 
+class FrozenPromptSetMismatch(RuntimeError):
+    """Raised at run start when the live DB diverges from the frozen artifact."""
+
+
+def resolve_prompt_set_sha256(store: Store, prompt_id: str) -> str | None:
+    """Return the prompt_set_sha256 to stamp on calls for this prompt.
+
+    Rules:
+      - Adhoc prompts (source='adhoc') are dev-only and not part of the
+        benchmark grid; they get None — no freeze guard, no stamp.
+      - For benchmark-eligible prompts, the live DB's canonical hash MUST
+        match the on-disk frozen artifact. If the artifact is missing or the
+        hashes diverge, abort loudly: a benchmark run with an unfrozen prompt
+        set is not reproducible.
+    """
+    prompt = store.get_prompt(prompt_id)
+    if prompt is None:
+        return None
+    if str(prompt.get("source") or "") == "adhoc":
+        return None
+    if not FROZEN_PROMPT_SET_PATH.exists():
+        raise FrozenPromptSetMismatch(
+            f"No frozen prompt-set artifact at {FROZEN_PROMPT_SET_PATH}. "
+            f"Run `python scripts/freeze_prompt_set.py` before generating against "
+            f"benchmark prompts."
+        )
+    eligible = [p for p in store.list_prompts() if is_eligible(p)]
+    live_hash = sha256_of(canonicalize(eligible))
+    _, frozen_hash = load_frozen(FROZEN_PROMPT_SET_PATH)
+    if live_hash != frozen_hash:
+        raise FrozenPromptSetMismatch(
+            f"Live prompt-set hash diverges from frozen artifact.\n"
+            f"  frozen ({FROZEN_PROMPT_SET_PATH}): {frozen_hash}\n"
+            f"  live   ({len(eligible)} prompts):      {live_hash}\n"
+            f"Either revert the DB change or re-freeze with "
+            f"`python scripts/freeze_prompt_set.py`."
+        )
+    return frozen_hash
+
+
 async def run_grid(
     store: Store,
     prompt_id: str,
@@ -370,7 +552,28 @@ async def run_grid(
     cells with the same (prompt, model, condition) don't collide on the
     unique index when an awaited API call yields the event loop between
     next_trial_index() and record_call().
+
+    Run-start guard: if `prompt_id` belongs to the benchmark grid (not adhoc),
+    the live DB's canonical prompt-set hash must match the frozen artifact.
+    Mismatches raise FrozenPromptSetMismatch BEFORE any provider call.
+
+    Prompt-text source of truth: for benchmark-eligible (non-adhoc) prompts,
+    the DB's `reformulated_text` is what the freeze guard hashes and what the
+    judge metadata pulls from — so the model MUST see the same text. The
+    `prompt_text` argument is overridden with the DB value in that case.
+    Adhoc prompts pass through verbatim (no frozen identity to protect).
     """
+    prompt_set_sha256 = resolve_prompt_set_sha256(store, prompt_id)
+
+    # If this is a frozen prompt, ignore caller-supplied text and use the
+    # canonical DB text. Otherwise (adhoc, or prompt not found) keep the
+    # caller's text. The caller is still the source of truth for adhoc runs.
+    prompt_row = store.get_prompt(prompt_id)
+    if prompt_row and str(prompt_row.get("source") or "") != "adhoc":
+        db_text = prompt_row.get("reformulated_text") or prompt_row.get("original_text") or ""
+        if db_text:
+            prompt_text = db_text
+
     tasks = []
     for m in models:
         for c in conditions:
@@ -379,5 +582,6 @@ async def run_grid(
                 tasks.append(run_cell(
                     store, prompt_id, prompt_text, m, c,
                     trial_index=base + i,
+                    prompt_set_sha256=prompt_set_sha256,
                 ))
     return await asyncio.gather(*tasks)

@@ -5,25 +5,36 @@ against each, reporting:
   - Pearson and Spearman correlation between human and judge scores
   - Mean absolute error
   - Per-call disagreements > 0.3 (flagged)
+  - Intent agreement (matches_prompt_intent: human vs judge)
   - Per-failure-mode agreement rate
+  - Sample composition: counts by (model_id, condition_id) and score bin
 
 Run from the project root:
     .\\.venv\\Scripts\\python.exe scripts\\validate_judge.py validation/handscored.jsonl
 
-Hand-scored file format (one JSON object per line):
+Hand-scored file format (one JSON object per line, ideally produced by
+`scripts/export_hitl_sample.py`):
     {
       "call_id":          "...",            # optional, for reference
       "prompt_record":    {...},            # subset of prompts row (text + metadata)
       "generated_code":   "...",
       "backtest_result":  {...},            # compile_success, runtime_success, ...
       "human_score":      0.7,
+      "matches_prompt_intent_human": true,  # optional
       "human_failure_mode": ["wrong_indicator"]  # optional
     }
+
+Also accepts the output schema from `scripts/export_hitl_sample.py` (model_id /
+condition_id / backtest_summary at the top level) once humans fill in the
+`human_score`, `matches_prompt_intent_human`, and `human_failure_mode` columns.
 
 Targets (per spec — soft, not hard gates):
   - correlation ~0.8
   - failure-mode exact-match agreement ~0.75
 The author makes the final call on whether to ship the current judge_version.
+
+IMPORTANT: This script evaluates judge credibility. It does NOT optimize the
+pass threshold (see docs/benchmark_decision_log.md §3).
 """
 
 from __future__ import annotations
@@ -99,6 +110,48 @@ def _load_jsonl(path: Path) -> list[dict]:
     return out
 
 
+def _adapt_export_format(item: dict) -> dict:
+    """Adapt the HITL export-script row format into what _score_one expects.
+
+    The exporter writes both `prompt_record` (full metadata mirroring what
+    the production judge sees) AND a flat `prompt_text` for human readability.
+    Prefer `prompt_record` when present so validation uses the same context
+    the live judge had. Falls back to a thin record built from prompt_text
+    when only an old-format file is provided.
+    Idempotent.
+    """
+    if "prompt_record" not in item and "prompt_text" in item:
+        item["prompt_record"] = {
+            "reformulated_text":         item["prompt_text"],
+            "original_text":             item["prompt_text"],
+            "strategy_type":             item.get("strategy_type"),
+            "evaluation_mode":           item.get("evaluation_mode"),
+            "interpretation_strictness": item.get("interpretation_strictness"),
+        }
+    if "backtest_result" not in item and "backtest_summary" in item:
+        item["backtest_result"] = item["backtest_summary"]
+    if "matches_prompt_intent_human" in item and "human_matches_prompt_intent" not in item:
+        item["human_matches_prompt_intent"] = item["matches_prompt_intent_human"]
+    # human_failure_mode may be a single string (CSV) OR a JSON list (legacy
+    # JSONL). Normalize to a list so primary-mode comparison is correct.
+    raw_hfm = item.get("human_failure_mode")
+    if isinstance(raw_hfm, str):
+        s = raw_hfm.strip()
+        if not s:
+            item["human_failure_mode"] = []
+        elif s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                item["human_failure_mode"] = parsed if isinstance(parsed, list) else [s]
+            except json.JSONDecodeError:
+                item["human_failure_mode"] = [s]
+        else:
+            item["human_failure_mode"] = [s]
+    elif raw_hfm is None:
+        item["human_failure_mode"] = []
+    return item
+
+
 async def _score_one(item: dict) -> dict | None:
     try:
         return await judge_call(
@@ -112,9 +165,12 @@ async def _score_one(item: dict) -> dict | None:
 
 
 async def main(path: Path) -> int:
-    items = _load_jsonl(path)
+    items = [_adapt_export_format(it) for it in _load_jsonl(path)]
+    # Only keep rows that have a human label — export rows with blank
+    # human_score are not yet ready for validation.
+    items = [it for it in items if it.get("human_score") is not None]
     if not items:
-        print(f"No items in {path}", file=sys.stderr)
+        print(f"No labeled items in {path} (rows must have non-null human_score)", file=sys.stderr)
         return 1
     print(f"Validating judge_version={JUDGE_VERSION} against {len(items)} hand-scored calls...")
 
@@ -177,6 +233,47 @@ async def main(path: Path) -> int:
         print(f"  Exact agreement:             {fm_agree}/{fm_total}  ({rate:.0%})  (target ~75%)")
         for cid, h, j in fm_disagree:
             print(f"    - {cid}: human={h or '[]'} judge={j or '[]'}")
+
+    # Intent agreement (matches_prompt_intent boolean)
+    intent_total = 0
+    intent_agree = 0
+    for item, j in results:
+        h_intent = item.get("human_matches_prompt_intent")
+        if not isinstance(h_intent, bool):
+            continue
+        j_intent = bool(j.get("matches_prompt_intent"))
+        intent_total += 1
+        if h_intent == j_intent:
+            intent_agree += 1
+    if intent_total:
+        print()
+        print("=== matches_prompt_intent agreement ===")
+        print(f"  N (with human intent label): {intent_total}")
+        print(f"  Exact agreement:             {intent_agree}/{intent_total}  ({intent_agree/intent_total:.0%})")
+
+    # Sample composition by stratum (model_id, condition_id) and score bin.
+    from collections import Counter
+
+    def _bin(s: float) -> str:
+        if s <= 0.3: return "0.0-0.3"
+        if s <  0.7: return "0.4-0.6"
+        if s <  0.9: return "0.7-0.8"
+        return "0.9-1.0"
+
+    cell_counts: Counter[tuple[str, str]] = Counter()
+    bin_counts:  Counter[str] = Counter()
+    for item, _ in results:
+        cell = (str(item.get("model_id") or "?"), str(item.get("condition_id") or "?"))
+        cell_counts[cell] += 1
+        bin_counts[_bin(float(item["human_score"]))] += 1
+    print()
+    print("=== Sample composition ===")
+    print("  by (model, condition):")
+    for (m, c), n in sorted(cell_counts.items()):
+        print(f"    {m:<24} {c:<20} n={n}")
+    print("  by human-score bin:")
+    for b in ("0.0-0.3", "0.4-0.6", "0.7-0.8", "0.9-1.0"):
+        print(f"    {b:<10} n={bin_counts.get(b, 0)}")
 
     print()
     print("Author makes the call on whether to ship this judge_version.")

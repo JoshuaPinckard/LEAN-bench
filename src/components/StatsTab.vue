@@ -56,11 +56,19 @@ function cellFor(model, condition) {
   return data.value.pass_rate_matrix.find(c => c.model === model && c.condition === condition)
 }
 
-function cellClass(rate) {
+function cellClass(cell) {
+  if (!cell) return ''
+  if (cell.status === 'excluded') return 'excluded'
+  const rate = cell.pass_rate
   if (rate == null) return ''
   if (rate < 0.4) return 'low'
   if (rate < 0.7) return 'mid'
   return 'high'
+}
+
+function shortHash(h) {
+  if (!h) return '—'
+  return h.slice(0, 12) + '…'
 }
 </script>
 
@@ -111,17 +119,42 @@ function cellClass(rate) {
             <td class="label">{{ m.friendly_name }}</td>
             <td v-for="c in conditions" :key="c.id"
                 class="cell"
-                :class="cellClass(cellFor(m.friendly_name, c.id)?.pass_rate)">
+                :class="cellClass(cellFor(m.friendly_name, c.id))"
+                :title="cellFor(m.friendly_name, c.id)?.status === 'excluded'
+                        ? 'Excluded by design — see docs/benchmark_decision_log.md' : ''">
               <template v-if="cellFor(m.friendly_name, c.id)">
-                <template v-if="cellFor(m.friendly_name, c.id).pass_rate != null">
-                  {{ Math.round(cellFor(m.friendly_name, c.id).pass_rate * 100) }}%
+                <template v-if="cellFor(m.friendly_name, c.id).status === 'excluded'">
+                  excluded
+                  <span class="n">(by design)</span>
                 </template>
-                <template v-else>—</template>
-                <span class="n">(n={{ cellFor(m.friendly_name, c.id).n }})</span>
+                <template v-else>
+                  <template v-if="cellFor(m.friendly_name, c.id).pass_rate != null">
+                    {{ Math.round(cellFor(m.friendly_name, c.id).pass_rate * 100) }}%
+                  </template>
+                  <template v-else>—</template>
+                  <span class="n">(n={{ cellFor(m.friendly_name, c.id).n }})</span>
+                </template>
               </template>
               <template v-else>—</template>
             </td>
           </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="provenance">
+      <h4>Benchmark provenance</h4>
+      <table class="prov">
+        <tbody>
+          <tr><th>benchmark_version</th><td><code>{{ data.benchmark_version || '—' }}</code></td></tr>
+          <tr><th>prompt_set_sha256</th><td>
+            <code :title="data.prompt_set_sha256 || ''">{{ shortHash(data.prompt_set_sha256) }}</code>
+            <span v-if="!data.prompt_set_sha256" style="color: #b00; margin-left: 8px;">
+              (no frozen artifact — run <code>scripts/freeze_prompt_set.py</code>)
+            </span>
+          </td></tr>
+          <tr><th>judge_threshold</th><td><code>{{ data.judge_threshold ?? '—' }}</code> (locked rubric semantics)</td></tr>
+          <tr><th>excluded calls</th><td>{{ data.excluded_calls ?? 0 }} (by design — see decision log)</td></tr>
         </tbody>
       </table>
     </div>
@@ -135,3 +168,32 @@ function cellClass(rate) {
     <span class="spinner"></span> Loading stats…
   </div>
 </template>
+
+<style scoped>
+.matrix td.cell.excluded {
+  background: repeating-linear-gradient(
+    45deg, #f0f0f3, #f0f0f3 6px, #e7e7eb 6px, #e7e7eb 12px
+  );
+  color: #666;
+  font-style: italic;
+}
+.provenance {
+  margin-top: 24px;
+  padding: 12px 14px;
+  background: var(--bg-chrome, #fafafa);
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 6px;
+}
+.provenance h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted, #888);
+}
+.prov { width: 100%; border-collapse: collapse; font-size: 13px; }
+.prov th { width: 180px; text-align: left; padding: 3px 8px 3px 0; font-weight: 500; color: var(--text-muted, #666); }
+.prov td { padding: 3px 0; font-family: var(--font-mono, monospace); }
+.prov code { background: transparent; padding: 0; }
+</style>

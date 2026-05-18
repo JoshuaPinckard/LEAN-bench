@@ -54,4 +54,46 @@ INTERPRETATION_STRICTNESS_VALUES: tuple[str, ...] = (
 # judge_pass=True. Pass/fail thresholds feed pass_rate_matrix and the UI's
 # headline metric, so changes here are a methodology change — bump JUDGE_VERSION
 # in harness/judge.py and re-judge.
+#
+# Treated as an a priori rubric-semantic cutoff, NOT a tunable knob. Validation
+# (scripts/validate_judge.py) evaluates judge credibility against humans; it
+# does not re-fit this threshold. Any future change requires bumping
+# JUDGE_VERSION and a full rejudge across affected calls.
 JUDGE_PASS_THRESHOLD: float = 0.7
+
+
+# --- Benchmark identity --------------------------------------------------
+
+# Stamped onto every call. Bumping this is a benchmark methodology change.
+BENCHMARK_VERSION: str = "LEAN-Bench-v1.0"
+
+
+# --- Call status enum ----------------------------------------------------
+
+# Persisted on calls.status. Lifecycle:
+#   started   — row created, provider call not yet returned
+#   completed — provider returned (with or without judge pass)
+#   error     — provider/orchestrator threw; calls.error has the text
+#   excluded  — design-time excluded (e.g. tooling-parity); never hits provider
+CALL_STATUSES: tuple[str, ...] = ("started", "completed", "error", "excluded")
+
+
+# --- Design-time cell exclusions ----------------------------------------
+
+# (model_id, condition_id) pairs that are excluded from the main benchmark
+# by design. Today's only exclusion is Gemini under tool-using conditions:
+# we lack Gemini-compatible MCP docs retrieval and the agentic feedback loop
+# is wired against Anthropic/OpenAI tool calling. Reported transparently as
+# `status='excluded', excluded_reason='tooling_parity'` rather than hidden.
+#
+# Rows for excluded cells are still created (auditable grid) but never make
+# a provider/judge call and are dropped from pass-rate denominators.
+EXCLUDED_CELLS: dict[tuple[str, str], str] = {
+    ("gemini-3.1-pro", "S3_web"):          "tooling_parity",
+    ("gemini-3.1-pro", "A1_agentic_full"): "tooling_parity",
+}
+
+
+def excluded_reason_for(model_id: str, condition_id: str) -> str | None:
+    """Return the exclusion reason for this cell, or None if not excluded."""
+    return EXCLUDED_CELLS.get((model_id, condition_id))

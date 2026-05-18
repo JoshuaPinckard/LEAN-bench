@@ -47,8 +47,12 @@ from backend.schemas import (
     GenerateRequest, GenerateResponse, ModelInfo, ModelsResponse,
     PromptIn, SchemaAutofillRequest, SchemaAutofillResponse, StatsResponse,
 )
+from harness.constants import BENCHMARK_VERSION, JUDGE_PASS_THRESHOLD
 from harness.models import CONDITIONS, FROZEN_DATE, MODELS_FROZEN
-from harness.orchestrator import run_grid
+from harness.orchestrator import (
+    FROZEN_PROMPT_SET_PATH, FrozenPromptSetMismatch, run_grid,
+)
+from harness.prompt_freeze import load_frozen
 from harness.schema_fill import SchemaAutofillError, fill_schema
 from harness.storage import Store
 
@@ -287,14 +291,19 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             )
         prompt_id = req.prompt_id
 
-    results = await run_grid(
-        store=store,
-        prompt_id=prompt_id,
-        prompt_text=req.prompt_text,
-        models=req.models,
-        conditions=req.conditions,
-        attempts=req.attempts,
-    )
+    try:
+        results = await run_grid(
+            store=store,
+            prompt_id=prompt_id,
+            prompt_text=req.prompt_text,
+            models=req.models,
+            conditions=req.conditions,
+            attempts=req.attempts,
+        )
+    except FrozenPromptSetMismatch as exc:
+        # 409 Conflict: the DB state and the frozen artifact disagree.
+        # No provider call fired; this is the freeze guard doing its job.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return GenerateResponse(results=[CallResult(**r) for r in results])
 
 
@@ -332,11 +341,23 @@ def get_call(call_id: str) -> dict:
 def stats() -> StatsResponse:
     store = get_store()
     matrix = store.pass_rate_matrix()
+    # Surface the frozen prompt-set hash if the artifact exists. Don't fail
+    # the stats endpoint if it doesn't (dev runs are valid without a freeze).
+    prompt_set_sha = None
+    if FROZEN_PROMPT_SET_PATH.exists():
+        try:
+            _, prompt_set_sha = load_frozen(FROZEN_PROMPT_SET_PATH)
+        except Exception:
+            prompt_set_sha = None
     return StatsResponse(
         total_spend_usd=store.total_cost_usd(),
         total_calls=store.call_count(),
+        excluded_calls=store.excluded_count(),
         total_prompts=len(store.list_prompts()),
         frozen_date=FROZEN_DATE,
+        benchmark_version=BENCHMARK_VERSION,
+        judge_threshold=JUDGE_PASS_THRESHOLD,
+        prompt_set_sha256=prompt_set_sha,
         spend_by_model=store.cost_by_model(),
         spend_by_condition=store.cost_by_condition(),
         pass_rate_matrix=[
@@ -344,7 +365,9 @@ def stats() -> StatsResponse:
                 model=row["model_id"],
                 condition=row["condition_id"],
                 n=row["n"],
+                excluded=row["excluded"],
                 pass_rate=row["pass_rate"],
+                status=row["status"],
             )
             for row in matrix
         ],

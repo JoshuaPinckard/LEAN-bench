@@ -13,6 +13,7 @@ const expanded = ref(false)
 
 const status = computed(() => {
   const r = props.result
+  if (r.status === 'excluded') return 'excluded'
   if (r.status === 'error') return 'error'
   if (r.overall_pass === true) return 'pass'
   if (r.compile_pass === false) return 'fail'
@@ -21,10 +22,11 @@ const status = computed(() => {
 
 const statusIcon = computed(() => {
   switch (status.value) {
-    case 'pass':  return '✓'
-    case 'fail':  return '✗'
-    case 'error': return '⚠'
-    default:      return '·'
+    case 'pass':     return '✓'
+    case 'fail':     return '✗'
+    case 'error':    return '⚠'
+    case 'excluded': return '∅'
+    default:         return '·'
   }
 })
 
@@ -51,7 +53,23 @@ function formatLatency(ms) {
       <span class="badge" :class="provider">{{ provider }}</span>
     </div>
 
-    <template v-if="result.status === 'error'">
+    <template v-if="result.status === 'excluded'">
+      <div class="excluded-box" style="
+        background: #f5f5f7; border: 1px dashed #ccc; padding: 10px;
+        border-radius: 4px; font-size: 13px; color: var(--text-muted, #666);
+      ">
+        <strong>Excluded by design</strong>
+        <div style="margin-top: 4px;">
+          Reason: <code>{{ result.excluded_reason || 'unspecified' }}</code>
+        </div>
+        <div style="margin-top: 6px; font-size: 11px;">
+          This cell is not part of the v1.0 benchmark grid. See
+          <code>docs/benchmark_decision_log.md</code>.
+        </div>
+      </div>
+    </template>
+
+    <template v-else-if="result.status === 'error'">
       <div class="error-box">{{ result.error }}</div>
     </template>
 

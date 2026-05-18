@@ -166,7 +166,8 @@ class CallResult(BaseModel):
     model: str
     condition: str
     attempt: int
-    status: str                         # completed | error | skipped
+    status: str                         # started | completed | error | excluded
+    excluded_reason: str | None = None  # populated iff status='excluded'
     generated_code: str | None
     response_text: str | None
     compile_pass: bool | None
@@ -182,6 +183,7 @@ class CallResult(BaseModel):
     output_tokens: int
     turns_used: int
     error: str | None
+    judge_error: str | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -193,15 +195,21 @@ class GenerateResponse(BaseModel):
 class CellStat(BaseModel):
     model: str
     condition: str
-    n: int
-    pass_rate: float | None             # judge_pass rate; None if no calls
+    n: int                              # NON-excluded rows (the denominator)
+    excluded: int = 0                   # design-time excluded rows for this cell
+    pass_rate: float | None             # judge_pass rate over n; None if no judged calls
+    status: str | None = None           # 'excluded' iff every row in cell is excluded
 
 
 class StatsResponse(BaseModel):
     total_spend_usd: float
-    total_calls: int
+    total_calls: int                    # attempted (non-excluded)
+    excluded_calls: int = 0             # design-time excluded
     total_prompts: int
     frozen_date: str
+    benchmark_version: str
+    judge_threshold: float
+    prompt_set_sha256: str | None = None
     spend_by_model: dict[str, float]
     spend_by_condition: dict[str, float]
     pass_rate_matrix: list[CellStat]

@@ -70,14 +70,30 @@ CONDITIONS: dict[str, dict] = {
         "semantics": "S1 + provider-native web search; observed search counts logged per call. No QC docs retrieval.",
     },
     "A1_agentic_full": {
-        "display_name": "Agentic full stack",
+        "display_name": "Agentic compile loop",
         "tools": ["qc_docs", "web_search", "agentic_loop"],
         "max_turns": 10,
         "tool_docs_retrieval": True,
         "tool_web_search": True,
         "tool_agentic_loop": True,
         "qc_docs_max_uses": 5,
-        "semantics": "S2 + S3 tools + agentic loop: after each code submission, LEAN harness runs Compile -> Backtest -> Trade checks and returns structured feedback. Model may iterate up to 10 turns. QC docs retrievals capped at 5 per turn; web searches uncapped (observed counts reported). Headline leaderboard condition.",
+        # v1.0 SCOPE NOTE: the per-turn feedback signal is AST compile only
+        # (harness/evaluator.py). When a submitted code block parses, the
+        # loop exits with feedback=None — there is no per-turn LEAN backtest.
+        # LEAN backtest + judge run ONCE on the final code, after the loop.
+        # The historical id 'A1_agentic_full' is retained to preserve the
+        # locked DB schema; the human-facing display name and these semantics
+        # are now honest about what runs today. Full per-turn Compile -> Backtest
+        # -> Trade feedback is the v1.1 roadmap (see decision log §7).
+        "semantics": (
+            "S2 + S3 tools + agentic compile loop: after each code submission, "
+            "the harness AST-compiles the response and returns a syntax-error "
+            "feedback string if parsing fails, prompting up to 10 refinement "
+            "turns. LEAN backtest + judge run once on the final code, after "
+            "the loop exits. QC docs retrievals capped at 5 per turn; web "
+            "searches uncapped (observed counts reported). Per-turn LEAN "
+            "backtest + judge feedback is a v1.1 deliverable."
+        ),
     },
 }
 
