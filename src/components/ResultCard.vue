@@ -78,6 +78,7 @@ function formatLatency(ms) {
         <span class="stage-pill" :class="stageClass(result.compile_pass)">compile</span>
         <span class="stage-pill" :class="stageClass(result.backtest_pass)">backtest</span>
         <span class="stage-pill" :class="stageClass(result.trade_pass)">trade</span>
+        <span class="stage-pill" :class="stageClass(result.schema_pass)">schema</span>
         <span class="stage-pill" :class="stageClass(result.judge_pass)">judge</span>
       </div>
 
@@ -86,6 +87,9 @@ function formatLatency(ms) {
         <span>{{ formatLatency(result.latency_ms) }}</span>
         <span>{{ result.input_tokens }} in / {{ result.output_tokens }} out</span>
         <span v-if="condition.max_turns > 1">turns: {{ result.turns_used }}/{{ condition.max_turns }}</span>
+        <span v-if="result.judge_score_a != null || result.judge_score_b != null" class="mono" style="color: var(--text-muted);">
+          judge {{ result.judge_score_a != null ? result.judge_score_a.toFixed(2) : '—' }}/{{ result.judge_score_b != null ? result.judge_score_b.toFixed(2) : '—' }}
+        </span>
       </div>
 
       <button class="code-toggle" @click="expanded = !expanded">

@@ -260,7 +260,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         raise HTTPException(status_code=400, detail="at least one model required")
     if not req.conditions:
         raise HTTPException(status_code=400, detail="at least one condition required")
-    if req.attempts < 1:
+    if req.attempts is not None and req.attempts < 1:
         raise HTTPException(status_code=400, detail="attempts must be >= 1")
 
     unknown_models = [m for m in req.models if m not in MODELS_FROZEN]
@@ -299,6 +299,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             models=req.models,
             conditions=req.conditions,
             attempts=req.attempts,
+            max_turns=req.max_turns,
         )
     except FrozenPromptSetMismatch as exc:
         # 409 Conflict: the DB state and the frozen artifact disagree.
@@ -331,7 +332,45 @@ def get_call(call_id: str) -> dict:
                 t["prompt_messages"] = json.loads(t["prompt_messages_json"])
             except (TypeError, json.JSONDecodeError):
                 t["prompt_messages"] = None
+        # v2: structured per-turn tool events (RAG + compiler). Decoded once
+        # here so the frontend never has to JSON.parse a string column.
+        raw_events = t.get("tool_events_json")
+        if raw_events:
+            try:
+                t["tool_events"] = json.loads(raw_events)
+            except (TypeError, json.JSONDecodeError):
+                t["tool_events"] = []
+        else:
+            t["tool_events"] = []
     c["turns"] = turns
+
+    # v2 monitoring aggregate: 'transcript' carries everything the Transcript
+    # tab needs without traversing all 24 rounds in the browser.
+    rag_events: list[dict] = []
+    compile_events: list[dict] = []
+    final_turn: dict | None = None
+    for t in turns:
+        for ev in t["tool_events"]:
+            ev_with_idx = {"turn_index": t["turn_index"], **ev}
+            if ev["name"] == "qc_docs_retrieve":
+                rag_events.append(ev_with_idx)
+            elif ev["name"] == "lean_backtest":
+                compile_events.append(ev_with_idx)
+        if t.get("is_final_turn"):
+            final_turn = t
+    if final_turn is None and turns:
+        # Fallback: pick the last turn we recorded.
+        final_turn = turns[-1]
+
+    c["transcript"] = {
+        "total_turns":       len(turns),
+        "final_turn_index":  final_turn["turn_index"] if final_turn else None,
+        "final_turn":        final_turn,
+        "rag_events":        rag_events,
+        "compile_events":    compile_events,
+        "rag_count":         len(rag_events),
+        "compile_count":     len(compile_events),
+    }
     return c
 
 

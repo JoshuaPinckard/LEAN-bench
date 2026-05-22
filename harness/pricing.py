@@ -20,9 +20,15 @@ PRICING: dict[str, dict[str, float | None]] = {
     "claude-opus-4-7":        {"input": 5.00,  "output": 25.00, "cache_read": None},
     "claude-opus-4-6":        {"input": 5.00,  "output": 25.00, "cache_read": None},
     "claude-sonnet-4-6":      {"input": 3.00,  "output": 15.00, "cache_read": None},
+    # Anthropic — UNVERIFIED placeholder rates, confirm against pricing page.
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00, "cache_read": None},
     # OpenAI — verified May 2026
     "gpt-5.5-2026-04-23":     {"input": 5.00,  "output": 30.00, "cache_read": None},
     "gpt-5.4-2026-03-05":     {"input": 2.50,  "output": 15.00, "cache_read": None},
+    # OpenAI — UNVERIFIED placeholder rates, confirm against pricing page.
+    "gpt-5.4-mini-2026-03-17": {"input": 0.25, "output": 2.00, "cache_read": None},
+    "gpt-5.4-nano-2026-03-17": {"input": 0.05, "output": 0.40, "cache_read": None},
+    "gpt-4.1-mini":            {"input": 0.40, "output": 1.60, "cache_read": None},
     # Google — verified May 2026
     "gemini-3.1-pro-preview": {"input": 2.00,  "output": 12.00, "cache_read": None},
 }

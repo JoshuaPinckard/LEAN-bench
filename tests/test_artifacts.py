@@ -18,11 +18,11 @@ def _make_artifact(call_id="abc-123", **overrides):
         prompt_id="lb-0001",
         model_friendly="claude-opus-4.7",
         model_pinned="claude-opus-4-7",
-        condition_id="S1_base",
+        condition_id="C1_oneshot",
         trial_index=0,
-        benchmark_version="LEAN-Bench-v1.0",
+        benchmark_version="LEAN-Bench-v2.0",
         prompt_set_sha256="deadbeef" * 8,
-        judge_version="v2",
+        judge_version="v3",
         judge_threshold=0.7,
         original_prompt="buy spy when rsi < 30",
         enriched_prompt="buy spy when rsi < 30",
@@ -59,7 +59,7 @@ def test_artifact_contains_provenance_and_hashes(tmp_path):
     art = _make_artifact(original_prompt="hello", generated_code="x = 1")
     path, _ = write_artifact(art, artifacts_dir=tmp_path)
     data = json.loads(path.read_text(encoding="ascii"))
-    assert data["benchmark_version"] == "LEAN-Bench-v1.0"
+    assert data["benchmark_version"] == "LEAN-Bench-v2.0"
     assert data["judge_threshold"] == 0.7
     assert data["prompt_set_sha256"] == "deadbeef" * 8
     # SHA256 of "hello"

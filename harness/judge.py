@@ -1,22 +1,42 @@
-"""LLM judge for LEAN-Bench.
+"""Dual-judge LLM scoring for LEAN-Bench v2.0 (proposal §Judge Validation).
 
-Given (prompt record, generated code, backtest result), asks claude-sonnet-4-6
-to score implementation correctness — NOT profitability — and to classify any
-failure mode from the locked taxonomy in harness/constants.py.
+Two INDEPENDENT judges score every (prompt, code, backtest) tuple in parallel
+with the same locked rubric. The call's `judge_score` is the AVERAGE of the
+two judge scores. The pass cutoff (JUDGE_PASS_THRESHOLD = 0.7) is applied to
+the average.
 
-Returns a dict matching the structure that Store.update_call_with_judge expects:
+Judge models (locked):
+    Judge A — claude-sonnet-4-6   (Anthropic)
+    Judge B — gpt-5.4-2026-03-05  (OpenAI)
+
+Different families avoid same-vendor judge bias. The proposal also requires
+a subset of prompts to be expert-reviewed (HITL) and the judge-vs-human
+agreement to be published; scripts/validate_judge.py covers the calculation
+side once HITL labels exist.
+
+Bump `JUDGE_VERSION` whenever the rubric, system prompt, or judge model
+identity changes. Bump triggers a full rejudge of affected calls.
+
+Returned dict — what update_call_with_judge expects:
     {
-        "judge_score":           float,    # 0.0–1.0
-        "judge_reasoning":       str,      # 50–150 words, auditable
-        "failure_mode":          list[str],# empty if score >= 0.9, else from FAILURE_MODES
-        "failure_notes":         str|None, # freetext for edge cases
-        "matches_prompt_intent": bool,     # independent of score
+        "judge_score":             float,    # AVERAGE of the two judges
+        "judge_reasoning":         str,      # concat'd A | B for the audit trail
+        "judge_version":           str,
+        "failure_mode":            list[str],# unioned across the two judges
+        "failure_notes":           str|None,
+        "matches_prompt_intent":   bool,     # AND of the two judges
+        # Per-judge breakdown:
+        "judge_score_a":           float,
+        "judge_score_b":           float,
+        "judge_reasoning_a":       str,
+        "judge_reasoning_b":       str,
+        "judge_version_a":         str,
+        "judge_version_b":         str,
+        "judge_model_a":           str,
+        "judge_model_b":           str,
+        "judge_error_a":           str|None,
+        "judge_error_b":           str|None,
     }
-
-`judge_version` (default "v1") is stored on the call row. Bump this whenever
-the rubric or system prompt materially changes — re-run scripts/rejudge.py to
-update prior calls. Locked failure-mode taxonomy means changing the enum in
-constants.py also requires a version bump.
 """
 
 from __future__ import annotations
@@ -27,45 +47,61 @@ import re
 from typing import Any
 
 from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 
 from harness.constants import FAILURE_MODES, FAILURE_MODE_DESCRIPTIONS
 
-JUDGE_MODEL = "claude-sonnet-4-6"
+JUDGE_VERSION = "v3"  # v3 = dual-judge averaged (was v2 single-judge sonnet).
+
+JUDGE_MODEL_A = "claude-sonnet-4-6"
+JUDGE_MODEL_B = "gpt-5.4-2026-03-05"
+
 JUDGE_TEMPERATURE = 0
 JUDGE_MAX_TOKENS = 1024
-JUDGE_VERSION = "v2"
 
-# Anthropic's claude-sonnet-4-6 input-token-per-minute quota is easily exceeded
-# when a grid run fires 18+ judges at once. Cap concurrent in-flight judge
-# requests so we stay under the rate limit without dropping calls. 3 is
-# empirically safe at the standard tier; tune up if the org's TPM grows.
-_JUDGE_CONCURRENCY = 3
-_JUDGE_SEMAPHORE: asyncio.Semaphore | None = None
+# Per-provider concurrency caps. The two judges talk to different APIs so
+# their semaphores are independent — saturating Anthropic's TPM does not
+# block OpenAI, and vice versa.
+_JUDGE_CONCURRENCY_ANTHROPIC = 3
+_JUDGE_CONCURRENCY_OPENAI = 3
+_JUDGE_SEM_A: asyncio.Semaphore | None = None
+_JUDGE_SEM_B: asyncio.Semaphore | None = None
 
 
 class JudgeError(RuntimeError):
-    """Raised when the judge returns malformed output that can't be salvaged."""
+    """Raised when a judge returns malformed output that can't be salvaged."""
 
 
-_client: AsyncAnthropic | None = None
+_anthropic_client: AsyncAnthropic | None = None
+_openai_client: AsyncOpenAI | None = None
 
 
-def _get_client() -> AsyncAnthropic:
-    """Lazy-init AsyncAnthropic with retries enabled. The SDK's max_retries
-    handles transient 429/5xx with exponential backoff — pairs with the
-    concurrency semaphore so a temporary spike doesn't drop calls."""
-    global _client
-    if _client is None:
-        _client = AsyncAnthropic(max_retries=4)
-    return _client
+def _get_anthropic() -> AsyncAnthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = AsyncAnthropic(max_retries=4)
+    return _anthropic_client
 
 
-def _get_semaphore() -> asyncio.Semaphore:
-    """Lazy-init to avoid binding to a loop at import time."""
-    global _JUDGE_SEMAPHORE
-    if _JUDGE_SEMAPHORE is None:
-        _JUDGE_SEMAPHORE = asyncio.Semaphore(_JUDGE_CONCURRENCY)
-    return _JUDGE_SEMAPHORE
+def _get_openai() -> AsyncOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AsyncOpenAI(max_retries=4)
+    return _openai_client
+
+
+def _sem_a() -> asyncio.Semaphore:
+    global _JUDGE_SEM_A
+    if _JUDGE_SEM_A is None:
+        _JUDGE_SEM_A = asyncio.Semaphore(_JUDGE_CONCURRENCY_ANTHROPIC)
+    return _JUDGE_SEM_A
+
+
+def _sem_b() -> asyncio.Semaphore:
+    global _JUDGE_SEM_B
+    if _JUDGE_SEM_B is None:
+        _JUDGE_SEM_B = asyncio.Semaphore(_JUDGE_CONCURRENCY_OPENAI)
+    return _JUDGE_SEM_B
 
 
 def _failure_mode_block() -> str:
@@ -75,7 +111,7 @@ def _failure_mode_block() -> str:
     )
 
 
-JUDGE_SYSTEM_PROMPT = f"""You are the evaluation judge for LEAN-Bench, a benchmark measuring how well LLMs generate QuantConnect LEAN algorithmic-trading code.
+JUDGE_SYSTEM_PROMPT = f"""You are an evaluation judge for LEAN-Bench, a benchmark measuring how well LLMs generate QuantConnect LEAN algorithmic-trading code.
 
 Your job is to score IMPLEMENTATION CORRECTNESS — whether the generated code does what the prompt asked. You are NOT scoring profitability. A perfectly-implemented losing strategy scores 1.0. A profitable strategy that trades the wrong asset scores low. Profitability metrics (Sharpe, return) may inform your reasoning but never drive your numeric score.
 
@@ -104,10 +140,6 @@ The benchmark measures code generation, not strategy quality. Drift toward equat
 
 True when the code's STRUCTURE faithfully realises what the prompt asked, even if execution details fall short. False when the model misread the prompt at a conceptual level (wrong asset class, wrong direction, wrong strategy family).
 
-Independence examples:
-- A correct golden-cross with a subtle off-by-one in warmup: score 0.5, matches_prompt_intent=true.
-- A polished implementation of the WRONG strategy: score 0.3, matches_prompt_intent=false.
-
 ## failure_mode (JSON array; empty if score >= 0.9)
 
 Pick zero or more from the locked taxonomy below. First element is treated as the primary failure mode.
@@ -116,7 +148,6 @@ Pick zero or more from the locked taxonomy below. First element is treated as th
 
 If the score is >= 0.9, `failure_mode` MUST be `[]`.
 If the score is < 0.9, include at least one entry.
-Use "none" only when score == 1.0 AND you need to make the no-failure intent explicit (otherwise prefer an empty array).
 
 ## failure_notes (string or null)
 
@@ -124,7 +155,7 @@ Freetext for edge cases the taxonomy doesn't capture, OR null. Keep it short —
 
 ## judge_reasoning
 
-Concise but specific. Typically 50–150 words. Cite the SPECIFIC element(s) of code that earned the score (correct/incorrect API call, indicator misuse, missing warmup, etc.). Avoid generalities. This goes into the audit trail; reviewers must be able to verify your call without re-reading the code.
+Concise but specific. Typically 50-150 words. Cite the SPECIFIC element(s) of code that earned the score (correct/incorrect API call, indicator misuse, missing warmup, etc.). Avoid generalities. This goes into the audit trail; reviewers must be able to verify your call without re-reading the code.
 
 ## Output format
 
@@ -139,7 +170,6 @@ Return ONLY a single JSON object. No prose before, no prose after, no markdown f
 }}"""
 
 
-# Locked schema for parsed judge output
 _REQUIRED = {"judge_score", "judge_reasoning", "failure_mode", "matches_prompt_intent"}
 
 
@@ -148,7 +178,6 @@ def _build_user_message(
     generated_code: str,
     backtest_result: dict,
 ) -> str:
-    """Render the per-call context into a single user message."""
     p = prompt_record
     parts: list[str] = []
     parts.append("# Original prompt")
@@ -165,6 +194,8 @@ def _build_user_message(
         "tickers":                     p.get("tickers"),
         "indicators":                  p.get("indicators"),
         "implementation_type":         p.get("implementation_type"),
+        "start_date":                  p.get("start_date"),
+        "end_date":                    p.get("end_date"),
     }
     parts.append(json.dumps(meta, indent=2))
     parts.append("")
@@ -195,7 +226,6 @@ def _build_user_message(
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    """Pull the first balanced JSON object from `text`, tolerant of fences/prose."""
     cleaned = re.sub(r"```(?:json)?\s*", "", text).strip().strip("`")
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end <= start:
@@ -207,7 +237,6 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _coerce_failure_mode(value: Any) -> list[str]:
-    """Accept list/str/None and return a list of allowed enum strings only."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -218,38 +247,12 @@ def _coerce_failure_mode(value: Any) -> list[str]:
     return [v for v in value if isinstance(v, str) and v in allowed]
 
 
-async def judge_call(
-    prompt_record: dict,
-    generated_code: str,
-    backtest_result: dict,
-    judge_version: str = JUDGE_VERSION,
-) -> dict:
-    """Score one (prompt, code, backtest) tuple. Returns a dict ready to pass
-    straight to Store.update_call_with_judge (minus `call_id`).
-
-    On parse failure the response is salvaged where possible:
-    - missing failure_mode -> []
-    - missing failure_notes -> None
-    - missing matches_prompt_intent -> derived from judge_score >= 0.7
-
-    If judge_score or judge_reasoning are missing, raises JudgeError.
-    """
-    user = _build_user_message(prompt_record, generated_code, backtest_result)
-    client = _get_client()
-    async with _get_semaphore():
-        resp = await client.messages.create(
-            model=JUDGE_MODEL,
-            max_tokens=JUDGE_MAX_TOKENS,
-            temperature=JUDGE_TEMPERATURE,
-            system=JUDGE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user}],
-        )
-    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+def _parse_judge_payload(raw: str) -> dict:
     parsed = _extract_json(raw)
-
-    # Required fields
     if "judge_score" not in parsed or "judge_reasoning" not in parsed:
-        raise JudgeError(f"Judge response missing required field: {sorted(_REQUIRED - parsed.keys())}")
+        raise JudgeError(
+            f"Judge missing required field: {sorted(_REQUIRED - parsed.keys())}"
+        )
     try:
         score = float(parsed["judge_score"])
     except (TypeError, ValueError) as exc:
@@ -257,15 +260,142 @@ async def judge_call(
     score = max(0.0, min(1.0, score))
 
     failure_mode = _coerce_failure_mode(parsed.get("failure_mode"))
-    matches_intent = parsed.get("matches_prompt_intent")
-    if not isinstance(matches_intent, bool):
-        matches_intent = score >= 0.7
+    matches = parsed.get("matches_prompt_intent")
+    if not isinstance(matches, bool):
+        matches = score >= 0.7
 
     return {
         "judge_score":           score,
         "judge_reasoning":       str(parsed["judge_reasoning"]),
         "failure_mode":          failure_mode,
         "failure_notes":         parsed.get("failure_notes") if isinstance(parsed.get("failure_notes"), str) else None,
-        "matches_prompt_intent": matches_intent,
+        "matches_prompt_intent": matches,
+    }
+
+
+async def _judge_anthropic(user_message: str) -> dict:
+    client = _get_anthropic()
+    async with _sem_a():
+        resp = await client.messages.create(
+            model=JUDGE_MODEL_A,
+            max_tokens=JUDGE_MAX_TOKENS,
+            temperature=JUDGE_TEMPERATURE,
+            system=JUDGE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+    return _parse_judge_payload(raw)
+
+
+async def _judge_openai(user_message: str) -> dict:
+    client = _get_openai()
+    async with _sem_b():
+        resp = await client.responses.create(
+            model=JUDGE_MODEL_B,
+            max_output_tokens=JUDGE_MAX_TOKENS,
+            instructions=JUDGE_SYSTEM_PROMPT,
+            input=[{"role": "user", "content": user_message}],
+        )
+    raw = (resp.output_text or "").strip()
+    return _parse_judge_payload(raw)
+
+
+async def judge_call(
+    prompt_record: dict,
+    generated_code: str,
+    backtest_result: dict,
+    judge_version: str = JUDGE_VERSION,
+) -> dict:
+    """Run both judges in parallel and combine. Returns a dict ready to pass
+    straight to Store.update_call_with_judge (minus `call_id`).
+
+    Combination rules:
+      - judge_score    = mean(a.score, b.score)  (if both succeeded)
+      - judge_pass     = derived later, using the locked threshold (0.7)
+      - failure_mode   = union of the two lists (a wins on order)
+      - matches_prompt_intent = a.intent AND b.intent (consensus)
+      - judge_reasoning = "[A] ... \\n\\n[B] ..." for the audit trail
+
+    If exactly one judge fails, the other carries the call and the failed
+    judge's score is `None`. If both fail, raises JudgeError.
+    """
+    user = _build_user_message(prompt_record, generated_code, backtest_result)
+
+    a_task = asyncio.create_task(_judge_anthropic(user))
+    b_task = asyncio.create_task(_judge_openai(user))
+    a_res: dict | BaseException
+    b_res: dict | BaseException
+    a_res, b_res = await asyncio.gather(a_task, b_task, return_exceptions=True)
+
+    a_ok = isinstance(a_res, dict)
+    b_ok = isinstance(b_res, dict)
+
+    if not a_ok and not b_ok:
+        raise JudgeError(
+            f"Both judges failed. A={type(a_res).__name__}: {a_res}; "
+            f"B={type(b_res).__name__}: {b_res}"
+        )
+
+    # Score combination — both, or whichever survived.
+    score_a = a_res["judge_score"] if a_ok else None
+    score_b = b_res["judge_score"] if b_ok else None
+    survivors = [s for s in (score_a, score_b) if s is not None]
+    avg_score = sum(survivors) / len(survivors)
+
+    # Reasoning audit trail: tag each side so reviewers can attribute.
+    reasoning_parts: list[str] = []
+    if a_ok:
+        reasoning_parts.append(f"[A:{JUDGE_MODEL_A}] {a_res['judge_reasoning']}")
+    else:
+        reasoning_parts.append(f"[A:{JUDGE_MODEL_A}] ERROR: {type(a_res).__name__}: {a_res}")
+    if b_ok:
+        reasoning_parts.append(f"[B:{JUDGE_MODEL_B}] {b_res['judge_reasoning']}")
+    else:
+        reasoning_parts.append(f"[B:{JUDGE_MODEL_B}] ERROR: {type(b_res).__name__}: {b_res}")
+
+    # Failure modes: union, preserving first-seen order from A.
+    fm_union: list[str] = []
+    seen: set[str] = set()
+    for src in (a_res if a_ok else None, b_res if b_ok else None):
+        if src is None:
+            continue
+        for fm in src["failure_mode"]:
+            if fm not in seen:
+                seen.add(fm)
+                fm_union.append(fm)
+
+    # matches_prompt_intent: consensus when both ran; surviving judge's value
+    # when only one ran.
+    if a_ok and b_ok:
+        intent = bool(a_res["matches_prompt_intent"]) and bool(b_res["matches_prompt_intent"])
+    elif a_ok:
+        intent = bool(a_res["matches_prompt_intent"])
+    else:
+        intent = bool(b_res["matches_prompt_intent"])  # type: ignore[index]
+
+    # Combined failure_notes: first non-empty.
+    failure_notes: str | None = None
+    if a_ok and a_res.get("failure_notes"):
+        failure_notes = a_res["failure_notes"]
+    elif b_ok and b_res.get("failure_notes"):
+        failure_notes = b_res["failure_notes"]
+
+    return {
+        "judge_score":           avg_score,
+        "judge_reasoning":       "\n\n".join(reasoning_parts),
+        "failure_mode":          fm_union,
+        "failure_notes":         failure_notes,
+        "matches_prompt_intent": intent,
         "judge_version":         judge_version,
+        # Per-judge breakdown for storage and downstream audit.
+        "judge_score_a":         score_a,
+        "judge_score_b":         score_b,
+        "judge_reasoning_a":     a_res["judge_reasoning"] if a_ok else None,
+        "judge_reasoning_b":     b_res["judge_reasoning"] if b_ok else None,
+        "judge_version_a":       judge_version,
+        "judge_version_b":       judge_version,
+        "judge_model_a":         JUDGE_MODEL_A,
+        "judge_model_b":         JUDGE_MODEL_B,
+        "judge_error_a":         None if a_ok else f"{type(a_res).__name__}: {a_res}",
+        "judge_error_b":         None if b_ok else f"{type(b_res).__name__}: {b_res}",
     }

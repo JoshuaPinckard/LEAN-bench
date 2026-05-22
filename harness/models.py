@@ -1,4 +1,18 @@
-"""Frozen constants for LEAN-Bench. Set once on Day 1 and never mutated.
+"""Frozen constants for LEAN-Bench v2.0 — proposal-faithful 2x2 factorial.
+
+Five conditions implement a 2x2 factorial over two tools (docs retrieval D,
+compiler feedback F) plus two baselines:
+
+    C1_oneshot         one-shot, no tools                   (baseline)
+    C2_docs            agent, D only                        (D=on, F=off)
+    C3_compiler        agent, F only                        (D=off, F=on)
+    C4_docs_compiler   agent, D + F                         (D=on,  F=on)
+    C5_agent_notools   agent, no tools                      (baseline, T=24)
+
+Frontier-model lineup is the existing v1.0 list of six (Anthropic +OpenAI +
+Google). The proposal's 3-model example list (sonnet-4.5 / chatGPT-5.2 /
+gemini-2.5-pro) is taken as illustrative; we keep the locked v1.0 6-model
+sweep so prior provenance carries over.
 
 Imported by every other module so there is exactly one source of truth for the
 model list, condition definitions, failure taxonomy, and source distribution.
@@ -6,7 +20,9 @@ model list, condition definitions, failure taxonomy, and source distribution.
 
 from __future__ import annotations
 
-FROZEN_DATE = "2026-05-09"
+import os
+
+FROZEN_DATE = "2026-05-22"
 
 # --- Models ---------------------------------------------------------------
 
@@ -15,96 +31,133 @@ MODELS_FROZEN: dict[str, dict[str, str]] = {
     "claude-opus-4.7":   {"provider": "anthropic", "model_id": "claude-opus-4-7",        "model_family": "claude"},
     "claude-opus-4.6":   {"provider": "anthropic", "model_id": "claude-opus-4-6",        "model_family": "claude"},
     "claude-sonnet-4.6": {"provider": "anthropic", "model_id": "claude-sonnet-4-6",      "model_family": "claude"},
+    "claude-haiku-4.5":  {"provider": "anthropic", "model_id": "claude-haiku-4-5-20251001", "model_family": "claude"},
     "gpt-5.5":           {"provider": "openai",    "model_id": "gpt-5.5-2026-04-23",     "model_family": "gpt"},
     "gpt-5.4":           {"provider": "openai",    "model_id": "gpt-5.4-2026-03-05",     "model_family": "gpt"},
+    "gpt-5.4-mini":      {"provider": "openai",    "model_id": "gpt-5.4-mini-2026-03-17", "model_family": "gpt"},
+    "gpt-5.4-nano":      {"provider": "openai",    "model_id": "gpt-5.4-nano-2026-03-17", "model_family": "gpt"},
+    "gpt-4.1-mini":      {"provider": "openai",    "model_id": "gpt-4.1-mini",           "model_family": "gpt"},
     "gemini-3.1-pro":    {"provider": "google",    "model_id": "gemini-3.1-pro-preview", "model_family": "gemini"},
 }
 
-# --- Conditions -----------------------------------------------------------
+# --- Run-count + turn defaults ------------------------------------------
+#
+# Proposal §Statistical Variance: N=5 for the single-shot baseline (C1),
+# N=3 for every agent pipeline (C2-C5). T=24 turns for every agent
+# condition. These are the publication defaults; env overrides exist so
+# smoke tests can run cheaply without touching code.
+DEFAULT_MAX_TURNS_AGENT: int = int(os.environ.get("LEANBENCH_MAX_TURNS", "24"))
+N_BASELINE_DEFAULT:      int = int(os.environ.get("LEANBENCH_N_BASELINE", "5"))
+N_AGENT_DEFAULT:         int = int(os.environ.get("LEANBENCH_N_AGENT", "3"))
 
-# 3 isolated single-turn conditions for clean attribution + 1 cumulative
-# agentic condition for headline numbers. Ablations are derived comparisons
-# between conditions, not separate runs.
-# Methodology note on tool budgets:
-#   - max_turns is hard-capped at the orchestrator level (10 for A1, 1 elsewhere).
-#   - qc_docs_max_uses is hard-capped at the MCP server we own (5 per turn);
-#     applies uniformly to any provider that speaks MCP. Gemini gets context
-#     injection instead — a disclosed methodology limitation.
-#   - web search is intentionally NOT capped. Each provider's native tool
-#     decides how many searches to run; we log observed counts from
-#     ProviderResponse.tools_called and report the distribution honestly. A
-#     uniform numeric cap is unenforceable across providers (Anthropic has
-#     max_uses, OpenAI/Gemini do not), so capping would be asymmetric and
-#     less defensible than reporting actual behavior. Framing for the paper:
-#     "real-world deployment uses provider-native tool behavior; capping
-#     artificially would not reflect production use."
+
+# --- Conditions -----------------------------------------------------------
+#
+# 2x2 factorial (D × F) + two baselines. Each tuple of (tool_docs_retrieval,
+# tool_compiler_feedback) isolates a single factor. C1 + C5 are the
+# no-tool reference points: C1 isolates "more attempts" via N replication;
+# C5 isolates "more attempts" via in-context iteration up to T=24 turns.
 CONDITIONS: dict[str, dict] = {
-    "S1_base": {
-        "display_name": "Single-turn baseline",
+    "C1_oneshot": {
+        "display_name": "One-shot, no tools",
         "tools": [],
         "max_turns": 1,
+        "default_attempts": N_BASELINE_DEFAULT,
         "tool_docs_retrieval": False,
+        "tool_compiler_feedback": False,
+        # Legacy column kept for storage back-compat (was web search).
         "tool_web_search": False,
         "tool_agentic_loop": False,
-        "qc_docs_max_uses": 0,
-        "semantics": "Prompt + LEAN API description (~2K-token system prompt). No web. No retrieval. No iteration. Pure parametric knowledge.",
-    },
-    "S2_docs": {
-        "display_name": "Single-turn + QC docs retrieval",
-        "tools": ["qc_docs"],
-        "max_turns": 1,
-        "tool_docs_retrieval": True,
-        "tool_web_search": False,
-        "tool_agentic_loop": False,
-        "qc_docs_max_uses": 5,
-        "semantics": "S1 + retrieval over QuantConnect documentation corpus. Up to 5 QC docs retrievals per turn before the single final code block.",
-    },
-    "S3_web": {
-        "display_name": "Single-turn + web search",
-        "tools": ["web_search"],
-        "max_turns": 1,
-        "tool_docs_retrieval": False,
-        "tool_web_search": True,
-        "tool_agentic_loop": False,
-        "qc_docs_max_uses": 0,
-        "semantics": "S1 + provider-native web search; observed search counts logged per call. No QC docs retrieval.",
-    },
-    "A1_agentic_full": {
-        "display_name": "Agentic compile loop",
-        "tools": ["qc_docs", "web_search", "agentic_loop"],
-        "max_turns": 10,
-        "tool_docs_retrieval": True,
-        "tool_web_search": True,
-        "tool_agentic_loop": True,
-        "qc_docs_max_uses": 5,
-        # v1.0 SCOPE NOTE: the per-turn feedback signal is AST compile only
-        # (harness/evaluator.py). When a submitted code block parses, the
-        # loop exits with feedback=None — there is no per-turn LEAN backtest.
-        # LEAN backtest + judge run ONCE on the final code, after the loop.
-        # The historical id 'A1_agentic_full' is retained to preserve the
-        # locked DB schema; the human-facing display name and these semantics
-        # are now honest about what runs today. Full per-turn Compile -> Backtest
-        # -> Trade feedback is the v1.1 roadmap (see decision log §7).
         "semantics": (
-            "S2 + S3 tools + agentic compile loop: after each code submission, "
-            "the harness AST-compiles the response and returns a syntax-error "
-            "feedback string if parsing fails, prompting up to 10 refinement "
-            "turns. LEAN backtest + judge run once on the final code, after "
-            "the loop exits. QC docs retrievals capped at 5 per turn; web "
-            "searches uncapped (observed counts reported). Per-turn LEAN "
-            "backtest + judge feedback is a v1.1 deliverable."
+            "Proposal Category 1. Single provider call, no tool augmentation. "
+            f"N={N_BASELINE_DEFAULT} replicate samples for variance accounting."
+        ),
+    },
+    "C2_docs": {
+        "display_name": "Agent + docs retrieval",
+        "tools": ["qc_docs_retrieve"],
+        "max_turns": DEFAULT_MAX_TURNS_AGENT,
+        "default_attempts": N_AGENT_DEFAULT,
+        "tool_docs_retrieval": True,
+        "tool_compiler_feedback": False,
+        "tool_web_search": False,
+        "tool_agentic_loop": True,
+        "semantics": (
+            "Proposal Category 2. Agent with frozen lean_rag retrieval. Tool "
+            "input is a string query; output is 5 chunks per the proposal "
+            "spec. Max T=24 turns of iteration."
+        ),
+    },
+    "C3_compiler": {
+        "display_name": "Agent + LEAN compiler feedback",
+        "tools": ["lean_backtest"],
+        "max_turns": DEFAULT_MAX_TURNS_AGENT,
+        "default_attempts": N_AGENT_DEFAULT,
+        "tool_docs_retrieval": False,
+        "tool_compiler_feedback": True,
+        "tool_web_search": False,
+        "tool_agentic_loop": True,
+        "semantics": (
+            "Proposal Category 3. Agent with lean_backtest_tool feedback. "
+            "Tool runs Docker-pinned LEAN and returns a filtered log "
+            "(ERROR::, Log::, ORDERS_PLACED:N, etc.). Max T=24 turns."
+        ),
+    },
+    "C4_docs_compiler": {
+        "display_name": "Agent + docs retrieval + LEAN compiler feedback",
+        "tools": ["qc_docs_retrieve", "lean_backtest"],
+        "max_turns": DEFAULT_MAX_TURNS_AGENT,
+        "default_attempts": N_AGENT_DEFAULT,
+        "tool_docs_retrieval": True,
+        "tool_compiler_feedback": True,
+        "tool_web_search": False,
+        "tool_agentic_loop": True,
+        "semantics": (
+            "Proposal Category 4. Agent with BOTH lean_rag retrieval AND "
+            "lean_backtest_tool feedback. Max T=24 turns."
+        ),
+    },
+    "C5_agent_notools": {
+        "display_name": "Agent, no tools (in-context iteration only)",
+        "tools": [],
+        "max_turns": DEFAULT_MAX_TURNS_AGENT,
+        "default_attempts": N_AGENT_DEFAULT,
+        "tool_docs_retrieval": False,
+        "tool_compiler_feedback": False,
+        "tool_web_search": False,
+        "tool_agentic_loop": True,
+        "semantics": (
+            "Proposal Category 5. Agent loop with [prompt, context] only. "
+            "Between turns the harness appends a neutral continuation "
+            "message (no compile/RAG signal) and re-invokes the model. "
+            "Isolates 'more attempts' from 'more information'. Max T=24."
         ),
     },
 }
 
+# Ordered tuple used by anything that needs a canonical iteration order.
+CONDITION_ORDER: tuple[str, ...] = (
+    "C1_oneshot",
+    "C2_docs",
+    "C3_compiler",
+    "C4_docs_compiler",
+    "C5_agent_notools",
+)
+
+
 # --- Sampling ------------------------------------------------------------
+#
+# N=5 baseline replicates, N=3 agent replicates. Variance-subset config kept
+# from v1.0 for back-compat with existing analysis scripts; conditions
+# updated to v2.0 IDs.
+MAIN_GRID_TRIALS = 1
+VARIANCE_SUBSET_TRIALS = N_AGENT_DEFAULT
+VARIANCE_SUBSET_PROMPT_COUNT = 100
+VARIANCE_SUBSET_CONDITIONS = ("C1_oneshot", "C4_docs_compiler")
 
-MAIN_GRID_TRIALS = 1                    # N=1 for the 24K main grid
-VARIANCE_SUBSET_TRIALS = 4              # pass^4 (tau-bench style)
-VARIANCE_SUBSET_PROMPT_COUNT = 100      # stratified by difficulty
-VARIANCE_SUBSET_CONDITIONS = ("S1_base", "A1_agentic_full")
 
-# --- Failure taxonomy (12 leaves, 4 top-level pre-registered) -----------
+# --- Failure taxonomy (mirrors v1.0; the proposal's pipeline still groups
+# failures into compile / runtime / trade / semantic) ---------------------
 
 FAILURE_TAXONOMY: dict[str, dict[str, str]] = {
     "compile_error": {
@@ -122,28 +175,45 @@ FAILURE_TAXONOMY: dict[str, dict[str, str]] = {
         "condition_never_true": "Entry condition impossible",
         "missing_order_call":  "Signal generated, no SetHoldings/MarketOrder",
     },
-    "semantic_misalignment": {  # trades but wrong strategy per judge
+    "schema_violation": {  # mechanically detected on the generated code
+        "wrong_securities_type": "Code subscribes to the wrong asset class",
+        "wrong_start_or_end_date": "SetStartDate/SetEndDate don't match prompt",
+        "wrong_resolution": "Resolution argument doesn't match prompt schema",
+    },
+    "semantic_misalignment": {  # passes the mechanical checks but the judge says wrong
         "wrong_indicator":         "Asked RSI, used MACD",
         "wrong_direction":         "Long instead of short",
         "wrong_universe_or_asset": "Ran on AAPL when prompt said BTC",
     },
 }
 
-PIPELINE_STAGES = ("compile", "backtest", "trade", "judge")
+# Proposal §Evaluation Methods: 5 ordered pass/fail stages plus a
+# continuous-metrics sidecar (no pass/fail).
+PIPELINE_STAGES: tuple[str, ...] = (
+    "compile",          # AST parse + LEAN compile (when backtest runs)
+    "runtime",          # backtest executes the date range without crashing
+    "trade",            # >=1 order placed
+    "schema",           # mechanical adherence to prompt schema fields
+    "judge",            # dual-judge semantic faithfulness
+)
+
 
 # --- Prompt curation targets --------------------------------------------
+#
+# Proposal §Prompt Curation: ~500-1000 hand-written prompts classified along
+# (asset_class, signal_type). We keep the existing v1.0 source-distribution
+# targets so the curated set carries over.
 
 TARGET_PROMPT_COUNT = 1000
 
-# source -> (count, percent)
 SOURCE_DISTRIBUTION_TARGETS: dict[str, tuple[int, int]] = {
     "qc_forum":      (250, 25),
     "qc_docs":       (100, 10),
     "reddit":        (200, 20),
     "stackexchange": (150, 15),
-    "github":        (150, 15),  # README descriptions only, NOT code
+    "github":        (150, 15),
     "tradingview":   (50,  5),
-    "original":      (100, 10),  # authored by Pinckard/Raissi group, post-2026
+    "original":      (100, 10),
 }
 
 DIFFICULTY_DISTRIBUTION: dict[str, int] = {
@@ -152,7 +222,6 @@ DIFFICULTY_DISTRIBUTION: dict[str, int] = {
     "hard":   25,
 }
 
-# Hard cutoff for is_post_cutoff flag (contamination control).
 POST_CUTOFF_DATE = "2025-12-01"
 
 # --- Defaults ------------------------------------------------------------
@@ -161,3 +230,15 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_STARTING_CASH = 100_000
+
+
+def default_attempts_for(condition_id: str) -> int:
+    """Proposal-anchored replicate count for this condition.
+
+    C1 baseline = N=5; agent conditions = N=3. Overridden by env at module
+    load (LEANBENCH_N_BASELINE / LEANBENCH_N_AGENT).
+    """
+    cond = CONDITIONS.get(condition_id)
+    if cond is None:
+        raise KeyError(f"Unknown condition_id={condition_id!r}")
+    return int(cond["default_attempts"])

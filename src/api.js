@@ -1,6 +1,6 @@
 // Single source of truth for backend HTTP. Components must NEVER fetch directly.
 
-const BASE = 'http://localhost:8000'
+const BASE = 'http://localhost:8010'
 
 async function req(method, path, body) {
   const res = await fetch(`${BASE}${path}`, {

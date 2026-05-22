@@ -71,6 +71,7 @@ function selectAllConds()   { selectedConds.value = new Set(props.conditions.map
 function selectNoneConds()  { selectedConds.value = new Set() }
 
 const passK = ref(false)
+const maxTurns = ref(24)
 
 const submitCount = computed(() => {
   const m = selectedModels.value.size
@@ -97,6 +98,7 @@ async function send() {
       models:      [...selectedModels.value],
       conditions:  [...selectedConds.value],
       attempts:    passK.value ? 4 : 1,
+      max_turns:   maxTurns.value,
     })
     results.value = data.results
   } catch (e) {
@@ -213,7 +215,16 @@ async function onPromptSaved(saved) {
         </div>
       </section>
 
-      <!-- E. Pass^4 toggle -->
+      <!-- E. Max turns (T) -->
+      <section class="input-section">
+        <div class="header">
+          <h3>Max turns (T)</h3>
+          <span class="info-icon" title="Per-trial turn limit for agentic conditions (C2/C3/C4/C5). C1_oneshot always uses 1 turn regardless. Lower this for cheap smoke tests; default is 24.">i</span>
+        </div>
+        <input type="number" v-model.number="maxTurns" min="1" max="100" step="1" style="width: 80px;" />
+      </section>
+
+      <!-- F. Pass^4 toggle -->
       <section class="input-section">
         <label class="toggle-switch">
           <input type="checkbox" v-model="passK" />

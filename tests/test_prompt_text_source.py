@@ -25,8 +25,9 @@ def _stub_run_cell_capture(captured: list[str]):
             "attempt": trial_index, "status": "completed",
             "generated_code": None, "response_text": None,
             "compile_pass": None, "backtest_pass": None, "trade_pass": None,
+            "schema_pass": None,
             "judge_pass": None, "overall_pass": None,
-            "failure_category_l1": None, "failure_category_l2": None,
+            "judge_score_a": None, "judge_score_b": None,
             "cost_usd": None, "latency_ms": 0,
             "input_tokens": 0, "output_tokens": 0, "turns_used": 0,
             "error": None, "judge_error": None,
@@ -52,7 +53,7 @@ def test_run_grid_uses_db_text_for_saved_prompt(tmp_path, monkeypatch):
         store, "lb-0001",
         prompt_text="CLIENT-SUPPLIED TEXT (should be ignored)",
         models=["claude-opus-4.7"],
-        conditions=["S1_base"],
+        conditions=["C1_oneshot"],
         attempts=1,
     ))
     assert captured == ["CANONICAL DB TEXT"]
@@ -75,7 +76,7 @@ def test_run_grid_keeps_caller_text_for_adhoc_prompt(tmp_path, monkeypatch):
         store, "adhoc-x",
         prompt_text="caller-supplied adhoc text",
         models=["claude-opus-4.7"],
-        conditions=["S1_base"],
+        conditions=["C1_oneshot"],
         attempts=1,
     ))
     assert captured == ["caller-supplied adhoc text"]

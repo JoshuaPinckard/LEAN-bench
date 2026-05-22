@@ -157,8 +157,23 @@ class GenerateRequest(BaseModel):
     prompt_id: str | None = None       # null means ad-hoc (auto-saved as adhoc-XXXX)
     prompt_text: str
     models: list[str]                   # friendly names from MODELS_FROZEN
-    conditions: list[str]               # condition IDs from CONDITIONS
-    attempts: int = 1                   # 4 for pass^4 mode
+    conditions: list[str]               # condition IDs from CONDITIONS (C1..C5)
+    # None means "use the proposal-anchored per-condition default" (N=5 for C1,
+    # N=3 for agent conditions). Pass an int to override uniformly.
+    attempts: int | None = None
+    # None means "use the proposal-anchored per-condition default" (24 for
+    # agent conditions, 1 for C1_oneshot). Pass an int to override the turn
+    # limit for agentic conditions only — C1 stays pinned to 1 turn.
+    max_turns: int | None = None
+
+    @field_validator("max_turns")
+    @classmethod
+    def check_max_turns(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if not (1 <= v <= 100):
+            raise ValueError("max_turns must be between 1 and 100")
+        return v
 
 
 class CallResult(BaseModel):
@@ -173,10 +188,13 @@ class CallResult(BaseModel):
     compile_pass: bool | None
     backtest_pass: bool | None
     trade_pass: bool | None
+    schema_pass: bool | None = None     # v2 stage-4 mechanical schema check
     judge_pass: bool | None
     overall_pass: bool | None
-    failure_category_l1: str | None
-    failure_category_l2: str | None
+    judge_score_a: float | None = None  # v2 dual-judge individual scores
+    judge_score_b: float | None = None
+    failure_category_l1: str | None = None
+    failure_category_l2: str | None = None
     cost_usd: float | None
     latency_ms: int
     input_tokens: int

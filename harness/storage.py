@@ -111,12 +111,12 @@ CREATE TABLE IF NOT EXISTS calls (
     model_family           TEXT NOT NULL,         -- claude|gpt|gemini
     model_id               TEXT NOT NULL,         -- friendly name from MODELS_FROZEN
     model_version          TEXT NOT NULL,         -- exact API string used
-    condition_id           TEXT NOT NULL,         -- S1_base|S2_docs|S3_web|A1_agentic_full
-    trial_index            INTEGER NOT NULL DEFAULT 0,  -- 0 main grid, 0..3 variance subset
+    condition_id           TEXT NOT NULL,         -- v2: C1_oneshot|C2_docs|C3_compiler|C4_docs_compiler|C5_agent_notools
+    trial_index            INTEGER NOT NULL DEFAULT 0,  -- 0..N-1, per condition replicates
 
     -- decomposed tool flags (redundant with condition_id, for query-friendliness)
     tool_docs_retrieval    INTEGER NOT NULL,      -- bool 0/1
-    tool_web_search        INTEGER NOT NULL,
+    tool_web_search        INTEGER NOT NULL,      -- legacy v1 column, retained 0
     tool_agentic_loop      INTEGER NOT NULL,
     max_turns_allowed      INTEGER NOT NULL,
 
@@ -384,10 +384,45 @@ class Store:
             # Threshold used to derive judge_pass for THIS row. Lets future
             # threshold changes coexist with old rows for audit.
             "judge_threshold":         "REAL",
+            # v2.0 additions ---------------------------------------------
+            # Dual-judge: judge_score on the call row stores the AVERAGE of the
+            # two judges; per-judge scores/reasoning/versions live in *_a/_b.
+            "judge_score_a":           "REAL",
+            "judge_score_b":           "REAL",
+            "judge_reasoning_a":       "TEXT",
+            "judge_reasoning_b":       "TEXT",
+            "judge_version_a":         "TEXT",
+            "judge_version_b":         "TEXT",
+            "judge_model_a":           "TEXT",
+            "judge_model_b":           "TEXT",
+            "judge_error_a":           "TEXT",
+            "judge_error_b":           "TEXT",
+            # Compiler-feedback factor (v2 replaces v1's tool_web_search role).
+            "tool_compiler_feedback":  "INTEGER NOT NULL DEFAULT 0",
+            # 5-stage pipeline: stage 4 (schema adherence) outcome.
+            "schema_pass":             "INTEGER",
+            "schema_violations":       "TEXT",     # JSON list[str]
         }
         for col, ddl in new_call_cols.items():
             if col not in call_cols:
                 self.conn.execute(f"ALTER TABLE calls ADD COLUMN {col} {ddl}")
+
+        # --- turns table additions (v2) ---
+        turn_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(turns)").fetchall()}
+        new_turn_cols = {
+            # v2: structured per-turn tool events (RAG queries + compiler runs).
+            # JSON list[{name, input, output, is_error, exit_status, ...}] —
+            # see harness/orchestrator.py for the writer and
+            # CallDetailsModal.vue (Transcript tab) for the reader.
+            "tool_events_json":  "TEXT",
+            # Convenience flag: True iff this turn was the model's final code
+            # submission (the one the harness scores). Lets the UI jump
+            # straight to the last meaningful turn without scanning all 24.
+            "is_final_turn":     "INTEGER",
+        }
+        for col, ddl in new_turn_cols.items():
+            if col not in turn_cols:
+                self.conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {ddl}")
 
         # --- deferred indexes (must exist after the columns do) ---
         self.conn.execute(
@@ -624,10 +659,12 @@ class Store:
     # All bool/JSON columns on `calls` that need normalization on insert/update.
     _CALL_BOOL_COLS = (
         "tool_docs_retrieval", "tool_web_search", "tool_agentic_loop",
+        "tool_compiler_feedback",
         "compile_pass", "backtest_pass", "trade_pass", "judge_pass", "overall_pass",
         "compile_success", "runtime_success", "matches_prompt_intent",
+        "schema_pass",
     )
-    _CALL_JSON_COLS = ("failure_mode",)
+    _CALL_JSON_COLS = ("failure_mode", "schema_violations")
 
     def _normalize_call_fields(self, fields: dict) -> dict:
         # Mirror condition <-> condition_id so callers can use either name.
@@ -777,10 +814,26 @@ class Store:
         failure_mode: list[str],
         failure_notes: str | None = None,
         matches_prompt_intent: bool,
+        # v2 dual-judge fields (optional so single-judge callers / rejudge tools
+        # still work). Pass these when running the proposal-faithful pipeline.
+        judge_score_a: float | None = None,
+        judge_score_b: float | None = None,
+        judge_reasoning_a: str | None = None,
+        judge_reasoning_b: str | None = None,
+        judge_version_a: str | None = None,
+        judge_version_b: str | None = None,
+        judge_model_a: str | None = None,
+        judge_model_b: str | None = None,
+        judge_error_a: str | None = None,
+        judge_error_b: str | None = None,
     ) -> dict:
         """Write judge fields and derive pass_rate inputs. Overwrites any prior
         judge values on re-judge. Returns the derived {judge_pass, overall_pass}
-        so callers can echo them back in their response payloads."""
+        so callers can echo them back in their response payloads.
+
+        In v2 the dual-judge averaged score is what `judge_score` carries; per-
+        judge scores/reasoning are persisted on the *_a/*_b columns. judge_pass
+        becomes True iff the AVERAGED judge_score >= JUDGE_PASS_THRESHOLD."""
         from harness.constants import JUDGE_PASS_THRESHOLD
 
         judge_pass = bool(judge_score >= JUDGE_PASS_THRESHOLD)
@@ -810,6 +863,18 @@ class Store:
         else:
             overall_pass = judge_pass
 
+        extra: dict[str, Any] = {}
+        if judge_score_a is not None:     extra["judge_score_a"]     = judge_score_a
+        if judge_score_b is not None:     extra["judge_score_b"]     = judge_score_b
+        if judge_reasoning_a is not None: extra["judge_reasoning_a"] = judge_reasoning_a
+        if judge_reasoning_b is not None: extra["judge_reasoning_b"] = judge_reasoning_b
+        if judge_version_a is not None:   extra["judge_version_a"]   = judge_version_a
+        if judge_version_b is not None:   extra["judge_version_b"]   = judge_version_b
+        if judge_model_a is not None:     extra["judge_model_a"]     = judge_model_a
+        if judge_model_b is not None:     extra["judge_model_b"]     = judge_model_b
+        if judge_error_a is not None:     extra["judge_error_a"]     = judge_error_a
+        if judge_error_b is not None:     extra["judge_error_b"]     = judge_error_b
+
         self.update_call(
             call_id,
             judge_score=judge_score,
@@ -821,8 +886,38 @@ class Store:
             matches_prompt_intent=matches_prompt_intent,
             judge_pass=judge_pass,
             overall_pass=overall_pass,
+            **extra,
         )
         return {"judge_pass": judge_pass, "overall_pass": overall_pass}
+
+    def update_call_with_schema(
+        self,
+        call_id: str,
+        *,
+        schema_pass: bool | None,
+        schema_violations: list[str] | None,
+    ) -> dict:
+        """Stage-4 schema-adherence outcome. Mechanical check of the generated
+        code against the prompt's declared securities_type / start_date /
+        end_date / resolution. Returns {"schema_pass": bool|None}."""
+        self.update_call(
+            call_id,
+            schema_pass=schema_pass,
+            schema_violations=schema_violations,
+        )
+        return {"schema_pass": schema_pass}
+
+    # ---- v2 lifecycle helpers --------------------------------------------
+
+    def wipe_calls(self) -> dict[str, int]:
+        """Drop all generation results (calls + turns) but keep prompts and
+        retrieval cache intact. Used by scripts/wipe_calls.py when migrating
+        from v1.0 to v2.0 condition IDs. Returns counts of rows removed."""
+        n_turns = int(self.conn.execute("SELECT COUNT(*) AS n FROM turns").fetchone()["n"])
+        n_calls = int(self.conn.execute("SELECT COUNT(*) AS n FROM calls").fetchone()["n"])
+        self.conn.execute("DELETE FROM turns")
+        self.conn.execute("DELETE FROM calls")
+        return {"turns_deleted": n_turns, "calls_deleted": n_calls}
 
     def get_calls_by_prompt(self, prompt_id: str) -> list[dict]:
         """All calls for a prompt, ordered by pass_number then created_at."""
@@ -913,10 +1008,17 @@ class Store:
 
     def record_turn(self, **fields) -> str:
         fields.setdefault("turn_id", str(uuid.uuid4()))
-        for bcol in ("ran_pipeline", "compile_pass", "backtest_pass", "trade_pass", "judge_pass"):
+        for bcol in (
+            "ran_pipeline", "compile_pass", "backtest_pass", "trade_pass",
+            "judge_pass", "is_final_turn",
+        ):
             if bcol in fields:
                 fields[bcol] = _b(fields[bcol])
-        for jcol in ("retrieval_queries", "retrieval_doc_ids", "web_search_queries", "web_search_result_urls"):
+        for jcol in (
+            "retrieval_queries", "retrieval_doc_ids",
+            "web_search_queries", "web_search_result_urls",
+            "tool_events_json",
+        ):
             if jcol in fields and not isinstance(fields[jcol], (str, type(None))):
                 fields[jcol] = _j(fields[jcol])
 
@@ -926,6 +1028,21 @@ class Store:
         sql = f"INSERT INTO turns({col_list}) VALUES({placeholders})"
         self.conn.execute(sql, [fields[c] for c in cols])
         return fields["turn_id"]
+
+    def mark_final_turn(self, call_id: str, turn_index: int) -> None:
+        """Flag a single turn as the final code-emitting turn for this call.
+
+        Idempotent: clears the flag on any other turn for the same call first,
+        so re-running this with a different index moves the marker cleanly.
+        """
+        self.conn.execute(
+            "UPDATE turns SET is_final_turn = 0 WHERE call_id = ?",
+            (call_id,),
+        )
+        self.conn.execute(
+            "UPDATE turns SET is_final_turn = 1 WHERE call_id = ? AND turn_index = ?",
+            (call_id, turn_index),
+        )
 
     def turns_for_call(self, call_id: str) -> list[dict]:
         rows = self.conn.execute(
