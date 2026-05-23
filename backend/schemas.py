@@ -157,7 +157,7 @@ class GenerateRequest(BaseModel):
     prompt_id: str | None = None       # null means ad-hoc (auto-saved as adhoc-XXXX)
     prompt_text: str
     models: list[str]                   # friendly names from MODELS_FROZEN
-    conditions: list[str]               # condition IDs from CONDITIONS (C1..C5)
+    conditions: list[str]               # condition IDs from CONDITIONS (C1..C4)
     # None means "use the proposal-anchored per-condition default" (N=5 for C1,
     # N=3 for agent conditions). Pass an int to override uniformly.
     attempts: int | None = None

@@ -5,7 +5,7 @@ values here requires re-judging all prior runs — bump `JUDGE_VERSION` in
 harness/judge.py whenever this file changes.
 
 v2.0 vs v1.0 deltas:
-- 5-condition factorial (C1..C5) replaces the 4-condition v1.0 design.
+- 4-condition factorial (C1..C4) — one baseline plus a 2x2 D × F factorial.
 - Dual-judge semantic check (claude-sonnet-4-6 + gpt-5.4, averaged).
 - 5-stage pipeline: compile -> runtime -> trade -> schema -> judge, with
   continuous practitioner metrics reported as a sidecar.

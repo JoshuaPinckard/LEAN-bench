@@ -21,7 +21,7 @@ def test_excluded_cells_table_is_empty_in_v2():
 
 
 def test_excluded_reason_for_returns_none_for_every_v2_cell():
-    for cid in ("C1_oneshot", "C2_docs", "C3_compiler", "C4_docs_compiler", "C5_agent_notools"):
+    for cid in ("C1_oneshot", "C2_docs", "C3_compiler", "C4_docs_compiler"):
         for model in ("claude-opus-4.7", "gpt-5.5", "gemini-3.1-pro"):
             assert excluded_reason_for(model, cid) is None, (model, cid)
 

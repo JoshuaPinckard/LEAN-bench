@@ -1,13 +1,12 @@
 """Run a single (prompt × model × condition × trial) cell end-to-end for
 LEAN-Bench v2.0 (proposal-faithful build).
 
-5 conditions, all driven by this orchestrator:
+4 conditions, all driven by this orchestrator:
 
     C1_oneshot          1 provider call, no tools                         (N=5)
     C2_docs             agent loop, qc_docs_retrieve only,    T<=24       (N=3)
     C3_compiler         agent loop, lean_backtest only,       T<=24       (N=3)
     C4_docs_compiler    agent loop, BOTH tools,               T<=24       (N=3)
-    C5_agent_notools    agent loop, no tools, neutral hop,    T<=24       (N=3)
 
 Per-call lifecycle (mirrors v1 but extended for v2):
 
@@ -106,16 +105,6 @@ SYSTEM_PROMPT = (
 SYSTEM_PROMPT_SHA256 = hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()
 
 
-# Neutral continuation message used by C5 (agent without tools). Keeping the
-# wording flat / unbiased — we are isolating the value of in-context iteration
-# without leaking any feedback signal.
-C5_CONTINUATION_PROMPT = (
-    "Please review your previous algorithm and submit an improved version. "
-    "If you believe the algorithm is already correct, simply return the same "
-    "code as your final answer."
-)
-
-
 def _safe_cost(model_pinned: str, in_tok: int, out_tok: int, cached: int) -> float | None:
     try:
         return cost_usd(model_pinned, in_tok, out_tok, cached)
@@ -138,20 +127,6 @@ def _last_code_from_tool_calls(response: ProviderResponse) -> str | None:
             if isinstance(code, str) and code.strip():
                 last = code
     return last
-
-
-def _agentic_continuation_message(provider: str) -> dict:
-    """Per-provider canonical 'continue with no feedback' user message.
-
-    For C5 only. We never inject this into the tool-using conditions
-    because they have natural follow-ups (tool_result)."""
-    if provider == "google":
-        from google.genai import types as genai_types
-        part = genai_types.Part(text=C5_CONTINUATION_PROMPT)
-        return {"role": "user", "_gemini_parts": [part]}
-    if provider == "openai":
-        return {"role": "user", "content": C5_CONTINUATION_PROMPT}
-    return {"role": "user", "content": C5_CONTINUATION_PROMPT}
 
 
 def _render_schema_block(prompt_record: dict | None) -> str | None:
@@ -243,19 +218,14 @@ async def _run_agent_loop(
     store: Store,
     call_id: str,
     record_turns: bool,
-    *,
-    c5_neutral_hop: bool = False,
 ) -> dict[str, Any]:
     """Drive the multi-turn loop. Returns a dict carrying the final code,
     aggregated tokens, last response, error text (if any), and turn count.
 
     Behaviors:
-      - C1: callers pass max_turns=1; no continuation hop; loop returns after
-        the first response.
+      - C1: callers pass max_turns=1; loop returns after the first response.
       - C2/C3/C4: callers pass tools=[...]; this function dispatches each
         tool_use to harness.agent_tools.dispatch and round-trips the result.
-      - C5: callers pass tools=None AND c5_neutral_hop=True; after each
-        response we append C5_CONTINUATION_PROMPT and keep iterating.
 
     Hard error contract: if a lean_backtest dispatch returns is_error=True
     with exit_status='docker_error', we abort the loop with an error string.
@@ -368,32 +338,16 @@ async def _run_agent_loop(
             # Continue the loop — model gets to use the tool output next turn.
             continue
 
-        # No tool calls this turn. If we have any code, we're done — assistant
-        # has emitted what we should evaluate.
-        if c5_neutral_hop and turn_index < max_turns - 1:
-            # C5: keep iterating with a neutral continuation prompt. Append
-            # the assistant turn so the model sees its own history.
-            messages.append({"role": "assistant", "content": resp["response_text"]})
-            messages.append(_agentic_continuation_message(provider))
-            _write_turn(
-                store, call_id, turn_index, messages, resp, final_code,
-                compile_eval, per_turn_tool_events, record_turns, model_pinned,
-                feedback_text=C5_CONTINUATION_PROMPT,
-            )
-            continue
-
-        # C1, or tool-condition where model ended without a tool call.
-        # If we have code, exit. Otherwise let the loop iterate once more
-        # (gives the model a chance to recover) until max_turns.
+        # No tool calls this turn. C1, or tool-condition where model ended
+        # without a tool call. If we have code, exit. Otherwise let the loop
+        # iterate once more (gives the model a chance to recover) until
+        # max_turns.
         _write_turn(
             store, call_id, turn_index, messages, resp, final_code,
             compile_eval, per_turn_tool_events, record_turns, model_pinned,
         )
         if final_code is not None:
             break
-        # No code yet and no tools — only meaningful for C5 / fallback.
-        if c5_neutral_hop:
-            continue
         break
 
     # Mark the turn that produced the final code so the UI can jump to it.
@@ -501,7 +455,7 @@ async def run_cell(
     rows. Returns a result dict matching the CallResult Pydantic schema.
 
     `max_turns_override`: when not None, overrides the condition default for
-    agentic conditions (C2-C5). C1_oneshot is immune — it always runs 1 turn,
+    agentic conditions (C2-C4). C1_oneshot is immune — it always runs 1 turn,
     because increasing it would change the meaning of the one-shot baseline.
     """
     cond = CONDITIONS[condition_id]
@@ -592,7 +546,6 @@ async def run_cell(
         store=store,
         call_id=call_id,
         record_turns=is_agentic(condition_id),
-        c5_neutral_hop=(condition_id == "C5_agent_notools"),
     )
 
     final_code = loop_outcome["final_code"]
@@ -868,7 +821,7 @@ async def run_grid(
     integer `attempts` to override (uniform across conditions).
 
     `max_turns`: when not None, overrides per-call turn limit for agentic
-    conditions (C2-C5). C1_oneshot stays pinned to 1 turn regardless.
+    conditions (C2-C4). C1_oneshot stays pinned to 1 turn regardless.
     """
     prompt_set_sha256 = resolve_prompt_set_sha256(store, prompt_id)
 

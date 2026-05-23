@@ -2,7 +2,7 @@
 
 v1.0 -> v2.0 migration: the condition IDs changed from
 {S1_base, S2_docs, S3_web, A1_agentic_full} to
-{C1_oneshot, C2_docs, C3_compiler, C4_docs_compiler, C5_agent_notools}.
+{C1_oneshot, C2_docs, C3_compiler, C4_docs_compiler}.
 Old generation results no longer fit the new factorial design, so this
 script clears them so the v2 grid can be populated from a clean slate.
 

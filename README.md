@@ -21,15 +21,14 @@ cell, the harness:
 Every row is stamped with `benchmark_version`, `prompt_set_sha256`,
 `judge_version`, and `judge_threshold` for provenance.
 
-## Conditions (2×2 factorial + 2 baselines)
+## Conditions (2×2 factorial + 1 baseline)
 
 | ID | Tools | Turns | N | Purpose |
 |---|---|---|---|---|
-| `C1_oneshot`        | none                            | 1   | 5 | Baseline — one-shot, no tools |
-| `C2_docs`           | `qc_docs_retrieve`              | ≤24 | 3 | D: docs retrieval only |
-| `C3_compiler`       | `lean_backtest`                 | ≤24 | 3 | F: compiler feedback only |
+| `C1_oneshot`        | none                                 | 1   | 5 | Baseline — one-shot, no tools |
+| `C2_docs`           | `qc_docs_retrieve`                   | ≤24 | 3 | D: docs retrieval only |
+| `C3_compiler`       | `lean_backtest`                      | ≤24 | 3 | F: compiler feedback only |
 | `C4_docs_compiler`  | `qc_docs_retrieve` + `lean_backtest` | ≤24 | 3 | D × F: both tools |
-| `C5_agent_notools`  | none (neutral continuation hop) | ≤24 | 3 | Isolates "more attempts" from "more information" |
 
 `N` is the default replicate count per cell, overridable via
 `LEANBENCH_N_BASELINE` / `LEANBENCH_N_AGENT`. Max turns is overridable via

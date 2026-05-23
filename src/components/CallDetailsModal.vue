@@ -17,6 +17,8 @@ const loading = ref(false)
 const expandedRag = ref(new Set())
 const expandedCompile = ref(new Set())
 const showAllTurns = ref(false)
+const showSystemPrompt = ref(false)
+const showUserPrompt = ref(true)
 
 async function load(id) {
   data.value = null
@@ -25,7 +27,7 @@ async function load(id) {
   loading.value = true
   try {
     data.value = await api.getCall(id)
-    tab.value = data.value.tool_agentic_loop ? 'transcript' : 'code'
+    tab.value = 'transcript'
     expandedRag.value = new Set()
     expandedCompile.value = new Set()
     showAllTurns.value = false
@@ -107,10 +109,13 @@ function logHighlight(tail) {
       </div>
 
       <div class="modal-tabs" v-if="data">
-        <button v-if="data.tool_agentic_loop" class="tab" :class="{ active: tab === 'transcript' }" @click="tab = 'transcript'">
+        <button class="tab" :class="{ active: tab === 'transcript' }" @click="tab = 'transcript'">
           Transcript
           <span v-if="transcript" class="mono" style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">
-            {{ transcript.rag_count }} RAG · {{ transcript.compile_count }} compile · {{ transcript.total_turns }} turns
+            <template v-if="data.tool_agentic_loop">
+              {{ transcript.rag_count }} RAG · {{ transcript.compile_count }} compile · {{ transcript.total_turns }} turns
+            </template>
+            <template v-else>one-shot</template>
           </span>
         </button>
         <button class="tab" :class="{ active: tab === 'code' }" @click="tab = 'code'">Final code</button>
@@ -125,13 +130,53 @@ function logHighlight(tail) {
         <template v-else-if="data">
           <!-- =================== TRANSCRIPT TAB =================== -->
           <div v-if="tab === 'transcript'" class="transcript">
-            <div v-if="!transcript || transcript.total_turns === 0" style="color: var(--text-muted);">
-              No per-turn rows recorded for this call (single-turn condition).
-            </div>
+            <template v-if="transcript">
+              <!-- Prompts the model actually saw -->
+              <section class="ts-section">
+                <h3 class="ts-section-title">Prompts sent to model</h3>
+                <div class="ts-cards">
+                  <div class="ts-card" :class="{ open: showUserPrompt }">
+                    <button class="ts-card-head" @click="showUserPrompt = !showUserPrompt">
+                      <span class="ts-turn-tag mono">USER</span>
+                      <span class="ts-card-title">
+                        Initial user message
+                        <span style="color: var(--text-muted);">
+                          ({{ transcript.initial_user_message ? transcript.initial_user_message.length : 0 }} chars)
+                        </span>
+                      </span>
+                      <span class="ts-chev">{{ showUserPrompt ? '▾' : '▸' }}</span>
+                    </button>
+                    <div v-if="showUserPrompt" class="ts-card-body">
+                      <pre class="code-block" style="max-height: 320px; background: #f8fafc;"><code>{{ transcript.initial_user_message || '(not recorded)' }}</code></pre>
+                    </div>
+                  </div>
+                  <div class="ts-card" :class="{ open: showSystemPrompt }">
+                    <button class="ts-card-head" @click="showSystemPrompt = !showSystemPrompt">
+                      <span class="ts-turn-tag mono">SYSTEM</span>
+                      <span class="ts-card-title">
+                        System prompt
+                        <span style="color: var(--text-muted);">
+                          (sha {{ (data.system_prompt_sha || '').slice(0, 8) || '—' }})
+                        </span>
+                      </span>
+                      <span class="ts-chev">{{ showSystemPrompt ? '▾' : '▸' }}</span>
+                    </button>
+                    <div v-if="showSystemPrompt" class="ts-card-body">
+                      <pre class="code-block" style="max-height: 320px; background: #f8fafc;"><code>{{ transcript.system_prompt || '(unavailable)' }}</code></pre>
+                    </div>
+                  </div>
+                </div>
+              </section>
 
-            <template v-else>
+              <!-- Single-turn note: no agent loop, the rest of the sections
+                   only make sense for agentic calls. -->
+              <div v-if="transcript.total_turns === 0" style="color: var(--text-muted); padding: 8px 0;">
+                Single-turn call — no agent loop. See the Code tab for the
+                model's response.
+              </div>
+
               <!-- Summary strip -->
-              <div class="ts-strip">
+              <div v-if="transcript.total_turns > 0" class="ts-strip">
                 <div class="ts-strip-item">
                   <div class="ts-label">RAG queries</div>
                   <div class="ts-value">{{ transcript.rag_count }}</div>
@@ -202,7 +247,7 @@ function logHighlight(tail) {
               </section>
 
               <!-- Final round -->
-              <section class="ts-section">
+              <section class="ts-section" v-if="transcript.total_turns > 0">
                 <h3 class="ts-section-title">
                   Final round
                   <span v-if="finalTurn" style="color: var(--text-muted); font-weight: 400; font-size: 13px;">
@@ -226,7 +271,7 @@ function logHighlight(tail) {
               </section>
 
               <!-- Optional: all-turns table (off by default — keeps the view clean) -->
-              <section class="ts-section">
+              <section class="ts-section" v-if="transcript.total_turns > 0">
                 <button class="secondary" @click="showAllTurns = !showAllTurns"
                         style="padding: 4px 10px; font-size: 12px;">
                   {{ showAllTurns ? '▼' : '▶' }} All {{ transcript.total_turns }} turns ({{ showAllTurns ? 'hide' : 'show' }})

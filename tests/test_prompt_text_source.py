@@ -18,7 +18,7 @@ def _stub_run_cell_capture(captured: list[str]):
     with and returns a minimal result dict."""
 
     async def _stub(store, prompt_id, prompt_text, model, condition, *,
-                    trial_index, prompt_set_sha256=None):
+                    trial_index, prompt_set_sha256=None, max_turns_override=None):
         captured.append(prompt_text)
         return {
             "call_id": "stub", "model": model, "condition": condition,

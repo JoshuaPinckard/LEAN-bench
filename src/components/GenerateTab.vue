@@ -219,7 +219,7 @@ async function onPromptSaved(saved) {
       <section class="input-section">
         <div class="header">
           <h3>Max turns (T)</h3>
-          <span class="info-icon" title="Per-trial turn limit for agentic conditions (C2/C3/C4/C5). C1_oneshot always uses 1 turn regardless. Lower this for cheap smoke tests; default is 24.">i</span>
+          <span class="info-icon" title="Per-trial turn limit for agentic conditions (C2/C3/C4). C1_oneshot always uses 1 turn regardless. Lower this for cheap smoke tests; default is 24.">i</span>
         </div>
         <input type="number" v-model.number="maxTurns" min="1" max="100" step="1" style="width: 80px;" />
       </section>

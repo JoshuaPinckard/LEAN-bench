@@ -18,7 +18,7 @@ from harness.models import CONDITIONS
 
 def tool_names_for(condition_id: str) -> list[str]:
     """Return the list of tool names exposed in this condition. Empty for
-    no-tool conditions (C1, C5)."""
+    the no-tool C1 baseline."""
     cond = CONDITIONS.get(condition_id)
     if cond is None:
         raise KeyError(f"Unknown condition_id={condition_id!r}")

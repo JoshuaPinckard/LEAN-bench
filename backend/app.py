@@ -50,7 +50,8 @@ from backend.schemas import (
 from harness.constants import BENCHMARK_VERSION, JUDGE_PASS_THRESHOLD
 from harness.models import CONDITIONS, FROZEN_DATE, MODELS_FROZEN
 from harness.orchestrator import (
-    FROZEN_PROMPT_SET_PATH, FrozenPromptSetMismatch, run_grid,
+    FROZEN_PROMPT_SET_PATH, FrozenPromptSetMismatch, SYSTEM_PROMPT,
+    _render_schema_block, run_grid,
 )
 from harness.prompt_freeze import load_frozen
 from harness.schema_fill import SchemaAutofillError, fill_schema
@@ -362,14 +363,42 @@ def get_call(call_id: str) -> dict:
         # Fallback: pick the last turn we recorded.
         final_turn = turns[-1]
 
+    # Reconstruct the exact user message the model saw on turn 0. For agentic
+    # calls we have it in turns[0].prompt_messages[0]; for C1 (no turn rows)
+    # we rebuild from the prompt row + schema block the orchestrator computes.
+    initial_user_message: str | None = None
+    if turns:
+        first_msgs = turns[0].get("prompt_messages") or []
+        if first_msgs:
+            first = first_msgs[0]
+            content = first.get("content") if isinstance(first, dict) else None
+            if isinstance(content, str):
+                initial_user_message = content
+    if initial_user_message is None:
+        prompt_row = store.get_prompt(c["prompt_id"])
+        if prompt_row:
+            base_text = (
+                prompt_row.get("reformulated_text")
+                or prompt_row.get("original_text")
+                or ""
+            )
+            schema_block = _render_schema_block(prompt_row)
+            initial_user_message = (
+                f"{base_text}\n\n{schema_block}" if schema_block else base_text
+            )
+
     c["transcript"] = {
-        "total_turns":       len(turns),
-        "final_turn_index":  final_turn["turn_index"] if final_turn else None,
-        "final_turn":        final_turn,
-        "rag_events":        rag_events,
-        "compile_events":    compile_events,
-        "rag_count":         len(rag_events),
-        "compile_count":     len(compile_events),
+        "total_turns":          len(turns),
+        "final_turn_index":     final_turn["turn_index"] if final_turn else None,
+        "final_turn":           final_turn,
+        "rag_events":           rag_events,
+        "compile_events":       compile_events,
+        "rag_count":            len(rag_events),
+        "compile_count":        len(compile_events),
+        # Prompts the model saw verbatim. system_prompt is the constant from
+        # the orchestrator (sha is on the call row as system_prompt_sha).
+        "system_prompt":        SYSTEM_PROMPT,
+        "initial_user_message": initial_user_message,
     }
     return c
 

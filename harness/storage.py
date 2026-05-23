@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS calls (
     model_family           TEXT NOT NULL,         -- claude|gpt|gemini
     model_id               TEXT NOT NULL,         -- friendly name from MODELS_FROZEN
     model_version          TEXT NOT NULL,         -- exact API string used
-    condition_id           TEXT NOT NULL,         -- v2: C1_oneshot|C2_docs|C3_compiler|C4_docs_compiler|C5_agent_notools
+    condition_id           TEXT NOT NULL,         -- v2: C1_oneshot|C2_docs|C3_compiler|C4_docs_compiler
     trial_index            INTEGER NOT NULL DEFAULT 0,  -- 0..N-1, per condition replicates
 
     -- decomposed tool flags (redundant with condition_id, for query-friendliness)

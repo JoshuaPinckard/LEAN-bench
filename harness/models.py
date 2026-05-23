@@ -1,13 +1,12 @@
 """Frozen constants for LEAN-Bench v2.0 — proposal-faithful 2x2 factorial.
 
-Five conditions implement a 2x2 factorial over two tools (docs retrieval D,
-compiler feedback F) plus two baselines:
+Four conditions implement a 2x2 factorial over two tools (docs retrieval D,
+compiler feedback F) plus one baseline:
 
     C1_oneshot         one-shot, no tools                   (baseline)
     C2_docs            agent, D only                        (D=on, F=off)
     C3_compiler        agent, F only                        (D=off, F=on)
     C4_docs_compiler   agent, D + F                         (D=on,  F=on)
-    C5_agent_notools   agent, no tools                      (baseline, T=24)
 
 Frontier-model lineup is the existing v1.0 list of six (Anthropic +OpenAI +
 Google). The proposal's 3-model example list (sonnet-4.5 / chatGPT-5.2 /
@@ -43,7 +42,7 @@ MODELS_FROZEN: dict[str, dict[str, str]] = {
 # --- Run-count + turn defaults ------------------------------------------
 #
 # Proposal §Statistical Variance: N=5 for the single-shot baseline (C1),
-# N=3 for every agent pipeline (C2-C5). T=24 turns for every agent
+# N=3 for every agent pipeline (C2-C4). T=24 turns for every agent
 # condition. These are the publication defaults; env overrides exist so
 # smoke tests can run cheaply without touching code.
 DEFAULT_MAX_TURNS_AGENT: int = int(os.environ.get("LEANBENCH_MAX_TURNS", "24"))
@@ -53,10 +52,9 @@ N_AGENT_DEFAULT:         int = int(os.environ.get("LEANBENCH_N_AGENT", "3"))
 
 # --- Conditions -----------------------------------------------------------
 #
-# 2x2 factorial (D × F) + two baselines. Each tuple of (tool_docs_retrieval,
-# tool_compiler_feedback) isolates a single factor. C1 + C5 are the
-# no-tool reference points: C1 isolates "more attempts" via N replication;
-# C5 isolates "more attempts" via in-context iteration up to T=24 turns.
+# 2x2 factorial (D × F) + one baseline. Each tuple of (tool_docs_retrieval,
+# tool_compiler_feedback) isolates a single factor. C1 is the no-tool
+# reference point: it isolates "more attempts" via N replication.
 CONDITIONS: dict[str, dict] = {
     "C1_oneshot": {
         "display_name": "One-shot, no tools",
@@ -117,22 +115,6 @@ CONDITIONS: dict[str, dict] = {
             "lean_backtest_tool feedback. Max T=24 turns."
         ),
     },
-    "C5_agent_notools": {
-        "display_name": "Agent, no tools (in-context iteration only)",
-        "tools": [],
-        "max_turns": DEFAULT_MAX_TURNS_AGENT,
-        "default_attempts": N_AGENT_DEFAULT,
-        "tool_docs_retrieval": False,
-        "tool_compiler_feedback": False,
-        "tool_web_search": False,
-        "tool_agentic_loop": True,
-        "semantics": (
-            "Proposal Category 5. Agent loop with [prompt, context] only. "
-            "Between turns the harness appends a neutral continuation "
-            "message (no compile/RAG signal) and re-invokes the model. "
-            "Isolates 'more attempts' from 'more information'. Max T=24."
-        ),
-    },
 }
 
 # Ordered tuple used by anything that needs a canonical iteration order.
@@ -141,7 +123,6 @@ CONDITION_ORDER: tuple[str, ...] = (
     "C2_docs",
     "C3_compiler",
     "C4_docs_compiler",
-    "C5_agent_notools",
 )
 
 
