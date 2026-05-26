@@ -25,7 +25,11 @@ def test_v2_condition_set_matches_proposal():
 
 def test_baseline_is_single_turn_and_no_tools():
     assert max_turns_for("C1_oneshot") == 1
+    # v2.1: tool_names_for is a back-compat shim and always returns [].
+    # The factor-flag decomposition still locks the baseline's no-tool surface.
     assert tool_names_for("C1_oneshot") == []
+    assert CONDITIONS["C1_oneshot"]["tool_docs_retrieval"] is False
+    assert CONDITIONS["C1_oneshot"]["tool_compiler_feedback"] is False
     assert not is_agentic("C1_oneshot")
 
 
@@ -35,11 +39,22 @@ def test_agent_conditions_run_24_turns():
         assert max_turns_for(cid) == 24, cid
 
 
-def test_factorial_tool_assignment():
-    # C2 has docs only; C3 has compiler only; C4 has both.
-    assert tool_names_for("C2_docs") == ["qc_docs_retrieve"]
-    assert tool_names_for("C3_compiler") == ["lean_backtest"]
-    assert set(tool_names_for("C4_docs_compiler")) == {"qc_docs_retrieve", "lean_backtest"}
+def test_factorial_tool_assignment_via_factor_flags():
+    # v2.1: native tool wiring is gone; the orchestrator uses the factor-flag
+    # decomposition to decide whether to handle {R} (docs_retrieval) and
+    # whether to inject compiler feedback into the next turn's context.
+    assert CONDITIONS["C2_docs"]["tool_docs_retrieval"] is True
+    assert CONDITIONS["C2_docs"]["tool_compiler_feedback"] is False
+
+    assert CONDITIONS["C3_compiler"]["tool_docs_retrieval"] is False
+    assert CONDITIONS["C3_compiler"]["tool_compiler_feedback"] is True
+
+    assert CONDITIONS["C4_docs_compiler"]["tool_docs_retrieval"] is True
+    assert CONDITIONS["C4_docs_compiler"]["tool_compiler_feedback"] is True
+
+    # And v2.1 shim returns [] regardless of condition.
+    for cid in ("C2_docs", "C3_compiler", "C4_docs_compiler"):
+        assert tool_names_for(cid) == [], cid
 
 
 def test_per_condition_default_attempts_match_proposal():

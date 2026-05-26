@@ -50,8 +50,7 @@ from backend.schemas import (
 from harness.constants import BENCHMARK_VERSION, JUDGE_PASS_THRESHOLD
 from harness.models import CONDITIONS, FROZEN_DATE, MODELS_FROZEN
 from harness.orchestrator import (
-    FROZEN_PROMPT_SET_PATH, FrozenPromptSetMismatch, SYSTEM_PROMPT,
-    _render_schema_block, run_grid,
+    FROZEN_PROMPT_SET_PATH, FrozenPromptSetMismatch, SYSTEM_PROMPTS, run_grid,
 )
 from harness.prompt_freeze import load_frozen
 from harness.schema_fill import SchemaAutofillError, fill_schema
@@ -345,27 +344,82 @@ def get_call(call_id: str) -> dict:
             t["tool_events"] = []
     c["turns"] = turns
 
-    # v2 monitoring aggregate: 'transcript' carries everything the Transcript
+    # v2.1 monitoring aggregate: 'transcript' carries everything the Transcript
     # tab needs without traversing all 24 rounds in the browser.
-    rag_events: list[dict] = []
+    #
+    # Event taxonomy (per harness/orchestrator.py:_summarise_turn_events):
+    #   rag_retrieve     — emitted for {R}-handshake RAG calls (C2/C4 only)
+    #   code_attempt     — emitted for every model code submission
+    #   lean_backtest    — emitted for every code attempt regardless of cond
+    #                      (carries `feedback_shown_to_model` flag to
+    #                      distinguish C3/C4 from C1/C2 gate-only runs)
+    #   schema_check     — emitted when the schema gate ran (i.e., trade
+    #                      passed). Carries the violation list.
+    #   judge            — emitted when the judge ran (i.e., schema passed).
+    #                      Carries per-judge scores + reasoning.
+    #   invalid_response — emitted when the parser couldn't classify the
+    #                      model's response as either RAG or code.
+    #
+    # Legacy event name `qc_docs_retrieve` (v2.0) is still recognised for
+    # rows written before the rename.
+    rag_events:     list[dict] = []
+    code_events:    list[dict] = []
     compile_events: list[dict] = []
+    schema_events:  list[dict] = []
+    judge_events:   list[dict] = []
+    invalid_events: list[dict] = []
     final_turn: dict | None = None
     for t in turns:
         for ev in t["tool_events"]:
             ev_with_idx = {"turn_index": t["turn_index"], **ev}
-            if ev["name"] == "qc_docs_retrieve":
+            name = ev["name"]
+            if name in ("rag_retrieve", "qc_docs_retrieve"):
                 rag_events.append(ev_with_idx)
-            elif ev["name"] == "lean_backtest":
+            elif name == "code_attempt":
+                code_events.append(ev_with_idx)
+            elif name == "lean_backtest":
                 compile_events.append(ev_with_idx)
+            elif name == "schema_check":
+                schema_events.append(ev_with_idx)
+            elif name == "judge":
+                judge_events.append(ev_with_idx)
+            elif name == "invalid_response":
+                invalid_events.append(ev_with_idx)
         if t.get("is_final_turn"):
             final_turn = t
     if final_turn is None and turns:
         # Fallback: pick the last turn we recorded.
         final_turn = turns[-1]
 
-    # Reconstruct the exact user message the model saw on turn 0. For agentic
-    # calls we have it in turns[0].prompt_messages[0]; for C1 (no turn rows)
-    # we rebuild from the prompt row + schema block the orchestrator computes.
+    # Per-turn user message: every turn carries its own assembled prompt
+    # (labeled context history + original prompt). Surface it directly on
+    # the turn dict so the UI can render the evolution turn-by-turn.
+    for t in turns:
+        msgs = t.get("prompt_messages") or []
+        if msgs and isinstance(msgs, list):
+            first = msgs[0]
+            if isinstance(first, dict) and isinstance(first.get("content"), str):
+                t["user_message"] = first["content"]
+            else:
+                t["user_message"] = None
+        else:
+            t["user_message"] = None
+
+    # Decode the JSON schema_violations column for the UI.
+    sv_raw = c.get("schema_violations")
+    if isinstance(sv_raw, str) and sv_raw:
+        try:
+            c["schema_violations_parsed"] = json.loads(sv_raw)
+        except (TypeError, json.JSONDecodeError):
+            c["schema_violations_parsed"] = None
+    else:
+        c["schema_violations_parsed"] = sv_raw if isinstance(sv_raw, list) else None
+
+    # v2.1: the initial user message is just the raw prompt text — the
+    # orchestrator no longer appends a schema block (curator-pinned dates /
+    # securities / resolution stay HIDDEN from the model by design). For
+    # agentic conditions we can also pull it from turns[0] verbatim, which
+    # includes any context-history block that was rendered (empty on turn 0).
     initial_user_message: str | None = None
     if turns:
         first_msgs = turns[0].get("prompt_messages") or []
@@ -377,27 +431,48 @@ def get_call(call_id: str) -> dict:
     if initial_user_message is None:
         prompt_row = store.get_prompt(c["prompt_id"])
         if prompt_row:
-            base_text = (
+            initial_user_message = (
                 prompt_row.get("reformulated_text")
                 or prompt_row.get("original_text")
                 or ""
             )
-            schema_block = _render_schema_block(prompt_row)
-            initial_user_message = (
-                f"{base_text}\n\n{schema_block}" if schema_block else base_text
-            )
+
+    # v2.1 has per-condition system prompts. Look up by the call's condition;
+    # fall back to C1 if a legacy row carries a missing/unknown condition_id.
+    cond_id = c.get("condition_id") or c.get("condition") or "C1_oneshot"
+    system_prompt_text = SYSTEM_PROMPTS.get(cond_id) or SYSTEM_PROMPTS["C1_oneshot"]
 
     c["transcript"] = {
         "total_turns":          len(turns),
         "final_turn_index":     final_turn["turn_index"] if final_turn else None,
         "final_turn":           final_turn,
+        # Per-event-type collections for the Transcript tab's grouped views.
         "rag_events":           rag_events,
+        "code_events":          code_events,
         "compile_events":       compile_events,
+        "schema_events":        schema_events,
+        "judge_events":         judge_events,
+        "invalid_events":       invalid_events,
+        # Counters (also stored as columns on the call row, but echoed here
+        # so the modal doesn't need two queries).
         "rag_count":            len(rag_events),
+        "code_count":           len(code_events),
         "compile_count":        len(compile_events),
-        # Prompts the model saw verbatim. system_prompt is the constant from
-        # the orchestrator (sha is on the call row as system_prompt_sha).
-        "system_prompt":        SYSTEM_PROMPT,
+        "schema_count":         len(schema_events),
+        "judge_count":          len(judge_events),
+        "invalid_count":        len(invalid_events),
+        # First-pass turn index per pipeline gate (None = never passed).
+        # 0-indexed in storage; the UI renders +1 for human-friendly display.
+        "first_pass": {
+            "compile": c.get("first_pass_compile"),
+            "runtime": c.get("first_pass_runtime"),
+            "trade":   c.get("first_pass_trade"),
+            "schema":  c.get("first_pass_schema"),
+            "judge":   c.get("first_pass_judge"),
+        },
+        # Prompts the model saw verbatim. The sha is on the call row as
+        # system_prompt_sha so the artifact can be cross-checked.
+        "system_prompt":        system_prompt_text,
         "initial_user_message": initial_user_message,
     }
     return c

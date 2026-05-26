@@ -402,6 +402,23 @@ class Store:
             # 5-stage pipeline: stage 4 (schema adherence) outcome.
             "schema_pass":             "INTEGER",
             "schema_violations":       "TEXT",     # JSON list[str]
+            # v2.1 (harness-driven loop, no provider tools) -----------------
+            # Per-cell counters separating the two kinds of model turns:
+            # `rag_call_count` counts turns where the model emitted `{R} ...`;
+            # `code_attempt_count` counts turns where it emitted a python fence.
+            # Both are also reconstructible from the turns table but cached
+            # here for cheap reporting queries.
+            "rag_call_count":          "INTEGER",
+            "code_attempt_count":      "INTEGER",
+            # First-pass turn index per pipeline gate. None when the gate
+            # never passed within max_turns. Lets the UI render "compile
+            # started passing at turn 2, runtime at turn 5, trades at turn
+            # 8" without scanning every turn row.
+            "first_pass_compile":      "INTEGER",
+            "first_pass_runtime":      "INTEGER",
+            "first_pass_trade":        "INTEGER",
+            "first_pass_schema":       "INTEGER",
+            "first_pass_judge":        "INTEGER",
         }
         for col, ddl in new_call_cols.items():
             if col not in call_cols:

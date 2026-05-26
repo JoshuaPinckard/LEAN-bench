@@ -1,38 +1,40 @@
-"""Translate a v2 condition_id into provider-specific tool configuration.
+"""Condition introspection helpers for the v2.1 agent loop.
 
-In v2 the tools are NOT provider-native search tools — they are first-party
-function tools:
-    qc_docs_retrieve   wraps lean_rag.retrieve()             (C2, C4)
-    lean_backtest      wraps lean_backtest_tool.run()        (C3, C4)
+In v2.1 the orchestrator drives RAG and compiler feedback itself — there are
+no provider-native tools exposed to the model. This module therefore reduces
+to: condition validation, max-turn lookup, and an agentic-flag predicate.
 
-The actual tool definitions live in harness/agent_tools.py. This module just
-maps a condition_id to the list of tool names that should be exposed to the
-model for that condition.
+`build_tools` and `tool_names_for` are kept as thin compatibility shims (both
+always return []) so any callers still asking for a tools list get a clean
+empty response rather than crashing.
 """
 
 from __future__ import annotations
 
-from harness.agent_tools import tool_defs_for
 from harness.models import CONDITIONS
 
 
 def tool_names_for(condition_id: str) -> list[str]:
-    """Return the list of tool names exposed in this condition. Empty for
-    the no-tool C1 baseline."""
-    cond = CONDITIONS.get(condition_id)
-    if cond is None:
+    """Always returns [] in v2.1. Kept as a back-compat shim."""
+    if condition_id not in CONDITIONS:
         raise KeyError(f"Unknown condition_id={condition_id!r}")
-    return list(cond["tools"])
+    return []
 
 
 def build_tools(condition_id: str, provider: str) -> list[dict]:
-    """Return the provider-shaped tool list for this condition.
+    """Always returns [] in v2.1.
 
-    Returns [] for conditions with no tools."""
-    names = tool_names_for(condition_id)
-    if not names:
-        return []
-    return tool_defs_for(provider, names)
+    v2.1 does not use provider-native function/tool APIs. RAG is invoked when
+    the model emits the `{R}` text marker (parsed by harness/orchestrator.py);
+    compiler feedback is the verbatim output of lean_backtest_tool, appended
+    to the next turn's context history. Neither facility is described to the
+    model as a tool definition.
+    """
+    if condition_id not in CONDITIONS:
+        raise KeyError(f"Unknown condition_id={condition_id!r}")
+    if provider not in ("anthropic", "openai", "google"):
+        raise ValueError(f"Unknown provider: {provider!r}")
+    return []
 
 
 def is_agentic(condition_id: str) -> bool:
