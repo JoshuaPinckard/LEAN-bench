@@ -33,7 +33,8 @@ onMounted(async () => {
     <h2>Backend not reachable</h2>
     <p>{{ bootError }}</p>
     <p>Start the FastAPI server with:</p>
-    <p class="mono">uvicorn backend.app:app --reload --port 8000</p>
+    <p class="mono">.\start.ps1</p>
+    <p class="mono">(or: uvicorn backend.app:app --reload --port 8010)</p>
     <p>then refresh this page.</p>
   </div>
 

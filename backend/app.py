@@ -1,7 +1,15 @@
 """FastAPI HTTP wrapper around the harness/ Python core.
 
 Run with:
-    uvicorn backend.app:app --reload --port 8000
+    .\\start.ps1
+    # or, equivalently:
+    uvicorn backend.app:app --reload --reload-dir backend --reload-dir harness --port 8010
+
+The frontend (src/api.js) hard-codes the backend at http://localhost:8010 —
+keep this port aligned with start.ps1. Restricting --reload-dir to backend +
+harness is required: backtests write Python files under lean_workspace/,
+which would otherwise trip uvicorn's watcher mid-request and kill in-flight
+/api/generate calls.
 
 Reads .env at startup and bridges Vite-style keys (VITE_ANTHROPIC_API_KEY,
 VITE_OPENAI_API_KEY, VITE_GEMINI_API_KEY) to the standard SDK env vars
@@ -47,14 +55,35 @@ from backend.schemas import (
     GenerateRequest, GenerateResponse, ModelInfo, ModelsResponse,
     PromptIn, SchemaAutofillRequest, SchemaAutofillResponse, StatsResponse,
 )
-from harness.constants import BENCHMARK_VERSION, JUDGE_PASS_THRESHOLD
-from harness.models import CONDITIONS, FROZEN_DATE, MODELS_FROZEN
-from harness.orchestrator import (
-    FROZEN_PROMPT_SET_PATH, FrozenPromptSetMismatch, SYSTEM_PROMPTS, run_grid,
+from harness.constants import (
+    BENCHMARK_VERSION, FROZEN_PROMPT_SET_PATH, JUDGE_PASS_THRESHOLD,
 )
+from harness.models import CONDITIONS, FROZEN_DATE, MODELS_FROZEN
 from harness.prompt_freeze import load_frozen
 from harness.schema_fill import SchemaAutofillError, fill_schema
 from harness.storage import Store
+
+# harness.orchestrator is deferred — its transitive imports (google.genai,
+# anthropic, openai SDKs) take ~2.3s cold and aren't needed for the
+# lightweight endpoints (models, conditions, prompts, stats). Endpoints
+# that DO need it (`/api/generate`, `/api/calls/{id}`) call _orch() which
+# imports lazily on first hit.
+
+_orchestrator_module = None
+
+
+def _orch():
+    """Return the lazily-imported harness.orchestrator module.
+
+    First call pays the ~2.3s import cost (provider SDKs); subsequent calls
+    return the cached module. Endpoints destructure only the names they
+    need from the returned namespace.
+    """
+    global _orchestrator_module
+    if _orchestrator_module is None:
+        import harness.orchestrator as _m  # noqa: WPS433
+        _orchestrator_module = _m
+    return _orchestrator_module
 
 
 _store: Store | None = None
@@ -291,8 +320,9 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             )
         prompt_id = req.prompt_id
 
+    orch = _orch()
     try:
-        results = await run_grid(
+        results = await orch.run_grid(
             store=store,
             prompt_id=prompt_id,
             prompt_text=req.prompt_text,
@@ -301,7 +331,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             attempts=req.attempts,
             max_turns=req.max_turns,
         )
-    except FrozenPromptSetMismatch as exc:
+    except orch.FrozenPromptSetMismatch as exc:
         # 409 Conflict: the DB state and the frozen artifact disagree.
         # No provider call fired; this is the freeze guard doing its job.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -440,7 +470,8 @@ def get_call(call_id: str) -> dict:
     # v2.1 has per-condition system prompts. Look up by the call's condition;
     # fall back to C1 if a legacy row carries a missing/unknown condition_id.
     cond_id = c.get("condition_id") or c.get("condition") or "C1_oneshot"
-    system_prompt_text = SYSTEM_PROMPTS.get(cond_id) or SYSTEM_PROMPTS["C1_oneshot"]
+    system_prompts = _orch().SYSTEM_PROMPTS
+    system_prompt_text = system_prompts.get(cond_id) or system_prompts["C1_oneshot"]
 
     c["transcript"] = {
         "total_turns":          len(turns),

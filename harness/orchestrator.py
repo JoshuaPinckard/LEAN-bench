@@ -55,7 +55,8 @@ from typing import Any
 from harness.artifacts import build_artifact, write_artifact
 from harness.conditions.builder import is_agentic, max_turns_for
 from harness.constants import (
-    BENCHMARK_VERSION, JUDGE_PASS_THRESHOLD, excluded_reason_for,
+    BENCHMARK_VERSION, FROZEN_PROMPT_SET_PATH, JUDGE_PASS_THRESHOLD,
+    excluded_reason_for,
 )
 from harness.evaluator import (
     derive_overall_pass,
@@ -74,7 +75,10 @@ from harness.providers.base import ProviderResponse, extract_code
 from harness.storage import Store
 
 
-FROZEN_PROMPT_SET_PATH = Path("results/frozen/prompt_set_v1.json")
+# FROZEN_PROMPT_SET_PATH is re-exported from harness.constants (moved there
+# in v2.1 so lightweight endpoints can read it without pulling in provider
+# SDKs). The import above keeps the name available at the orchestrator's
+# public surface for back-compat.
 
 
 PROVIDER_CALL = {

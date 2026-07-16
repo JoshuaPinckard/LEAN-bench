@@ -16,6 +16,13 @@ v2.0 vs v1.0 deltas:
 
 from __future__ import annotations
 
+from pathlib import Path
+
+# Path to the frozen prompt-set artifact stamped into every benchmark run.
+# Lives here (rather than in harness/orchestrator.py) so /api/stats and other
+# lightweight endpoints can import it without dragging in provider SDKs.
+FROZEN_PROMPT_SET_PATH: Path = Path("results/frozen/prompt_set_v1.json")
+
 # Locked failure-mode taxonomy. JSON-stored on `calls.failure_mode` as a list
 # (first element is treated as the primary failure mode for analysis).
 FAILURE_MODES: tuple[str, ...] = (
