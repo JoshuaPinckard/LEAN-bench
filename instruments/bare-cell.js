@@ -55,6 +55,28 @@ async function drawVertex() {
   return { raw_text: txt || null, served: j.modelVersion, usage: j.usageMetadata };
 }
 
+function drawClaudeNearBare() {
+  const { spawnSync } = require('child_process');
+  const HOMES = 'C:/lbres/homes', TMP = 'C:/lbres/tmp';
+  const EXE = 'C:\\Users\\joshp\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe';
+  const env = {
+    SystemRoot: 'C:\\Windows', windir: 'C:\\Windows',
+    PATH: 'C:\\Windows\\System32;' + path.dirname(process.execPath),
+    TEMP: TMP, TMP: TMP,
+    USERPROFILE: path.join(HOMES, 'blank'), HOME: path.join(HOMES, 'blank'),
+    APPDATA: path.join(HOMES, 'appdata'), LOCALAPPDATA: path.join(HOMES, 'localappdata'),
+    PROGRAMDATA: 'C:\\ProgramData', COMSPEC: 'C:\\Windows\\System32\\cmd.exe',
+    CLAUDE_CONFIG_DIR: path.join(HOMES, 'claude-config'),
+  };
+  const cwd = fs.mkdtempSync('C:/lbres/runs/h5cl-');
+  const r = spawnSync(EXE, ['-p', '--setting-sources', '', '--strict-mcp-config', '--tools', '', '--disable-slash-commands',
+    '--system-prompt', SYSTEM_LINE, '--model', MODEL, '--effort', EFFORT, '--output-format', 'json', '--no-session-persistence', '--max-turns', '1'],
+    { input: v.prompt, encoding: 'utf8', cwd, env, shell: false, timeout: 20 * 60 * 1000, maxBuffer: 256 * 1024 * 1024 });
+  fs.rmSync(cwd, { recursive: true, force: true });
+  try { const j = JSON.parse(r.stdout); return { raw_text: j.result ?? null, served: MODEL }; }
+  catch (e) { return { raw_text: null, error: (r.stderr || r.stdout || 'no output').slice(0, 200) }; }
+}
+
 function extractProgram(text) {
   if (!text) return null;
   const fences = [...text.matchAll(/```(?:python)?\s*\n([\s\S]*?)```/g)].map(m => m[1]);
@@ -70,7 +92,7 @@ function extractProgram(text) {
     if (have.has(i)) continue;
     const t0 = Date.now();
     let res;
-    try { res = SURFACE === 'openai' ? await drawOpenAI() : await drawVertex(); }
+    try { res = SURFACE === 'openai' ? await drawOpenAI() : SURFACE === 'claude' ? drawClaudeNearBare() : await drawVertex(); }
     catch (e) { res = { raw_text: null, error: String(e.message).slice(0, 200) }; }
     const program = extractProgram(res.raw_text || '');
     const env = { leg: 'H5-bare', surface: SURFACE, model: MODEL, effort: EFFORT, prompt_id: 'BL-01b',
