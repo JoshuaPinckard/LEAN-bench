@@ -20,13 +20,17 @@ from pathlib import Path
 R = Path(__file__).resolve().parent.parent
 REC = R / "codebook" / "CODEBOOK-HASHES.txt"
 
+# Layout of the clean repository (2026-08-22): instruments/ replaces
+# harness/, prompts/ replaces rung2/; the probe apparatus and the
+# registered-statistics engine stayed in the sealed archive by owner
+# ruling and are no longer governed files.
 FILES = [
     "codebook/CODEBOOK-v2.md", "codebook/dof_extract.py", "codebook/validate_extractor.py",
     "bank/bank_spec.py", "bank/t1_ref_template.py", "bank/bank_runner.py", "bank/verify_bank.py",
-    "harness/gen_drivers.js", "harness/run_probe.js", "harness/grade.py",
-    "analysis/confirmatory.py", "analysis/probe_decide.py",
-    "rung2/gen_variants_v5.py", "rung2/variants-v5.json",
-    "probes/PX-01.txt", "probes/PX-02.txt", "probes/PROBES-MANIFEST.json",
+    "instruments/gen_drivers.js", "instruments/grade.py", "instruments/bench-grade.py",
+    "instruments/lattice-arm-gen.js", "instruments/lattice-arm-grade.py",
+    "instruments/generate.js", "instruments/canary.js",
+    "prompts/gen_variants_v5.py", "prompts/variants-v5.json", "prompts/T1v0.txt",
 ]
 
 
