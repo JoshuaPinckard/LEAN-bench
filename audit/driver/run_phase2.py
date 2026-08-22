@@ -92,9 +92,12 @@ def main():
 
     jobs = []
     for task in sorted(tasks.values(), key=lambda t: t["id"]):
+        allowed = __import__('os').environ.get("AUDIT_FAMILIES", "claude,codex").split(",")
         for idx, family in REF_FAMILIES.items():
             if family == "gemini":
                 continue          # pends the owner's Vertex word; ledger back-fills later
+            if family not in allowed:
+                continue          # e.g. AUDIT_FAMILIES=codex while the claude session is busy elsewhere
             model = {"claude": "claude-sonnet-5", "codex": "gpt-5.6-terra(medium)"}[family]
             key = f"p2|{task['id']}|ref|{model}|{idx}"
             if key in done:
@@ -103,7 +106,7 @@ def main():
 
     print(f"{len(jobs)} reference jobs to run (of {len(tasks) * 3})")
     halted = False
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=int(__import__('os').environ.get('AUDIT_WORKERS', '3'))) as ex:
         futs = {ex.submit(do_ref, t, i, reqs): (t["id"], i) for t, i in jobs}
         for fut in concurrent.futures.as_completed(futs):
             tid, idx = futs[fut]
