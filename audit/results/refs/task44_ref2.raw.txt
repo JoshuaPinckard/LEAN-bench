@@ -1,0 +1,105 @@
+```python
+import backtrader as bt
+
+
+class TrendFollowingPullback(bt.Strategy):
+
+    params = (
+        ('atr_period', 14),
+        ('ema_period', 50),
+        ('pullback_mult', 1.5),
+        ('tp_mult', 2.5),
+        ('sl_mult', 1.5),
+        ('risk_pct', 0.01),
+        ('max_entries', 4),
+        ('recent_high_lookback', 20),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.order = None
+        self._reset_state()
+
+    def _reset_state(self):
+        self.entry_prices = []
+        self.entry_atrs = []
+        self.entry_stops = []
+        self.entry_count = 0
+        self.blocked = False
+        self.ref_high = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy():
+                ep = order.executed.price
+                atr_val = self.atr[0]
+                self.entry_prices.append(ep)
+                self.entry_atrs.append(atr_val)
+                self.entry_stops.append(ep - self.p.sl_mult * atr_val)
+                self.entry_count += 1
+                if self.entry_count >= self.p.max_entries:
+                    self.blocked = True
+                self.ref_high = self.data.high[0]
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self._reset_state()
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        atr = self.atr[0]
+        ema = self.ema[0]
+
+        if self.position:
+            if self.ref_high is None or high > self.ref_high:
+                self.ref_high = high
+
+            # Stop-loss: any individual entry's stop breached
+            for sl in self.entry_stops:
+                if low <= sl:
+                    self.order = self.close()
+                    return
+
+            # Exit: price closes below EMA(50)
+            if close < ema:
+                self.order = self.close()
+                return
+
+            # Take-profit: 2.5 ATR from first entry point
+            if self.entry_prices:
+                tp = self.entry_prices[0] + self.p.tp_mult * self.entry_atrs[0]
+                if high >= tp:
+                    self.order = self.close()
+                    return
+
+            # Scale-in: additional entry on next pullback
+            if not self.blocked and self.ref_high is not None:
+                pullback_level = self.ref_high - self.p.pullback_mult * atr
+                if close <= pullback_level and close > ema:
+                    size = int((self.broker.getvalue() * self.p.risk_pct) / close)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+        else:
+            # Initial entry: price above EMA, pullback from rolling recent high
+            if close > ema:
+                lookback = min(self.p.recent_high_lookback, len(self.data))
+                recent_high = max(self.data.high.get(size=lookback))
+                pullback_level = recent_high - self.p.pullback_mult * atr
+                if close <= pullback_level:
+                    size = int((self.broker.getvalue() * self.p.risk_pct) / close)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+```
+
+```json
+{"assumptions": [{"topic": "recent_high_lookback", "choice": "20-bar rolling maximum of the High series defines the 'recent high' for the initial pullback entry signal", "reason": "Spec names a 'recent high' without specifying a lookback window; 20 bars is a conventional short-term lookback for a daily trend-following system"}, {"topic": "scale_in_reference_high", "choice": "After each filled buy, ref_high resets to the high of the fill bar; while in a position, ref_high tracks the running maximum High seen since the last entry", "reason": "Spec says 'from the next high' without defining how that high is identified; the running maximum since the last entry captures any post-entry bounce that forms the next local high"}, {"topic": "take_profit_anchor", "choice": "Take-profit is measured from the first entry's executed price using the ATR captured at first-entry fill time; triggered when the bar's High reaches or exceeds that fixed level", "reason": "Spec says '2.5 ATR from the entry point' (singular); with multiple scale-in entries, 'the entry point' is interpreted as the initial entry; the bar High is used to detect intraday reach of the TP level"}, {"topic": "stop_loss_trigger_and_scope", "choice": "Stop-loss is checked against the bar's Low (intraday detection); if any individual entry's stop is breached, the entire accumulated position is closed via self.close()", "reason": "Spec sets per-entry stops but says 'the position is forcibly closed' on trigger; backtrader does not support closing individual lots from an accumulated position, so all lots are closed; Low rather than Close is used for stop detection on daily OHLCV bars"}, {"topic": "exit_priority", "choice": "Within a bar, stop-loss is evaluated first, then EMA-cross exit, then take-profit; scale-in is only considered if no exit condition fires", "reason": "Spec does not define priority when multiple conditions fire on the same bar; protective stop takes precedence as the primary risk-management mechanism"}, {"topic": "position_sizing_outcome", "choice": "size = floor(0.01 * broker.getvalue() / close); at $10,000 starting capital with AAPL above $100 this yields 0–1 shares per entry", "reason": "Spec defines 1% of total capital per entry in position-value terms; implemented exactly as stated; the small capital base relative to AAPL price produces minimal share counts but fidelity to the spec is preserved"}, {"topic": "infeasible_daily_timeframe", "choice": "Strategy operates on the provided daily feed without modification", "reason": "Spec targets D1; the harness supplies 1-day bars so no adaptation is needed"}, {"topic": "blocked_reset", "choice": "The blocked flag and all entry tracking reset only when the entire position is fully closed (notify_trade isclosed)", "reason": "Spec says 'do not open new positions until all current positions are fully closed'; resetting on full position close matches this condition exactly"}]}
+```

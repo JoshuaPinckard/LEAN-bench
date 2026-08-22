@@ -1,0 +1,80 @@
+```python
+import backtrader as bt
+
+
+class NvdaResistanceBreakoutStrategy(bt.Strategy):
+    params = dict(
+        ema_period=8,
+        entry_level=179.33,
+        tp1_level=184.89,
+        tp2_level=192.95,
+        risk_per_trade=0.02,
+    )
+
+    def __init__(self):
+        # Indicator: 8-period Exponential Moving Average.
+        self.ema = bt.indicators.ExponentialMovingAverage(
+            self.data.close, period=self.p.ema_period
+        )
+        self.order = None        # guards pending orders
+        self.trail_stop = None   # current trailing-stop price level
+        self.tp1_done = False     # first (50%) take-profit already taken
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled,
+                             order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        # Only one working order at a time.
+        if self.order:
+            return
+
+        # Flat: look for a breakout entry above the resistance level.
+        if not self.position:
+            self.trail_stop = None
+            self.tp1_done = False
+
+            # Entry: closing price of the current bar exceeds 179.33.
+            if self.data.close[0] > self.p.entry_level:
+                # The trailing-stop distance equals the EMA value, so the
+                # potential loss per share (entry - initial stop) == EMA.
+                risk_per_share = self.ema[0]
+                if risk_per_share > 0:
+                    cash_risk = self.p.risk_per_trade * self.broker.getvalue()
+                    size = int(cash_risk / risk_per_share)
+                    if size >= 1:
+                        self.order = self.buy(size=size)
+            return
+
+        # In a position: maintain the trailing stop (ratchets upward only,
+        # lagging the close by a distance equal to the 8-period EMA value).
+        candidate = self.data.close[0] - self.ema[0]
+        if self.trail_stop is None:
+            self.trail_stop = candidate
+        else:
+            self.trail_stop = max(self.trail_stop, candidate)
+
+        # Trailing stop hit -> exit the whole position (risk management first).
+        if self.data.low[0] <= self.trail_stop:
+            self.order = self.close()
+            return
+
+        # Final take-profit: close the remaining part upon reaching 192.95.
+        if self.tp1_done:
+            if self.data.high[0] >= self.p.tp2_level:
+                self.order = self.close()
+            return
+
+        # First take-profit: close 50% of the position upon reaching 184.89.
+        if self.data.high[0] >= self.p.tp1_level:
+            half = abs(self.position.size) / 2.0
+            if half > 0:
+                self.order = self.sell(size=half)
+                self.tp1_done = True
+```
+```json
+{"assumptions": [{"topic": "trailing-stop distance", "choice": "Read literally: the stop lags the price by a distance equal to the current 8-period EMA value, i.e. stop_level = close - EMA(8), ratcheted so it only moves up (max of previous and new candidate).", "reason": "The spec explicitly says 'lagging by a distance equal to the value of the 8-period EMA', so the trail distance is the EMA value itself, not the price-minus-EMA difference."}, {"topic": "position sizing", "choice": "risk_per_share = EMA(8) at the signal bar (since entry - initial stop = EMA), size = floor(0.02 * broker.getvalue() / EMA); require size >= 1 else no trade.", "reason": "Spec: 'potential loss from the stop-loss does not exceed 2% of total trading capital.' The initial stop distance equals the EMA value, and 'total trading capital' is taken as the broker's current account value."}, {"topic": "trailing-stop reference price / trigger", "choice": "The stop follows the bar close (close - EMA, ratcheted up); it is triggered when the bar low <= stop level, exiting the full remaining position at market.", "reason": "Spec says the stop 'follows the price' and 'will not fall below its previous value' but does not name a specific price; close is used for tracking and low for the intrabar breach test."}, {"topic": "take-profit trigger / execution", "choice": "'Upon reaching price P' is detected when the bar high >= P; TP1 sells 50% of the current position, TP2 closes the remainder. Exits are market orders (filled next bar open per backtrader).", "reason": "OHLCV daily bars: 'reaching' a level means an intrabar touch (high), and market orders are the canonical default. 50% of a small/odd position can be fractional; backtrader permits fractional sizing."}, {"topic": "exit priority within a bar", "choice": "Trailing stop is evaluated before the take-profits on each bar.", "reason": "The spec frames the trailing stop as risk management; protective exits are given precedence where the spec is silent on ordering."}, {"topic": "re-entry / timeframe", "choice": "One position at a time; after a full exit a new breakout entry may occur. Strategy runs on the daily feed as provided.", "reason": "Canonical single-position default; the feed is already D1, matching the spec's D1 requirement, so no gap."}]}
+```

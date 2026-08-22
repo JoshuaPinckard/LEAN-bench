@@ -41,7 +41,7 @@ NUMERIC_KEY = {
 }
 LEG_OF = {"A_entries_exits": "SPY", "A_full": "SPY", "A_sell_ratio": "SPY", "B_entries": "AAPL", "B_exits": "AAPL", "B_full": "AAPL",
           "dates_all": None, "full": None}
-EXEC_DIR = R / "harness" / "exec"
+EXEC_DIR = R / "exec"
 EXEC_DIR.mkdir(exist_ok=True)
 
 
@@ -58,8 +58,8 @@ def armPrompt(arm):
     if p.exists():
         return p.read_text(encoding="utf-8")
     if arm == "T1v0":
-        return (R / "rung2" / "T1v0.txt").read_text(encoding="utf-8")
-    vs = json.loads((R / "rung2" / "variants-v5.json").read_text(encoding="utf-8"))
+        return (R / "prompts" / "T1v0.txt").read_text(encoding="utf-8")
+    vs = json.loads((R / "prompts" / "variants-v5.json").read_text(encoding="utf-8"))
     for v in vs["variants"]:
         if v["id"] == arm:
             return v["prompt"]

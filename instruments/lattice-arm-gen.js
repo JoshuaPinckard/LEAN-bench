@@ -10,8 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const R = 'C:/Users/joshp/Desktop/LEAN-Bench-Research';
-const D = require(path.join(R, 'harness', 'gen_drivers.js'));
+const R = require('path').resolve(__dirname, '..');
+const D = require(path.join(__dirname, 'gen_drivers.js'));
 
 const MODEL = process.argv[2];
 const EFFORT = process.argv[3];
@@ -70,7 +70,7 @@ function genGeminiCli({ prompt }) {
 const NOASK = process.argv.includes('noask');
 const SUFFIX = 'You will NOT return anything except for the program.';
 
-const OUTDIR = path.join(R, 'lattice_arm', NOASK ? 'gens_noask' : 'gens');
+const OUTDIR = path.join(R, 'arm', NOASK ? 'gens_noask' : 'gens');
 fs.mkdirSync(OUTDIR, { recursive: true });
 const OUT = path.join(OUTDIR, `${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}.jsonl`);
 
@@ -81,10 +81,10 @@ const VARIANTS = process.argv[4] === 'corner-first'
   : ['BL-01b', 'BL-01c', 'T1v0', 'BL-01a'];
 const N = 10;
 
-const vfile = JSON.parse(fs.readFileSync(path.join(R, 'rung2', 'variants-v5.json'), 'utf8'));
+const vfile = JSON.parse(fs.readFileSync(path.join(R, 'prompts', 'variants-v5.json'), 'utf8'));
 const byId = {};
 for (const v of vfile.variants) byId[v.id] = v;
-const t1 = fs.readFileSync(path.join(R, 'rung2', 'T1v0.txt'), 'utf8');
+const t1 = fs.readFileSync(path.join(R, 'prompts', 'T1v0.txt'), 'utf8');
 byId['T1v0'] = { id: 'T1v0', prompt: t1, sha256: crypto.createHash('sha256').update(t1, 'utf8').digest('hex') };
 for (const id of VARIANTS) {
   const v = byId[id];
@@ -92,7 +92,7 @@ for (const id of VARIANTS) {
   if (got !== v.sha256) throw new Error(`FROZEN PROMPT MISMATCH ${id}`);
 }
 if (NOASK) {
-  const man2 = JSON.parse(fs.readFileSync(path.join(R, 'lattice_arm', 'RUN-MANIFEST-2.json'), 'utf8'));
+  const man2 = JSON.parse(fs.readFileSync(path.join(R, 'arm', 'RUN-MANIFEST-2.json'), 'utf8'));
   for (const id of ['T1v0', 'BL-01a', 'BL-01b', 'BL-01c']) {
     const txt = byId[id].prompt.replace(/\n+$/, '') + '\n\n' + SUFFIX + '\n';
     const got = crypto.createHash('sha256').update(txt, 'utf8').digest('hex');

@@ -1,0 +1,110 @@
+```python
+import backtrader as bt
+import collections
+
+
+class NVDAPreEarningsMomentumBreakout(bt.Strategy):
+    # Fixed price levels and parameters taken verbatim from the specification.
+    params = dict(
+        support_low=6455.0,     # lower boundary of nearest support zone
+        support_high=6465.0,    # upper boundary of nearest support zone
+        key_support=6430.75,    # key support = 50% retracement
+        resistance=6496.25,     # resistance / previous high (breakout level)
+        target=6508.75,         # take-profit target (new ATH)
+        sma_period=200,         # 200-period SMA on the daily timeframe
+        risk_pct=0.01,          # fixed risk per trade (within the 1-2% limit)
+        cash_buffer=0.95,       # affordability headroom vs available cash
+        commission=0.001,       # harness commission (for affordability sizing)
+    )
+
+    def __init__(self):
+        self.order = None
+        # Build a daily-close series from the 1h feed to approximate the
+        # 200-day SMA (the harness feed is 1h, not daily).
+        self.daily_closes = collections.deque(maxlen=self.p.sma_period)
+        self.cur_day = None
+        # Tracks that a pullback down to the key support has occurred.
+        self.pullback_seen = False
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin,
+                             order.Rejected):
+            self.order = None
+
+    def _update_daily_sma(self):
+        d = self.data.datetime.date(0)
+        if self.cur_day is None:
+            self.cur_day = d
+        elif d != self.cur_day:
+            # A new calendar day started: the previous bar closed the prior day.
+            self.daily_closes.append(self.data.close[-1])
+            self.cur_day = d
+
+    def next(self):
+        self._update_daily_sma()
+
+        c = self.data.close[0]
+        o = self.data.open[0]
+        h = self.data.high[0]
+        l = self.data.low[0]
+
+        # Track a pullback down to the key support (50% retracement level).
+        if l <= self.p.key_support:
+            self.pullback_seen = True
+
+        if self.order is not None:
+            return
+
+        # -------- Exits (while in a position) --------
+        if self.position:
+            # 1) Take-profit: target level (new ATH) reached.
+            if h >= self.p.target:
+                self.order = self.close()
+                return
+            # 2) Stop-loss: price drops below the nearest support zone (6455).
+            if l <= self.p.support_low:
+                self.order = self.close()
+                return
+            # 3) Alternative exit: bearish candle on increased volume.
+            if c < o and self.data.volume[0] > self.data.volume[-1]:
+                self.order = self.close()
+                return
+            return
+
+        # -------- Entry (long only) --------
+        # 200-day SMA trend confirmation must be available and bullish.
+        if len(self.daily_closes) < self.p.sma_period:
+            return
+        sma200 = sum(self.daily_closes) / len(self.daily_closes)
+        trend_ok = c > sma200
+
+        # Condition 1: price above or within the nearest support zone.
+        cond1 = c >= self.p.support_low
+        # Condition 2: a pullback to key support occurred and price recovers.
+        cond2 = self.pullback_seen and c > self.data.close[-1]
+        # Condition 3: breakout above resistance 6496.25 with increased volume.
+        breakout = (self.data.close[-1] <= self.p.resistance and
+                    c > self.p.resistance)
+        cond3 = breakout and self.data.volume[0] > self.data.volume[-1]
+
+        if trend_ok and cond1 and cond2 and cond3:
+            stop_dist = c - self.p.support_low
+            if stop_dist <= 0:
+                return
+            # Size so the potential loss at the stop stays within the risk limit,
+            # capped by what the available cash can actually afford.
+            risk_budget = self.broker.getvalue() * self.p.risk_pct
+            size = risk_budget / stop_dist
+            max_affordable = (self.p.cash_buffer * self.broker.getcash() /
+                              (c * (1 + self.p.commission)))
+            size = min(size, max_affordable)
+            if size > 0:
+                self.order = self.buy(size=size)
+                # Require a fresh pullback before any subsequent entry.
+                self.pullback_seen = False
+```
+```json
+{"assumptions": [{"topic": "infeasible", "choice": "Dropped the optional NVDA ATH filter (entry condition 4) and the NVDA-earnings news blackout (additional rule 2).", "reason": "Both require NVDA stock price and an earnings calendar; only a single ES OHLCV feed is available, so these cannot be evaluated."}, {"topic": "infeasible", "choice": "Ran all signals on the native 1h feed rather than a >=4h timeframe.", "reason": "The harness fixes the feed at 1h and cannot be resampled inside a strategy; running on 1h is the closest literal reading of the >=4h requirement."}, {"topic": "sma_daily", "choice": "Approximated the daily 200-SMA by collecting the last 1h close of each calendar day into a 200-element window and averaging it.", "reason": "The feed is 1h, not daily; building daily closes from it is the closest literal reading of a 200-period daily SMA."}, {"topic": "sma_confirmation", "choice": "Applied the (optional) 200-day SMA as a binding long-trend filter (require close > SMA) and require the 200-day window to be full before any entry.", "reason": "The indicator is listed with its stated purpose of confirming the global uptrend; at a genuine new-ATH breakout price is well above the 200-day SMA, so the gate effectively always passes and rarely alters behaviour."}, {"topic": "pullback_definition", "choice": "Pullback = any bar whose low reached <= 6430.75 (flag set); recovery = current close > previous close and price at/above nearest support; flag reset after each entry.", "reason": "The spec describes a chart pattern ('pullback from key support that started to recover') without a mechanical rule; this is a literal, reset-per-trade encoding requiring a fresh pullback before re-entry."}, {"topic": "breakout_and_volume", "choice": "Breakout = close crossing from <= 6496.25 to > 6496.25; increased/rising volume = volume > previous bar's volume.", "reason": "'Breaks above the resistance' is read as a fresh cross event; a single volume-increase check covers both entry condition 3 and additional rule 3."}, {"topic": "exit_execution", "choice": "Take-profit when high >= 6508.75, stop-loss when low <= 6455, checked in priority order TP -> SL -> bearish-reversal, executed with self.close() (market at next bar open).", "reason": "Levels are detected intrabar via high/low; backtrader market orders fill at the next open, the closest available execution to the stated price triggers."}, {"topic": "bearish_reversal_exit", "choice": "Alternative exit fires on a bearish candle (close < open) with volume > previous bar's volume.", "reason": "The spec gives a bearish candlestick on increased volume only as an example; this is a minimal literal encoding of that alternative exit."}, {"topic": "position_sizing", "choice": "Fixed risk = 1% of total equity divided by the stop distance (entry-6455), then capped at 95% of available cash / price.", "reason": "1% sits inside the stated 1-2% limit; because backtrader has no ES contract multiplier, each unit costs ~6496 of the $10k cash, so the affordability cap binds (actual risk stays well under 1%)."}, {"topic": "point_value", "choice": "Treated price differences directly as per-unit dollar risk ('points' = price units).", "reason": "The harness PandasData/broker apply no ES $50 multiplier, so one unit's P&L equals the raw price change; risk-in-points is computed on that basis."}]}
+```

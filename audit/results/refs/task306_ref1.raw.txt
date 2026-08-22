@@ -1,0 +1,202 @@
+```python
+import backtrader as bt
+import math
+import numpy as np
+from hmmlearn.hmm import GaussianHMM
+
+
+class MacdHmmAtrStrategy(bt.Strategy):
+    # Intraday AAPL 5m strategy: MACD(12,26,9) cross confirmed by a 2-state
+    # Gaussian HMM regime transition, with an ATR(14)-based stop of width
+    # ATR * k, k = base_k * (slow/fast) = 1.0 * (26/12).
+    params = dict(
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        atr_period=14,
+        base_k=1.0,
+        hmm_states=2,
+        train_window=390,      # rolling window of last 390 log returns
+        hmm_n_iter=100,
+        hmm_random_state=42,
+        stake=1,               # fixed 1-share sizing
+    )
+
+    def __init__(self):
+        self.macd = bt.indicators.MACD(
+            self.data,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        # +1 when MACD crosses above signal, -1 when it crosses below
+        self.mcross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        # k = base_k * (slow_period / fast_period)
+        self.k = self.p.base_k * (self.p.macd_slow / self.p.macd_fast)
+
+        # HMM / regime state
+        self.returns = []          # close-to-close log returns
+        self.last_date = None      # for session-open (daily) detection
+        self.model = None
+        self.bull_state = None
+        self.bear_state = None
+        self.prev_label = None     # previous bar's semantic label ('bull'/'bear')
+
+        # order tracking
+        self.entry_order = None    # pending market entry / exit order
+        self.stop_order = None     # currently live ATR stop order
+
+    # ---- HMM helpers -----------------------------------------------------
+    def _fit_hmm(self):
+        # Train on the last `train_window` returns STRICTLY before the current
+        # bar (past data only -> no lookahead).
+        w = self.p.train_window
+        train = np.asarray(self.returns[-(w + 1):-1], dtype=float).reshape(-1, 1)
+        try:
+            model = GaussianHMM(
+                n_components=self.p.hmm_states,
+                covariance_type='diag',
+                n_iter=self.p.hmm_n_iter,
+                random_state=self.p.hmm_random_state,
+            )
+            model.fit(train)
+            means = model.means_.flatten()
+            self.model = model
+            # bull = state with the higher mean return, bear = the lower
+            self.bull_state = int(np.argmax(means))
+            self.bear_state = int(np.argmin(means))
+        except Exception:
+            # keep the previously fitted model on failure
+            pass
+
+    def _infer_label(self):
+        if self.model is None:
+            return None
+        w = self.p.train_window
+        if len(self.returns) < w:
+            return None
+        # Viterbi decode over the last `w` returns (incl. current); current
+        # hidden state is the last decoded state.
+        seq = np.asarray(self.returns[-w:], dtype=float).reshape(-1, 1)
+        try:
+            states = self.model.predict(seq)
+        except Exception:
+            return None
+        return 'bull' if int(states[-1]) == self.bull_state else 'bear'
+
+    # ---- stop management -------------------------------------------------
+    def _refresh_stop(self):
+        dist = self.atr[0] * self.k
+        price = self.data.close[0]
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+        if self.position.size > 0:
+            self.stop_order = self.sell(
+                size=self.position.size,
+                exectype=bt.Order.Stop,
+                price=price - dist,
+            )
+        elif self.position.size < 0:
+            self.stop_order = self.buy(
+                size=abs(self.position.size),
+                exectype=bt.Order.Stop,
+                price=price + dist,
+            )
+
+    # ---- shared per-bar core --------------------------------------------
+    def _core(self, trading):
+        # 1) accumulate close-to-close log returns (also during warm-up)
+        if len(self) > 1 and self.data.close[-1] > 0:
+            self.returns.append(math.log(self.data.close[0] / self.data.close[-1]))
+
+        # 2) refit HMM once per day, at the session open, on past data only
+        cur_date = self.data.datetime.date(0)
+        new_session = (self.last_date is None) or (cur_date != self.last_date)
+        self.last_date = cur_date
+        if new_session and len(self.returns) >= self.p.train_window + 1:
+            self._fit_hmm()
+
+        # 3) infer current regime label and detect a transition on this bar
+        label = self._infer_label()
+        trans_bull = (label == 'bull') and (self.prev_label is not None) and (self.prev_label != 'bull')
+        trans_bear = (label == 'bear') and (self.prev_label is not None) and (self.prev_label != 'bear')
+        if label is not None:
+            self.prev_label = label
+
+        if not trading:
+            return
+
+        # MACD crossover on this bar
+        cross_up = self.mcross[0] > 0
+        cross_down = self.mcross[0] < 0
+
+        bull_confirm = cross_up and trans_bull      # long entry / short exit
+        bear_confirm = cross_down and trans_bear    # short entry / long exit
+
+        # guard: wait for any pending entry/exit market order to resolve
+        if self.entry_order is not None:
+            return
+
+        # 4) risk management: refresh the ATR stop each bar while in position
+        if self.position:
+            self._refresh_stop()
+
+        if self.position.size > 0:              # long open
+            if bear_confirm:                    # opposite confirmation -> exit
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.entry_order = self.close()
+        elif self.position.size < 0:            # short open
+            if bull_confirm:                    # opposite confirmation -> exit
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.entry_order = self.close()
+        else:                                   # flat
+            if bull_confirm:
+                self.entry_order = self.buy(size=self.p.stake)
+            elif bear_confirm:
+                self.entry_order = self.sell(size=self.p.stake)
+
+    def prenext(self):
+        # accumulate returns / regime state during indicator warm-up (no trading)
+        self._core(trading=False)
+
+    def next(self):
+        self._core(trading=True)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if order is self.entry_order:
+                self.entry_order = None
+            if order is self.stop_order:
+                self.stop_order = None
+            return
+        if order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self.entry_order:
+                self.entry_order = None
+            if order is self.stop_order:
+                self.stop_order = None
+            return
+```
+```json
+{"assumptions": [
+  {"topic": "dependencies", "choice": "Import numpy and hmmlearn (GaussianHMM) even though they are outside the harness's stated import allowlist (backtrader/math/collections/statistics).", "reason": "The spec explicitly mandates regime detection via a hmmlearn 2-state Gaussian HMM; substituting a hand-rolled HMM would violate fidelity, so the required libraries are imported."},
+  {"topic": "hmm_hyperparameters", "choice": "GaussianHMM(n_components=2, covariance_type='diag', n_iter=100, random_state=42).", "reason": "Spec fixes only the 2 Gaussian states; covariance type / iterations / seed are unstated. Chosen for convergence and deterministic, reproducible fits (needed for trace comparison)."},
+  {"topic": "state_labeling", "choice": "Label the fitted state with the higher mean return 'bull' (argmax of means_) and the lower 'bear'.", "reason": "Directly implements 'Define state 1 as bull and state 0 as bear by comparing each state's mean return'; index assignment follows the mean comparison rather than fixed 0/1."},
+  {"topic": "state_inference", "choice": "Each bar, Viterbi-decode (model.predict) the last 390 returns (including the current bar) and take the final decoded state as the current hidden state.", "reason": "Spec says 'infer the current hidden state' per bar but not the decoding method; Viterbi over the rolling window is the standard hmmlearn inference and matches the 390-bar window."},
+  {"topic": "transition_definition", "choice": "'Transitions into bull/bear' means the semantic regime label changed from the previous bar to the current bar; comparison uses labels (bull/bear), not raw state indices.", "reason": "Spec ties entries to a same-bar state transition; using labels keeps transitions meaningful across daily refits where raw state indices may swap."},
+  {"topic": "training_window", "choice": "At each session's first bar, refit on the 390 log returns strictly preceding that bar (current bar excluded); inference window is the last 390 returns including the current bar.", "reason": "Honors 'refit once per day at the session open using only past data (no lookahead)' by excluding the current session-open bar from training while still inferring the current state."},
+  {"topic": "return_warmup", "choice": "Accumulate close-to-close log returns in prenext() as well as next().", "reason": "Spec asks for the last 390 returns since data start; without prenext accumulation the window would omit all bars consumed by indicator warm-up."},
+  {"topic": "position_sizing", "choice": "Fixed size of 1 share per entry.", "reason": "Spec offers 'position size fixed (e.g., 1 share) or percent-of-equity sizing'; the fixed 1-share option is selected."},
+  {"topic": "stop_reference", "choice": "Measure the ATR stop from the current bar's close each bar (long: close - ATR*k; short: close + ATR*k), and re-issue it via cancel-and-replace every bar while in position.", "reason": "Spec gives the stop distance (ATR*k) and says 'updated each bar' but not the reference price; the current close is used so the distance trails price as ATR changes."},
+  {"topic": "one_position", "choice": "An opposite confirmation only closes the open position (no same-bar reversal); a new position in the opposite direction requires a fresh confirmation while flat.", "reason": "Canonical single-position default (hold at most one position, no re-entry while open); the spec's separate entry/exit clauses are honored while both directions remain reachable over time."},
+  {"topic": "refit_failure", "choice": "If a hmmlearn fit or predict raises, retain the previously fitted model (and skip inference for that bar) rather than trading with no model.", "reason": "Spec is silent on numerical failures; keeping the last valid model avoids spurious signals from a degenerate refit."}
+]}
+```

@@ -1,0 +1,220 @@
+```python
+# complete strategy class
+import backtrader as bt
+import math
+import collections
+
+
+class MultifunctionalAIStrategy(bt.Strategy):
+    """
+    Multifunctional AI trading strategy with comprehensive risk management.
+
+    Signal engine: an LSTM that predicts BUY / SELL / HOLD from a sequence of
+    1H bars is required by the spec but cannot be trained/executed inside
+    backtrader with only an OHLCV feed. It is replaced here with a deterministic
+    3-class proxy over the recent price sequence (declared infeasible in the
+    assumptions). All risk-management, sizing, and exit rules are implemented
+    exactly as stated.
+    """
+
+    params = dict(
+        seq_len=24,               # length of the price sequence the model reads
+        signal_threshold=0.002,   # dead-band that produces the HOLD class
+        atr_period=14,            # volatility measure used for the Stop Loss
+        atr_mult=1.5,             # Stop Loss distance = atr_mult * ATR
+        risk_reward=2.0,          # Take Profit = risk_reward * risk  (1:2)
+        risk_per_trade=0.01,      # fixed % of equity risked per trade (1%)
+        max_daily_risk=0.02,      # 2% cumulative daily loss -> stop for the day
+        max_drawdown=0.05,        # 5% account drawdown -> suspend trading
+        close_before_news=False,  # no economic-calendar feed available -> off
+    )
+
+    def __init__(self):
+        # Volatility for automatic Stop Loss placement.
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        # Order / position tracking.
+        self.order = None
+        self.pending_entry = False
+        self.pending_dir = 0
+        self.pending_stop_dist = None
+
+        self.trade_dir = 0          # 1 = long, -1 = short, 0 = flat
+        self.entry_price = None
+        self.stop_price = None
+        self.take_price = None
+
+        # Daily-risk / drawdown tracking (auto-reset every 24h).
+        self.current_date = None
+        self.day_start_value = None
+        self.equity_peak = None
+        self.daily_loss = 0.0
+        self.trading_halted_today = False
+        self.drawdown_halted = False
+
+        # Feature: rolling imbalance between BUY / SELL / HOLD signals.
+        self.signal_history = collections.deque(maxlen=self.p.seq_len)
+
+        # Trade log.
+        self.trade_log = []
+
+    # ---- LSTM signal proxy (BUY / SELL / HOLD) -------------------------------
+    def _predict(self):
+        if len(self.data) <= self.p.seq_len:
+            return 'HOLD'
+        past = self.data.close[-self.p.seq_len]
+        now = self.data.close[0]
+        if past == 0:
+            return 'HOLD'
+        momentum = (now - past) / past
+        if momentum > self.p.signal_threshold:
+            return 'BUY'
+        if momentum < -self.p.signal_threshold:
+            return 'SELL'
+        return 'HOLD'
+
+    # -------------------------------------------------------------------------
+    def next(self):
+        value = self.broker.getvalue()
+        d = self.data.datetime.datetime(0).date()
+
+        # --- Auto-reset of risk parameters every 24h (on calendar-day change).
+        if self.current_date != d:
+            self.current_date = d
+            self.day_start_value = value
+            self.equity_peak = value
+            self.daily_loss = 0.0
+            self.trading_halted_today = False
+            self.drawdown_halted = False
+
+        # --- Maximum daily risk: cumulative loss vs day-start equity.
+        if value > self.equity_peak:
+            self.equity_peak = value
+        self.daily_loss = max(0.0, self.day_start_value - value)
+        if self.daily_loss >= self.p.max_daily_risk * self.day_start_value:
+            self.trading_halted_today = True
+
+        # --- Maximum drawdown from the running equity peak.
+        dd = (self.equity_peak - value) / self.equity_peak if self.equity_peak else 0.0
+        if dd >= self.p.max_drawdown:
+            self.drawdown_halted = True
+
+        # --- Model prediction (also fed to the imbalance feature).
+        pred = self._predict()
+        self.signal_history.append(pred)
+
+        # Guard pending orders.
+        if self.order is not None:
+            return
+
+        # --- Manage an open position -----------------------------------------
+        if self.position:
+            if self.trade_dir == 1:  # long
+                if self.data.low[0] <= self.stop_price:          # Stop Loss hit
+                    self.order = self.close()
+                    return
+                if self.data.high[0] >= self.take_price:         # Take Profit hit
+                    self.order = self.close()
+                    return
+                if pred == 'BUY':                                # same direction -> trail SL
+                    new_stop = self.data.close[0] - self.p.atr_mult * self.atr[0]
+                    if new_stop > self.stop_price:
+                        self.stop_price = new_stop
+                elif pred == 'SELL':                             # opposite -> close now
+                    self.order = self.close()
+                    return
+            elif self.trade_dir == -1:  # short
+                if self.data.high[0] >= self.stop_price:         # Stop Loss hit
+                    self.order = self.close()
+                    return
+                if self.data.low[0] <= self.take_price:          # Take Profit hit
+                    self.order = self.close()
+                    return
+                if pred == 'SELL':                               # same direction -> trail SL
+                    new_stop = self.data.close[0] + self.p.atr_mult * self.atr[0]
+                    if new_stop < self.stop_price:
+                        self.stop_price = new_stop
+                elif pred == 'BUY':                              # opposite -> close now
+                    self.order = self.close()
+                    return
+            return
+
+        # --- No position: entries (blocked while trading is halted) -----------
+        if self.trading_halted_today or self.drawdown_halted:
+            return
+        if pred == 'HOLD':
+            return
+
+        atr = self.atr[0]
+        if atr <= 0:
+            return
+
+        # Stop Loss distance from volatility; position size from fixed % risk.
+        stop_dist = self.p.atr_mult * atr
+        risk_amount = self.p.risk_per_trade * value
+        size = risk_amount / stop_dist
+        if size <= 0:
+            return
+
+        self.pending_stop_dist = stop_dist
+        if pred == 'BUY':
+            self.pending_dir = 1
+            self.pending_entry = True
+            self.order = self.buy(size=size)
+        elif pred == 'SELL':
+            self.pending_dir = -1
+            self.pending_entry = True
+            self.order = self.sell(size=size)
+
+    # -------------------------------------------------------------------------
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed and self.pending_entry:
+            price = order.executed.price
+            self.entry_price = price
+            self.trade_dir = self.pending_dir
+            sd = self.pending_stop_dist
+            if self.trade_dir == 1:
+                self.stop_price = price - sd
+                self.take_price = price + self.p.risk_reward * sd
+            else:
+                self.stop_price = price + sd
+                self.take_price = price - self.p.risk_reward * sd
+
+            # Risk per trade: size in points * lot size (recorded in the log).
+            expected_risk = sd * abs(order.executed.size)
+            self.trade_log.append({
+                'datetime': self.data.datetime.datetime(0).isoformat(),
+                'decision': 'BUY' if self.trade_dir == 1 else 'SELL',
+                'entry_price': price,
+                'size': order.executed.size,
+                'stop_loss': self.stop_price,
+                'take_profit': self.take_price,
+                'risk_points': sd,
+                'expected_risk': expected_risk,
+            })
+            self.pending_entry = False
+
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order.status != order.Completed:
+                self.pending_entry = False
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.trade_log.append({
+                'datetime': self.data.datetime.datetime(0).isoformat(),
+                'decision': 'CLOSE',
+                'pnl': trade.pnl,
+                'pnlcomm': trade.pnlcomm,
+            })
+            self.trade_dir = 0
+            self.entry_price = None
+            self.stop_price = None
+            self.take_price = None
+```
+```json
+{"assumptions": [{"topic": "infeasible", "choice": "The LSTM model that predicts BUY/SELL/HOLD from data sequences is replaced by a deterministic 3-class proxy: momentum over a seq_len=24 bar window with a signal_threshold=0.002 dead-band produces the HOLD class.", "reason": "An LSTM cannot be trained or executed inside backtrader from a single OHLCV feed; the closest literal reading is a sequence-based 3-class classifier."}, {"topic": "infeasible", "choice": "The set of 62 independent features (incl. BUY/SELL/HOLD imbalance features) is not built; only the price sequence drives the proxy, and the rolling signal imbalance is tracked in signal_history.", "reason": "Full feature engineering and model training are part of the infeasible LSTM pipeline; imbalance is retained as a rolling window to honor its presence."}, {"topic": "volatility stop loss", "choice": "Volatility = ATR(14); Stop Loss distance = atr_mult (1.5) * ATR.", "reason": "ATR is the standard volatility measure; period 14 is canonical and the multiplier is a reasonable default since the spec is silent on it."}, {"topic": "risk/reward", "choice": "risk_reward = 2.0 (1:2); Take Profit distance = 2 * Stop Loss distance.", "reason": "Chosen from the spec's own examples (1:2 or 1:3)."}, {"topic": "risk per trade", "choice": "risk_per_trade = 1% of current equity; size = (0.01*equity)/stop_distance.", "reason": "Chosen from the spec's 1-2% example; automatic risk-based sizing as stated."}, {"topic": "max daily risk", "choice": "2% of day-start equity; cumulative daily loss = day_start_value - current account value (includes unrealized). Halts new entries until the next day.", "reason": "Spec example is 2%; account-value change is a direct reading of 'cumulative loss for the day'."}, {"topic": "max drawdown", "choice": "5% measured from the running equity peak; halts new entries when reached.", "reason": "Spec example is 5%; drawdown from peak equity is the standard reading."}, {"topic": "auto-reset 24h", "choice": "Reset daily loss, drawdown halt, equity peak, and day-start value on each calendar-day change of the 1H feed.", "reason": "The 1H feed provides no other 24h boundary; date change is the natural reset trigger."}, {"topic": "risk-per-trade display", "choice": "'Display' the expected risk (risk_points * size) by recording it in the in-memory trade_log rather than printing.", "reason": "The harness forbids prints; the trade log is the available output channel."}, {"topic": "infeasible", "choice": "Close-before-news is present as a disabled flag (close_before_news=False) and never triggers.", "reason": "No economic-calendar/news feed exists in the OHLCV data, so the 30-minutes-before-news close cannot be implemented."}, {"topic": "trade log", "choice": "Log records decision (BUY/SELL/HOLD as CLOSE on exit), datetime, entry price, size, stop loss, take profit, risk points, and expected risk (plus realized PnL on close).", "reason": "The spec's trade-log field list is truncated; recorded the stated decision plus the risk/execution fields already computed."}, {"topic": "SL/TP execution", "choice": "The bracket is managed inside the strategy: each bar checks low/high against the stored stop/take and closes via self.close(); Stop Loss is checked before Take Profit within a bar.", "reason": "Manual management is required because the Stop Loss is trailed on same-direction signals; SL-first ordering is a reasonable tie-break for bars that span both levels."}, {"topic": "shorting", "choice": "Shorting is enabled; SELL opens a short, BUY opens a long, HOLD does nothing.", "reason": "The spec explicitly defines opening short positions on SELL, overriding the long-only canonical default."}, {"topic": "asset", "choice": "GC=F (gold futures) 1H feed is treated as the XAU/USD gold instrument.", "reason": "The harness fixes the feed to GC=F; it is the closest available gold instrument."}]}
+```

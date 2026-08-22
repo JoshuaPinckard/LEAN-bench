@@ -1,0 +1,85 @@
+```python
+import backtrader as bt
+
+
+class WilliamsRMomentumATR(bt.Strategy):
+    params = dict(
+        wr_period=14,          # Williams %R period
+        mom_period=14,         # Momentum period
+        atr_period=14,         # ATR period
+        wr_cross_long=-80,     # %R level crossed UP through for a long entry
+        wr_cross_short=-20,    # %R level crossed DOWN through for a short entry
+        atr_mult=2.0,          # adjustable ATR multiple for the protective stop
+        trailing=False,        # False = static stop from entry (default);
+                               # True  = stop updated each bar (trailing/volatility stop)
+    )
+
+    def __init__(self):
+        # Built-in Backtrader indicators, exactly as specified
+        self.wr = bt.indicators.WilliamsR(self.data, period=self.p.wr_period)
+        self.mom = bt.indicators.Momentum(self.data, period=self.p.mom_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None        # pending-order guard
+        self.stop_price = None    # active protective stop level
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if self.position:
+                # A fresh entry just filled -> set the protective stop from entry price.
+                entry = order.executed.price
+                if self.position.size > 0:      # long
+                    self.stop_price = entry - self.p.atr_mult * self.atr[0]
+                else:                           # short
+                    self.stop_price = entry + self.p.atr_mult * self.atr[0]
+            else:
+                # A close just filled -> flat, no stop.
+                self.stop_price = None
+        # Completed / Canceled / Margin / Rejected -> release the guard
+        self.order = None
+
+    def next(self):
+        # Entry signals (evaluated every bar; also used as opposite-signal exits)
+        long_signal = (self.wr[-1] <= self.p.wr_cross_long and
+                       self.wr[0] > self.p.wr_cross_long and
+                       self.mom[0] > 0)
+        short_signal = (self.wr[-1] >= self.p.wr_cross_short and
+                        self.wr[0] < self.p.wr_cross_short and
+                        self.mom[0] < 0)
+
+        if self.order:
+            return
+
+        # ---- Flat: look for an entry ----
+        if not self.position:
+            if long_signal:
+                self.order = self.buy()
+            elif short_signal:
+                self.order = self.sell()
+            return
+
+        # ---- In a position: protective stop first, then opposite-signal exit ----
+        if self.position.size > 0:  # long
+            if self.p.trailing:
+                # trailing volatility stop: ratchet up, never down
+                cand = self.data.close[0] - self.p.atr_mult * self.atr[0]
+                self.stop_price = cand if self.stop_price is None else max(self.stop_price, cand)
+            if self.stop_price is not None and self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+            elif short_signal:
+                self.order = self.close()
+        else:                       # short
+            if self.p.trailing:
+                # trailing volatility stop: ratchet down, never up
+                cand = self.data.close[0] + self.p.atr_mult * self.atr[0]
+                self.stop_price = cand if self.stop_price is None else min(self.stop_price, cand)
+            if self.stop_price is not None and self.data.high[0] >= self.stop_price:
+                self.order = self.close()
+            elif long_signal:
+                self.order = self.close()
+```
+```json
+{"assumptions": [{"topic": "atr_mult default", "choice": "atr_mult defaults to 2.0", "reason": "Spec calls the ATR multiple 'adjustable' but states no default value; 2.0 is a common protective-stop multiple and is exposed as a parameter."}, {"topic": "static vs trailing default", "choice": "trailing=False by default (static stop fixed at entry); trailing=True updates the stop each bar", "reason": "Spec requires the default to be a static-from-entry stop with an optional trailing/volatility mode selectable via a parameter."}, {"topic": "trailing stop definition", "choice": "When trailing=True, each bar recompute close - atr_mult*ATR (long) / close + atr_mult*ATR (short) and move the stop only in the favorable direction (ratchet)", "reason": "Spec gives the stop formula relative to a reference price but only says 'updated each bar as a trailing/volatility stop'; anchoring the moving stop to the current close and ratcheting is the standard volatility-stop reading."}, {"topic": "static stop ATR value", "choice": "For the static stop, ATR at the fill bar (self.atr[0] in notify_order) is used together with the executed entry price", "reason": "Spec ties the stop to 'entry_price' and ATR; the fill bar is the point of entry, so its ATR is used to fix the level."}, {"topic": "stop evaluation/execution", "choice": "The stop is evaluated in next() against the current bar's intrabar low (long) / high (short); a hit triggers self.close(), which fills at the next bar's open. Stop is checked before the opposite-signal exit", "reason": "Spec is silent on the stop's order mechanics; a next()-based touch check on low/high is the deterministic, closest literal reading of a protective stop on OHLCV bars, and precedence must be resolved."}, {"topic": "opposite-signal exit / no reversal", "choice": "On an opposite entry signal while in a position, only close (canonical single-position rule); a new position is opened only on a later bar when flat", "reason": "Spec's exit rule says 'close an open position' and does not state reversal; canonical default #3 forbids re-entry while a position is open."}, {"topic": "intraday / seasonality", "choice": "All 5-minute bars are treated identically with no time-of-day, session, or calendar filters", "reason": "Spec says run on intraday data without seasonality assumptions."}]}
+```

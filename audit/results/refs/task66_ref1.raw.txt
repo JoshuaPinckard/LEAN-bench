@@ -1,0 +1,136 @@
+```python
+# complete strategy class
+import backtrader as bt
+
+
+class DoubleBottomStrategy(bt.Strategy):
+    params = (
+        ('sma_period', 200),        # trend SMA
+        ('vol_period', 20),         # volume-average period for breakout confirmation
+        ('pivot_window', 5),        # bars on each side used to confirm a swing pivot
+        ('min_bottom_gap', 10),     # at least 10 candles between the two bottoms
+        ('bottom_tolerance', 0.01), # second bottom within 1% (lower or higher) of first
+        ('stop_pct', 0.005),        # stop-loss 0.5% below the second bottom
+        ('rr_ratio', 2.0),          # take-profit at 2:1 reward:risk
+    )
+
+    def __init__(self):
+        # SMA(200) to define the higher-timeframe bullish trend
+        self.sma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.sma_period)
+        # 20-period average volume for breakout strength confirmation
+        self.vol_sma = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.vol_period)
+
+        self.order = None
+        self.stop_price = None
+        self.take_price = None
+        self.entry_bottom2 = None
+
+        # confirmed swing pivots stored as (absolute_bar_index, price)
+        self.pivot_lows = []
+        self.pivot_highs = []
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy():
+                # define risk from the actual fill and the second bottom
+                entry_price = order.executed.price
+                stop = self.entry_bottom2 * (1.0 - self.p.stop_pct)
+                risk = entry_price - stop
+                self.stop_price = stop
+                self.take_price = entry_price + self.p.rr_ratio * risk
+            self.order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _update_pivots(self):
+        # confirm a swing pivot that occurred `pivot_window` bars ago
+        w = self.p.pivot_window
+        idx = len(self.data) - 1
+        if idx < 2 * w:
+            return
+        center = idx - w
+        center_low = self.data.low[-w]
+        center_high = self.data.high[-w]
+        is_low = True
+        is_high = True
+        for k in range(1, w + 1):
+            if (self.data.low[-w - k] <= center_low or
+                    self.data.low[-w + k] <= center_low):
+                is_low = False
+            if (self.data.high[-w - k] >= center_high or
+                    self.data.high[-w + k] >= center_high):
+                is_high = False
+        if is_low:
+            self.pivot_lows.append((center, center_low))
+        if is_high:
+            self.pivot_highs.append((center, center_high))
+
+    def _find_double_bottom(self):
+        # latest confirmed swing low is the candidate second bottom
+        if len(self.pivot_lows) < 2:
+            return None
+        idx2, low2 = self.pivot_lows[-1]
+        for j in range(len(self.pivot_lows) - 2, -1, -1):
+            idx1, low1 = self.pivot_lows[j]
+            # at least 10 candles between the two bottoms
+            if idx2 - idx1 < self.p.min_bottom_gap:
+                continue
+            # second bottom no more than 1% lower or higher than the first
+            if abs(low2 - low1) / low1 > self.p.bottom_tolerance:
+                continue
+            # intermediate peak (neckline) between the two bottoms
+            necks = [ph for (pi, ph) in self.pivot_highs if idx1 < pi < idx2]
+            if not necks:
+                continue
+            return max(necks), low2
+        return None
+
+    def _manage_exit(self):
+        # stop-loss (intrabar low), then take-profit (intrabar high),
+        # then trend-reversal exit (close below SMA200)
+        if self.data.low[0] <= self.stop_price:
+            self.order = self.close()
+            return
+        if self.data.high[0] >= self.take_price:
+            self.order = self.close()
+            return
+        if self.data.close[0] < self.sma[0]:
+            self.order = self.close()
+
+    def _check_entry(self):
+        db = self._find_double_bottom()
+        if db is None:
+            return
+        neckline, low2 = db
+        # breakout of the neckline (first close above it) with rising volume,
+        # and price above the 200 SMA (bullish higher timeframe)
+        if (self.data.close[0] > neckline and
+                self.data.close[-1] <= neckline and
+                self.data.volume[0] > self.vol_sma[0] and
+                self.data.close[0] > self.sma[0]):
+            self.entry_bottom2 = low2
+            self.order = self.buy()
+
+    def next(self):
+        self._update_pivots()
+
+        if self.order:
+            return
+
+        if self.position:
+            self._manage_exit()
+            return
+
+        self._check_entry()
+```
+```json
+{"assumptions": [{"topic": "pivot/swing detection", "choice": "Bottoms and peaks are identified as strict fractal pivots confirmed with a symmetric window of 5 bars on each side (a low/high strictly beyond its 5 neighbors either way).", "reason": "The spec defines the pattern in terms of 'lows' and an 'intermediate peak' but is silent on how swing points are detected; a fixed pivot window is the standard causal way to locate them in a backtest."},
+{"topic": "neckline definition", "choice": "The neckline (intermediate peak) is taken as the highest confirmed pivot high located between the two bottoms.", "reason": "The spec calls for a single intermediate peak between the bottoms; using the highest swing high in that interval is the natural resistance level to break."},
+{"topic": "neckline breakout", "choice": "'Breaks above the neckline' is implemented as the first bar whose close crosses from at/below to above the neckline (close[-1] <= neckline < close[0]).", "reason": "The spec does not state whether breakout is measured on close or intrabar; using a fresh closing cross gives an unambiguous single breakout event on which volume can be confirmed."},
+{"topic": "volume confirmation", "choice": "Breakout volume confirmation requires the breakout bar's volume to be strictly greater than the 20-period SMA of volume.", "reason": "The spec asks for 'an increase in volume compared to the average volume over the last 20 periods'; interpreted as current volume > SMA(volume,20)."},
+{"topic": "risk / stop / take reference", "choice": "Stop-loss = second bottom * (1 - 0.5%); risk = actual executed entry price - stop; take-profit = entry + 2 * risk, computed at fill in notify_order.", "reason": "The spec fixes the stop at 0.5% below the second bottom and take-profit at 2:1 of that risk; using the real fill price makes the 2:1 ratio exact."},
+{"topic": "exit precedence", "choice": "When multiple exits could trigger on one bar, they are evaluated in order: stop-loss (via bar low), then take-profit (via bar high), then close-below-SMA200; all exits use self.close().", "reason": "The spec lists three exits without ordering; a conservative stop-first precedence resolves same-bar ambiguity deterministically."},
+{"topic": "warm-up", "choice": "No manual bar-skipping; backtrader's automatic minperiod (200 from the SMA) governs when trading logic begins, so early pivots only accumulate once next() runs.", "reason": "Canonical warm-up handling; the price-above-SMA200 filter cannot be evaluated before the SMA is ready anyway."}]}
+```

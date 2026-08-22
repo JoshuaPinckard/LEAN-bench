@@ -1,0 +1,127 @@
+```python
+import backtrader as bt
+
+
+class DoubleBottomStrategy(bt.Strategy):
+
+    params = (
+        ('sma_period', 200),
+        ('vol_avg_period', 20),
+        ('bottom_tolerance', 0.01),   # 1% max difference between bottoms
+        ('min_bars_between', 10),      # min bars separating two bottoms
+        ('stop_pct', 0.005),           # 0.5% below second bottom
+        ('local_n', 5),               # bars on each side for local extremum detection
+        ('max_lookback', 200),        # max bars to scan backward for pattern
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_avg_period)
+        self.order = None
+        self.stop_price = None
+        self.take_profit_price = None
+        self._pending_stop = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy():
+                fill = order.executed.price
+                risk = fill - self._pending_stop
+                self.stop_price = self._pending_stop
+                self.take_profit_price = fill + 2.0 * risk
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            self._pending_stop = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            close = self.data.close[0]
+            if close <= self.stop_price:
+                self.order = self.close()
+                return
+            if close >= self.take_profit_price:
+                self.order = self.close()
+                return
+            if close < self.sma200[0]:
+                self.order = self.close()
+                return
+            return
+
+        if self.data.close[0] <= self.sma200[0]:
+            return
+
+        result = self._find_double_bottom()
+        if result is not None:
+            _, low2 = result
+            self._pending_stop = low2 * (1.0 - self.p.stop_pct)
+            self.order = self.buy()
+
+    def _find_double_bottom(self):
+        n = self.p.local_n
+        available = len(self.data)
+        lb = min(self.p.max_lookback, available - 1)
+        total = min(lb + n + 1, available)
+
+        # Need enough history for two bottoms (each n-confirmed) plus minimum gap plus prev bar
+        if total < 2 * n + self.p.min_bars_between + 2:
+            return None
+
+        # Volume must exceed 20-period average to confirm breakout
+        if self.data.volume[0] <= self.vol_sma20[0]:
+            return None
+
+        current_close = self.data.close[0]
+        prev_close = self.data.close[-1]
+
+        # lows[i] / highs[i] = value i bars ago (0 = current bar)
+        lows = [self.data.low[-i] for i in range(total)]
+        highs = [self.data.high[-i] for i in range(total)]
+
+        # Only consider indices with n confirmed bars on each side
+        valid_range = range(n, total - n)
+
+        local_mins = [
+            i for i in valid_range
+            if all(lows[i] <= lows[j] for j in range(i - n, i + n + 1) if j != i)
+        ]
+        local_maxs = [
+            i for i in valid_range
+            if all(highs[i] >= highs[j] for j in range(i - n, i + n + 1) if j != i)
+        ]
+
+        # Pattern (in bars-ago indexing, larger index = older bar):
+        #   b1 (oldest bottom) > nl (neckline) > b2 (newer bottom) > 0 (current breakout)
+        for b2 in local_mins:
+            low2 = lows[b2]
+            for nl in local_maxs:
+                if nl <= b2:
+                    continue  # neckline must be older than second bottom
+                neckline = highs[nl]
+                if neckline <= low2:
+                    continue  # neckline must be above second bottom
+                if current_close <= neckline:
+                    continue  # require current close to break above neckline
+                if prev_close > neckline:
+                    continue  # require fresh crossover (previous close at or below neckline)
+                for b1 in local_mins:
+                    if b1 <= nl:
+                        continue  # first bottom must be older than neckline
+                    if b1 - b2 < self.p.min_bars_between:
+                        continue  # at least 10 bars between the two bottoms
+                    low1 = lows[b1]
+                    if abs(low1 - low2) / max(low1, low2) > self.p.bottom_tolerance:
+                        continue  # bottoms must be within 1% of each other
+                    if neckline <= low1:
+                        continue  # neckline must be above first bottom
+                    return (neckline, low2)
+
+        return None
+```
+
+```json
+{"assumptions": [{"topic": "local extremum detection window (local_n)", "choice": "5 bars on each side; a bar is a local minimum if its low is the minimum within ±5 bars, and a local maximum if its high is the maximum within ±5 bars", "reason": "The spec names 'first low', 'intermediate peak', and 'second low' but gives no algorithmic definition of a local extremum. 5 bars per side is a standard choice for daily-bar chart pattern recognition, balancing noise suppression against responsiveness."}, {"topic": "max lookback for pattern scan", "choice": "200 bars", "reason": "The spec does not bound how far back to search for the double bottom. Patterns older than 200 bars are unlikely to be actionable; this also keeps per-bar scan cost bounded."}, {"topic": "neckline price level", "choice": "The HIGH of the local-maximum bar between the two bottoms; breakout condition is current_close > high[neckline_bar]", "reason": "The spec calls it the 'intermediate peak' and says price must 'break above' it. Using the intraday high of the peak bar is the standard resistance level in technical analysis."}, {"topic": "stop-loss and take-profit exit checks use close price", "choice": "All exit conditions (stop, take-profit, SMA200) are evaluated against the bar's close price", "reason": "The spec says 'place a stop-loss' (implying a live order) but the feed provides only OHLCV daily bars. The SMA exit explicitly uses 'closes a candle below', so close-based checking is applied consistently to all exits."}, {"topic": "take-profit risk computed from actual fill price", "choice": "risk = fill_price - stop_price; take_profit = fill_price + 2 * risk, where fill_price is obtained from notify_order on the buy execution", "reason": "The spec says '2:1 potential profit is two times the risk defined by the stop-loss'. Risk depends on entry price; using the actual fill (next bar open under default market order) is more accurate than using the signal bar close."}, {"topic": "breakout freshness (fresh crossover required)", "choice": "The bar immediately before the current one must have a close at or below the neckline (prev_close <= neckline), so the current bar is the first close above the neckline", "reason": "The spec says price 'breaks above' the neckline, implying a crossover event rather than a continuation of an already-broken level. Without this guard, the same stale pattern could re-trigger entries many bars after the actual breakout."}, {"topic": "bottom tolerance comparison formula", "choice": "abs(low1 - low2) / max(low1, low2) <= 0.01", "reason": "The spec says 'no more than 1% lower or higher'. Dividing by the larger of the two values gives a symmetric percentage that matches common technical-analysis practice."}, {"topic": "pattern priority when multiple valid patterns exist in the lookback", "choice": "The first pattern found by iterating b2, nl, b1 in ascending index order (most recent second bottom, earliest valid neckline, earliest valid first bottom) is returned", "reason": "The spec does not address ambiguity; the most recent second bottom is the most actionable signal."}]}
+```

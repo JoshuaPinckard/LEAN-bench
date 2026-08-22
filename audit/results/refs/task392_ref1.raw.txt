@@ -1,0 +1,225 @@
+```python
+        self.stop_order = None
+        self.limit_order = None
+        self.trade_dir = 0
+        self.entry_price = None
+        self.entry_atr = None
+        self.extreme = None
+        self.trail_active = False
+
+    @staticmethod
+    def _acc(form, o, h, l, c, v):
+        if h > form[1]:
+            form[1] = h
+        if l < form[2]:
+            form[2] = l
+        form[3] = c
+        form[4] += v
+
+    def _order_blocks(self):
+        tf = self.tf60
+        n = self.p.ob_period
+        o = tf.o; h = tf.h; l = tf.l; c = tf.c
+        N = len(c)
+        bull = None
+        bear = None
+        # bullish OB: most recent down candle before a 20-bar breakout above Donchian high
+        i = N - 1
+        while i >= n:
+            dch = max(h[i - n:i])
+            if c[i] > dch:
+                j = i - 1
+                while j >= 0:
+                    if c[j] < o[j]:
+                        bull = (l[j], h[j])
+                        break
+                    j -= 1
+                break
+            i -= 1
+        # bearish OB: most recent up candle before a 20-bar breakdown below Donchian low
+        i = N - 1
+        while i >= n:
+            dcl = min(l[i - n:i])
+            if c[i] < dcl:
+                j = i - 1
+                while j >= 0:
+                    if c[j] > o[j]:
+                        bear = (l[j], h[j])
+                        break
+                    j -= 1
+                break
+            i -= 1
+        return bull, bear
+
+    def next(self):
+        d = self.data
+        dt = d.datetime.datetime(0)
+        o = d.open[0]; h = d.high[0]; l = d.low[0]; c = d.close[0]; v = d.volume[0]
+
+        # --- base 60m timeframe (every bar is complete) ---
+        self.tf60.update(o, h, l, c, v)
+        m60 = self.tf60.score()
+        atr60 = self.tf60.atr
+
+        # --- daily bucket (by calendar date); score updates on completion ---
+        dk = dt.date()
+        if dk != self.cur_day:
+            if self.form_d is not None:
+                f = self.form_d
+                self.tfd.update(f[0], f[1], f[2], f[3], f[4])
+                self.daily_score = self.tfd.score()
+            self.form_d = [o, h, l, c, v]
+            self.cur_day = dk
+        else:
+            self._acc(self.form_d, o, h, l, c, v)
+
+        # --- 4H bucket (by (date, hour//4)); score updates on completion ---
+        hk = (dk, dt.hour // 4)
+        if hk != self.cur_h4:
+            if self.form_h is not None:
+                f = self.form_h
+                self.tfh4.update(f[0], f[1], f[2], f[3], f[4])
+                self.h4_score = self.tfh4.score()
+            self.form_h = [o, h, l, c, v]
+            self.cur_h4 = hk
+        else:
+            self._acc(self.form_h, o, h, l, c, v)
+
+        # --- pending-order guard ---
+        if self.entry_order is not None or self.exit_order is not None:
+            return
+
+        # --- in-position management (trailing + early exit) ---
+        if self.position:
+            self._manage(m60, atr60)
+            return
+
+        if atr60 is None:
+            return
+
+        # --- entry evaluation with order-block filter ---
+        bull_ob, bear_ob = self._order_blocks()
+        price = c
+        in_bull = bull_ob is not None and bull_ob[0] <= price <= bull_ob[1]
+        in_bear = bear_ob is not None and bear_ob[0] <= price <= bear_ob[1]
+
+        long_ok = (self.daily_score >= self.p.daily_long_th and
+                   self.h4_score >= self.p.h4_long_th and
+                   m60 >= self.p.m60_long_th and not in_bear)
+        short_ok = (self.daily_score <= -self.p.daily_short_th and
+                    self.h4_score <= -self.p.h4_short_th and
+                    m60 <= -self.p.m60_short_th and not in_bull)
+
+        if long_ok:
+            stop = price - self.p.stop_atr_mult * atr60
+            limit = price + self.p.tp_atr_mult * atr60
+            br = self.buy_bracket(stopprice=stop, limitprice=limit)
+            self.entry_order = br[0]; self.stop_order = br[1]; self.limit_order = br[2]
+            self.trade_dir = 1
+            self.entry_atr = atr60
+        elif short_ok:
+            stop = price + self.p.stop_atr_mult * atr60
+            limit = price - self.p.tp_atr_mult * atr60
+            br = self.sell_bracket(stopprice=stop, limitprice=limit)
+            self.entry_order = br[0]; self.stop_order = br[1]; self.limit_order = br[2]
+            self.trade_dir = -1
+            self.entry_atr = atr60
+
+    def _manage(self, m60, atr60):
+        p = self.p
+        # early exit: 60m score flip or daily filter no longer supports position
+        if self.trade_dir == 1:
+            if m60 <= -p.m60_short_th or self.daily_score < p.daily_long_th:
+                self._exit_now()
+                return
+        else:
+            if m60 >= p.m60_long_th or self.daily_score > -p.daily_short_th:
+                self._exit_now()
+                return
+
+        # trailing stop
+        if not p.use_trailing or atr60 is None or self.entry_price is None:
+            return
+        if self.trade_dir == 1:
+            if self.extreme is None or self.data.high[0] > self.extreme:
+                self.extreme = self.data.high[0]
+            if (self.extreme - self.entry_price) >= p.trail_trigger_atr * atr60:
+                self.trail_active = True
+            if self.trail_active:
+                ns = self.extreme - p.trail_atr_mult * atr60
+                cur = self.stop_order.created.price if (self.stop_order is not None and self.stop_order.alive()) else None
+                if cur is None or ns > cur:
+                    self._replace_stop(ns)
+        else:
+            if self.extreme is None or self.data.low[0] < self.extreme:
+                self.extreme = self.data.low[0]
+            if (self.entry_price - self.extreme) >= p.trail_trigger_atr * atr60:
+                self.trail_active = True
+            if self.trail_active:
+                ns = self.extreme + p.trail_atr_mult * atr60
+                cur = self.stop_order.created.price if (self.stop_order is not None and self.stop_order.alive()) else None
+                if cur is None or ns < cur:
+                    self._replace_stop(ns)
+
+    def _replace_stop(self, ns):
+        if self.stop_order is not None and self.stop_order.alive():
+            self.cancel(self.stop_order)
+        sz = abs(self.position.size)
+        if sz <= 0:
+            self.stop_order = None
+            return
+        if self.trade_dir == 1:
+            self.stop_order = self.sell(exectype=bt.Order.Stop, price=ns, size=sz)
+        else:
+            self.stop_order = self.buy(exectype=bt.Order.Stop, price=ns, size=sz)
+
+    def _cancel_children(self):
+        for od in (self.stop_order, self.limit_order):
+            if od is not None and od.alive():
+                self.cancel(od)
+
+    def _exit_now(self):
+        self._cancel_children()
+        self.exit_order = self.close()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        # order is done: Completed / Canceled / Margin / Rejected / Expired
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                self.entry_price = order.executed.price
+                self.extreme = self.data.high[0] if self.trade_dir == 1 else self.data.low[0]
+                self.trail_active = False
+            else:
+                # entry failed -> discard its (auto-cancelled) bracket children
+                self.stop_order = None
+                self.limit_order = None
+                self.trade_dir = 0
+            self.entry_order = None
+        if order is self.exit_order:
+            self.exit_order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self._cancel_children()
+            self.stop_order = None
+            self.limit_order = None
+            self.trade_dir = 0
+            self.entry_price = None
+            self.entry_atr = None
+            self.extreme = None
+            self.trail_active = False
+```
+```json
+{"assumptions": [{"topic": "infeasible", "choice": "Instead of cerebro.resampledata, 4H and daily bars are aggregated manually inside the strategy from the single 60m feed (daily keyed by calendar date; 4H keyed by (date, hour//4) -> two 4H buckets per RTH session). Each higher-timeframe score is recomputed only when a bucket completes and is held constant between completions.", "reason": "The harness fixes cerebro with one 60m PandasData feed; resampledata is a pre-run cerebro call that cannot be invoked from within a bt.Strategy, so manual resampling is the closest literal reading, and forward-holding mirrors how resampled indicator values behave on the base bars."},
+{"topic": "score-range", "choice": "The 15 per-timeframe signals are summed and then clamped to [-10, +10].", "reason": "Summing 15 unit signals yields a natural range of [-15, +15], but the spec states the score is 'in [-10, +10]', so the sum is clipped to that stated range (thresholds used are +/-2 and +/-3, so clipping never affects alignment logic)."},
+{"topic": "slope(5)", "choice": "OBV/AccumDist/VPT 'slope(5)' is computed as value[-1] - value[-6] (change over 5 bars); up if >0, down if <0.", "reason": "The spec says 'slope(5) up/down' without defining the estimator; a 5-bar difference is the simplest sign-consistent reading."},
+{"topic": "indicator-conventions", "choice": "Stochastic(14) uses Backtrader's default slow Stochastic (K = SMA3 of raw %K, D = SMA3 of K); the bullish cross is tested as K crossing above D with K<20, bearish as K crossing below D with K>80. RSI(14) and ATR(10) use Wilder smoothing; CCI uses 0.015 mean-deviation.", "reason": "The spec names the indicators by parameter only; these match Backtrader's default implementations so the reference matches an idiomatic bt build."},
+{"topic": "donchian-breakout", "choice": "Donchian high/low is the highest high / lowest low of the prior 20 bars (excluding the current bar); a close above/below it is a breakout. The same prior-20 definition drives the order-block breakout/breakdown detection.", "reason": "If the current bar were included, 'close above Donchian high' could essentially never trigger; excluding the current bar makes the stated breakout signal detectable."},
+{"topic": "order-block", "choice": "A 'down candle' is close<open and an 'up candle' is close>open; the bullish/bearish order block stores that candle's [low, high], and 'in zone' means the current bar's close lies within that range.", "reason": "The spec leaves candle direction and the price used for the zone test unspecified; close vs open and current close are the standard conventions."},
+{"topic": "trailing-stop", "choice": "Trailing is enabled by default (use_trailing=True). Both the +1*ATR activation and the 2*ATR trail distance use the current 60m ATR(10). It is implemented by cancelling and replacing the bracket's stop child; any leftover child orders are cancelled when the trade closes.", "reason": "The spec marks trailing 'optional' but describes it, so it is implemented and enabled; it does not say whether the trailing ATR is the entry ATR or current ATR, so current 60m ATR(10) is used for consistency with 'trail stop at 2*ATR'."},
+{"topic": "entry-price-proxy", "choice": "Bracket stop-loss and take-profit levels are computed from the signal bar's close (used as the entry-price proxy); entries are market orders via buy_bracket/sell_bracket using the default sizer.", "reason": "Bracket prices must be submitted before the fill price is known, and position sizing is unstated so the canonical default sizer applies."},
+{"topic": "daily-filter-exit", "choice": "'Daily filter no longer supports the position' means daily score < +3 for an open long (or daily score > -3 for an open short), triggering an early close.", "reason": "The daily filter allows longs only at score >= +3 and shorts only at <= -3, so losing that condition is the natural exit trigger."},
+{"topic": "unused-indicators", "choice": "SMA(10/50/100/200), Volume SMA(20) and the outer Bollinger bands are not separately materialized; Bollinger mid (=SMA20) is the only band-related value used, per the scoring rules.", "reason": "The spec lists these under 'indicators computed per timeframe as needed', and no scoring rule references them, so they are not needed by the decision logic."}]}
+```

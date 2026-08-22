@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-R = Path(r"C:\Users\joshp\Desktop\LEAN-Bench-Research") / "lattice_arm"
+R = Path(r"C:\Users\joshp\Desktop\LEAN-Bench") / "arm"
 ASK_RE = re.compile(
     r"(?i)what .{0,50}(period|type)|please (provide|specify)|should .{0,40}use\?"
     r"|i need (the|a|an)?\s?.{0,60}(period|type)"

@@ -19,6 +19,8 @@ const CLAUDE_EXE = process.env.LB_CLAUDE_EXE || 'C:\\Users\\joshp\\AppData\\Roam
 const CODEX_JS = process.env.LB_CODEX_JS || 'C:\\Users\\joshp\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js';
 if (!fs.existsSync(CLAUDE_EXE)) { console.error('CLAUDE_EXE missing: ' + CLAUDE_EXE); process.exit(3); }
 if (!fs.existsSync(CODEX_JS)) { console.error('CODEX_JS missing: ' + CODEX_JS); process.exit(3); }
+const GEMINI_JS = process.env.LB_GEMINI_JS || 'C:\\Users\\joshp\\AppData\\Roaming\\npm\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js';
+if (!fs.existsSync(GEMINI_JS)) { console.error('GEMINI_JS missing: ' + GEMINI_JS); process.exit(3); }
 
 function cleanEnv(extra) {
   return Object.assign({
@@ -39,7 +41,20 @@ function ensureAuth() {
   fs.mkdirSync(cc, { recursive: true });
   const cred = 'C:\\Users\\joshp\\.claude\\.credentials.json';
   if (fs.existsSync(cred)) fs.copyFileSync(cred, path.join(cc, '.credentials.json'));
-  return { ch, cc };
+  const gh = path.join(HOMES, 'gemini', '.gemini');
+  fs.mkdirSync(gh, { recursive: true });
+  fs.copyFileSync('C:\\Users\\joshp\\.gemini\\oauth_creds.json', path.join(gh, 'oauth_creds.json'));
+  // auth-mode selector only - carries no instructions
+  fs.writeFileSync(path.join(gh, 'settings.json'), JSON.stringify({ security: { auth: { selectedType: 'oauth-personal' } } }));
+  return { ch, cc, gh: path.join(HOMES, 'gemini') };
+}
+
+function geminiDraw(cwd, home) {
+  const r = spawnSync(process.execPath, [GEMINI_JS, '-p', PROBE, '-o', 'json', '--approval-mode', 'plan', '--skip-trust'],
+    { encoding: 'utf8', cwd, env: cleanEnv({ USERPROFILE: home.replace(/\//g, '\\'), HOME: home }), shell: false, timeout: 600000, maxBuffer: 64 * 1024 * 1024 });
+  const m = (r.stdout || '').match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]).response || ''; } catch (e) {} }
+  return r.stdout || '';
 }
 
 const MARKER = 'LB-CANARY-' + Date.now().toString(36).toUpperCase();
@@ -62,7 +77,7 @@ function claudeDraw(cwd, cfg, laneFlags) {
 }
 
 (async () => {
-  const { ch, cc } = ensureAuth();
+  const { ch, cc, gh } = ensureAuth();
   const results = [];
 
   { // codex: plant in cwd must fire; clean cwd must give a SUBSTANTIVE silent
@@ -88,6 +103,17 @@ function claudeDraw(cwd, cfg, laneFlags) {
                    laneflags_planted_silent: b.trim().length > 10 && !b.includes(MARKER) && !/STANDING INSTRUCTION/i.test(b),
                    clean_silent: c.trim().length > 10 && !c.includes(MARKER),
                    planted_head: aTxt.replace(/\n/g, ' ').slice(0, 120), lane_head: b.replace(/\n/g, ' ').slice(0, 120), clean_head: c.replace(/\n/g, ' ').slice(0, 120) });
+  }
+
+  { // gemini: plant in cwd must fire; clean must be substantive-silent
+    const p = fs.mkdtempSync(path.join(RUNS, 'can-gm-p-'));
+    fs.writeFileSync(path.join(p, 'GEMINI.md'), PLANT);
+    const plantedTxt = String(geminiDraw(p, gh));
+    const c = fs.mkdtempSync(path.join(RUNS, 'can-gm-c-'));
+    const cleanTxt = String(geminiDraw(c, gh));
+    results.push({ surface: 'gemini', plant_fired: plantedTxt.includes(MARKER),
+                   clean_silent: cleanTxt.trim().length > 10 && !cleanTxt.includes(MARKER) && !/STANDING INSTRUCTION/i.test(cleanTxt),
+                   planted_head: plantedTxt.replace(/\n/g, ' ').slice(0, 120), clean_head: cleanTxt.replace(/\n/g, ' ').slice(0, 120) });
   }
 
   const pass = results.every(r => r.plant_fired && r.clean_silent !== false && r.laneflags_planted_silent !== false);

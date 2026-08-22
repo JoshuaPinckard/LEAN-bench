@@ -1,0 +1,161 @@
+```python
+import backtrader as bt
+
+
+class TrendPullbackScaleIn(bt.Strategy):
+    params = (
+        ('atr_period', 14),
+        ('ema_period', 50),
+        ('high_lookback', 20),      # "recent high" window (declared assumption)
+        ('pullback_mult', 1.5),     # pullback / scaling / stop distance in ATR
+        ('tp_mult', 2.5),           # take-profit distance in ATR
+        ('stop_mult', 1.5),         # stop-loss distance in ATR
+        ('max_entries', 4),         # max consecutive entries in one direction
+        ('risk_per_entry', 0.01),   # 1% of total capital per individual position
+    )
+
+    def __init__(self):
+        # --- Indicators (exact periods from the spec) ---
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema = bt.indicators.ExponentialMovingAverage(
+            self.data.close, period=self.p.ema_period)
+        # "recent high" from which pullbacks are measured
+        self.recent_high = bt.indicators.Highest(
+            self.data.high, period=self.p.high_lookback)
+
+        # --- Order / pending-order tracking (canonical default #5) ---
+        self.order = None
+        self.order_intent = None
+        self.pending_atr = None
+        self._pending_removal = []
+
+        # --- Position sequence state ---
+        self.entries = []        # per-position records: id, price, size, stop
+        self.seq_entries = 0     # consecutive entries made in current sequence
+        self.ref_high = None     # frozen reference high for the sequence
+        self.ref_atr = None      # frozen ATR for the sequence's pullback levels
+        self.tp_level = None     # take-profit price (from the entry point)
+        self._eid = 0
+
+    # --- helpers ---
+    def _reset_sequence(self):
+        self.entries = []
+        self.seq_entries = 0
+        self.ref_high = None
+        self.ref_atr = None
+        self.tp_level = None
+
+    def _position_size(self, price):
+        # Each individual position = 1% of total trading capital (notional).
+        value = self.broker.getvalue()
+        if price <= 0:
+            return 0.0
+        return (self.p.risk_per_entry * value) / price
+
+    def next(self):
+        if self.order:
+            return
+
+        atr = self.atr[0]
+        ema = self.ema[0]
+        close = self.data.close[0]
+        pos = self.position.size
+
+        # ------------------------------------------------------------------
+        # FLAT: look for the first (initial) entry of a new sequence.
+        # ------------------------------------------------------------------
+        if pos == 0:
+            if self.seq_entries != 0 or self.entries:
+                self._reset_sequence()
+
+            # Buy condition 1: price above EMA(50).
+            # Buy condition 2: pullback of 1.5 ATR from a recent high.
+            level1 = self.recent_high[0] - self.p.pullback_mult * atr
+            if close > ema and close <= level1:
+                size = self._position_size(close)
+                if size > 0:
+                    self.ref_high = self.recent_high[0]
+                    self.ref_atr = atr
+                    self.pending_atr = atr
+                    self.order_intent = 'first'
+                    self.order = self.buy(size=size)
+            return
+
+        # ------------------------------------------------------------------
+        # IN POSITION: full-position exits take priority (declared ordering).
+        # ------------------------------------------------------------------
+
+        # Sell condition 2: price closes below EMA(50) -> close entire position.
+        if close < ema:
+            self.order_intent = 'close_all'
+            self.order = self.close()
+            return
+
+        # Sell condition 1: take-profit 2.5 ATR from the entry point -> close all.
+        if self.tp_level is not None and close >= self.tp_level:
+            self.order_intent = 'close_all'
+            self.order = self.close()
+            return
+
+        # Buy condition 3: scaling in on a further 1.5 ATR pullback level,
+        # up to the maximum of 4 consecutive entries (Buy condition 4).
+        if self.seq_entries < self.p.max_entries and close > ema:
+            k = self.seq_entries + 1
+            add_level = self.ref_high - k * self.p.pullback_mult * self.ref_atr
+            if close <= add_level:
+                size = self._position_size(close)
+                if size > 0:
+                    self.pending_atr = atr
+                    self.order_intent = 'add'
+                    self.order = self.buy(size=size)
+                    return
+
+        # Risk management 3: per-position stop-loss 1.5 ATR below each entry.
+        # Any position whose stop is breached is forcibly closed.
+        triggered = [e for e in self.entries if close <= e['stop']]
+        if triggered:
+            total = sum(e['size'] for e in triggered)
+            self._pending_removal = triggered
+            self.order_intent = 'stop_partial'
+            self.order = self.sell(size=total)
+            return
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        intent = self.order_intent
+
+        if order.status == order.Completed:
+            if intent in ('first', 'add'):
+                price = order.executed.price
+                self._eid += 1
+                self.entries.append({
+                    'id': self._eid,
+                    'price': price,
+                    'size': abs(order.executed.size),
+                    'stop': price - self.p.stop_mult * self.pending_atr,
+                })
+                if intent == 'first':
+                    self.tp_level = price + self.p.tp_mult * self.pending_atr
+                    self.seq_entries = 1
+                else:
+                    self.seq_entries += 1
+            elif intent == 'close_all':
+                self._reset_sequence()
+            elif intent == 'stop_partial':
+                ids = {e['id'] for e in self._pending_removal}
+                self.entries = [e for e in self.entries if e['id'] not in ids]
+                self._pending_removal = []
+
+        self.order = None
+        self.order_intent = None
+
+        # If the account is fully flat, reset the sequence counters so the
+        # 4-entry cap only re-arms once all current positions are closed.
+        if order.status == order.Completed and self.position.size == 0:
+            self._reset_sequence()
+```
+```json
+{"assumptions": [{"topic": "recent high definition", "choice": "\"a recent high\" is the highest high over a rolling 20-day lookback (bt.indicators.Highest, period 20).", "reason": "Spec references 'a recent high' / 'the next high' without defining the swing-high window; 20 daily bars (~1 month) is a reasonable D1 pullback reference."}, {"topic": "condition evaluation timing", "choice": "All conditions (pullback, take-profit, stop-loss, EMA break) are evaluated on the daily close; market orders then fill at the next bar's open.", "reason": "Only Sell rule 2 explicitly names 'closes'; the spec is otherwise silent on intrabar vs close and market orders are the canonical backtrader default for this harness."}, {"topic": "scaling-in level spacing", "choice": "Each additional entry k (k=1..4) triggers when close <= ref_high - k*1.5*ATR, using the reference high and ATR frozen at the first entry (successive pullback levels 1.5 ATR apart).", "reason": "'a new pullback level of 1.5 ATR from the next high' is ambiguous; freezing the reference and spacing levels by 1.5 ATR is the deterministic literal reading of stacking pullback entries."}, {"topic": "take-profit reference point", "choice": "The 2.5 ATR take-profit (which closes the entire position) is measured from the first entry of the sequence, using the ATR frozen at that first entry.", "reason": "Spec says 'from the entry point' (singular) and closes the entire position; the position's entry point is its initial entry."}, {"topic": "per-position stop-loss handling", "choice": "Each individual entry gets its own stop at fill_price - 1.5*ATR(at that entry). When breached, only that sub-position is force-closed (partial sell); the consecutive-entry count is not decremented.", "reason": "Spec sets the stop 'for each position' and speaks of 'losing entry(ies)', implying independent per-position stops rather than one aggregate stop."}, {"topic": "within-bar exit/entry priority", "choice": "On a given bar, full-position exits (EMA break, then take-profit) are checked first, then scaling-in adds, then per-position stops.", "reason": "The scaling add level (ref_high - k*1.5*ATR) numerically coincides with the prior entry's 1.5-ATR stop; prioritizing the add keeps rule 3 (scaling in) functional while still applying stops on subsequent bars. Spec does not specify tie ordering."}, {"topic": "position sizing / fractional shares", "choice": "Each entry's size = 1% of current total portfolio value / price, allowing fractional shares (no rounding).", "reason": "1% of $10,000 (~$100) is less than one AAPL share; integer rounding would floor to 0 and prevent any trades, so fractional notional sizing is required to honor the 1%-per-position rule."}, {"topic": "4% total risk cap", "choice": "The 4% maximum total risk in one direction is enforced by capping the sequence at 4 entries of 1% each.", "reason": "Spec itself states 4% 'corresponds to 4 consecutive entries at 1% each'; the entry cap implements this directly."}, {"topic": "long-only", "choice": "Only long entries are implemented; no shorting.", "reason": "The specification describes only long (buy on bullish trend/pullback) logic; canonical long-only default applies."}, {"topic": "infeasible", "choice": "The 'ETFs' instrument, 'D1 timeframe', and 'backtest the last two years before live trading' instructions are applied as-is to the fixed harness feed (AAPL daily bars, 2020-2025); the two-year backtest note is meta-advice with no in-strategy code.", "reason": "The harness fixes the instrument (AAPL, a stock not an ETF) and the full backtest window; the daily timeframe already matches, and the pre-live backtesting instruction is not an executable trading rule."}]}
+```

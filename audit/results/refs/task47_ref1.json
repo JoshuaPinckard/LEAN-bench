@@ -1,0 +1,95 @@
+{
+  "task_id": 47,
+  "ref_idx": 1,
+  "model": "opus",
+  "code": "import backtrader as bt\nimport collections\n\n\nclass FVGSwingFailureBreakoutStrategy(bt.Strategy):\n    # Parameters (values chosen only where the spec is silent; see assumptions).\n    params = dict(\n        swing_lookback=1,     # fractal pivot half-width for 4h swing highs/lows\n        flag_window=288,      # 24h (in 5m bars): validity of the 4h setup conditions\n        ob_body_mult=1.5,     # \"strong candle\" body vs recent average body\n        ob_avg_period=20,     # lookback for the average body used above\n        ob_window=48,         # order block must be within 4h of the breakout\n        rr=1000.0 / 300.0,    # 1:3.33 reward-to-risk (from the $300 -> $1000 example)\n        risk_pct=0.01,        # 1% of capital risked per trade\n        max_hold_bars=48,     # 4 hours maximum holding time\n    )\n\n    def __init__(self):\n        # ---- 4h aggregation state (single 5m feed resampled internally) ----\n        self.cur_bucket = None\n        self.h4_open = self.h4_high = self.h4_low = self.h4_close = None\n        self.h4o, self.h4h, self.h4l, self.h4c = [], [], [], []\n\n        # ---- 4h swing state ----\n        self.last_swing_high = None\n        self.prev_swing_high = None\n        self.last_swing_low = None\n        self.prev_swing_low = None\n\n        # ---- setup condition timestamps (in 5m bar index) ----\n        self.fvg_zone = None          # (low, high) of most recent bullish FVG\n        self.fvg_enter_bar = None     # price entered the FVG zone\n        self.swing_fail_bar = None    # bullish swing-failure formed\n        self.mss_bar = None           # bullish market structure shift formed\n\n        # ---- order block state (5m) ----\n        self.ob_top = None\n        self.ob_bottom = None\n        self.ob_bar = None\n        self.bodies = collections.deque(maxlen=self.p.ob_avg_period)\n        self.prev_close = None\n\n        # ---- trade state ----\n        self.order = None\n        self.entry_price = None\n        self.stop_price = None\n        self.tp1_price = None\n        self.tp2_price = None\n        self.half_size = 0.0\n        self.tp1_done = False\n        self.entry_bar = None\n        self.exiting = False\n\n        # ---- bar counter ----\n        self.bar_i = -1\n\n    # ------------------------------------------------------------------\n    def _reset_trade(self):\n        self.entry_price = None\n        self.stop_price = None\n        self.tp1_price = None\n        self.tp2_price = None\n        self.half_size = 0.0\n        self.tp1_done = False\n        self.entry_bar = None\n        self.exiting = False\n\n    def _valid(self, stamp):\n        return stamp is not None and (self.bar_i - stamp) <= self.p.flag_window\n\n    # ------------------------------------------------------------------\n    def _process_4h_bar(self):\n        n = len(self.h4c)\n        lb = self.p.swing_lookback\n\n        # --- 4h swing detection (fractal pivot) ---\n        if n >= 2 * lb + 1:\n            i = n - 1 - lb\n            is_high = (all(self.h4h[i] > self.h4h[i - k] for k in range(1, lb + 1)) and\n                       all(self.h4h[i] > self.h4h[i + k] for k in range(1, lb + 1)))\n            is_low = (all(self.h4l[i] < self.h4l[i - k] for k in range(1, lb + 1)) and\n                      all(self.h4l[i] < self.h4l[i + k] for k in range(1, lb + 1)))\n            if is_high:\n                self.prev_swing_high = self.last_swing_high\n                self.last_swing_high = self.h4h[i]\n                # bullish swing failure: higher high with an immediate lower-high pullback bar\n                if self.prev_swing_high is not None and self.last_swing_high > self.prev_swing_high:\n                    self.swing_fail_bar = self.bar_i\n            if is_low:\n                self.prev_swing_low = self.last_swing_low\n                self.last_swing_low = self.h4l[i]\n\n        # --- FVG detection (bullish: bull candle then bear candle, non-overlapping bodies) ---\n        if n >= 2:\n            o2, c2, h2 = self.h4o[-2], self.h4c[-2], self.h4h[-2]\n            o1, c1, l1 = self.h4o[-1], self.h4c[-1], self.h4l[-1]\n            bull_first = c2 > o2\n            bear_second = c1 < o1\n            if bull_first and bear_second and c2 < c1:  # bodies do not overlap (upward gap)\n                low = min(h2, l1)\n                high = max(h2, l1)\n                if high > low:\n                    self.fvg_zone = (low, high)\n\n        # --- MSS (bullish): a 4h close breaks below the last confirmed swing low ---\n        if self.last_swing_low is not None and self.h4c[-1] < self.last_swing_low:\n            self.mss_bar = self.bar_i\n\n    # ------------------------------------------------------------------\n    def next(self):\n        self.bar_i += 1\n        dt = self.data.datetime.datetime(0)\n        o = self.data.open[0]\n        h = self.data.high[0]\n        l = self.data.low[0]\n        c = self.data.close[0]\n\n        # ---------- 1) 4h aggregation ----------\n        bucket = (dt.year, dt.month, dt.day, dt.hour // 4)\n        if self.cur_bucket is None:\n            self.cur_bucket = bucket\n            self.h4_open, self.h4_high, self.h4_low, self.h4_close = o, h, l, c\n        elif bucket != self.cur_bucket:\n            self.h4o.append(self.h4_open)\n            self.h4h.append(self.h4_high)\n            self.h4l.append(self.h4_low)\n            self.h4c.append(self.h4_close)\n            self._process_4h_bar()\n            self.cur_bucket = bucket\n            self.h4_open, self.h4_high, self.h4_low, self.h4_close = o, h, l, c\n        else:\n            self.h4_high = max(self.h4_high, h)\n            self.h4_low = min(self.h4_low, l)\n            self.h4_close = c\n\n        # ---------- 2) price enters the FVG zone ----------\n        if self.fvg_zone is not None:\n            zlow, zhigh = self.fvg_zone\n            if l <= zhigh and h >= zlow:\n                self.fvg_enter_bar = self.bar_i\n\n        # ---------- 3) manage an open position ----------\n        if self.position and not self.exiting:\n            bars_open = self.bar_i - self.entry_bar if self.entry_bar is not None else 0\n            if self.stop_price is not None and l <= self.stop_price:          # stop-loss\n                self.close()\n                self.exiting = True\n            elif bars_open > self.p.max_hold_bars:                             # max holding time\n                self.close()\n                self.exiting = True\n            elif self.tp2_price is not None and h >= self.tp2_price:           # 100% take-profit\n                self.close()\n                self.exiting = True\n            elif (not self.tp1_done) and self.tp1_price is not None and h >= self.tp1_price:\n                self.sell(size=self.half_size)                                # 50% partial take-profit\n                self.tp1_done = True\n\n        # ---------- 4) entry ----------\n        can_enter = ((not self.position) and self.order is None and\n                     (not self.exiting) and dt.weekday() < 5)\n        if (can_enter and self._valid(self.fvg_enter_bar) and\n                self._valid(self.swing_fail_bar) and self._valid(self.mss_bar)):\n            if (self.ob_top is not None and self.ob_bar is not None and\n                    (self.bar_i - self.ob_bar) <= self.p.ob_window and\n                    self.prev_close is not None and\n                    self.prev_close <= self.ob_top and c > self.ob_top):       # upward OB breakout\n                stop = self.ob_bottom\n                per_unit = c - stop\n                if per_unit > 0:\n                    value = self.broker.getvalue()\n                    cash = self.broker.getcash()\n                    size = (self.p.risk_pct * value) / per_unit\n                    max_aff = 0.995 * cash / c if c > 0 else 0.0\n                    if size > max_aff:\n                        size = max_aff\n                    if size > 0:\n                        self.entry_price = c\n                        self.stop_price = stop\n                        self.tp1_price = c + 0.5 * self.p.rr * per_unit\n                        self.tp2_price = c + self.p.rr * per_unit\n                        self.half_size = size / 2.0\n                        self.tp1_done = False\n                        self.entry_bar = self.bar_i\n                        self.order = self.buy(size=size)\n                        # one trade per confirmed setup\n                        self.fvg_enter_bar = None\n                        self.swing_fail_bar = None\n                        self.mss_bar = None\n\n        # ---------- 5) update order block candidate from this bar ----------\n        body = abs(c - o)\n        if len(self.bodies) >= self.p.ob_avg_period:\n            avg_body = sum(self.bodies) / len(self.bodies)\n            if c < o and body >= self.p.ob_body_mult * avg_body:  # last strong bearish candle\n                self.ob_top = o\n                self.ob_bottom = c\n                self.ob_bar = self.bar_i\n        self.bodies.append(body)\n        self.prev_close = c\n\n    # ------------------------------------------------------------------\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n        if order.status == order.Completed:\n            if order is self.order:\n                self.order = None\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            if order is self.order:\n                self.order = None\n                if not self.position:\n                    self._reset_trade()\n\n    def notify_trade(self, trade):\n        if trade.isclosed:\n            self._reset_trade()",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Traded the provided BTC-USD 5m spot feed instead of Bitcoin futures.",
+      "reason": "Spec calls for Bitcoin futures but the harness supplies only a BTC-USD OHLCV feed; used the closest literal instrument available."
+    },
+    {
+      "topic": "4h timeframe",
+      "choice": "Resampled the 4-hour timeframe internally by aggregating 48 consecutive 5m bars into 4h buckets aligned to 00/04/08/12/16/20 UTC.",
+      "reason": "The harness adds a single 5m feed; the 4h analysis timeframe must be reconstructed inside the strategy."
+    },
+    {
+      "topic": "swing detection",
+      "choice": "4h swing highs/lows identified as fractal pivots with lookback 1 (one lower/higher bar on each side).",
+      "reason": "Spec references highs/lows and higher highs/lower lows but gives no pivot definition."
+    },
+    {
+      "topic": "FVG definition",
+      "choice": "Implemented the literal two-candle FVG; for this long-only strategy only the bullish case (bullish candle then bearish candle with non-overlapping bodies, c2<c1) is tracked. Zone = [high of bullish candle, low of bearish candle]. 'Price enters' = a 5m bar's range touches the zone.",
+      "reason": "Spec defines FVG on two candles and says 'price returns to this zone'; the bullish variant is the one relevant to a long."
+    },
+    {
+      "topic": "swing failure (bullish)",
+      "choice": "Confirmed when a new 4h swing high exceeds the previous swing high and the following pivot-confirming bar makes a lower high (pullback that does not reach the high).",
+      "reason": "Matches the spec's bullish swing-failure definition and the 'cannot break the previous high after a pullback' example."
+    },
+    {
+      "topic": "MSS (bullish)",
+      "choice": "Confirmed when a completed 4h candle closes below the last confirmed 4h swing low ('breaks the previous low' -> bullish shift).",
+      "reason": "Directly follows the spec's MSS definition ('a low for a bullish shift') and the condition-3 example."
+    },
+    {
+      "topic": "condition combination / validity",
+      "choice": "FVG entry, swing failure and MSS must all be active within a 288-bar (24h) window to arm entry; they may occur simultaneously or sequentially.",
+      "reason": "Spec says 'simultaneously or sequentially' but gives no time window; a 24h validity keeps the setup fresh."
+    },
+    {
+      "topic": "order block",
+      "choice": "Bullish order block = last 5m bearish candle whose body >= 1.5x the 20-bar average body ('strong candle'); order block body = [close, open]; must be within 48 bars (4h) of the breakout. Upward breakout = a 5m close above the body top.",
+      "reason": "Spec defines the OB as the body of the last strong candle before a sharp move; thresholds for 'strong' and 'recent' are unspecified."
+    },
+    {
+      "topic": "entry price and stop",
+      "choice": "Entry reference = close of the breakout bar; stop = opposite (lower) side of the order block body.",
+      "reason": "Spec: stop 'on the opposite side of the Order Block'; market order fills next open, so the breakout close is used to size and set targets."
+    },
+    {
+      "topic": "take-profit / partials",
+      "choice": "Total take-profit distance = 3.333x risk (R:R 1:3.33 from the $300->$1000 example). TP1 (sell half) at +50% of that distance; TP2 (close remainder) at +100%.",
+      "reason": "Spec ties reward to the 1:3.33 ratio and requires partial closes at 50% and 100% of the total take-profit."
+    },
+    {
+      "topic": "risk sizing",
+      "choice": "size = (1% of equity) / (entry - stop), capped to affordable cash (0.995*cash/price). Capping only reduces risk.",
+      "reason": "Spec: 1% fixed risk with loss not exceeding risk; the spot/cash environment has no leverage, so full risk-based size may be unaffordable and is capped down."
+    },
+    {
+      "topic": "maximum holding time",
+      "choice": "Force-close after 48 5m bars (4 hours).",
+      "reason": "Spec states 'more than 3-4 hours'; chose the upper bound of the stated range."
+    },
+    {
+      "topic": "weekends",
+      "choice": "No new entries on Saturday/Sunday (UTC); management of an already-open position still runs.",
+      "reason": "Spec says the strategy is 'not active on weekends'; interpreted as no new activity while still honoring protective exits."
+    },
+    {
+      "topic": "trade lifecycle",
+      "choice": "One trade per confirmed setup (arming flags cleared on entry); long-only, single position, no pyramiding or re-entry while open.",
+      "reason": "Spec describes only a long setup and gives no re-entry rule; applied canonical single-position defaults."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2026-06-15T01:40:00",
+      "side": "BUY",
+      "size": 0.15151926136263594,
+      "price": 65660.9375
+    },
+    {
+      "dt": "2026-06-15T05:45:00",
+      "side": "SELL",
+      "size": -0.15151926136263594,
+      "price": 65686.078125
+    }
+  ]
+}

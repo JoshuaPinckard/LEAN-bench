@@ -1,0 +1,167 @@
+{
+  "task_id": 66,
+  "ref_idx": 2,
+  "model": "sonnet",
+  "code": "import backtrader as bt\n\n\nclass DoubleBottomStrategy(bt.Strategy):\n\n    params = (\n        ('sma_period', 200),\n        ('vol_avg_period', 20),\n        ('bottom_tolerance', 0.01),   # 1% max difference between bottoms\n        ('min_bars_between', 10),      # min bars separating two bottoms\n        ('stop_pct', 0.005),           # 0.5% below second bottom\n        ('local_n', 5),               # bars on each side for local extremum detection\n        ('max_lookback', 200),        # max bars to scan backward for pattern\n    )\n\n    def __init__(self):\n        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)\n        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_avg_period)\n        self.order = None\n        self.stop_price = None\n        self.take_profit_price = None\n        self._pending_stop = None\n\n    def notify_order(self, order):\n        if order.status == order.Completed:\n            if order.isbuy():\n                fill = order.executed.price\n                risk = fill - self._pending_stop\n                self.stop_price = self._pending_stop\n                self.take_profit_price = fill + 2.0 * risk\n            self.order = None\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n            self._pending_stop = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if self.position:\n            close = self.data.close[0]\n            if close <= self.stop_price:\n                self.order = self.close()\n                return\n            if close >= self.take_profit_price:\n                self.order = self.close()\n                return\n            if close < self.sma200[0]:\n                self.order = self.close()\n                return\n            return\n\n        if self.data.close[0] <= self.sma200[0]:\n            return\n\n        result = self._find_double_bottom()\n        if result is not None:\n            _, low2 = result\n            self._pending_stop = low2 * (1.0 - self.p.stop_pct)\n            self.order = self.buy()\n\n    def _find_double_bottom(self):\n        n = self.p.local_n\n        available = len(self.data)\n        lb = min(self.p.max_lookback, available - 1)\n        total = min(lb + n + 1, available)\n\n        # Need enough history for two bottoms (each n-confirmed) plus minimum gap plus prev bar\n        if total < 2 * n + self.p.min_bars_between + 2:\n            return None\n\n        # Volume must exceed 20-period average to confirm breakout\n        if self.data.volume[0] <= self.vol_sma20[0]:\n            return None\n\n        current_close = self.data.close[0]\n        prev_close = self.data.close[-1]\n\n        # lows[i] / highs[i] = value i bars ago (0 = current bar)\n        lows = [self.data.low[-i] for i in range(total)]\n        highs = [self.data.high[-i] for i in range(total)]\n\n        # Only consider indices with n confirmed bars on each side\n        valid_range = range(n, total - n)\n\n        local_mins = [\n            i for i in valid_range\n            if all(lows[i] <= lows[j] for j in range(i - n, i + n + 1) if j != i)\n        ]\n        local_maxs = [\n            i for i in valid_range\n            if all(highs[i] >= highs[j] for j in range(i - n, i + n + 1) if j != i)\n        ]\n\n        # Pattern (in bars-ago indexing, larger index = older bar):\n        #   b1 (oldest bottom) > nl (neckline) > b2 (newer bottom) > 0 (current breakout)\n        for b2 in local_mins:\n            low2 = lows[b2]\n            for nl in local_maxs:\n                if nl <= b2:\n                    continue  # neckline must be older than second bottom\n                neckline = highs[nl]\n                if neckline <= low2:\n                    continue  # neckline must be above second bottom\n                if current_close <= neckline:\n                    continue  # require current close to break above neckline\n                if prev_close > neckline:\n                    continue  # require fresh crossover (previous close at or below neckline)\n                for b1 in local_mins:\n                    if b1 <= nl:\n                        continue  # first bottom must be older than neckline\n                    if b1 - b2 < self.p.min_bars_between:\n                        continue  # at least 10 bars between the two bottoms\n                    low1 = lows[b1]\n                    if abs(low1 - low2) / max(low1, low2) > self.p.bottom_tolerance:\n                        continue  # bottoms must be within 1% of each other\n                    if neckline <= low1:\n                        continue  # neckline must be above first bottom\n                    return (neckline, low2)\n\n        return None",
+  "assumptions": [
+    {
+      "topic": "local extremum detection window (local_n)",
+      "choice": "5 bars on each side; a bar is a local minimum if its low is the minimum within \u00b15 bars, and a local maximum if its high is the maximum within \u00b15 bars",
+      "reason": "The spec names 'first low', 'intermediate peak', and 'second low' but gives no algorithmic definition of a local extremum. 5 bars per side is a standard choice for daily-bar chart pattern recognition, balancing noise suppression against responsiveness."
+    },
+    {
+      "topic": "max lookback for pattern scan",
+      "choice": "200 bars",
+      "reason": "The spec does not bound how far back to search for the double bottom. Patterns older than 200 bars are unlikely to be actionable; this also keeps per-bar scan cost bounded."
+    },
+    {
+      "topic": "neckline price level",
+      "choice": "The HIGH of the local-maximum bar between the two bottoms; breakout condition is current_close > high[neckline_bar]",
+      "reason": "The spec calls it the 'intermediate peak' and says price must 'break above' it. Using the intraday high of the peak bar is the standard resistance level in technical analysis."
+    },
+    {
+      "topic": "stop-loss and take-profit exit checks use close price",
+      "choice": "All exit conditions (stop, take-profit, SMA200) are evaluated against the bar's close price",
+      "reason": "The spec says 'place a stop-loss' (implying a live order) but the feed provides only OHLCV daily bars. The SMA exit explicitly uses 'closes a candle below', so close-based checking is applied consistently to all exits."
+    },
+    {
+      "topic": "take-profit risk computed from actual fill price",
+      "choice": "risk = fill_price - stop_price; take_profit = fill_price + 2 * risk, where fill_price is obtained from notify_order on the buy execution",
+      "reason": "The spec says '2:1 potential profit is two times the risk defined by the stop-loss'. Risk depends on entry price; using the actual fill (next bar open under default market order) is more accurate than using the signal bar close."
+    },
+    {
+      "topic": "breakout freshness (fresh crossover required)",
+      "choice": "The bar immediately before the current one must have a close at or below the neckline (prev_close <= neckline), so the current bar is the first close above the neckline",
+      "reason": "The spec says price 'breaks above' the neckline, implying a crossover event rather than a continuation of an already-broken level. Without this guard, the same stale pattern could re-trigger entries many bars after the actual breakout."
+    },
+    {
+      "topic": "bottom tolerance comparison formula",
+      "choice": "abs(low1 - low2) / max(low1, low2) <= 0.01",
+      "reason": "The spec says 'no more than 1% lower or higher'. Dividing by the larger of the two values gives a symmetric percentage that matches common technical-analysis practice."
+    },
+    {
+      "topic": "pattern priority when multiple valid patterns exist in the lookback",
+      "choice": "The first pattern found by iterating b2, nl, b1 in ascending index order (most recent second bottom, earliest valid neckline, earliest valid first bottom) is returned",
+      "reason": "The spec does not address ambiguity; the most recent second bottom is the most actionable signal."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 10,
+  "tape": [
+    {
+      "dt": "2021-06-15T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 126.6592421533219
+    },
+    {
+      "dt": "2021-07-12T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 142.51850183873523
+    },
+    {
+      "dt": "2021-07-14T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 144.36078433286042
+    },
+    {
+      "dt": "2022-03-15T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 147.7134197726543
+    },
+    {
+      "dt": "2022-03-16T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 153.73355381345266
+    },
+    {
+      "dt": "2022-04-27T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 152.61759051221244
+    },
+    {
+      "dt": "2022-04-29T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 158.42238298865084
+    },
+    {
+      "dt": "2022-05-02T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 153.4007100151784
+    },
+    {
+      "dt": "2023-02-03T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 145.5595309829737
+    },
+    {
+      "dt": "2023-02-27T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 145.46665970602933
+    },
+    {
+      "dt": "2023-03-06T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 151.4543124625378
+    },
+    {
+      "dt": "2023-07-20T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 192.39280905028917
+    },
+    {
+      "dt": "2023-12-06T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 192.2735994925461
+    },
+    {
+      "dt": "2024-02-20T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 179.98463913307552
+    },
+    {
+      "dt": "2024-05-06T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 180.53911545314375
+    },
+    {
+      "dt": "2024-07-03T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 218.11061688690268
+    },
+    {
+      "dt": "2024-10-16T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 229.87676649695567
+    },
+    {
+      "dt": "2025-03-12T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 218.98294858814833
+    },
+    {
+      "dt": "2025-09-22T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 247.5995237986898
+    }
+  ]
+}

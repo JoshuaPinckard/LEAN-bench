@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-R = Path(r"C:\Users\joshp\Desktop\LEAN-Bench-Research")
-for p in ("harness", "bank", "codebook"):
+R = Path(__file__).resolve().parent.parent
+for p in ("instruments", "bank", "codebook"):
     sys.path.insert(0, str(R / p))
 import grade  # noqa: E402
 from bank_runner import load_bank  # noqa: E402
@@ -18,9 +18,9 @@ MODEL, EFFORT = sys.argv[1], sys.argv[2]
 NOASK = "noask" in sys.argv[3:]
 _safe_model = re.sub(r"[^\w.-]", "", MODEL)
 LANE = f"{_safe_model}_{EFFORT}"
-GENS = R / "lattice_arm" / ("gens_noask" if NOASK else "gens") / f"{LANE}.jsonl"
-EXEC = R / "lattice_arm" / "exec"
-GRADED = R / "lattice_arm" / ("graded_noask" if NOASK else "graded")
+GENS = R / "arm" / ("gens_noask" if NOASK else "gens") / f"{LANE}.jsonl"
+EXEC = R / "arm" / "exec"
+GRADED = R / "arm" / ("graded_noask" if NOASK else "graded")
 EXEC.mkdir(parents=True, exist_ok=True)
 GRADED.mkdir(parents=True, exist_ok=True)
 grade.EXEC_DIR = EXEC          # arm manifests live with the arm, not in harness/exec

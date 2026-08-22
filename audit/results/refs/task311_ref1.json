@@ -1,0 +1,60 @@
+{
+  "task_id": 311,
+  "ref_idx": 1,
+  "model": "opus",
+  "code": "import backtrader as bt\n\n\nclass SmaAtrTrailStrategy(bt.Strategy):\n    # NOTE: commission (0.001) and slippage are broker-level PLACEHOLDERS.\n    # The actual broker/commission/slippage configuration is owned by the\n    # harness at the cerebro level; the params below are inert placeholders\n    # so the spec's \"commission/slippage placeholders\" are explicitly present.\n    params = (\n        ('sma_period', 20),\n        ('atr_period', 14),\n        ('atr_mult', 3),\n        ('commission', 0.001),  # placeholder; real value set on broker by harness\n        ('slippage', 0.0),      # placeholder; real value set on broker by harness\n    )\n\n    def __init__(self):\n        # Indicators exactly as specified: SMA(20) on close and ATR(14).\n        self.sma = bt.indicators.SimpleMovingAverage(\n            self.data.close, period=self.p.sma_period)\n        self.atr = bt.indicators.AverageTrueRange(\n            self.data, period=self.p.atr_period)\n        # Cross of close vs SMA(20): +1 crosses above, -1 crosses below.\n        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)\n\n        self.order = None         # pending entry order (guard)\n        self.stop_order = None    # resting trailing-stop exit order\n        self.trail_stop = None    # current ratcheting trailing-stop level\n        self.highest_close = None  # highest close since entry (long)\n        self.lowest_close = None   # lowest close since entry (short)\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status in (order.Completed, order.Canceled,\n                             order.Margin, order.Rejected):\n            if order is self.order:\n                self.order = None\n            if order is self.stop_order:\n                self.stop_order = None\n\n    def notify_trade(self, trade):\n        # Reset per-trade trailing state once the position is fully closed.\n        if trade.isclosed:\n            self.trail_stop = None\n            self.highest_close = None\n            self.lowest_close = None\n\n    def next(self):\n        # ---- Entries: only when flat and no pending entry order ----\n        if not self.position:\n            if self.order is not None:\n                return\n            if self.crossover[0] > 0:      # prior-bar close crossed above SMA(20)\n                self.order = self.buy()     # market -> fills at next bar open\n            elif self.crossover[0] < 0:    # prior-bar close crossed below SMA(20)\n                self.order = self.sell()    # market -> fills at next bar open\n            return\n\n        # ---- Manage open position: ratchet trailing stop in trade's favor ----\n        if self.position.size > 0:          # LONG\n            if self.highest_close is None:\n                self.highest_close = self.data.close[0]\n            else:\n                self.highest_close = max(self.highest_close, self.data.close[0])\n            candidate = self.highest_close - self.p.atr_mult * self.atr[0]\n            if self.trail_stop is None:\n                self.trail_stop = candidate\n            else:\n                # trail_stop = max(previous_trail_stop, highest_close - 3*ATR)\n                self.trail_stop = max(self.trail_stop, candidate)\n\n            if self.crossover[0] < 0:        # close crossed below SMA(20) -> exit\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.close()\n            else:\n                # (Re)place the stop-loss exit order, updated each bar.\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                self.stop_order = self.sell(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Stop,\n                    price=self.trail_stop)\n\n        elif self.position.size < 0:        # SHORT\n            if self.lowest_close is None:\n                self.lowest_close = self.data.close[0]\n            else:\n                self.lowest_close = min(self.lowest_close, self.data.close[0])\n            candidate = self.lowest_close + self.p.atr_mult * self.atr[0]\n            if self.trail_stop is None:\n                self.trail_stop = candidate\n            else:\n                # trail_stop = min(previous_trail_stop, lowest_close + 3*ATR)\n                self.trail_stop = min(self.trail_stop, candidate)\n\n            if self.crossover[0] > 0:        # close crossed above SMA(20) -> exit\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.close()\n            else:\n                # (Re)place the stop-loss exit order, updated each bar.\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                self.stop_order = self.buy(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Stop,\n                    price=self.trail_stop)",
+  "assumptions": [
+    {
+      "topic": "short SMA-cross exit",
+      "choice": "Close a short position when close crosses above SMA(20) (the mirror of the stated long exit), in addition to its trailing stop.",
+      "reason": "The spec explicitly states the SMA-cross exit only for longs, but provides a short trailing-stop formula and fully symmetric long/short entries. The mirror condition is the reasonable symmetric reading needed to make shorts exitable; declared because it is not literally written."
+    },
+    {
+      "topic": "stop execution",
+      "choice": "Implemented the trailing stop as real backtrader Stop orders sized to the open position and updated each bar via cancel/replace (triggers intrabar at the stop price); the SMA-cross exit uses a market order (fills at next bar open).",
+      "reason": "Spec says 'Execute stop exits as stop orders updated each bar.' The SMA-cross exit is a close-based signal, so it is executed as a market close per standard backtrader semantics."
+    },
+    {
+      "topic": "entry timing",
+      "choice": "Detect the close/SMA crossover in next() and submit a plain market order, which fills at the next bar's open.",
+      "reason": "Matches 'enter at the next bar open when the prior bar close crosses' \u2014 from the entry bar's open, the just-closed (prior) bar is the crossover bar, using default market-on-next-open semantics (no cheat-on-open)."
+    },
+    {
+      "topic": "highest/lowest close initialization",
+      "choice": "highest_close_since_entry (long) / lowest_close_since_entry (short) initialized from the close of the entry bar (first next() after the fill) and updated each subsequent bar.",
+      "reason": "The entry fills at a bar open; the first available close 'since entry' is that entry bar's close."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "Default sizer for entries (fixed size, 1 share); stop and market exits sized to the current open position.",
+      "reason": "Spec: 'Use default sizer (e.g., fixed size).' Exit sizing to abs(position size) guarantees a full close and matches the default 1-share position."
+    },
+    {
+      "topic": "commission/slippage",
+      "choice": "Included as inert params ('commission'=0.001, 'slippage'=0.0) plus a comment; no broker configuration is done inside the strategy.",
+      "reason": "Spec asks to 'include commission/slippage placeholders,' while cerebro/broker setup (commission 0.001) is owned by the harness."
+    },
+    {
+      "topic": "pending-order / one-position guard",
+      "choice": "Entries only when flat and no pending entry order; the resting trailing-stop order is canceled before issuing an SMA-cross market close to avoid a double exit / position flip.",
+      "reason": "Canonical defaults: single position at a time, no pyramiding/re-entry while open, guard pending orders reset in notify_order."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2026-04-15T17:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 264.9100036621094
+    },
+    {
+      "dt": "2026-04-15T18:10:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 265.0199890136719
+    }
+  ]
+}

@@ -1,0 +1,149 @@
+```python
+import backtrader as bt
+import math
+
+
+class CupAndHandleStrategy(bt.Strategy):
+    params = (
+        ('window', 400),            # bars scanned to locate the whole formation
+        ('min_formation', 250),     # >= 1 year (~250 daily candles) from left rim to now
+        ('vol_period', 50),         # average-volume period for breakout confirmation
+        ('risk_pct', 0.02),         # risk per trade (<= 1-2% of total capital)
+        ('rim_tol', 0.10),          # max relative gap allowed between the two cup rims
+        ('min_cup_depth', 0.10),    # cup must be at least this deep vs the rim
+        ('max_cup_depth', 0.60),    # cup must not be deeper than this vs the rim
+        ('handle_retrace', 1.0 / 3.0),  # handle low may retrace <= 1/3 of cup height
+        ('min_handle', 5),          # min handle length (bars)
+        ('max_handle', 60),         # max handle length (bars)
+        ('side_frac', 0.20),        # each cup side spans >= this fraction of cup width (U not V)
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_level = None
+        # volume indicator used to confirm the breakout
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_period)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _detect(self):
+        # Identify a Cup-and-Handle in the trailing window using OHLC only.
+        # Returns (resistance, handle_low) or None.
+        W = self.p.window
+        highs = self.data.high.get(size=W)
+        lows = self.data.low.get(size=W)
+        if len(highs) < W or len(lows) < W:
+            return None
+
+        # Left rim: highest high in the earliest region, forced far enough back that
+        # the formation (left rim -> now) spans at least min_formation bars.
+        left_search_end = W - self.p.min_formation  # exclusive
+        if left_search_end <= 1:
+            return None
+        left_rim_idx = max(range(0, left_search_end), key=lambda k: highs[k])
+        left_rim = highs[left_rim_idx]
+
+        # Right rim: highest high in the recent region, positioned so the handle
+        # (right rim -> bar before breakout) has a length within [min_handle, max_handle].
+        right_lo = max((W - 1) - self.p.max_handle, left_rim_idx + 1)
+        right_hi = (W - 1) - self.p.min_handle + 1  # exclusive
+        if right_hi <= right_lo:
+            return None
+        right_rim_idx = max(range(right_lo, right_hi), key=lambda k: highs[k])
+        right_rim = highs[right_rim_idx]
+
+        # Cup bottom: lowest low strictly between the two rims.
+        if right_rim_idx <= left_rim_idx + 1:
+            return None
+        bottom_idx = min(range(left_rim_idx + 1, right_rim_idx), key=lambda k: lows[k])
+        bottom = lows[bottom_idx]
+
+        # Neckline / resistance = upper boundary of the cup.
+        resistance = max(left_rim, right_rim)
+
+        # Handle low = lowest low from the right rim up to the bar before the breakout bar.
+        handle_low = min(lows[right_rim_idx:W - 1])
+
+        # ---- pattern validation ----
+        if left_rim <= 0 or right_rim <= 0:
+            return None
+        rim = (left_rim + right_rim) / 2.0
+        # rims must sit at a comparable level
+        if abs(left_rim - right_rim) / max(left_rim, right_rim) > self.p.rim_tol:
+            return None
+        # cup depth (magnitude of the U)
+        cup_height = rim - bottom
+        if cup_height <= 0:
+            return None
+        depth = cup_height / rim
+        if depth < self.p.min_cup_depth or depth > self.p.max_cup_depth:
+            return None
+        # U-shape (rounded, not a sharp V): both sides must span enough bars
+        cup_width = right_rim_idx - left_rim_idx
+        if cup_width <= 0:
+            return None
+        left_side = bottom_idx - left_rim_idx
+        right_side = right_rim_idx - bottom_idx
+        if left_side < self.p.side_frac * cup_width or right_side < self.p.side_frac * cup_width:
+            return None
+        # handle: a small decline/consolidation in the upper part of the cup
+        if handle_low <= bottom:
+            return None
+        if (right_rim - handle_low) > self.p.handle_retrace * cup_height:
+            return None
+
+        return resistance, handle_low
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            # Exit: price drops below the lowest point of the handle (stop-loss)
+            if self.stop_level is not None and self.data.close[0] < self.stop_level:
+                self.order = self.close()
+            return
+
+        # need a full window of history to search the formation
+        if len(self.data) < self.p.window:
+            return
+
+        detected = self._detect()
+        if detected is None:
+            return
+        resistance, handle_low = detected
+
+        price = self.data.close[0]
+        # Breakout above resistance; requiring the close above also satisfies the
+        # "preferably close above resistance" condition.
+        if price <= resistance:
+            return
+        # Volume confirmation: breakout volume above the average of the last 50 candles.
+        if self.data.volume[0] <= self.vol_sma[0]:
+            return
+
+        # Position sizing from the stop-loss distance (handle low).
+        risk_per_share = price - handle_low
+        if risk_per_share <= 0:
+            return
+        value = self.broker.getvalue()
+        risk_capital = self.p.risk_pct * value
+        size = int(math.floor(risk_capital / risk_per_share))
+
+        # cap by affordable cash (leave a small buffer for commission)
+        cash = self.broker.get_cash()
+        affordable = int(math.floor((cash * 0.99) / price))
+        size = min(size, affordable)
+        if size < 1:
+            return
+
+        self.stop_level = handle_low
+        self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [{"topic": "timeframe", "choice": "Implemented on the provided 1d AAPL feed and required the formation (left rim -> current bar) to span >= 250 daily bars.", "reason": "Harness fixes a 1d feed; the spec itself gives the daily interpretation ('at least 1 year ... about 250 candles'), so no separate 1y timeframe resample is needed."}, {"topic": "pattern_detection_geometry", "choice": "Scan a 400-bar window: left rim = highest high in the earliest region (forced >=250 bars before now); right rim = highest high 5-60 bars before now; cup bottom = lowest low between the rims. Validate with rim symmetry <=10%, cup depth 10-60% of rim, each cup side >=20% of cup width (U not V), handle low above the cup bottom, handle retrace <= 1/3 of cup height.", "reason": "Spec defines the pattern qualitatively (U-shaped cup, small handle) but gives no numeric thresholds; chose standard Cup-and-Handle heuristics using OHLC only."}, {"topic": "resistance_level", "choice": "Neckline / resistance = max(left rim high, right rim high).", "reason": "Spec: resistance is 'the upper boundary of the cup (the pattern neckline)'."}, {"topic": "breakout_condition", "choice": "Enter when the breakout candle's CLOSE is above resistance.", "reason": "Satisfies the mandatory 'price must break upward above resistance' (rule 2) and the preferred 'closing price above resistance' (rule 4) in one confirmed condition, avoiding intrabar ambiguity."}, {"topic": "volume_confirmation", "choice": "Used SMA(volume, 50) and required breakout volume > that average.", "reason": "Spec: 'above the average volume over the last 50 candles'; SMA over the last 50 bars is the direct implementation of that average."}, {"topic": "handle_length", "choice": "Handle constrained to 5-60 bars.", "reason": "Spec is silent on handle duration; chose reasonable bounds for a short consolidation relative to a >=1-year cup."}, {"topic": "exit_trigger", "choice": "Close the position when the daily close falls below the stored handle low.", "reason": "Spec: 'Close the position when price drops below the lowest point of the handle'; used the close to confirm the drop below the handle-low stop level."}, {"topic": "risk_pct", "choice": "Risk per trade set to 2% of total equity.", "reason": "Spec: risk 'must not exceed 1-2%'; chose the upper bound of the allowed range."}, {"topic": "position_sizing", "choice": "size = floor(risk_pct * broker equity / (breakout close - handle low)), then capped by floor(0.99 * cash / price); skip if <1 share.", "reason": "Spec: 'Position size must be calculated based on the stop-loss'; entry approximated by the breakout close (fill occurs next open) and capped so the order is affordable and not margin-rejected."}, {"topic": "single_position", "choice": "At most one position at a time; no pyramiding or re-entry while open.", "reason": "Canonical default; spec does not call for scaling in or multiple concurrent positions."}]}
+```

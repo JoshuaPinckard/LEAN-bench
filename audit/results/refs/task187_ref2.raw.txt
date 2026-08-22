@@ -1,0 +1,148 @@
+```python
+import backtrader as bt
+import random
+import math
+import statistics
+
+
+class PeriodicRebalancingStrategy(bt.Strategy):
+
+    def __init__(self):
+        self._closes = []
+        self._dates = []
+
+    def next(self):
+        self._closes.append(float(self.data.close[0]))
+        self._dates.append(self.data.datetime.date(0))
+
+    def stop(self):
+        # Resample daily bars to weekly: last daily close of each ISO calendar week
+        week_map = {}
+        week_order = []
+        for date, close in zip(self._dates, self._closes):
+            key = date.isocalendar()[:2]   # (ISO year, ISO week number)
+            if key not in week_map:
+                week_order.append(key)
+            week_map[key] = close          # last close of week wins
+        weekly_closes = [week_map[k] for k in week_order]
+        n_weeks = len(weekly_closes)
+
+        # Valid start indices: w0+52 must be a defined index
+        valid_starts = [i for i in range(n_weeks) if i + 52 < n_weeks]
+
+        random.seed(42)
+        n_runs = min(50, len(valid_starts))
+        start_indices = random.sample(valid_starts, n_runs)
+
+        commission = 0.001          # 0.1% per trade side
+        initial_cash = 10000.0
+        rebalance_at = {12, 24, 36, 48}   # rebalance weeks within 52-week run
+
+        total_returns = []
+        max_drawdowns = []
+        sharpe_ratios = []
+
+        for w0 in start_indices:
+            closes = [weekly_closes[w0 + k] for k in range(53)]   # weeks 0..52
+
+            # Initial buy at close of start week
+            shares = initial_cash / (closes[0] * (1.0 + commission))
+            pv = [shares * closes[0]]      # portfolio value after initial buy
+
+            for k in range(1, 53):
+                price = closes[k]
+                if k == 52:
+                    # Final exit: sell, collect cash
+                    cash = shares * price * (1.0 - commission)
+                    pv.append(cash)
+                elif k in rebalance_at:
+                    # Full close then immediate re-open at same week close
+                    cash = shares * price * (1.0 - commission)
+                    shares = cash / (price * (1.0 + commission))
+                    pv.append(shares * price)
+                else:
+                    pv.append(shares * price)
+
+            # Total return relative to initial cash
+            total_returns.append((pv[-1] - initial_cash) / initial_cash)
+
+            # Maximum drawdown (negative fraction)
+            peak = pv[0]
+            mdd = 0.0
+            for v in pv:
+                if v > peak:
+                    peak = v
+                dd = (v - peak) / peak
+                if dd < mdd:
+                    mdd = dd
+            max_drawdowns.append(mdd)
+
+            # Annualised Sharpe ratio from 52 weekly returns, risk-free rate = 0
+            weekly_rets = [(pv[i] - pv[i - 1]) / pv[i - 1] for i in range(1, 53)]
+            mean_r = statistics.mean(weekly_rets)
+            std_r = statistics.stdev(weekly_rets)   # sample stdev (N-1)
+            sharpe = (mean_r / std_r * math.sqrt(52)) if std_r > 0.0 else 0.0
+            sharpe_ratios.append(sharpe)
+
+        avg_tr = statistics.mean(total_returns)
+        avg_mdd = statistics.mean(max_drawdowns)
+        avg_sharpe = statistics.mean(sharpe_ratios)
+
+        print(f"Average Total Return: {avg_tr:.6f}")
+        print(f"Average Max Drawdown: {avg_mdd:.6f}")
+        print(f"Average Sharpe Ratio: {avg_sharpe:.6f}")
+
+        self.avg_total_return = avg_tr
+        self.avg_max_drawdown = avg_mdd
+        self.avg_sharpe_ratio = avg_sharpe
+```
+
+```json
+{"assumptions": [
+  {
+    "topic": "infeasible — 50 separate cerebro runs",
+    "choice": "All 50 backtests are simulated in stop() by manually replaying weekly close prices collected in next(). No actual bt orders are placed.",
+    "reason": "The harness provides one bt.Strategy instance over one Cerebro run; launching 50 separate Cerebro instances from within a bt.Strategy is not supported by the framework. Manual simulation is the closest literal reading of 'run a separate backtest for each start date'."
+  },
+  {
+    "topic": "random seed",
+    "choice": "random.seed(42) is used for reproducibility.",
+    "reason": "The spec says '50 random start dates' but specifies no seed. A fixed seed ensures deterministic execution required for audit trace comparison."
+  },
+  {
+    "topic": "weekly bar definition",
+    "choice": "A weekly bar is defined as the last daily close of each ISO calendar week (Monday–Sunday grouping via date.isocalendar()).",
+    "reason": "The spec says 'resampling from daily data'; ISO week is the standard and matches backtrader's own weekly resampling boundary."
+  },
+  {
+    "topic": "transaction price",
+    "choice": "All buys and sells (entry, rebalances, final exit) are executed at the weekly close price.",
+    "reason": "Only close prices are unambiguous at the weekly bar level; the spec does not specify intraweek execution timing."
+  },
+  {
+    "topic": "52-week forward horizon",
+    "choice": "A start week index w0 is valid if weekly_closes[w0+52] exists (i.e., w0+52 < total_weekly_bars).",
+    "reason": "52 trading-week bars must exist after the start week to run the full strategy period including the final exit bar."
+  },
+  {
+    "topic": "risk-free rate for Sharpe",
+    "choice": "Risk-free rate = 0.",
+    "reason": "The spec does not mention a risk-free rate; 0 is the standard assumption when omitted."
+  },
+  {
+    "topic": "Sharpe ratio computation",
+    "choice": "Weekly portfolio returns (52 values) are used; annualised by multiplying by sqrt(52). Sample standard deviation (N-1 denominator) via statistics.stdev.",
+    "reason": "The spec names Sharpe ratio without detailing its formula; weekly returns match the working timeframe and sqrt(52) annualisation is the standard convention."
+  },
+  {
+    "topic": "total return base",
+    "choice": "Total return denominator is the initial cash ($10,000), not the post-commission portfolio value after the first buy.",
+    "reason": "Standard total-return definition compares ending capital to starting capital; initial commission is part of the strategy cost."
+  },
+  {
+    "topic": "portfolio value at rebalance week",
+    "choice": "At a rebalance week, pv[k] is the mark-to-market value immediately after the close-and-reopen (shares_new × price), not the pre-sell value.",
+    "reason": "Both sell and re-buy happen 'immediately' at the same weekly close; the post-transaction state is the correct end-of-week portfolio value for return and drawdown tracking."
+  }
+]}
+```

@@ -1,5 +1,5 @@
 """Compute the professor's-arm results: per model x effort lattice statistics
-and the effort curves. Writes lattice_arm/RESULTS.json and prints the table."""
+and the effort curves. Writes arm/RESULTS.json and prints the table."""
 import json
 import re
 import sys
@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-R = Path(r"C:\Users\joshp\Desktop\LEAN-Bench-Research") / "lattice_arm"
+R = Path(r"C:\Users\joshp\Desktop\LEAN-Bench") / "arm"
 PAIR = re.compile(r"^(SMA|EMA|WMA)(\d+)$")
 EFFORT_ORDER = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "default": 5}
 

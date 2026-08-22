@@ -1,0 +1,84 @@
+```python
+# complete strategy class
+import backtrader as bt
+import math
+import statistics
+import collections
+
+
+class CostAwarePortfolioOptimization(bt.Strategy):
+    # Cost-aware portfolio optimization: at every step choose the asset weight w
+    # that maximizes  (r - I(t))w - λ w'Σ w - Θ|w|^(3/2),  with t = |w - w0|,
+    # then rebalance toward that target weight.
+    params = dict(
+        lookback=252,     # T = 1 year of daily bars used to estimate r and Σ
+        lam=2.0,          # λ : risk-aversion coefficient
+        theta=0.01,       # Θ : market-impact / transaction-cost coefficient
+        w_min=0.0,        # lower box bound on the asset weight (long-only)
+        w_max=1.0,        # upper box bound on the asset weight (max-weight constraint)
+        grid=200,         # resolution of the 1-D weight grid used by the optimizer
+    )
+
+    def __init__(self):
+        self.order = None
+        self.rets = collections.deque(maxlen=self.p.lookback)
+        self.prev_close = None
+
+    def _objective(self, w, w0, r, sigma2):
+        # (r - I(t)) w - λ σ² w² - Θ |w|^(3/2),  I(t) = Θ t^(3/2),  t = |w - w0|
+        t = abs(w - w0)
+        it = self.p.theta * (t ** 1.5)                       # impact cost I(t)
+        return ((r - it) * w
+                - self.p.lam * sigma2 * w * w
+                - self.p.theta * (abs(w) ** 1.5))
+
+    def next(self):
+        # maintain the rolling window of historical simple returns
+        c = self.data.close[0]
+        if self.prev_close is not None and self.prev_close > 0.0:
+            self.rets.append(c / self.prev_close - 1.0)
+        self.prev_close = c
+
+        if self.order:
+            return
+        if len(self.rets) < self.p.lookback:
+            return
+
+        # expected return r and risk Σ (variance) over the reinvestment period (annualized)
+        mean_d = statistics.fmean(self.rets)
+        var_d = statistics.pvariance(self.rets)
+        r = mean_d * self.p.lookback
+        sigma2 = var_d * self.p.lookback
+
+        # current portfolio weight w0 of the asset (remainder held in cash)
+        value = self.broker.getvalue()
+        w0 = (self.position.size * c) / value if value > 0.0 else 0.0
+        w0 = min(max(w0, self.p.w_min), self.p.w_max)
+
+        # solve w* = argmax objective over the box [w_min, w_max] via grid search;
+        # the current weight w0 is included so "do nothing" is always a candidate,
+        # which is how the model declines to trade when costs exceed the benefit.
+        best_w = w0
+        best_f = self._objective(w0, w0, r, sigma2)
+        n = self.p.grid
+        span = self.p.w_max - self.p.w_min
+        for i in range(n + 1):
+            w = self.p.w_min + span * i / n
+            f = self._objective(w, w0, r, sigma2)
+            if f > best_f:
+                best_f = f
+                best_w = w
+
+        # rebalance toward the optimal target weight w*
+        self.order = self.order_target_percent(target=best_w)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled,
+                            order.Margin, order.Rejected):
+            self.order = None
+```
+```json
+{"assumptions": [{"topic": "infeasible", "choice": "Reduced the multi-asset portfolio problem to a single scalar weight w for AAPL (remainder in cash): Σ becomes the scalar return variance, r a scalar expected return, and the weight vector/covariance-matrix/|w|^(3/2) operations collapse to their 1-D forms.", "reason": "The harness supplies only one asset (AAPL 1d OHLCV). A vector w, covariance matrix Σ, factor loadings X, factor covariance F, and specific-risk matrix D cannot be formed from a single instrument."}, {"topic": "infeasible", "choice": "Factor-model covariance (Σ = XᵀFX + D), sector-exposure constraints, turnover constraints, and liquidity filters are omitted.", "reason": "All require multiple assets / factor / sector / order-book data absent from a single-asset OHLCV feed; the spec presents them as optional ('to improve accuracy', 'examples'), and the liquidity-filter sentence is truncated."}, {"topic": "expected return r", "choice": "r = annualized historical mean of trailing daily simple returns (mean_daily × lookback), estimated over a 252-bar (T=1 year) window.", "reason": "Spec says r is expected return over the reinvestment period T=1 year computed from historical returns; it is silent on the exact estimator, so the annualized trailing mean is the closest literal reading."}, {"topic": "risk Σ", "choice": "Σ = annualized population variance of trailing daily returns (pvariance × lookback) over the same 252-bar window.", "reason": "Spec: covariance matrix from historical returns over the same T=1 year period; with one asset this is the annualized return variance."}, {"topic": "I(t) definition", "choice": "I(t) = Θ·t^(3/2) with t = |w − w0|, and the objective keeps both the (r − I(t))·w term and the separate Θ·|w|^(3/2) term exactly as written.", "reason": "Spec defines impact costs as proportional to trading volume^(3/2) with coefficient Θ, and lists both terms in the objective; both were implemented literally (Θ intentionally appears in both, mirroring the spec's shared symbol)."}, {"topic": "constraints", "choice": "Applied the box (max-weight) constraint 0 ≤ w ≤ 1 (long-only) and did NOT apply the full-investment constraint l_b = u_b = w0.", "reason": "The listed constraints are 'examples'; applying l_b = u_b = w0 literally freezes w at the current weight and makes trading impossible, so the max-weight example bound is used instead; long-only per canonical default #4."}, {"topic": "lambda", "choice": "λ = 2.0.", "reason": "Spec leaves the risk-aversion coefficient as a free control parameter; 2.0 yields interior optima for AAPL-scale return/variance, keeping the risk/return trade-off active."}, {"topic": "theta", "choice": "Θ = 0.01.", "reason": "Spec leaves the impact coefficient unspecified; a small positive value makes impact/transaction costs a meaningful friction without dominating the return term."}, {"topic": "rebalance frequency", "choice": "Re-solve and rebalance every bar (daily).", "reason": "Spec offers 'daily or weekly' as examples; daily is chosen and matches the 1d feed."}, {"topic": "weight realization", "choice": "Target weights are realized with self.order_target_percent(target=w*), overriding the default sizer.", "reason": "The spec is explicitly weight-based, so canonical default #1 (plain buy/sell) does not apply; order_target_percent is the faithful mechanism for hitting a target portfolio weight."}, {"topic": "optimizer", "choice": "1-D grid search over w with 200 subdivisions, with w0 included as a candidate.", "reason": "No numpy/solver is available (imports limited to backtrader/math/collections/statistics); grid search maximizes the objective and including w0 lets the model choose not to trade when costs exceed the benefit (spec's dynamic-rebalancing behavior)."}]}
+```

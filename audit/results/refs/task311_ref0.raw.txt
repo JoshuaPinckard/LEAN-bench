@@ -1,0 +1,123 @@
+```python
+import backtrader as bt
+
+
+class SmaAtrTrailStrategy(bt.Strategy):
+    """
+    Intraday AAPL 5-minute strategy: long & short, one position at a time
+    (no pyramiding).
+
+    Entries (only when flat):
+      - long  when the prior bar close crosses ABOVE SMA(20) -> buy at next bar open
+      - short when the prior bar close crosses BELOW SMA(20) -> sell at next bar open
+
+    Exits:
+      - close the position on an SMA(20) cross against it, OR
+      - a ratcheting trailing stop of 3 * ATR(14) off the best close since entry,
+        submitted as a stop order that is refreshed each bar.
+        long : trail = max(prev_trail, highest_close_since_entry - 3*ATR)
+        short: trail = min(prev_trail, lowest_close_since_entry  + 3*ATR)
+      The max/min ratchet guarantees the stop only moves in the trade's favor.
+    """
+
+    params = dict(
+        sma_period=20,
+        atr_period=14,
+        atr_mult=3.0,
+        # commission / slippage placeholders (broker is configured by the harness)
+        commission=0.001,   # placeholder
+        slippage_perc=0.0,  # placeholder
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        # +1 => close crossed above SMA, -1 => close crossed below SMA (at this bar)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.order = None          # pending entry / market-exit order
+        self.stop_order = None     # pending trailing stop order
+        self.extreme_close = None  # highest (long) / lowest (short) close since entry
+        self.trail_stop = None     # current ratcheting trailing stop level
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if order is self.order:
+                self.order = None
+            if order is self.stop_order:
+                self.stop_order = None
+            if not self.position:            # trade closed -> reset trail state
+                self.extreme_close = None
+                self.trail_stop = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self.order:
+                self.order = None
+            if order is self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        # Wait for a pending entry or market-exit order to resolve.
+        if self.order:
+            return
+
+        atr = self.atr[0]
+        price = self.data.close[0]
+
+        if not self.position:
+            # Flat: drop any stray stop, reset trail state, look for an entry.
+            if self.stop_order:
+                self.cancel(self.stop_order)
+                self.stop_order = None
+            self.extreme_close = None
+            self.trail_stop = None
+
+            if self.crossover[0] > 0:        # prior bar close crossed above SMA(20)
+                self.order = self.buy()
+            elif self.crossover[0] < 0:      # prior bar close crossed below SMA(20)
+                self.order = self.sell()
+            return
+
+        if self.position.size > 0:
+            # --- Long management ---
+            self.extreme_close = price if self.extreme_close is None \
+                else max(self.extreme_close, price)
+            new_trail = self.extreme_close - self.p.atr_mult * atr
+            self.trail_stop = new_trail if self.trail_stop is None \
+                else max(self.trail_stop, new_trail)     # ratchet up only
+
+            if self.crossover[0] < 0:                    # close crosses below SMA
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+            else:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.stop_order = self.sell(exectype=bt.Order.Stop,
+                                            price=self.trail_stop,
+                                            size=self.position.size)
+        else:
+            # --- Short management ---
+            self.extreme_close = price if self.extreme_close is None \
+                else min(self.extreme_close, price)
+            new_trail = self.extreme_close + self.p.atr_mult * atr
+            self.trail_stop = new_trail if self.trail_stop is None \
+                else min(self.trail_stop, new_trail)     # ratchet down only
+
+            if self.crossover[0] > 0:                    # close crosses above SMA
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+            else:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.stop_order = self.buy(exectype=bt.Order.Stop,
+                                           price=self.trail_stop,
+                                           size=abs(self.position.size))
+```
+```json
+{"assumptions": [{"topic": "short exit on SMA cross", "choice": "Close a short when close crosses ABOVE SMA(20) (mirror of the stated long exit).", "reason": "The spec explicitly states only the long SMA-cross exit, but it trades both sides and supplies both long and short trailing-stop formulas, implying a symmetric SMA-cross exit for shorts."}, {"topic": "trailing stop execution", "choice": "Implemented as real stop orders that are cancelled and re-submitted every bar at the current ratcheted trail level (sell-stop for longs, buy-stop for shorts).", "reason": "Matches the spec's primary instruction 'Execute stop exits as stop orders updated each bar'; broker evaluates the stop intrabar before next()."}, {"topic": "extreme close initialization", "choice": "highest_close_since_entry / lowest_close_since_entry seeded from the first in-position bar's close (the entry bar).", "reason": "Spec is silent on the seed value for the running extreme at entry."}, {"topic": "commission/slippage placeholders", "choice": "Exposed as params (commission=0.001, slippage_perc=0.0) with comments; actual commission/slippage is configured on the broker by the harness.", "reason": "Only a single Strategy class may be emitted; Cerebro/broker setup (including the 0.001 commission) is added externally, so these are declared as placeholders."}, {"topic": "position sizing", "choice": "Entries use the default sizer (plain buy()/sell(), fixed size); closing stop orders are explicitly sized to the current position.", "reason": "Spec says 'Use default sizer (e.g., fixed size)'; sizing the stop to position.size guarantees a full flat regardless of the fixed stake."}, {"topic": "crossover mapping / entry timing", "choice": "bt.CrossOver(close, SMA) evaluated at bar i (+1 above / -1 below) represents the 'prior bar close crosses'; the resulting market order fills at the next bar's open.", "reason": "A market order sent in next() fills at the following bar's open, so the signal bar becomes the 'prior bar' relative to the next-open entry."}]}
+```

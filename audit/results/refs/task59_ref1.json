@@ -1,0 +1,137 @@
+{
+  "task_id": 59,
+  "ref_idx": 1,
+  "model": "opus",
+  "code": "import backtrader as bt\nimport math\nimport collections\nimport statistics\n\n\nclass FutureReturnDistributionStrategy(bt.Strategy):\n    params = (\n        ('fast_ma', 13),\n        ('slow_ma', 40),\n        ('rsi_period', 14),\n        ('macd_fast', 12),\n        ('macd_slow', 26),\n        ('macd_signal', 9),\n        ('bars_per_window', 6),        # 6 x 5min = one 30-minute candle\n        ('ma_crosses_required', 1),    # ma_crosses must equal 1\n        ('rsi_threshold', 70.0),       # avg_rsi must be above 70\n        ('hold_periods', 6),           # close after 6 x 30-minute periods\n        ('stop_loss', 0.015),          # 1.5% below entry\n        ('take_profit', 0.030),        # 3.0% above entry\n        ('capital_fraction', 0.99),    # ~100% of available capital\n    )\n\n    def __init__(self):\n        # --- Indicators computed on the 5-minute feed ---\n        # Two moving averages: fast SMA(13), slow SMA(40)\n        self.fast_sma = bt.indicators.SMA(self.data.close, period=self.p.fast_ma)\n        self.slow_sma = bt.indicators.SMA(self.data.close, period=self.p.slow_ma)\n        # +1 when fast crosses above slow (used to count bullish crossovers)\n        self.crossover = bt.indicators.CrossOver(self.fast_sma, self.slow_sma)\n        # RSI with the standard period of 14\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        # MACD with default settings (12/26/9) -- required indicator in the set.\n        self.macd = bt.indicators.MACD(\n            self.data.close,\n            period_me1=self.p.macd_fast,\n            period_me2=self.p.macd_slow,\n            period_signal=self.p.macd_signal,\n        )\n\n        # --- Order / position bookkeeping ---\n        self.order = None\n        self.entry_price = None\n        self.entry_bucket_id = None\n\n        # --- 30-minute window aggregation state ---\n        self.cur_bucket_key = None\n        self.bucket_id = -1\n        self.window_crosses = 0\n        self.window_rsi = []\n\n    def _bucket_key(self, dt):\n        # Identify the clock-aligned 30-minute window this 5-minute bar belongs to.\n        minutes = dt.hour * 60 + dt.minute\n        return (dt.year, dt.month, dt.day, minutes // 30)\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status == order.Completed:\n            if order.isbuy():\n                self.entry_price = order.executed.price\n                self.entry_bucket_id = self.bucket_id\n        if order.status in (order.Completed, order.Canceled,\n                            order.Margin, order.Rejected):\n            self.order = None\n\n    def notify_trade(self, trade):\n        if trade.isclosed:\n            self.entry_price = None\n            self.entry_bucket_id = None\n\n    def _finalize_window(self):\n        # Evaluate the just-completed 30-minute candle for an entry.\n        n = len(self.window_rsi)\n        if n < self.p.bars_per_window:\n            # Only act on full 30-minute candles (ignore partial warm-up windows).\n            return\n\n        ma_crosses = self.window_crosses\n        avg_rsi = statistics.mean(self.window_rsi)\n\n        if self.order or self.position:\n            return\n\n        # Entry filter: exactly one bullish MA crossover and average RSI above 70.\n        if ma_crosses == self.p.ma_crosses_required and avg_rsi > self.p.rsi_threshold:\n            price = self.data.close[0]\n            cash = self.broker.get_cash()\n            size = int((cash * self.p.capital_fraction) / price)\n            if size > 0:\n                self.order = self.buy(size=size)\n\n    def next(self):\n        dt = self.data.datetime.datetime(0)\n        key = self._bucket_key(dt)\n\n        # Detect a 30-minute window boundary.\n        if key != self.cur_bucket_key:\n            if self.cur_bucket_key is not None:\n                self._finalize_window()\n            self.cur_bucket_key = key\n            self.bucket_id += 1\n            self.window_crosses = 0\n            self.window_rsi = []\n\n        # Accumulate this 5-minute bar into the current 30-minute window.\n        if self.crossover[0] > 0:\n            self.window_crosses += 1\n        self.window_rsi.append(self.rsi[0])\n\n        # --- Position management (checked on every 5-minute bar) ---\n        if self.position and not self.order and self.entry_price is not None:\n            stop_price = self.entry_price * (1.0 - self.p.stop_loss)\n            take_price = self.entry_price * (1.0 + self.p.take_profit)\n\n            if self.data.low[0] <= stop_price:\n                # Stop-loss: price dropped 1.5% below entry.\n                self.order = self.close()\n            elif self.data.high[0] >= take_price:\n                # Take-profit: price rose 3.0% above entry.\n                self.order = self.close()\n            elif (self.entry_bucket_id is not None and\n                  (self.bucket_id - self.entry_bucket_id) >= self.p.hold_periods):\n                # Fixed holding period: 6 x 30-minute periods after opening.\n                self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "indicator timeframe",
+      "choice": "SMA(13), SMA(40) and RSI(14) are computed on the 5-minute feed, then aggregated per 30-minute window (upward crossovers counted across the 6 five-minute bars; avg_rsi = mean of the 6 five-minute RSI values).",
+      "reason": "The spec states ma_crosses are 'based on 5-minute data' and avg_rsi is the 'average RSI over the 30-minute period'; counting multiple intra-window crosses is only possible with 5-minute SMAs, so 'aggregate into 30-minute candles' is read as the decision cadence / feature aggregation, not as recomputing indicators on 30-minute OHLC."
+    },
+    {
+      "topic": "30-minute aggregation mechanism",
+      "choice": "Aggregation is done manually inside the strategy by bucketing 5-minute bars into clock-aligned 30-minute windows (minute // 30), rather than via cerebro.resampledata.",
+      "reason": "The harness fixes a single 5-minute PandasData feed and forbids top-level cerebro setup, so no resampled feed can be added."
+    },
+    {
+      "topic": "window completion / decision timing",
+      "choice": "A 30-minute candle is finalized when the first bar of the next window arrives; the entry is evaluated then and the market buy fills at the following bar's open. Only complete 6-bar windows are evaluated.",
+      "reason": "Bars are streamed one at a time; next-bar fill is the standard backtrader convention, and partial windows during warm-up must be skipped."
+    },
+    {
+      "topic": "MACD usage",
+      "choice": "MACD(12/26/9) is instantiated as a required indicator but is not referenced by the entry/exit logic.",
+      "reason": "The spec's explicit entry filter uses only ma_crosses and avg_rsi; adding a MACD condition would invent a filter the spec does not state."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "Buy size = int(available_cash * 0.99 / price), approximating 100% of available capital.",
+      "reason": "The spec asks for ~100% of capital; a 0.99 factor leaves headroom for the 0.1% commission and next-bar fill to avoid margin rejection."
+    },
+    {
+      "topic": "stop-loss / take-profit trigger",
+      "choice": "Checked on every 5-minute bar against the bar's low (-1.5%) and high (+3.0%); exit executed with a market self.close() that fills at the next bar's open.",
+      "reason": "The environment is OHLCV with market orders; intrabar touch of low/high is the closest literal reading of 'price drops/rises', and market close is the canonical exit."
+    },
+    {
+      "topic": "holding period counting",
+      "choice": "The 6 30-minute periods are counted as 6 subsequent trading windows (monotonic), so overnight gaps are skipped and a position may be held across sessions; no end-of-day flat rule is added.",
+      "reason": "Literal reading of 'close after 6 30-minute periods'; the spec is silent on session boundaries."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "The strategy is applied to the single provided AAPL 5-minute feed (~3 months) instead of 30-50 liquid S&P 500 tickers over several years.",
+      "reason": "The harness supplies only one data feed and a fixed date range; a multi-asset universe and multi-year history are not available in this environment."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 7,
+  "tape": [
+    {
+      "dt": "2026-04-20T14:05:00",
+      "side": "BUY",
+      "size": 36.0,
+      "price": 273.9100036621094
+    },
+    {
+      "dt": "2026-04-20T17:05:00",
+      "side": "SELL",
+      "size": -36.0,
+      "price": 271.8500061035156
+    },
+    {
+      "dt": "2026-05-08T14:05:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 293.6650085449219
+    },
+    {
+      "dt": "2026-05-08T17:05:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 291.9700012207031
+    },
+    {
+      "dt": "2026-05-20T14:05:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 299.69000244140625
+    },
+    {
+      "dt": "2026-05-20T17:05:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 300.5249938964844
+    },
+    {
+      "dt": "2026-06-15T14:05:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 295.55499267578125
+    },
+    {
+      "dt": "2026-06-15T17:05:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 296.5899963378906
+    },
+    {
+      "dt": "2026-06-22T14:05:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 301.8399963378906
+    },
+    {
+      "dt": "2026-06-22T17:05:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 299.94000244140625
+    },
+    {
+      "dt": "2026-07-01T14:05:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 292.04901123046875
+    },
+    {
+      "dt": "2026-07-01T17:05:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 294.04998779296875
+    },
+    {
+      "dt": "2026-07-02T14:05:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 303.07000732421875
+    },
+    {
+      "dt": "2026-07-02T17:05:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 307.3500061035156
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "task_id": 97,
+  "ref_idx": 0,
+  "model": "opus",
+  "code": "import backtrader as bt\nimport math\n\n\nclass EMAForecastStrategy(bt.Strategy):\n    params = dict(\n        ema_period=21,        # EMA period (spec: 21)\n        threshold=0.005,      # 0.5% minimum deviation for an entry signal\n        stop_loss=0.02,       # 2% stop-loss distance from entry\n        take_profit=0.03,     # 3% take-profit distance from entry\n        size_pct=0.95,        # ~100% of available capital per trade (buffered)\n    )\n\n    def __init__(self):\n        # EMA(21). k = 2 / (period + 1) as stated in the spec.\n        self.ema = bt.indicators.ExponentialMovingAverage(\n            self.data.close, period=self.p.ema_period)\n        self.k = 2.0 / (self.p.ema_period + 1)\n\n        self.entry_order = None   # pending market entry order\n        self.close_order = None   # pending market crossover-exit order\n        self.stop_order = None    # resting protective stop-loss order\n        self.take_order = None    # resting protective take-profit order\n        self.entry_price = None\n\n    def _has_pending(self):\n        return self.entry_order is not None or self.close_order is not None\n\n    def _place_protective_orders(self):\n        # Called once an entry fills; attaches stop-loss + take-profit (OCO).\n        size = abs(self.position.size)\n        if size == 0:\n            return\n        if self.position.size > 0:  # long\n            stop_price = self.entry_price * (1.0 - self.p.stop_loss)   # 2% below\n            take_price = self.entry_price * (1.0 + self.p.take_profit)  # 3% above\n            self.stop_order = self.sell(\n                size=size, exectype=bt.Order.Stop, price=stop_price)\n            self.take_order = self.sell(\n                size=size, exectype=bt.Order.Limit, price=take_price,\n                oco=self.stop_order)\n        else:  # short\n            stop_price = self.entry_price * (1.0 + self.p.stop_loss)   # 2% above\n            take_price = self.entry_price * (1.0 - self.p.take_profit)  # 3% below\n            self.stop_order = self.buy(\n                size=size, exectype=bt.Order.Stop, price=stop_price)\n            self.take_order = self.buy(\n                size=size, exectype=bt.Order.Limit, price=take_price,\n                oco=self.stop_order)\n\n    def _cancel_protective(self):\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n        if self.take_order is not None:\n            self.cancel(self.take_order)\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        if order.status == order.Completed:\n            if order is self.entry_order:\n                self.entry_price = order.executed.price\n                self.entry_order = None\n                self._place_protective_orders()\n            elif order is self.stop_order or order is self.take_order:\n                # A protective order filled; its OCO sibling is auto-cancelled.\n                self.stop_order = None\n                self.take_order = None\n            elif order is self.close_order:\n                self.close_order = None\n            return\n\n        if order.status in (order.Canceled, order.Margin, order.Rejected):\n            if order is self.entry_order:\n                self.entry_order = None\n            elif order is self.stop_order:\n                self.stop_order = None\n            elif order is self.take_order:\n                self.take_order = None\n            elif order is self.close_order:\n                self.close_order = None\n\n    def next(self):\n        close = self.data.close[0]\n        ema = self.ema[0]\n\n        # Forecast EMA for the NEXT day, built from the current bar:\n        # EMA_forecast(N+1) = Close(N)*k + EMA(N)*(1-k)\n        forecast_next = close * self.k + ema * (1.0 - self.k)\n\n        # --- Manage an open position -------------------------------------\n        # Stop-loss / take-profit are resting orders; here we only evaluate\n        # the crossover exit against the forecast that targeted the current\n        # bar (i.e. the forecast computed on the previous bar).\n        if self.position:\n            if self.close_order is None and not math.isnan(self.ema[-2]):\n                forecast_today = (self.data.close[-1] * self.k\n                                  + self.ema[-1] * (1.0 - self.k))\n                forecast_prev = (self.data.close[-2] * self.k\n                                 + self.ema[-2] * (1.0 - self.k))\n                diff_now = close - forecast_today\n                diff_prev = self.data.close[-1] - forecast_prev\n\n                if self.position.size > 0:\n                    # Long exit: close crosses forecast from above to below.\n                    if diff_prev > 0 and diff_now < 0:\n                        self._cancel_protective()\n                        self.close_order = self.close()\n                else:\n                    # Short exit: close crosses forecast from below to above.\n                    if diff_prev < 0 and diff_now > 0:\n                        self._cancel_protective()\n                        self.close_order = self.close()\n            return\n\n        # --- Flat: look for an entry -------------------------------------\n        if self._has_pending():\n            return\n\n        # Signals require a >= 0.5% deviation of Close(N) from the forecast.\n        long_signal = (forecast_next - close) / close >= self.p.threshold\n        short_signal = (close - forecast_next) / close >= self.p.threshold\n\n        if not (long_signal or short_signal):\n            return\n\n        cash = self.broker.get_cash()\n        size = int(cash * self.p.size_pct / close)\n        if size <= 0:\n            return\n\n        if long_signal:\n            # Close(N) significantly below forecast -> expect upward reversion.\n            self.entry_order = self.buy(size=size)\n        elif short_signal:\n            # Close(N) significantly above forecast -> expect downward reversion.\n            self.entry_order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "entry threshold basis",
+      "choice": "The 0.5% entry threshold is measured as the relative deviation of Close(N) from the forecast, using Close(N) as the denominator: (forecast_next - close)/close >= 0.005 for longs and (close - forecast_next)/close >= 0.005 for shorts.",
+      "reason": "The spec states 'the difference ... must be at least 0.5%' but does not specify the percentage base; Close(N) is the quantity the spec references first and is the natural denominator."
+    },
+    {
+      "topic": "optional trend filter",
+      "choice": "The EMA(50) 'trades only in the direction of the main trend' filter is NOT included.",
+      "reason": "The spec presents it under 'Additional rules' as optional ('an additional condition CAN be added ... For example'), so the core stated strategy is implemented without inventing this extra filter."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "Fixed sizing of int(available_cash * 0.95 / Close(N)) shares per trade (same formula for long and short).",
+      "reason": "Spec says 'Fixed, for example, 100% of available capital'. Since entries are market orders filled at the next bar's open, a 5% buffer avoids margin rejections from overnight gaps and the 0.001 commission while keeping close to full-capital deployment."
+    },
+    {
+      "topic": "exit order mechanics",
+      "choice": "Stop-loss and take-profit are placed as resting Stop and Limit OCO orders that fill at their exact 2%/3% price levels; the crossover exit is a market self.close() filled at the next bar's open, and it first cancels the two protective orders.",
+      "reason": "Spec defines stop-loss/take-profit as fixed price levels (best modeled by resting orders) and the crossover exit as an event-driven exit (best modeled by a market close); backtrader's next-open fill for market orders is the environment default."
+    },
+    {
+      "topic": "crossover interpretation",
+      "choice": "The exit crossover compares each day's actual Close(N+1) to the forecast EMA_forecast(N+1) that was computed on the prior bar; a strict sign change of (Close - forecast) between the previous and current bar triggers the exit.",
+      "reason": "Spec ties the exit to 'the next day's closing price crosses the forecast EMA(N+1)'; the forecast for a given day is fixed on the preceding day, so the crossover is evaluated on the aligned Close-vs-prior-forecast difference series."
+    },
+    {
+      "topic": "warm-up",
+      "choice": "The crossover exit is skipped on bars where the EMA value two bars back is NaN (guarded via math.isnan).",
+      "reason": "The crossover uses EMA[-1] and EMA[-2], which are undefined during the first bars after the EMA's minperiod; spec is silent on warm-up, so these bars are guarded rather than acted upon. Entries rely only on the current EMA, valid from backtrader's automatic minperiod."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2020-02-03T05:00:00",
+      "side": "BUY",
+      "size": 127.0,
+      "price": 73.28515870612867
+    },
+    {
+      "dt": "2020-02-24T05:00:00",
+      "side": "SELL",
+      "size": -127.0,
+      "price": 71.75962518984169
+    }
+  ]
+}

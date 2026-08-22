@@ -1,0 +1,202 @@
+```python
+import backtrader as bt
+import collections
+
+
+class SPTRsiDivergenceBreakout(bt.Strategy):
+    # SPT — RSI Bullish Divergence + Breakout with Volume Confirmation (4H)
+    params = (
+        ('rsi_period', 14),
+        ('breakout_lookback', 20),
+        ('vol_ma_period', 20),
+        ('low_lookback', 10),
+        ('stop_pct', 0.02),
+        ('take_pct', 0.06),
+        ('risk_pct', 0.01),
+        ('bars_per_group', 4),   # 1h feed -> synthetic 4H bar
+    )
+
+    def __init__(self):
+        self.order = None
+
+        # --- 4H aggregation state (built from the 1h feed) ---
+        self._grp_count = 0
+        self._g_high = None
+        self._g_low = None
+        self._g_close = None
+        self._g_vol = 0.0
+        self._g_dt = None
+
+        # --- completed 4H series ---
+        maxlen = max(self.p.breakout_lookback, self.p.vol_ma_period,
+                     self.p.low_lookback) + 5
+        self.h4_high = collections.deque(maxlen=maxlen)
+        self.h4_low = collections.deque(maxlen=maxlen)
+        self.h4_close = collections.deque(maxlen=maxlen)
+        self.h4_vol = collections.deque(maxlen=maxlen)
+        self.h4_rsi = collections.deque(maxlen=maxlen)
+
+        # --- pivot buffers (last 3 completed 4H bars) ---
+        self._piv_low = collections.deque(maxlen=3)
+        self._piv_high = collections.deque(maxlen=3)
+        self._piv_rsi = collections.deque(maxlen=3)
+
+        # previous confirmed local extremes: (price, rsi)
+        self.prev_local_low = None
+        self.prev_local_high = None
+
+        # bullish divergence latch (armed until a breakout consumes it)
+        self.bull_div_active = False
+
+        # --- Wilder RSI running state (on 4H closes) ---
+        self._prev_close = None
+        self._avg_gain = None
+        self._avg_loss = None
+        self._seed_gains = []
+        self._seed_losses = []
+
+        # --- trade state ---
+        self.entry_price = None
+        self.stop_price = None
+        self.target_price = None
+
+    # ---- Wilder's RSI, computed manually on the 4H close series ----
+    def _update_rsi(self, close):
+        if self._prev_close is None:
+            self._prev_close = close
+            return None
+        change = close - self._prev_close
+        self._prev_close = close
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        n = self.p.rsi_period
+        if self._avg_gain is None:
+            self._seed_gains.append(gain)
+            self._seed_losses.append(loss)
+            if len(self._seed_gains) < n:
+                return None
+            self._avg_gain = sum(self._seed_gains) / n
+            self._avg_loss = sum(self._seed_losses) / n
+        else:
+            self._avg_gain = (self._avg_gain * (n - 1) + gain) / n
+            self._avg_loss = (self._avg_loss * (n - 1) + loss) / n
+        if self._avg_loss == 0:
+            return 100.0
+        rs = self._avg_gain / self._avg_loss
+        return 100.0 - 100.0 / (1.0 + rs)
+
+    def next(self):
+        # --- stop-loss / take-profit monitored intrabar on the 1h feed ---
+        if self.position and self.order is None and self.stop_price is not None:
+            if self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+            elif self.data.high[0] >= self.target_price:
+                self.order = self.close()
+
+        # --- aggregate 1h bars into a synthetic 4H bar ---
+        h = self.data.high[0]
+        l = self.data.low[0]
+        c = self.data.close[0]
+        v = self.data.volume[0]
+        if self._grp_count == 0:
+            self._g_high = h
+            self._g_low = l
+            self._g_vol = 0.0
+        self._g_high = max(self._g_high, h)
+        self._g_low = min(self._g_low, l)
+        self._g_close = c
+        self._g_vol += v
+        self._g_dt = self.data.datetime.datetime(0)
+        self._grp_count += 1
+
+        if self._grp_count < self.p.bars_per_group:
+            return
+        self._grp_count = 0
+        self._on_4h_bar(self._g_high, self._g_low, self._g_close,
+                        self._g_vol, self._g_dt)
+
+    def _on_4h_bar(self, high, low, close, vol, dt):
+        # --- update indicators / series (always, regardless of orders) ---
+        rsi = self._update_rsi(close)
+        self.h4_high.append(high)
+        self.h4_low.append(low)
+        self.h4_close.append(close)
+        self.h4_vol.append(vol)
+        self.h4_rsi.append(rsi if rsi is not None else float('nan'))
+
+        self._piv_low.append(low)
+        self._piv_high.append(high)
+        self._piv_rsi.append(rsi)
+
+        # --- pivot / divergence detection (1-bar pivot on the middle bar) ---
+        bear_div = False
+        if len(self._piv_rsi) == 3 and self._piv_rsi[1] is not None:
+            # local low -> bullish divergence
+            if self._piv_low[1] < self._piv_low[0] and self._piv_low[1] < self._piv_low[2]:
+                cur = (self._piv_low[1], self._piv_rsi[1])
+                if self.prev_local_low is not None and \
+                   cur[0] < self.prev_local_low[0] and cur[1] > self.prev_local_low[1]:
+                    self.bull_div_active = True
+                self.prev_local_low = cur
+            # local high -> bearish divergence
+            if self._piv_high[1] > self._piv_high[0] and self._piv_high[1] > self._piv_high[2]:
+                curh = (self._piv_high[1], self._piv_rsi[1])
+                if self.prev_local_high is not None and \
+                   curh[0] > self.prev_local_high[0] and curh[1] < self.prev_local_high[1]:
+                    bear_div = True
+                self.prev_local_high = curh
+
+        # --- manage an open position: alternative exits ---
+        if self.position:
+            if self.order is None:
+                if bear_div:
+                    self.order = self.close()
+                    return
+                if len(self.h4_low) >= self.p.low_lookback + 1:
+                    prior_low = min(list(self.h4_low)[-(self.p.low_lookback + 1):-1])
+                    if close < prior_low:
+                        self.order = self.close()
+                        return
+            return
+
+        # --- entry logic (only when flat and no pending order) ---
+        if self.order is not None or rsi is None:
+            return
+        # time filter: signals accepted only in Nov–Dec 2025
+        if not (dt.year == 2025 and dt.month in (11, 12)):
+            return
+        if not self.bull_div_active:
+            return
+        if len(self.h4_high) < self.p.breakout_lookback + 1:
+            return
+        if len(self.h4_vol) < self.p.vol_ma_period:
+            return
+
+        resistance = max(list(self.h4_high)[-(self.p.breakout_lookback + 1):-1])
+        vol_sma = sum(list(self.h4_vol)[-self.p.vol_ma_period:]) / self.p.vol_ma_period
+
+        if close > resistance and vol > vol_sma:
+            value = self.broker.getvalue()
+            size = (self.p.risk_pct * value) / (self.p.stop_pct * close)
+            if size > 0:
+                self.entry_price = close
+                self.order = self.buy(size=size)
+                self.bull_div_active = False
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.stop_price = self.entry_price * (1.0 - self.p.stop_pct)
+                self.target_price = self.entry_price * (1.0 + self.p.take_pct)
+            else:
+                self.entry_price = None
+                self.stop_price = None
+                self.target_price = None
+        self.order = None
+```
+```json
+{"assumptions": [{"topic": "infeasible", "choice": "The feed is 1h but the spec requires a 4-hour chart; since cerebro-level resampling is not available to the strategy, I aggregate every 4 consecutive 1h bars into one synthetic 4H bar (open=first, high=max, low=min, close=last, volume=sum) and run all 4H logic on that series.", "reason": "Only a single 1h PandasData feed is provided and the harness owns cerebro setup, so manual fixed-count aggregation is the closest literal reading of '4-hour chart'."}, {"topic": "infeasible", "choice": "4H grouping uses a naive fixed count of 4 bars and ignores session/day boundaries (equity intraday bars do not divide evenly into 4h blocks).", "reason": "No session/calendar information is available to align 4h boundaries, and the harness feed spans irregular intraday hours."}, {"topic": "RSI computation", "choice": "RSI(14) is computed manually with Wilder's smoothing (SMMA seed = simple average of first 14 changes) on the 4H closes.", "reason": "bt.indicators cannot operate on the manually built 4H series; Wilder's method matches backtrader's default RSI."}, {"topic": "local pivot definition", "choice": "A local low/high is a 1-bar pivot: a 4H bar whose low/high is strictly below/above both immediately adjacent 4H bars, confirmed one bar later.", "reason": "The spec references 'previous local low/high' but does not define the pivot lookback; the minimal 1-bar pivot is the simplest literal reading."}, {"topic": "resistance breakout window", "choice": "'high of the last 20 bars' = highest high of the 20 4H bars preceding the current bar (current bar excluded); breakout = current 4H close > that value.", "reason": "Resistance is the prior high being broken, so the current bar is excluded from the 20-bar window."}, {"topic": "volume SMA window", "choice": "SMA(volume,20) is the mean of the 20 most recent 4H volumes including the current bar; confirmation requires current volume > that SMA.", "reason": "Standard SMA(volume,20)[0] includes the current bar; the spec compares the current bar's volume to it."}, {"topic": "10-bar low exit window", "choice": "'low of the last 10 bars' = lowest low of the 10 4H bars preceding the current bar (current excluded); exit when current close < that value.", "reason": "The breakdown level is the prior support, so the current bar is excluded from the 10-bar window."}, {"topic": "divergence-then-breakout sequencing", "choice": "A bullish divergence arms a latch that stays active until a qualifying breakout+volume 4H bar triggers entry (which consumes the latch); the latch is not otherwise time-expired.", "reason": "The spec says the breakout occurs 'then' after divergence but is silent on how long the divergence remains valid."}, {"topic": "position sizing inputs", "choice": "Capital = current broker portfolio value (self.broker.getvalue()); entry price for sizing = current 4H close. size = (0.01 * value) / (0.02 * close).", "reason": "The spec's formula requires 'capital' and 'entry price' at signal time; portfolio value and the signalling 4H close are the available proxies."}, {"topic": "stop/take-profit mechanics", "choice": "Stop (2% below) and take-profit (6% above) are computed from the actual fill price and monitored intrabar on each 1h bar using the bar's low/high; stop is checked before take-profit.", "reason": "The spec gives price-based SL/TP; checking on the 1h feed gives finer, order-of-arrival fidelity, and stop-before-target is a conservative default when both are touched in one bar."}, {"topic": "time filter scope", "choice": "The Nov–Dec 2025 filter is applied only to entries; exits (SL/TP, bearish divergence, 10-bar-low breakdown) remain active at all times.", "reason": "The spec restricts 'signals' (entries); open positions must still be exitable outside the window."}, {"topic": "position management", "choice": "Long-only, at most one position at a time, no pyramiding or re-entry while in a position, pending orders guarded by an order attribute reset in notify_order.", "reason": "Canonical defaults applied where the spec is silent."}]}
+```

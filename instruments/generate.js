@@ -37,6 +37,7 @@ if (PROMPT_ID === 'T1v0') {
 }
 
 const HOMES = path.join(ROOT, 'homes'), TMP = path.join(ROOT, 'tmp');
+const GEMINI_JS = process.env.LB_GEMINI_JS || 'C:\\Users\\joshp\\AppData\\Roaming\\npm\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js';
 const CLAUDE_EXE = process.env.LB_CLAUDE_EXE || 'C:\\Users\\joshp\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe';
 const CODEX_JS = process.env.LB_CODEX_JS || 'C:\\Users\\joshp\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js';
 function cleanEnv(extra) {
@@ -72,6 +73,15 @@ function draw(cwd) {
     const r = spawnSync(process.execPath, [CODEX_JS, 'exec', '--skip-git-repo-check', '--ephemeral', '-s', 'read-only', '--json', '-o', lastMsg, '-m', MODEL, '-c', `model_reasoning_effort=${EFFORT}`, '-'],
       { input: prompt, encoding: 'utf8', cwd, env: cleanEnv({ CODEX_HOME: home }), shell: false, timeout: 20 * 60 * 1000, maxBuffer: 256 * 1024 * 1024 });
     return { raw_text: fs.existsSync(lastMsg) ? fs.readFileSync(lastMsg, 'utf8') : null, exit: r.status };
+  }
+  if (SURFACE === 'gemini') {
+    const home = path.join(HOMES, 'gemini');
+    const r = spawnSync(process.execPath, [GEMINI_JS, '-p', prompt, '-o', 'json', '--approval-mode', 'plan', '--skip-trust'],
+      { encoding: 'utf8', cwd, env: cleanEnv({ USERPROFILE: home.replace(/\//g, '\\'), HOME: home }), shell: false, timeout: 20 * 60 * 1000, maxBuffer: 256 * 1024 * 1024 });
+    const m = (r.stdout || '').match(/\{[\s\S]*\}/);
+    let txt = null, served = null;
+    if (m) { try { const j = JSON.parse(m[0]); txt = j.response ?? null; served = j.stats ? Object.keys(j.stats.models || {}) : null; } catch (e) {} }
+    return { raw_text: txt, exit: r.status, served };
   }
   const r = spawnSync(CLAUDE_EXE, ['-p', '--setting-sources', '', '--strict-mcp-config', '--tools', '', '--disable-slash-commands', '--model', MODEL, '--effort', EFFORT, '--output-format', 'json', '--no-session-persistence', '--max-turns', '1'],
     { input: prompt, encoding: 'utf8', cwd, env: cleanEnv({ CLAUDE_CONFIG_DIR: path.join(HOMES, 'claude-config') }), shell: false, timeout: 20 * 60 * 1000, maxBuffer: 256 * 1024 * 1024 });
