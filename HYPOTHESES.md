@@ -27,9 +27,33 @@ H4. **The union carries a convention its parts lack (descent failure).**
     TV >= 0.3 (exploratory: 0.28-0.89 across tiers).
 Totals: H1 180 + H2 120 + H3 60 + H4 60 = 420 draws, codex + claude.
 
+## A2. The bare-model leg (H5) - the field-standard surface, key cells only
+
+Convention: model-level benchmarks (HELM, lm-evaluation-harness, Inspect,
+LiveCodeBench, BigCodeBench, Aider) call every vendor through its raw
+API with one identical evaluator instruction; system-level benchmarks
+(Terminal-Bench, SWE-bench vendor entries) use every vendor's native CLI.
+The rule: the surface is SYMMETRIC across vendors within a claim. Leg A
+(above and SS B) is the native-CLI comparison. Leg B here is the
+bare-model comparison on the cells the paper leans on:
+
+H5. **The ask asymmetry is the models', not the harnesses'.** Cells:
+    BL-01b at high effort, n=30 per model. Surfaces, symmetric-bare:
+    gemini via Vertex (pinned); gpt-5.6 via the OpenAI API (owner-
+    approved, small; subject to a zero-cost model-availability check -
+    if the gpt-5.6 models are not API-available, that is disclosed and
+    codex remains CLI-only in this leg); claude via the CLI with
+    --system-prompt full replacement (near-bare; residual = a one-line
+    SDK identity preamble + a date/email context block, disclosed - the
+    subscription-funding substitute for the Anthropic API). One
+    identical minimal system line for all three: "Complete the task."
+    Prediction: bare-codex ask-rate remains > 0.3; bare-claude remains
+    0; the CLI-vs-bare delta per family is reported as the harness
+    contribution. ~90 draws.
+
 ## B. The benchmark (the 13 remaining prompts), design of record
 
-Design (the arm's shape, owner default pending his word): 13 frozen
+Design (the arm's shape, owner-confirmed 2026-08-22): 13 frozen
 prompts (BL-00, BL-02b', BL-02b, BL-02c, BL-03, BL-04, BL-05, BL-07,
 BL-08, OM-B, OM-C, ER-01, ER-01c) x {gpt-5.6-luna, gpt-5.6-terra} x
 5 efforts x {base, no-ask} x n=10 = 2,600 draws; gpt-5.6-sol after
