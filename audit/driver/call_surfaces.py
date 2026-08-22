@@ -76,5 +76,37 @@ def call_drafter(family: str, prompt: str, out_path: Path, timeout: int = 1200) 
     if family == "codex":
         return call_codex(prompt, "gpt-5.6-terra", out_path, effort="medium", timeout=timeout, min_bytes=300)
     if family == "gemini":
-        raise RuntimeError("gemini drafter surface pends the owner's Vertex word (HYPOTHESES.md SS C)")
+        return call_vertex_gemini(prompt, "gemini-3.6-flash", out_path, timeout=timeout)
     raise ValueError(f"unknown family {family}")
+
+
+def call_vertex_gemini(prompt: str, model: str, out_path: Path, timeout: int = 1200,
+                       min_bytes: int = 150) -> str:
+    """Vertex generateContent, pinned model (owner Vertex grant 2026-08-22).
+    modelVersion echoed by the API is recorded beside the output."""
+    import urllib.request
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.with_suffix(out_path.suffix + ".prompt.txt").write_text(prompt, encoding="utf-8")
+    token = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True,
+                           encoding="utf-8", shell=True).stdout.strip()
+    if not token:
+        raise CLIError("gcloud token unavailable")
+    project, location = "project-627ff42f-869d-48b1-919", "us-central1"
+    url = (f"https://aiplatform.googleapis.com/v1/projects/{project}/locations/{location}"
+           f"/publishers/google/models/{model}:generateContent")
+    body = json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                       "generationConfig": {"maxOutputTokens": 65535}}).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        j = json.loads(resp.read().decode())
+    if "error" in j:
+        raise CLIError(f"vertex: {str(j['error'])[:200]}")
+    text = "".join(p.get("text", "") for c in j.get("candidates", [])
+                   for p in c.get("content", {}).get("parts", []))
+    if len(text.encode()) < min_bytes:
+        raise CLIError(f"vertex output too small ({len(text)}B)")
+    out_path.write_text(text, encoding="utf-8")
+    out_path.with_suffix(out_path.suffix + ".meta.json").write_text(
+        json.dumps({"modelVersion": j.get("modelVersion"), "usage": j.get("usageMetadata")}), encoding="utf-8")
+    return text

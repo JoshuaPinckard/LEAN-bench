@@ -1,0 +1,398 @@
+{
+  "task_id": 1,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\n\n\nclass InverseHeadAndShoulders(bt.Strategy):\n    \"\"\"\n    Inverse Head and Shoulders strategy with 4h volume confirmation and daily 20-day SMA trend filter.\n    Aggregates 1h bars into daily and 4-hour bars to evaluate pattern, volume, and breakout conditions.\n    \"\"\"\n\n    def __init__(self):\n        self.order = None\n        self.sl = None\n        self.tp = None\n        self.current_neckline = None\n\n        # Data aggregation attributes\n        self.daily_bars = []\n        self.current_daily = None\n        self.last_date = None\n\n        self.completed_4h_bars = []\n        self.current_4h_bars = []\n        self.last_red_4h_volume = None\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def find_ihs_pattern(self, daily_bars):\n        \"\"\"\n        Detects an Inverse Head and Shoulders pattern on daily bars.\n        Looks for Left Shoulder, Head, and Right Shoulder pivot lows.\n        Returns: (pattern_found, neckline_price, head_low)\n        \"\"\"\n        if len(daily_bars) < 20:\n            return False, 0.0, 0.0\n\n        bars = daily_bars[-60:]\n        lows = [b['low'] for b in bars]\n        highs = [b['high'] for b in bars]\n        n = len(lows)\n\n        pivots = []\n        for i in range(1, n - 1):\n            if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:\n                pivots.append(i)\n\n        if len(pivots) < 3:\n            return False, 0.0, 0.0\n\n        for r_idx in range(len(pivots) - 1, 1, -1):\n            i_right = pivots[r_idx]\n            for h_idx in range(r_idx - 1, 0, -1):\n                i_head = pivots[h_idx]\n                for l_idx in range(h_idx - 1, -1, -1):\n                    i_left = pivots[l_idx]\n\n                    if lows[i_head] < lows[i_left] and lows[i_head] < lows[i_right]:\n                        if abs(lows[i_left] - lows[i_right]) / lows[i_left] <= 0.05:\n                            sub_h1 = highs[i_left : i_head + 1]\n                            p1_rel = sub_h1.index(max(sub_h1))\n                            p1_idx = i_left + p1_rel\n                            p1_high = highs[p1_idx]\n\n                            sub_h2 = highs[i_head : i_right + 1]\n                            p2_rel = sub_h2.index(max(sub_h2))\n                            p2_idx = i_head + p2_rel\n                            p2_high = highs[p2_idx]\n\n                            if p2_idx != p1_idx:\n                                slope = (p2_high - p1_high) / (p2_idx - p1_idx)\n                                neckline = p1_high + slope * ((n - 1) - p1_idx)\n                            else:\n                                neckline = (p1_high + p2_high) / 2.0\n\n                            head_low = lows[i_head]\n                            if neckline > head_low:\n                                return True, neckline, head_low\n        return False, 0.0, 0.0\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        o = self.data.open[0]\n        h = self.data.high[0]\n        l = self.data.low[0]\n        c = self.data.close[0]\n        v = self.data.volume[0]\n\n        # 1. Update Daily Bar Aggregation\n        if dt != self.last_date:\n            if self.current_daily is not None:\n                self.daily_bars.append(self.current_daily)\n            self.current_daily = {'open': o, 'high': h, 'low': l, 'close': c, 'volume': v}\n            self.last_date = dt\n        else:\n            self.current_daily['high'] = max(self.current_daily['high'], h)\n            self.current_daily['low'] = min(self.current_daily['low'], l)\n            self.current_daily['close'] = c\n            self.current_daily['volume'] += v\n\n        # 2. Manage Intraday Stop Loss / Take Profit\n        if self.position:\n            if self.sl is not None and l <= self.sl:\n                self.close()\n                return\n            elif self.tp is not None and h >= self.tp:\n                self.close()\n                return\n\n        # 3. Update 4h Bar Aggregation\n        self.current_4h_bars.append({'open': o, 'high': h, 'low': l, 'close': c, 'volume': v})\n\n        if len(self.current_4h_bars) == 4:\n            b_open = self.current_4h_bars[0]['open']\n            b_high = max(b['high'] for b in self.current_4h_bars)\n            b_low = min(b['low'] for b in self.current_4h_bars)\n            b_close = self.current_4h_bars[-1]['close']\n            b_vol = sum(b['volume'] for b in self.current_4h_bars)\n\n            bar_4h = {'open': b_open, 'high': b_high, 'low': b_low, 'close': b_close, 'volume': b_vol}\n            self.completed_4h_bars.append(bar_4h)\n            self.current_4h_bars = []\n\n            # Alternative Exit: Close if 4h candle closes below neckline\n            if self.position and self.current_neckline is not None:\n                if bar_4h['close'] < self.current_neckline:\n                    self.close()\n                    return\n\n            # Track last bearish (red) 4h candle volume\n            if bar_4h['close'] < bar_4h['open']:\n                self.last_red_4h_volume = bar_4h['volume']\n\n            # Entry Evaluation on 4h candle completion\n            if not self.position and self.order is None:\n                # 20-day SMA trend filter on daily chart\n                if len(self.daily_bars) >= 21:\n                    daily_closes = [b['close'] for b in self.daily_bars]\n                    sma20_curr = sum(daily_closes[-20:]) / 20.0\n                    sma20_prev = sum(daily_closes[-21:-1]) / 20.0\n                    trend_ok = sma20_curr >= sma20_prev\n                else:\n                    trend_ok = True\n\n                if trend_ok:\n                    pattern_found, neckline, head_low = self.find_ihs_pattern(self.daily_bars)\n                    if pattern_found:\n                        if bar_4h['close'] > neckline:\n                            vol_ok = (\n                                self.last_red_4h_volume is not None\n                                and bar_4h['volume'] >= 1.5 * self.last_red_4h_volume\n                            )\n                            if vol_ok:\n                                breakout_price = bar_4h['close']\n                                stop_loss = head_low * 0.99\n                                distance = neckline - head_low\n                                take_profit = breakout_price + distance\n\n                                risk_per_share = breakout_price - stop_loss\n                                if risk_per_share > 0:\n                                    capital = self.broker.getvalue()\n                                    risk_amount = capital * 0.01\n                                    size = int(risk_amount / risk_per_share)\n                                    if size > 0:\n                                        self.sl = stop_loss\n                                        self.tp = take_profit\n                                        self.current_neckline = neckline\n                                        self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "timeframe_aggregation",
+      "choice": "Aggregate 1h input bars into 4h bars (blocks of 4 consecutive 1h bars) and Daily bars (grouped by calendar date) inside the strategy.",
+      "reason": "The execution environment supplies a single 1h data feed, whereas the spec requires daily chart pattern/SMA logic and 4h breakout/volume confirmation."
+    },
+    {
+      "topic": "pattern_detection",
+      "choice": "Identify Inverse Head and Shoulders using pivot lows over the last 60 daily bars, requiring Left/Right shoulders to be within 5% of each other, Head lower than both, and a linear neckline connecting intermediate peaks.",
+      "reason": "Provides an explicit, deterministic algorithm for pattern recognition matching standard chart pattern rules."
+    },
+    {
+      "topic": "volume_confirmation",
+      "choice": "Require the 4h breakout candle volume to be >= 1.5 * the volume of the most recent 4h candle where Close < Open.",
+      "reason": "Literally implements the condition that breakout volume must be at least 50% higher than the previous bearish 4h candle."
+    },
+    {
+      "topic": "stop_loss_take_profit",
+      "choice": "Set Stop-Loss at 0.99 * head_low (slightly below the lowest point of the head) and Take-Profit at breakout_price + (neckline - head_low).",
+      "reason": "Matches the specified SL rule ('below lowest point of head') and TP rule ('distance from neckline to head projected upward from breakout')."
+    },
+    {
+      "topic": "risk_management",
+      "choice": "Calculate position size risking 1% of total portfolio value (broker equity) divided by risk per share (Breakout Price - Stop Loss).",
+      "reason": "Fulfills the specification requirement that potential loss at stop-loss does not exceed 1-2% of total capital per trade."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 30,
+  "tape": [
+    {
+      "dt": "2023-10-11T15:30:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 178.58999633789062
+    },
+    {
+      "dt": "2023-10-25T17:30:00",
+      "side": "SELL",
+      "size": -7.0,
+      "price": 171.13999938964844
+    },
+    {
+      "dt": "2023-11-02T15:30:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 176.77000427246094
+    },
+    {
+      "dt": "2023-11-06T16:30:00",
+      "side": "SELL",
+      "size": -7.0,
+      "price": 179.08999633789062
+    },
+    {
+      "dt": "2023-11-14T17:30:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 187.05999755859375
+    },
+    {
+      "dt": "2024-01-05T20:30:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 180.2799072265625
+    },
+    {
+      "dt": "2024-04-12T14:30:00",
+      "side": "BUY",
+      "size": 9.0,
+      "price": 176.74249267578125
+    },
+    {
+      "dt": "2024-04-16T16:30:00",
+      "side": "SELL",
+      "size": -9.0,
+      "price": 169.41000366210938
+    },
+    {
+      "dt": "2024-05-07T15:30:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 182.16000366210938
+    },
+    {
+      "dt": "2024-06-03T14:30:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 194.8300018310547
+    },
+    {
+      "dt": "2024-06-05T16:30:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 195.9199981689453
+    },
+    {
+      "dt": "2024-06-10T19:30:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 192.9600067138672
+    },
+    {
+      "dt": "2024-06-11T16:30:00",
+      "side": "BUY",
+      "size": 5.0,
+      "price": 204.2476043701172
+    },
+    {
+      "dt": "2024-06-12T14:30:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 215.22000122070312
+    },
+    {
+      "dt": "2024-06-12T18:30:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 218.95010375976562
+    },
+    {
+      "dt": "2024-07-10T14:30:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 231.11000061035156
+    },
+    {
+      "dt": "2024-07-15T16:30:00",
+      "side": "BUY",
+      "size": 3.0,
+      "price": 235.32000732421875
+    },
+    {
+      "dt": "2024-08-05T14:30:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 207.94070434570312
+    },
+    {
+      "dt": "2024-08-16T17:30:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 226.5500030517578
+    },
+    {
+      "dt": "2024-08-28T14:30:00",
+      "side": "SELL",
+      "size": -7.0,
+      "price": 229.6300048828125
+    },
+    {
+      "dt": "2024-08-29T15:30:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 232.44760131835938
+    },
+    {
+      "dt": "2024-09-03T17:30:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 223.8251953125
+    },
+    {
+      "dt": "2024-11-27T15:30:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 235.16000366210938
+    },
+    {
+      "dt": "2024-12-02T15:30:00",
+      "side": "SELL",
+      "size": -7.0,
+      "price": 240.27000427246094
+    },
+    {
+      "dt": "2024-12-02T18:30:00",
+      "side": "BUY",
+      "size": 5.0,
+      "price": 239.4199981689453
+    },
+    {
+      "dt": "2024-12-04T15:30:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 243.44000244140625
+    },
+    {
+      "dt": "2024-12-09T16:30:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 246.48500061035156
+    },
+    {
+      "dt": "2024-12-11T15:30:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 249.42999267578125
+    },
+    {
+      "dt": "2024-12-12T16:30:00",
+      "side": "BUY",
+      "size": 3.0,
+      "price": 248.47999572753906
+    },
+    {
+      "dt": "2024-12-16T18:30:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 251.08999633789062
+    },
+    {
+      "dt": "2024-12-26T14:30:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 258.3550109863281
+    },
+    {
+      "dt": "2024-12-26T15:30:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 258.364990234375
+    },
+    {
+      "dt": "2025-01-06T17:30:00",
+      "side": "BUY",
+      "size": 3.0,
+      "price": 245.75999450683594
+    },
+    {
+      "dt": "2025-01-21T18:30:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 220.40469360351562
+    },
+    {
+      "dt": "2025-02-14T16:30:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 243.94000244140625
+    },
+    {
+      "dt": "2025-02-21T18:30:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 247.44509887695312
+    },
+    {
+      "dt": "2025-07-01T13:30:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 206.6649932861328
+    },
+    {
+      "dt": "2025-07-07T13:30:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 212.67999267578125
+    },
+    {
+      "dt": "2025-07-22T16:30:00",
+      "side": "BUY",
+      "size": 12.0,
+      "price": 213.24000549316406
+    },
+    {
+      "dt": "2025-07-30T14:30:00",
+      "side": "SELL",
+      "size": -12.0,
+      "price": 210.6199951171875
+    },
+    {
+      "dt": "2025-08-28T15:30:00",
+      "side": "BUY",
+      "size": 10.0,
+      "price": 230.9600067138672
+    },
+    {
+      "dt": "2025-09-02T17:30:00",
+      "side": "SELL",
+      "size": -10.0,
+      "price": 228.4199981689453
+    },
+    {
+      "dt": "2025-09-03T14:30:00",
+      "side": "BUY",
+      "size": 6.0,
+      "price": 236.81390380859375
+    },
+    {
+      "dt": "2025-09-04T14:30:00",
+      "side": "SELL",
+      "size": -6.0,
+      "price": 237.67999267578125
+    },
+    {
+      "dt": "2025-09-04T16:30:00",
+      "side": "BUY",
+      "size": 6.0,
+      "price": 237.14999389648438
+    },
+    {
+      "dt": "2025-09-10T16:30:00",
+      "side": "SELL",
+      "size": -6.0,
+      "price": 227.7449951171875
+    },
+    {
+      "dt": "2025-09-22T16:30:00",
+      "side": "BUY",
+      "size": 3.0,
+      "price": 253.72999572753906
+    },
+    {
+      "dt": "2025-10-28T13:30:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 269.135009765625
+    },
+    {
+      "dt": "2025-10-28T15:30:00",
+      "side": "BUY",
+      "size": 3.0,
+      "price": 268.69500732421875
+    },
+    {
+      "dt": "2025-11-03T16:30:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 266.659912109375
+    },
+    {
+      "dt": "2025-11-11T18:30:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 274.489990234375
+    },
+    {
+      "dt": "2025-11-17T18:30:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 267.7699890136719
+    },
+    {
+      "dt": "2025-11-25T16:30:00",
+      "side": "BUY",
+      "size": 6.0,
+      "price": 277.82000732421875
+    },
+    {
+      "dt": "2025-12-03T15:30:00",
+      "side": "SELL",
+      "size": -6.0,
+      "price": 287.32000732421875
+    },
+    {
+      "dt": "2026-02-24T17:30:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 272.489990234375
+    },
+    {
+      "dt": "2026-02-25T15:30:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 273.6300048828125
+    },
+    {
+      "dt": "2026-04-15T16:30:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 264.57000732421875
+    },
+    {
+      "dt": "2026-04-17T15:30:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 271.95001220703125
+    },
+    {
+      "dt": "2026-05-01T17:30:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 282.80499267578125
+    },
+    {
+      "dt": "2026-05-07T14:30:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 290.4700012207031
+    }
+  ]
+}
