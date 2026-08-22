@@ -7,7 +7,14 @@ Pre-stated prediction: bare-codex ask-rate > 0.3. **REFUTED.**
   prompt/effort): 0.5 ask-rate (arm 5/10; clean-room 15/30).
 - bare gemini-3.6-flash, high, n=30 (Vertex, served pinned 30/30):
   30 programs, 0 asks - matching its harnessed lane (also 0).
-- bare claude: pending the CLI freeing (prediction: stays 0).
+- bare claude (near-bare via --system-prompt), high, n=30: 30 programs,
+  0 asks - prediction CONFIRMED. MA defaults from its same 20/50 menu
+  (50-leaning in this cell by source-read).
+
+COMPLETE TRIPTYCH (BL-01b, high, n=30/family, one identical system line):
+every bare model writes 30/30 programs with zero asks. The entire ask
+phenomenon localizes to the codex CLI's agentic layer (0.5 harnessed vs
+0.0 bare for the same model, prompt, and effort).
 
 The decomposition this establishes:
 - WHAT fills the void is the MODEL: bare-luna silently picks its same
