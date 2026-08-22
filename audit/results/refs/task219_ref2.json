@@ -1,0 +1,99 @@
+{
+  "task_id": 219,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import statistics\nimport backtrader as bt\n\n\nclass CapitulationShortSqueeze(bt.Strategy):\n    params = (\n        ('bb_period', 126),\n        ('bb_dev', 2.0),\n        ('rsi_period', 14),\n        ('ema_period', 200),\n        ('atr_period', 14),\n        ('vol_sma_period', 20),\n        ('base_size', 100),\n    )\n\n    def __init__(self):\n        self.order = None\n        self.entry_price = 0.0\n        self.initial_size = 0\n        self.stop_loss = 0.0\n        self.tp1_done = False\n        self.tp2_done = False\n        self.pending_stop_loss = 0.0\n\n        # Primary Indicators\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev\n        )\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.ema200 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)\n\n        # Crossovers\n        self.crossover_bb_bot = bt.indicators.CrossOver(self.data.close, self.bb.lines.bot)\n        self.crossover_bb_top = bt.indicators.CrossOver(self.bb.lines.top, self.data.close)\n\n        # Dynamic max line for breakout crossover\n        max_mid_ema = bt.If(self.bb.lines.mid > self.ema200, self.bb.lines.mid, self.ema200)\n        self.crossover_alt = bt.indicators.CrossOver(self.data.close, max_mid_ema)\n\n    def notify_order(self, order):\n        if order.status in [order.Completed]:\n            if self.position.size != 0 and self.initial_size == 0:\n                self.entry_price = order.executed.price\n                self.initial_size = abs(self.position.size)\n                self.stop_loss = self.pending_stop_loss\n                self.tp1_done = False\n                self.tp2_done = False\n            elif self.position.size == 0:\n                self.initial_size = 0\n                self.entry_price = 0.0\n                self.stop_loss = 0.0\n            self.order = None\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        # Volatility Filter check\n        if len(self) >= self.p.bb_period:\n            widths = [self.bb.lines.top[-i] - self.bb.lines.bot[-i] for i in range(self.p.bb_period)]\n            median_width = statistics.median(widths)\n            current_width = self.bb.lines.top[0] - self.bb.lines.bot[0]\n            vol_filter_ok = current_width >= median_width\n        else:\n            vol_filter_ok = True\n\n        if not self.position:\n            if not vol_filter_ok:\n                return\n\n            # Long Entry 1: Capitulation + Bounce\n            capitulation_prev = (\n                (self.data.close[-1] < self.bb.lines.bot[-1]) and\n                (self.rsi[-1] < 30.0) and\n                (self.data.volume[-1] >= 1.8 * self.vol_sma[-1])\n            )\n            bullish_confirmation = (\n                (self.crossover_bb_bot[0] > 0) or\n                (\n                    (self.data.close[0] > self.data.open[0]) and\n                    ((self.data.high[0] - self.data.low[0]) >= 1.2 * self.atr[0])\n                )\n            )\n\n            # Long Entry 2: Breakout and Hold\n            breakout_long = (\n                (self.crossover_alt[0] > 0) and\n                (self.data.volume[0] >= 1.5 * self.vol_sma[0]) and\n                (self.rsi[0] > 50.0)\n            )\n\n            if capitulation_prev and bullish_confirmation:\n                local_low = min([self.data.low[-i] for i in range(4)])\n                self.pending_stop_loss = local_low - 1.0 * self.atr[0]\n                self.order = self.buy(size=self.p.base_size)\n                return\n\n            elif breakout_long:\n                max_mid_ema_val = max(self.bb.lines.mid[0], self.ema200[0])\n                atr_stop = self.data.close[0] - 1.0 * self.atr[0]\n                self.pending_stop_loss = max(max_mid_ema_val, atr_stop)\n                self.order = self.buy(size=self.p.base_size)\n                return\n\n            # Short Entry: Hedging Short\n            overbought_prev = (\n                (self.data.close[-1] > self.bb.lines.top[-1]) and\n                (self.rsi[-1] > 70.0) and\n                (self.data.volume[-1] >= 1.8 * self.vol_sma[-1])\n            )\n            bearish_confirmation = (\n                (self.crossover_bb_top[0] < 0) or\n                (\n                    (self.data.close[0] < self.data.open[0]) and\n                    ((self.data.high[0] - self.data.low[0]) >= 1.2 * self.atr[0])\n                )\n            )\n\n            if overbought_prev and bearish_confirmation:\n                local_high = max([self.data.high[-i] for i in range(4)])\n                self.pending_stop_loss = local_high + 1.0 * self.atr[0]\n                self.order = self.sell(size=self.p.base_size)\n                return\n\n        elif self.position.size > 0:\n            # Alternative full exit\n            if self.data.close[0] >= self.ema200[0] + 1.5 * self.atr[0]:\n                self.order = self.close()\n                return\n\n            # Stop loss check\n            if self.data.low[0] <= self.stop_loss:\n                self.order = self.close()\n                return\n\n            # Trailing stop update\n            self.stop_loss = max(self.stop_loss, self.data.close[0] - 2.0 * self.atr[0])\n\n            # Partial exit scaling\n            if not self.tp1_done and self.data.high[0] >= self.bb.lines.mid[0]:\n                tp1_size = round(0.5 * self.initial_size)\n                self.order = self.sell(size=tp1_size)\n                self.tp1_done = True\n                self.stop_loss = max(self.stop_loss, self.entry_price)\n\n            elif self.tp1_done and not self.tp2_done and self.data.high[0] >= self.bb.lines.top[0]:\n                tp2_size = round(0.3 * self.initial_size)\n                self.order = self.sell(size=tp2_size)\n                self.tp2_done = True\n\n            elif self.tp2_done and self.data.high[0] >= self.bb.lines.top[0] + 0.5 * self.atr[0]:\n                self.order = self.close()\n\n        elif self.position.size < 0:\n            # Short stop loss check\n            if self.data.high[0] >= self.stop_loss:\n                self.order = self.close()\n                return\n\n            # Trailing stop update for short\n            self.stop_loss = min(self.stop_loss, self.data.close[0] + 2.0 * self.atr[0])\n\n            # Short partial exits\n            if not self.tp1_done and self.data.low[0] <= self.bb.lines.mid[0]:\n                tp1_size = round(0.5 * self.initial_size)\n                self.order = self.buy(size=tp1_size)\n                self.tp1_done = True\n                self.stop_loss = min(self.stop_loss, self.entry_price)\n\n            elif self.tp1_done and not self.tp2_done and self.data.low[0] <= self.bb.lines.bot[0]:\n                self.order = self.close()\n                self.tp2_done = True",
+  "assumptions": [
+    {
+      "topic": "position_sizing",
+      "choice": "Fixed initial position size of 100 shares",
+      "reason": "The specification requires scaled-out partial exits (50%, 30%, 20%). Setting base_size to 100 guarantees clean integer share allocations for all exit legs without truncation issues."
+    },
+    {
+      "topic": "volatility_filter",
+      "choice": "BB bandwidth median comparison over 126 bars implemented",
+      "reason": "The spec notes that an optional volatility filter can be used to prevent entry when BB bandwidth is lower than its 126-bar median, so this check is explicitly included before entries."
+    },
+    {
+      "topic": "hedging_short",
+      "choice": "Symmetrical short entries enabled when flat",
+      "reason": "The spec details complete entry, stop-loss, and target exit rules for a hedging short condition, so it was implemented as an alternative entry mode when no position is open."
+    },
+    {
+      "topic": "signal_low_lookback",
+      "choice": "4-bar lookback for local min/max around signal candle",
+      "reason": "The spec prescribes a stop level relative to the local low/high of the signal candle defined as 'min(low of the last 3-5 bars)'. A 4-bar window covering index [-3] to [0] fits this specification precisely."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 5,
+  "tape": [
+    {
+      "dt": "2024-10-01T14:30:00",
+      "side": "SELL",
+      "size": -100.0,
+      "price": 224.6999969482422
+    },
+    {
+      "dt": "2024-10-01T17:30:00",
+      "side": "BUY",
+      "size": 50.0,
+      "price": 223.92999267578125
+    },
+    {
+      "dt": "2024-10-01T18:30:00",
+      "side": "BUY",
+      "size": 50.0,
+      "price": 225.44000244140625
+    },
+    {
+      "dt": "2025-07-01T15:30:00",
+      "side": "SELL",
+      "size": -100.0,
+      "price": 207.9600067138672
+    },
+    {
+      "dt": "2025-07-02T14:30:00",
+      "side": "BUY",
+      "size": 100.0,
+      "price": 212.27999877929688
+    },
+    {
+      "dt": "2025-09-22T16:30:00",
+      "side": "SELL",
+      "size": -100.0,
+      "price": 253.72999572753906
+    },
+    {
+      "dt": "2025-09-25T18:30:00",
+      "side": "BUY",
+      "size": 100.0,
+      "price": 254.5500030517578
+    },
+    {
+      "dt": "2025-10-29T15:30:00",
+      "side": "SELL",
+      "size": -100.0,
+      "price": 267.6099853515625
+    },
+    {
+      "dt": "2025-10-30T14:30:00",
+      "side": "BUY",
+      "size": 100.0,
+      "price": 269.0899963378906
+    },
+    {
+      "dt": "2026-05-01T15:30:00",
+      "side": "SELL",
+      "size": -100.0,
+      "price": 283.9549865722656
+    },
+    {
+      "dt": "2026-05-05T15:30:00",
+      "side": "BUY",
+      "size": 100.0,
+      "price": 280.2300109863281
+    }
+  ]
+}

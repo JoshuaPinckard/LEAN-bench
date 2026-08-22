@@ -1,0 +1,157 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionWalkForward(bt.Strategy):
+    params = (
+        ("is_len", 252),
+        ("gap_len", 21),
+        ("oos_len", 126),
+        ("k", 2.0),
+        ("m", 3.0),
+        ("risk_pct", 0.01),
+    )
+
+    def __init__(self):
+        self.sma252 = bt.indicators.SimpleMovingAverage(self.data.close, period=252)
+        self.std252 = bt.indicators.StandardDeviation(self.data.close, period=252)
+        self.rsi14 = bt.indicators.RSI(self.data.close, period=14)
+        self.atr14 = bt.indicators.AverageTrueRange(self.data, period=14)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=50)
+        self.ema200 = bt.indicators.EMA(self.data.close, period=200)
+
+        self.order = None
+        self.fixed_theta = None
+        self.fixed_sigma = None
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        current_bar = len(self) - 1
+        step = self.p.gap_len + self.p.oos_len
+        first_is_end = self.p.is_len - 1
+
+        if current_bar >= first_is_end:
+            offset = current_bar - first_is_end
+            bar_in_cycle = offset % step
+
+            if bar_in_cycle == 0:
+                self.fixed_theta = float(self.sma252[0])
+                self.fixed_sigma = float(self.std252[0])
+
+            is_oos_active = bar_in_cycle > self.p.gap_len
+        else:
+            is_oos_active = False
+
+        if self.position:
+            if self.order is not None:
+                return
+
+            if self.fixed_theta is None or self.fixed_sigma is None:
+                return
+
+            if self.position.size > 0:
+                tp_cond = self.data.close[0] >= self.fixed_theta
+                sl1_cond = (
+                    self.data.close[0]
+                    <= self.fixed_theta - self.p.m * self.fixed_sigma
+                )
+                sl2_cond = (
+                    self.data.close[0]
+                    <= self.position.price - 2.0 * self.atr14[0]
+                )
+
+                if tp_cond or sl1_cond or sl2_cond:
+                    self.order = self.close()
+
+            elif self.position.size < 0:
+                tp_cond = self.data.close[0] <= self.fixed_theta
+                sl1_cond = (
+                    self.data.close[0]
+                    >= self.fixed_theta + self.p.m * self.fixed_sigma
+                )
+                sl2_cond = (
+                    self.data.close[0]
+                    >= self.position.price + 2.0 * self.atr14[0]
+                )
+
+                if tp_cond or sl1_cond or sl2_cond:
+                    self.order = self.close()
+
+        else:
+            if not is_oos_active or self.order is not None:
+                return
+
+            if self.fixed_theta is None or self.fixed_sigma is None:
+                return
+
+            long_cond = (
+                self.data.close[0] < self.fixed_theta - self.p.k * self.fixed_sigma
+                and self.rsi14[0] < 40.0
+                and self.ema50[0] >= self.ema200[0]
+            )
+
+            short_cond = (
+                self.data.close[0] > self.fixed_theta + self.p.k * self.fixed_sigma
+                and self.rsi14[0] > 60.0
+                and self.ema50[0] <= self.ema200[0]
+            )
+
+            if long_cond:
+                capital = self.broker.getvalue()
+                risk_amount = self.p.risk_pct * capital
+                dist_to_stop = self.data.close[0] - (
+                    self.fixed_theta - self.p.m * self.fixed_sigma
+                )
+                denom = max(dist_to_stop, 1.5 * self.atr14[0])
+                if denom > 0:
+                    size = int(risk_amount / denom)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+
+            elif short_cond:
+                capital = self.broker.getvalue()
+                risk_amount = self.p.risk_pct * capital
+                dist_to_stop = (
+                    self.fixed_theta + self.p.m * self.fixed_sigma
+                ) - self.data.close[0]
+                denom = max(dist_to_stop, 1.5 * self.atr14[0])
+                if denom > 0:
+                    size = int(risk_amount / denom)
+                    if size > 0:
+                        self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "rolling_window_regime",
+      "choice": "12 months in-sample = 252 trading days, 1 month gap = 21 trading days, 6 months OOS trading = 126 trading days. Window shift step per cycle = 147 trading days (21 gap + 126 OOS).",
+      "reason": "Translates calendar month spans into exact daily bar counts for precise, deterministic execution traces."
+    },
+    {
+      "topic": "trend_filter",
+      "choice": "Long entries require EMA(50) >= EMA(200); Short entries require EMA(50) <= EMA(200).",
+      "reason": "Implements the stated rule: skip shorts if EMA(50) < EMA(200) is violated (i.e., when EMA(50) > EMA(200)) and skip longs if EMA(50) < EMA(200)."
+    },
+    {
+      "topic": "take_profit_crossover",
+      "choice": "Exit long when Close >= fixed theta; exit short when Close <= fixed theta.",
+      "reason": "Implements mean-reversion take-profit exit upon price returning to theta."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position size is computed using account portfolio value divided by max(distance to m*sigma stop, 1.5*ATR(14)), floored to whole integer shares.",
+      "reason": "Strictly matches the formula: quantity = (1% of capital) / max(distance to stop, 1.5*ATR(14))."
+    }
+  ]
+}
+```

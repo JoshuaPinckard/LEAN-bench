@@ -1,0 +1,142 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionStrikeVector(bt.Strategy):
+    params = (
+        ("ema_period", 20),
+        ("bb_period", 20),
+        ("bb_dev_outer", 2.0),
+        ("bb_dev_inner", 0.5),
+        ("atr_period", 14),
+        ("sma_atr_period", 60),
+        ("sma_vol_period", 20),
+        ("max_risk_pct", 0.05),
+        ("max_drawdown_pct", 0.10),
+        ("max_hold_bars", 20),
+    )
+
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.bb20_2 = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev_outer
+        )
+        self.bb20_05 = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev_inner
+        )
+        self.atr14 = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_atr60 = bt.indicators.SMA(self.atr14, period=self.p.sma_atr_period)
+        self.sma_vol20 = bt.indicators.SMA(self.data.volume, period=self.p.sma_vol_period)
+
+        self.crossover_bot = bt.indicators.CrossOver(self.data.close, self.bb20_2.bot)
+        self.crossover_top = bt.indicators.CrossOver(self.data.close, self.bb20_2.top)
+
+        self.order = None
+        self.stop_price = None
+        self.entry_bar = 0
+        self.peak_value = 0.0
+        self.stop_trading = False
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            if order.status == order.Completed:
+                if self.position:
+                    self.entry_bar = len(self)
+
+    def next(self):
+        current_value = self.broker.getvalue()
+        if current_value > self.peak_value:
+            self.peak_value = current_value
+
+        drawdown = (
+            (self.peak_value - current_value) / self.peak_value
+            if self.peak_value > 0
+            else 0.0
+        )
+        if drawdown >= self.p.max_drawdown_pct:
+            self.stop_trading = True
+            if self.position:
+                self.close()
+            return
+
+        if self.stop_trading:
+            return
+
+        if self.order is not None:
+            return
+
+        if self.position:
+            bars_held = len(self) - self.entry_bar
+            inside_bb05 = (
+                self.data.close[0] >= self.bb20_05.bot[0]
+                and self.data.close[0] <= self.bb20_05.top[0]
+            )
+            time_expired = bars_held >= self.p.max_hold_bars
+
+            hit_stop = False
+            if self.position.size > 0:
+                if self.stop_price is not None and self.data.close[0] <= self.stop_price:
+                    hit_stop = True
+            elif self.position.size < 0:
+                if self.stop_price is not None and self.data.close[0] >= self.stop_price:
+                    hit_stop = True
+
+            if inside_bb05 or time_expired or hit_stop:
+                self.order = self.close()
+            return
+
+        atr_filter = self.atr14[0] > 1.5 * self.sma_atr60[0]
+        vol_filter = self.data.volume[0] < self.sma_vol20[0]
+        gap_filter = abs(self.data.open[0] - self.data.close[-1]) > 1.5 * self.atr14[0]
+
+        if atr_filter or vol_filter or gap_filter:
+            return
+
+        if self.crossover_bot[0] > 0:
+            stop_price = self.ema20[0] - 2.0 * self.atr14[0]
+            risk_per_share = self.data.close[0] - stop_price
+            if risk_per_share > 0:
+                max_risk = self.p.max_risk_pct * current_value
+                size = int(max_risk / risk_per_share)
+                if size > 0:
+                    self.stop_price = stop_price
+                    self.order = self.buy(size=size)
+
+        elif self.crossover_top[0] < 0:
+            stop_price = self.ema20[0] + 2.0 * self.atr14[0]
+            risk_per_share = stop_price - self.data.close[0]
+            if risk_per_share > 0:
+                max_risk = self.p.max_risk_pct * current_value
+                size = int(max_risk / risk_per_share)
+                if size > 0:
+                    self.stop_price = stop_price
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "exit_inside_bb05",
+      "choice": "Inside BB(20, 0.5) is defined as close price falling between lower and upper bands of BollingerBands(20, 0.5), i.e., bot_0.5 <= close <= top_0.5.",
+      "reason": "The specification defines BB(20, 0.5) as the zone of return to fair price (+/- 0.5 standard deviations around the mean)."
+    },
+    {
+      "topic": "stop_loss_implementation",
+      "choice": "Initial stop level is computed at entry signal time using current EMA(20) and ATR(14) values and monitored on close prices in next().",
+      "reason": "Specification dictates initial stop = EMA(20) ± 2*ATR(14) to determine both position sizing and exit risk threshold."
+    },
+    {
+      "topic": "drawdown_limit",
+      "choice": "Drawdown is calculated relative to peak equity achieved during backtest; reaching >= 10% triggers immediate close and halts trading permanently.",
+      "reason": "Aligns with specification instruction 'if portfolio drawdown >= 10%, close all positions and stop trading'."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position size is computed as int(0.05 * current_portfolio_value / risk_per_share).",
+      "reason": "Ensures risk to initial stop does not exceed 5% of total capital."
+    }
+  ]
+}
+```

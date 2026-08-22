@@ -1,0 +1,316 @@
+```python
+import backtrader as bt
+
+
+class ReferenceTradingStrategy(bt.Strategy):
+    """
+    Reference implementation of two-component trading system (Primary + Auxiliary).
+    Primary (Predictive): Rebound after panic (up to 90% capital).
+    Auxiliary (Reactive): Short-term volatility & scalp strategies (up to 10% capital).
+    """
+
+    def __init__(self):
+        # Order and Position Tracking
+        self.order = None
+        self.trade_type = None
+        self.entry_price = 0.0
+        self.entry_atr = 0.0
+        self.stop_price = 0.0
+        self.target_price = 0.0
+        self.entry_bar = 0
+
+        # State Tracking
+        self.last_panic_bar = -999
+        self.last_ema_cross_bar = -999
+        self.last_squeeze_bar = -999
+        self.gap_up_bar = -999
+        self.gap_down_bar = -999
+
+        # Primary Indicators
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+        self.sma_atr126 = bt.indicators.SMA(self.atr14, period=126)
+
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2.0)
+        self.rsi14 = bt.indicators.RSI(self.data.close, period=14)
+
+        self.sma_vol50 = bt.indicators.SMA(self.data.volume, period=50)
+        self.sma_vol20 = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.ema20 = bt.indicators.EMA(self.data.close, period=20)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=50)
+        self.ema100 = bt.indicators.EMA(self.data.close, period=100)
+        self.ema200 = bt.indicators.EMA(self.data.close, period=200)
+
+        # Auxiliary Indicators
+        self.bb_width = self.bb.top - self.bb.bot
+        self.sma_bb_width = bt.indicators.SMA(self.bb_width, period=100)
+        self.sma_atr100 = bt.indicators.SMA(self.atr14, period=100)
+
+        self.stoch = bt.indicators.Stochastic(self.data, period=14, period_dfast=3, period_dslow=3)
+
+        # Crossovers
+        self.co_close_bbmid = bt.indicators.CrossOver(self.data.close, self.bb.mid)
+        self.co_ema20_ema50 = bt.indicators.CrossOver(self.ema20, self.ema50)
+        self.co_ema50_ema20 = bt.indicators.CrossOver(self.ema50, self.ema20)
+        self.co_close_bbtop = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.co_stoch_k_d = bt.indicators.CrossOver(self.stoch.percK, self.stoch.percD)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.position:
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+            else:
+                self.trade_type = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if not self.position:
+                self.trade_type = None
+
+        self.order = None
+
+    def _get_aux_size(self):
+        capital = self.broker.getvalue()
+        max_aux_cash = 0.10 * capital
+        size_cap = int(max_aux_cash / self.data.close[0]) if self.data.close[0] > 0 else 0
+        if self.atr14[0] > 0:
+            size_risk = int((0.01 * capital) / self.atr14[0])
+            size = min(size_cap, size_risk)
+        else:
+            size = size_cap
+        if size < 1 and size_cap >= 1:
+            size = 1
+        return size
+
+    def next(self):
+        # 1. Update Signals & Event Trackers
+        if self.co_ema20_ema50[0] > 0:
+            self.last_ema_cross_bar = len(self)
+
+        # Panic detector conditions
+        p1 = self.atr14[0] > (self.sma_atr126[0] * 1.5)
+        p2 = self.data.close[0] < self.bb.bot[0]
+        p3 = self.rsi14[0] < 30
+        p4 = self.data.volume[0] > (self.sma_vol50[0] * 1.3)
+        if sum([p1, p2, p3, p4]) >= 3:
+            self.last_panic_bar = len(self)
+
+        # Squeeze detector
+        if (self.bb_width[0] < self.sma_bb_width[0] * 0.8) and (self.atr14[0] < self.sma_atr100[0]):
+            self.last_squeeze_bar = len(self)
+
+        # Gap detector
+        if len(self) > 1 and self.atr14[-1] > 0:
+            if (self.data.open[0] >= self.data.close[-1] + 1.5 * self.atr14[-1]) and (self.data.close[-1] > self.bb.top[-1]):
+                self.gap_up_bar = len(self)
+            elif (self.data.open[0] <= self.data.close[-1] - 1.5 * self.atr14[-1]) and (self.data.close[-1] < self.bb.bot[-1]):
+                self.gap_down_bar = len(self)
+
+        # Pending order guard
+        if self.order:
+            return
+
+        # 2. Position Management
+        if self.position:
+            bars_in_trade = len(self) - self.entry_bar
+
+            if self.trade_type == 'PRIMARY':
+                # Trailing stop update if profitable
+                if self.data.close[0] > self.entry_price:
+                    self.stop_price = max(self.stop_price, self.data.close[0] - 2.0 * self.atr14[0])
+
+                if self.data.low[0] <= self.stop_price:
+                    self.order = self.close()
+                elif self.data.high[0] >= self.target_price:
+                    self.order = self.close()
+                elif self.rsi14[0] > 70 and self.data.close[0] > self.bb.top[0]:
+                    self.order = self.close()
+                elif self.co_ema50_ema20[0] > 0 or self.data.close[0] < self.ema50[0]:
+                    self.order = self.close()
+
+            elif self.trade_type == 'AUX1_LONG':
+                if self.data.low[0] <= self.stop_price:
+                    self.order = self.close()
+                elif self.data.high[0] >= self.target_price or self.data.close[0] <= self.bb.mid[0]:
+                    self.order = self.close()
+                elif bars_in_trade >= 3:
+                    self.order = self.close()
+
+            elif self.trade_type == 'AUX1_SHORT':
+                if self.data.high[0] >= self.stop_price:
+                    self.order = self.close()
+                elif self.data.low[0] <= self.target_price or self.data.close[0] >= self.bb.mid[0]:
+                    self.order = self.close()
+                elif bars_in_trade >= 3:
+                    self.order = self.close()
+
+            elif self.trade_type == 'AUX2_LONG':
+                if self.data.low[0] <= self.stop_price:
+                    self.order = self.close()
+                elif self.data.high[0] >= self.target_price or self.data.close[0] < self.ema20[0]:
+                    self.order = self.close()
+                elif bars_in_trade >= 10:
+                    self.order = self.close()
+
+            elif self.trade_type == 'AUX2_SHORT':
+                if self.data.high[0] >= self.stop_price:
+                    self.order = self.close()
+                elif self.data.low[0] <= self.target_price or self.data.close[0] > self.ema20[0]:
+                    self.order = self.close()
+                elif bars_in_trade >= 10:
+                    self.order = self.close()
+
+            elif self.trade_type == 'AUX3_LONG':
+                if self.data.low[0] <= self.stop_price:
+                    self.order = self.close()
+                elif self.data.close[0] >= self.bb.top[0] or self.data.high[0] >= self.target_price:
+                    self.order = self.close()
+                elif bars_in_trade >= 8:
+                    self.order = self.close()
+
+            elif self.trade_type == 'AUX3_SHORT':
+                if self.data.high[0] >= self.stop_price:
+                    self.order = self.close()
+                elif self.data.close[0] <= self.bb.bot[0] or self.data.low[0] <= self.target_price:
+                    self.order = self.close()
+                elif bars_in_trade >= 8:
+                    self.order = self.close()
+
+            return
+
+        # 3. Entry Evaluation (Prioritized Order)
+        capital = self.broker.getvalue()
+
+        # Primary Entry Strategy
+        trend_ok = len(self) >= 220 and self.sma200[0] > self.sma200[-20]
+        panic_recent = 0 <= (len(self) - self.last_panic_bar) <= 10
+        ema_cross_recent = (self.co_ema20_ema50[0] > 0) or (0 <= (len(self) - self.last_ema_cross_bar) <= 10)
+        entry_trigger = (self.co_close_bbmid[0] > 0) and ema_cross_recent
+
+        if trend_ok and panic_recent and entry_trigger:
+            max_cash = 0.90 * capital
+            size = int(max_cash / self.data.close[0]) if self.data.close[0] > 0 else 0
+            if size > 0:
+                self.trade_type = 'PRIMARY'
+                self.entry_atr = self.atr14[0]
+                self.stop_price = self.data.close[0] - 1.5 * self.entry_atr
+                self.target_price = self.data.close[0] + 3.0 * self.entry_atr
+                self.order = self.buy(size=size)
+                return
+
+        # Auxiliary Strategy 1 — "Pre-volatility" breakout
+        squeeze_recent = 0 <= (len(self) - self.last_squeeze_bar) <= 3
+        if squeeze_recent:
+            if self.co_close_bbtop[0] > 0 and self.data.volume[0] > self.sma_vol20[0] * 1.2:
+                size = self._get_aux_size()
+                if size > 0:
+                    self.trade_type = 'AUX1_LONG'
+                    self.entry_atr = self.atr14[0]
+                    self.stop_price = self.data.close[0] - 1.0 * self.entry_atr
+                    self.target_price = self.data.close[0] + 1.5 * self.entry_atr
+                    self.order = self.buy(size=size)
+                    return
+            elif (self.data.close[0] < self.bb.bot[0] and self.data.close[-1] >= self.bb.bot[-1]) and self.data.volume[0] > self.sma_vol20[0] * 1.2:
+                size = self._get_aux_size()
+                if size > 0:
+                    self.trade_type = 'AUX1_SHORT'
+                    self.entry_atr = self.atr14[0]
+                    self.stop_price = self.data.close[0] + 1.0 * self.entry_atr
+                    self.target_price = self.data.close[0] - 1.5 * self.entry_atr
+                    self.order = self.sell(size=size)
+                    return
+
+        # Auxiliary Strategy 2 — "Post-gap" trend continuation
+        gap_up_active = 0 <= (len(self) - self.gap_up_bar) <= 10
+        gap_down_active = 0 <= (len(self) - self.gap_down_bar) <= 10
+
+        if gap_up_active:
+            pullback = (self.data.low[0] <= self.ema20[0]) or (self.data.low[0] <= self.bb.mid[0])
+            stoch_trigger = (self.co_stoch_k_d[0] > 0) and (self.stoch.percK[-1] < 20 or self.stoch.percD[-1] < 20)
+            if pullback and stoch_trigger:
+                size = self._get_aux_size()
+                if size > 0:
+                    self.trade_type = 'AUX2_LONG'
+                    self.entry_atr = self.atr14[0]
+                    self.stop_price = self.data.close[0] - 1.0 * self.entry_atr
+                    self.target_price = self.data.close[0] + 2.0 * self.entry_atr
+                    self.order = self.buy(size=size)
+                    return
+
+        if gap_down_active:
+            pullback = (self.data.high[0] >= self.ema20[0]) or (self.data.high[0] >= self.bb.mid[0])
+            stoch_trigger = (self.co_stoch_k_d[0] < 0) and (self.stoch.percK[-1] > 80 or self.stoch.percD[-1] > 80)
+            if pullback and stoch_trigger:
+                size = self._get_aux_size()
+                if size > 0:
+                    self.trade_type = 'AUX2_SHORT'
+                    self.entry_atr = self.atr14[0]
+                    self.stop_price = self.data.close[0] + 1.0 * self.entry_atr
+                    self.target_price = self.data.close[0] - 2.0 * self.entry_atr
+                    self.order = self.sell(size=size)
+                    return
+
+        # Auxiliary Strategy 3 — Trend scalping
+        long_trend = self.ema20[0] > self.ema50[0] > self.ema100[0] > self.ema200[0]
+        short_trend = self.ema20[0] < self.ema50[0] < self.ema100[0] < self.ema200[0]
+
+        if long_trend:
+            pullback = self.data.close[0] <= self.bb.mid[0]
+            stoch_trigger = (self.co_stoch_k_d[0] > 0) and (self.stoch.percK[-1] < 30 or self.stoch.percD[-1] < 30)
+            if pullback and stoch_trigger:
+                size = self._get_aux_size()
+                if size > 0:
+                    self.trade_type = 'AUX3_LONG'
+                    self.entry_atr = self.atr14[0]
+                    self.stop_price = self.data.close[0] - 1.0 * self.entry_atr
+                    self.target_price = self.data.close[0] + 1.2 * self.entry_atr
+                    self.order = self.buy(size=size)
+                    return
+
+        if short_trend:
+            pullback = self.data.close[0] >= self.bb.mid[0]
+            stoch_trigger = (self.co_stoch_k_d[0] < 0) and (self.stoch.percK[-1] > 70 or self.stoch.percD[-1] > 70)
+            if pullback and stoch_trigger:
+                size = self._get_aux_size()
+                if size > 0:
+                    self.trade_type = 'AUX3_SHORT'
+                    self.entry_atr = self.atr14[0]
+                    self.stop_price = self.data.close[0] + 1.0 * self.entry_atr
+                    self.target_price = self.data.close[0] - 1.2 * self.entry_atr
+                    self.order = self.sell(size=size)
+                    return
+```
+```json
+{
+  "assumptions": [
+    {
+      "topic": "position_architecture",
+      "choice": "Single position tracking with prioritized signal entry (Primary > Aux 1 > Aux 2 > Aux 3).",
+      "reason": "Backtrader natively tracks a single net position on a single data feed. Simultaneous separate trades are serialized by priority."
+    },
+    {
+      "topic": "crossover_timing",
+      "choice": "EMA20/EMA50 crossover is satisfied if it occurred on the current bar or within the recent 10-bar window leading up to entry.",
+      "reason": "Strict simultaneous exact-bar crossover of two independent indicator pairs rarely occurs on 5-minute bars."
+    },
+    {
+      "topic": "gap_regime_window",
+      "choice": "Gap detection maintains an active gap state for 10 bars to allow entry on subsequent pullbacks.",
+      "reason": "Gap momentum continuation entry occurs on a pullback following a gap event."
+    },
+    {
+      "topic": "auxiliary_position_sizing",
+      "choice": "Auxiliary sizing uses 1% account risk capped at 10% total account capital.",
+      "reason": "Aligns risk management rule (risk <= 1% capital) with capital allocation limit (<= 10% total portfolio)."
+    },
+    {
+      "topic": "stochastic_short_trigger",
+      "choice": "Short stochastic trigger evaluated as CrossOver(percK, percD) < 0 from above overbought thresholds.",
+      "reason": "Mirrors long stochastic cross-up from oversold territory."
+    }
+  ]
+}
+```

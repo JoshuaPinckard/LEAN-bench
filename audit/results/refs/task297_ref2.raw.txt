@@ -1,0 +1,176 @@
+```python
+import backtrader as bt
+
+
+class OptionProxyStrategy(bt.Strategy):
+    params = (
+        (
+            "strategy_type",
+            1,
+        ),  # 1 for Strategy 1 (CSP-proxy), 2 for Strategy 2 (CC-proxy)
+        ("commission", 0.001),
+    )
+
+    def __init__(self):
+        # Indicators required by specification
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.boll = bt.indicators.BollingerBands(
+            self.data, period=20, devfactor=2.0
+        )
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.ema20 = bt.indicators.EMA(self.data.close, period=20)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=20)
+
+        # Reversal indicator for Strategy 2 entry / exit
+        self.crossover = bt.indicators.CrossOver(self.ema20, self.sma50)
+
+        # Order & position tracking attributes
+        self.order = None
+        self.entry_price = 0.0
+        self.bar_entered = 0
+        self.k_entry = 0.0
+        self.atr_entry = 0.0
+        self.reached_50pct = False
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.bar_entered = len(self)
+                self.reached_50pct = False
+                raw_k = (
+                    self.atr[0] / self.entry_price
+                    if self.entry_price > 0
+                    else 0.01
+                )
+                self.k_entry = min(max(raw_k, 0.01), 0.05)
+                self.atr_entry = self.atr[0]
+            self.order = None
+        elif order.status in [
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        ]:
+            self.order = None
+
+    def next(self):
+        # Guard pending orders
+        if self.order:
+            return
+
+        liquidity_ok = self.data.volume[0] > self.vol_sma[0]
+
+        if not self.position:
+            if self.p.strategy_type == 1:
+                # Strategy 1 (CSP-proxy: buy-the-dip mean reversion)
+                cond_boll = self.data.close[0] < self.boll.lines.bot[0]
+                cond_rsi = self.rsi[0] < 35
+
+                if cond_boll and cond_rsi and liquidity_ok:
+                    raw_k = self.atr[0] / self.data.close[0]
+                    k = min(max(raw_k, 0.01), 0.05)
+                    limit_price = self.data.close[0] * (1.0 - k)
+                    size = int((self.broker.getcash() * 0.20) / limit_price)
+                    if size > 0:
+                        self.order = self.buy(
+                            exectype=bt.Order.Limit,
+                            price=limit_price,
+                            size=size,
+                        )
+
+            elif self.p.strategy_type == 2:
+                # Strategy 2 (CC-proxy: trend + capped upside)
+                cond_cross = self.crossover[0] > 0
+                cond_close = self.data.close[0] > self.ema20[0]
+
+                if cond_cross and cond_close and liquidity_ok:
+                    size = int(
+                        (self.broker.getcash() * 0.995) / self.data.close[0]
+                    )
+                    if size > 0:
+                        self.order = self.buy(size=size)
+        else:
+            bars_held = len(self) - self.bar_entered
+
+            if self.p.strategy_type == 1:
+                # Strategy 1 Exit rules
+                tp_price = self.entry_price * (1.0 + 0.5 * self.k_entry)
+                tp_hit = (self.data.high[0] >= tp_price) or (
+                    self.data.high[0] >= self.boll.lines.mid[0]
+                )
+
+                sl_price = self.entry_price - 1.5 * self.atr_entry
+                sl_hit = self.data.low[0] <= sl_price
+
+                timeout_hit = bars_held >= 20
+
+                if tp_hit or sl_hit or timeout_hit:
+                    self.order = self.close()
+
+            elif self.p.strategy_type == 2:
+                # Strategy 2 Exit rules
+                # Track early exit / 50% protection trigger
+                if self.data.high[0] >= self.entry_price * (
+                    1.0 + 0.5 * self.k_entry
+                ):
+                    self.reached_50pct = True
+
+                # Take-profit conditions
+                tp_band = self.data.high[0] >= self.boll.lines.top[0]
+                tp_rise = self.data.high[0] >= self.entry_price * (
+                    1.0 + self.k_entry
+                )
+                tp_hit = tp_band or tp_rise
+
+                # Early exit condition
+                early_exit_hit = (
+                    self.reached_50pct and self.data.close[0] < self.ema20[0]
+                )
+
+                # Stop-loss conditions
+                sl_ema = self.data.close[0] < (
+                    self.ema20[0] - 1.0 * self.atr[0]
+                )
+                sl_cross = self.crossover[0] < 0
+                sl_hit = sl_ema or sl_cross
+
+                # Time-out condition
+                timeout_hit = bars_held >= 20
+
+                if tp_hit or early_exit_hit or sl_hit or timeout_hit:
+                    self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "strategy_selection",
+      "choice": "Implemented both strategies within a single Strategy class parameterized by strategy_type (1 for CSP-proxy, 2 for CC-proxy, default=1).",
+      "reason": "The specification details two separate strategies to evaluate, while the execution harness requires exactly one module-level class inheriting from bt.Strategy."
+    },
+    {
+      "topic": "reverse_crossover_definition",
+      "choice": "Interpreted 'reverse CrossOver (SMA(50) crosses EMA(20) from above to below)' as EMA(20) crossing below SMA(50) (crossover < 0).",
+      "reason": "The entry signal requires EMA(20) to cross above SMA(50), making EMA(20) higher than SMA(50). A bearish reversal of this state occurs when EMA(20) crosses back below SMA(50)."
+    },
+    {
+      "topic": "strategy1_tp_condition",
+      "choice": "Triggered Strategy 1 take-profit when price reaches either Entry + 0.5*k*Entry or touches middle Bollinger line (boll.mid), whichever occurs first.",
+      "reason": "The specification states 'close at market on the first event', indicating an OR logic between reaching the price target and touching the middle Bollinger band."
+    },
+    {
+      "topic": "position_sizing_commission_buffer",
+      "choice": "Applied a 0.5% cash buffer (0.995 * capital) for 100% position sizing in Strategy 2.",
+      "reason": "Using exact 100% cash allocation causes order rejection in Backtrader when a non-zero commission (0.001) is charged."
+    },
+    {
+      "topic": "indicator_value_persistence",
+      "choice": "Saved k and ATR values upon trade execution to compute fixed entry-based take-profit and stop-loss targets.",
+      "reason": "Option proxies specify targets based on entry price and entry volatility/premium values (k*Entry and ATR)."
+    }
+  ]
+}
+```

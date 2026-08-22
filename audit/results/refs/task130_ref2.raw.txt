@@ -1,0 +1,145 @@
+```python
+import backtrader as bt
+
+
+class AntiLossStreakSkipper(bt.Strategy):
+    params = (
+        ("fast_period", 10),
+        ("slow_period", 30),
+        ("tp_pct", 0.04),
+        ("sl_pct", 0.02),
+        ("stake_pct", 0.01),
+    )
+
+    def __init__(self):
+        self.sma_fast = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.fast_period
+        )
+        self.sma_slow = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.slow_period
+        )
+        self.crossover = bt.indicators.CrossOver(self.sma_fast, self.sma_slow)
+
+        self.order = None
+        self.tp_order = None
+        self.sl_order = None
+        self.tp_ref = None
+        self.sl_ref = None
+
+        self.state = "NORMAL"  # 'NORMAL' or 'SKIPPING'
+
+        self.hypo_pending = False
+        self.hypo_active = False
+        self.hypo_entry = 0.0
+        self.hypo_tp = 0.0
+        self.hypo_sl = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.order and order.ref == self.order.ref:
+                self.order = None
+                entry_price = order.executed.price
+                tp_price = entry_price * (1.0 + self.p.tp_pct)
+                sl_price = entry_price * (1.0 - self.p.sl_pct)
+
+                self.tp_order = self.sell(
+                    size=order.executed.size,
+                    price=tp_price,
+                    exectype=bt.Order.Limit,
+                )
+                self.sl_order = self.sell(
+                    size=order.executed.size,
+                    price=sl_price,
+                    exectype=bt.Order.Stop,
+                    oco=self.tp_order,
+                )
+                self.tp_ref = self.tp_order.ref
+                self.sl_ref = self.sl_order.ref
+
+            elif self.tp_ref and order.ref == self.tp_ref:
+                self.state = "NORMAL"
+                self.tp_ref = None
+                self.sl_ref = None
+                self.tp_order = None
+                self.sl_order = None
+
+            elif self.sl_ref and order.ref == self.sl_ref:
+                self.state = "SKIPPING"
+                self.tp_ref = None
+                self.sl_ref = None
+                self.tp_order = None
+                self.sl_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if self.order and order.ref == self.order.ref:
+                self.order = None
+            if self.tp_ref and order.ref == self.tp_ref:
+                self.tp_ref = None
+                self.tp_order = None
+            if self.sl_ref and order.ref == self.sl_ref:
+                self.sl_ref = None
+                self.sl_order = None
+
+    def next(self):
+        if self.hypo_pending:
+            self.hypo_entry = self.data.open[0]
+            self.hypo_tp = self.hypo_entry * (1.0 + self.p.tp_pct)
+            self.hypo_sl = self.hypo_entry * (1.0 - self.p.sl_pct)
+            self.hypo_active = True
+            self.hypo_pending = False
+
+        if self.hypo_active:
+            tp_hit = self.data.high[0] >= self.hypo_tp
+            sl_hit = self.data.low[0] <= self.hypo_sl
+
+            if tp_hit and sl_hit:
+                self.state = "NORMAL"
+                self.hypo_active = False
+            elif tp_hit:
+                self.state = "NORMAL"
+                self.hypo_active = False
+            elif sl_hit:
+                self.hypo_active = False
+
+        if self.order or self.tp_ref or self.sl_ref:
+            return
+
+        if self.crossover[0] > 0:
+            if self.position:
+                return
+
+            if self.state == "NORMAL":
+                equity = self.broker.getvalue()
+                size = max(
+                    1, int((equity * self.p.stake_pct) / self.data.close[0])
+                )
+                self.order = self.buy(size=size)
+            elif self.state == "SKIPPING":
+                if not self.hypo_active and not self.hypo_pending:
+                    self.hypo_pending = True
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_condition",
+      "choice": "SMA 10 / SMA 30 bullish crossover used as standard entry signal.",
+      "reason": "The spec leaves standard entry conditions open ('e.g., moving average crossovers, breakouts, etc.'). SMA crossover is a canonical trend-following entry."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "1% of current portfolio equity allocated to trade size = floor(0.01 * equity / close_price).",
+      "reason": "Spec states 'fixed position size for all trades (e.g., 1% of equity per trade)'."
+    },
+    {
+      "topic": "hypothetical_trade_execution",
+      "choice": "Hypothetical/skipped trades enter on the Open price of the bar following the signal, evaluated against 4% TP and 2% SL levels.",
+      "reason": "Matches the real market order execution timing and bracket exit logic of executed trades."
+    }
+  ]
+}
+```

@@ -1,0 +1,57 @@
+{
+  "task_id": 79,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\n\n\nclass BreakoutMomentumSOFI(bt.Strategy):\n    params = (\n        (\"weekly_period\", 52),\n        (\"daily_sma_period\", 200),\n        (\"hourly_breakout_period\", 20),\n        (\"hourly_vol_period\", 20),\n        (\"atr_period\", 14),\n        (\"atr_mult\", 2.0),\n        (\"pct_stop\", 0.05),\n        (\"tp_pct\", 0.05),\n        (\"near_high_pct\", 0.02),\n        (\"risk_pct\", 0.015),\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.vol_sma = bt.indicators.SMA(\n            self.data.volume, period=self.p.hourly_vol_period\n        )\n\n        self.daily_closes = []\n        self.current_day_date = None\n        self.current_day_close = None\n\n        self.weekly_highs = []\n        self.current_week_key = None\n        self.current_week_high = None\n\n        self.order = None\n        self.pending_trade_type = None\n        self.trade_type = None\n        self.entry_price = None\n        self.stop_price = None\n        self.tp_taken = False\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status == order.Completed:\n            if order.isbuy():\n                if self.entry_price is None:\n                    self.entry_price = order.executed.price\n                    self.trade_type = self.pending_trade_type\n                    sl_atr = self.entry_price - self.p.atr_mult * self.atr[0]\n                    sl_pct = self.entry_price * (1.0 - self.p.pct_stop)\n                    self.stop_price = max(sl_atr, sl_pct)\n                    self.tp_taken = False\n            elif order.issell():\n                if self.position.size == 0:\n                    self.trade_type = None\n                    self.entry_price = None\n                    self.stop_price = None\n                    self.tp_taken = False\n                    self.pending_trade_type = None\n\n        if order.status in [\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        ]:\n            self.order = None\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        week_key = self.data.datetime.date(0).isocalendar()[:2]\n\n        if self.current_day_date is None:\n            self.current_day_date = dt\n            self.current_day_close = self.data.close[0]\n        elif dt != self.current_day_date:\n            self.daily_closes.append(self.current_day_close)\n            self.current_day_date = dt\n            self.current_day_close = self.data.close[0]\n        else:\n            self.current_day_close = self.data.close[0]\n\n        if self.current_week_key is None:\n            self.current_week_key = week_key\n            self.current_week_high = self.data.high[0]\n        elif week_key != self.current_week_key:\n            self.weekly_highs.append(self.current_week_high)\n            self.current_week_key = week_key\n            self.current_week_high = self.data.high[0]\n        else:\n            self.current_week_high = max(\n                self.current_week_high, self.data.high[0]\n            )\n\n        if self.position.size > 0:\n            if self.order is not None:\n                return\n\n            if len(self.weekly_highs) >= self.p.weekly_period:\n                weekly_high_52 = max(\n                    self.weekly_highs[-self.p.weekly_period :]\n                )\n                if (\n                    self.trade_type == \"short_term\"\n                    and self.data.close[0] > weekly_high_52\n                ):\n                    self.trade_type = \"long_term\"\n                    sl_atr = self.entry_price - self.p.atr_mult * self.atr[0]\n                    sl_pct = self.entry_price * (1.0 - self.p.pct_stop)\n                    self.stop_price = max(sl_atr, sl_pct)\n\n            if self.data.low[0] <= self.stop_price:\n                self.order = self.close()\n                return\n\n            if self.trade_type == \"short_term\" and not self.tp_taken:\n                if self.data.high[0] >= self.entry_price * (1.0 + self.p.tp_pct):\n                    tp_size = max(1, self.position.size // 2)\n                    self.order = self.sell(size=tp_size)\n                    self.tp_taken = True\n                    self.stop_price = max(self.stop_price, self.entry_price)\n            return\n\n        if self.order is not None:\n            return\n\n        if (\n            len(self.daily_closes) < self.p.daily_sma_period\n            or len(self.weekly_highs) < self.p.weekly_period\n        ):\n            return\n\n        sma_200_day = sum(\n            self.daily_closes[-self.p.daily_sma_period :]\n        ) / float(self.p.daily_sma_period)\n        daily_uptrend = self.data.close[0] > sma_200_day\n\n        weekly_high_52 = max(self.weekly_highs[-self.p.weekly_period :])\n\n        long_term_signal = daily_uptrend and (\n            self.data.close[0] > weekly_high_52\n        )\n\n        hourly_high_20 = max(\n            [\n                self.data.high[-i]\n                for i in range(1, self.p.hourly_breakout_period + 1)\n            ]\n        )\n        hourly_breakout = self.data.close[0] > hourly_high_20\n        increased_volume = self.data.volume[0] > self.vol_sma[0]\n        not_near_weekly_high = self.data.close[0] < (\n            1.0 - self.p.near_high_pct\n        ) * weekly_high_52\n\n        short_term_signal = (\n            daily_uptrend\n            and hourly_breakout\n            and increased_volume\n            and not_near_weekly_high\n        )\n\n        signal_type = None\n        if long_term_signal:\n            signal_type = \"long_term\"\n        elif short_term_signal:\n            signal_type = \"short_term\"\n\n        if signal_type is not None:\n            entry_price = self.data.close[0]\n            sl_atr = entry_price - self.p.atr_mult * self.atr[0]\n            sl_pct = entry_price * (1.0 - self.p.pct_stop)\n            stop_price = max(sl_atr, sl_pct)\n\n            risk_per_share = entry_price - stop_price\n            if risk_per_share <= 0:\n                return\n\n            capital = self.broker.getvalue()\n            max_risk_amount = capital * self.p.risk_pct\n            size = int(max_risk_amount / risk_per_share)\n\n            max_cash_size = int(self.broker.getcash() / entry_price)\n            size = min(size, max_cash_size)\n\n            if size > 0:\n                self.pending_trade_type = signal_type\n                self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "timeframe_aggregation",
+      "choice": "Aggregate daily and weekly historical bars manually from 1h bars by tracking date and calendar week boundaries",
+      "reason": "The execution environment supplies a single hourly data feed (self.data); tracking completed daily closes and weekly highs manually ensures exact multi-timeframe calculations without lookahead bias."
+    },
+    {
+      "topic": "parameter_defaults",
+      "choice": "N=52 weeks for weekly breakout high, 200 days for daily SMA, 20 hours for hourly resistance breakout and volume SMA, 14-period ATR with 2.0x multiplier, 5% percentage stop, 5% short-term take profit, 2% threshold for 'near historical weekly high' filter, and 1.5% capital risk per trade",
+      "reason": "The specification explicitly references these example parameter values in parenthetical notes."
+    },
+    {
+      "topic": "stop_loss_conservative_definition",
+      "choice": "More conservative stop loss is defined as the tighter stop loss (higher stop price for long positions, i.e., max(entry - 2*ATR, entry * 0.95))",
+      "reason": "A higher stop price limits the maximum dollar loss per share per trade, preserving capital strictly."
+    },
+    {
+      "topic": "increased_volume_definition",
+      "choice": "Volume is defined as increased if current 1h volume exceeds the 20-period 1h volume SMA",
+      "reason": "The specification states 'breaks a resistance level... with increased volume'."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 2,
+  "tape": [
+    {
+      "dt": "2024-09-27T14:30:00",
+      "side": "BUY",
+      "size": 759.0,
+      "price": 8.026000022888184
+    },
+    {
+      "dt": "2024-09-30T18:30:00",
+      "side": "SELL",
+      "size": -759.0,
+      "price": 7.840000152587891
+    },
+    {
+      "dt": "2024-10-04T14:30:00",
+      "side": "BUY",
+      "size": 721.0,
+      "price": 7.940000057220459
+    },
+    {
+      "dt": "2024-10-04T17:30:00",
+      "side": "SELL",
+      "size": -360.0,
+      "price": 8.239999771118164
+    }
+  ]
+}

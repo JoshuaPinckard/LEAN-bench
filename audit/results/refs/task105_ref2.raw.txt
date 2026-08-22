@@ -1,0 +1,136 @@
+```python
+import backtrader as bt
+
+
+class LiquidityMomentumStrategy(bt.Strategy):
+    params = (
+        ("period", 24),
+        ("risk_pct", 0.01),
+    )
+
+    def __init__(self):
+        self.order = None
+
+        # Equilibrium (EQ): average price over the last 24 hours (bars)
+        self.eq = bt.indicators.SMA(self.data.close, period=self.p.period)
+
+        # Fibonacci Retracement boundaries over last 24 bars
+        self.high_24 = bt.indicators.Highest(self.data.high, period=self.p.period)
+        self.low_24 = bt.indicators.Lowest(self.data.low, period=self.p.period)
+        self.range_24 = self.high_24 - self.low_24
+
+        self.fib214 = self.low_24 + 0.214 * self.range_24
+        self.fib236 = self.low_24 + 0.236 * self.range_24
+        self.fib382 = self.low_24 + 0.382 * self.range_24
+        self.fib500 = self.low_24 + 0.500 * self.range_24
+        self.fib618 = self.low_24 + 0.618 * self.range_24
+        self.fib786 = self.low_24 + 0.786 * self.range_24
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def get_volume_nodes(self):
+        vols = [self.data.volume[-i] for i in range(self.p.period)]
+        closes = [self.data.close[-i] for i in range(self.p.period)]
+        max_idx = vols.index(max(vols))
+        min_idx = vols.index(min(vols))
+        return closes[max_idx], closes[min_idx]
+
+    def next(self):
+        if self.order:
+            return
+
+        if len(self) < self.p.period + 3:
+            return
+
+        hvn_price, lvn_price = self.get_volume_nodes()
+        close = self.data.close[0]
+        close_prev = self.data.close[-1]
+
+        # 1. Trend Context
+        bullish_trend = close > self.eq[0] and close > self.fib500[0]
+        bearish_trend = close < self.eq[0] and close < self.fib500[0]
+
+        # 2. Liquidity Sweep Proxy (test of recent extreme low/high)
+        liquidity_test_long = self.data.low[0] <= self.low_24[-1] or self.data.low[-1] <= self.low_24[-2]
+        liquidity_test_short = self.data.high[0] >= self.high_24[-1] or self.data.high[-1] >= self.high_24[-2]
+
+        # Structure Signals
+        bos_long = close > self.data.high[-1]
+        bos_short = close < self.data.low[-1]
+
+        fvg_long_break = close > self.data.high[-2] and self.data.low[0] > self.data.high[-2]
+        fvg_short_break = close < self.data.low[-2] and self.data.high[0] < self.data.low[-2]
+
+        ob_long_enter = self.data.low[0] <= self.data.high[-1] and close >= self.data.low[-1]
+        ob_short_enter = self.data.high[0] >= self.data.low[-1] and close <= self.data.high[-1]
+
+        # Fibonacci level cross triggers
+        fib_cross_long = close >= self.fib618[0] and close_prev < self.fib618[-1]
+        fib_cross_short = close <= self.fib382[0] and close_prev > self.fib382[-1]
+
+        if not self.position:
+            # Long Entry
+            if bullish_trend and liquidity_test_long and fib_cross_long and (bos_long or fvg_long_break or ob_long_enter):
+                sl_price = min(self.data.low[-1], lvn_price)
+                if sl_price >= close:
+                    sl_price = close * 0.99
+                tp_price = max(self.fib786[0], hvn_price)
+                if tp_price <= close:
+                    tp_price = close * 1.02
+
+                risk_dist = close - sl_price
+                capital = self.broker.getvalue()
+                risk_amount = capital * self.p.risk_pct
+                size = int(risk_amount / risk_dist) if risk_dist > 0 else 1
+                size = max(1, size)
+
+                orders = self.buy_bracket(size=size, limitprice=tp_price, stopprice=sl_price)
+                self.order = orders[0]
+
+            # Short Entry
+            elif bearish_trend and liquidity_test_short and fib_cross_short and (bos_short or fvg_short_break or ob_short_enter):
+                sl_price = max(self.data.high[-1], hvn_price)
+                if sl_price <= close:
+                    sl_price = close * 1.01
+                tp_price = min(self.fib214[0], lvn_price)
+                if tp_price >= close:
+                    tp_price = close * 0.98
+
+                risk_dist = sl_price - close
+                capital = self.broker.getvalue()
+                risk_amount = capital * self.p.risk_pct
+                size = int(risk_amount / risk_dist) if risk_dist > 0 else 1
+                size = max(1, size)
+
+                orders = self.sell_bracket(size=size, limitprice=tp_price, stopprice=sl_price)
+                self.order = orders[0]
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Extended hours (pre-market/after-hours) session data is absent in the provided 1h data feed. Liquidity zone tests are proxied by checking if price touched or swept the 24-bar lowest low (for longs) or highest high (for shorts).",
+      "reason": "The feed contains regular trading hours bars only, making direct pre-market/after-hours session identification infeasible."
+    },
+    {
+      "topic": "Volume Profile / HVN / LVN",
+      "choice": "HVN (High Volume Node) is defined as the close price of the highest volume bar in the 24-bar window; LVN (Low Volume Node) is defined as the close price of the lowest volume bar in the same window.",
+      "reason": "Provides a discrete volume profile representation without external tick-level order book data."
+    },
+    {
+      "topic": "Order Block & Fair Value Gap definitions",
+      "choice": "Order Block zone is defined using the previous bar's high-low range. FVG is defined when current bar low > 2-bars-ago high (bullish) or current bar high < 2-bars-ago low (bearish).",
+      "reason": "Standard quantitative representation of market structure shifts and price imbalance zones."
+    },
+    {
+      "topic": "Position Sizing",
+      "choice": "Position size is calculated as (Account Equity * 1%) / |Entry Price - Stop Loss Price|, rounded down to nearest integer.",
+      "reason": "Fulfills the stated risk management requirement of 1% capital risk per trade."
+    }
+  ]
+}
+```

@@ -1,0 +1,129 @@
+{
+  "task_id": 25,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import datetime\nimport backtrader as bt\n\n\nclass SessionTimeStrategy(bt.Strategy):\n    params = (\n        ('atr_period', 5),\n        ('atr_threshold', 0.05),\n        ('sl_pct', 0.005),\n        ('tp_pct', 0.01),\n        ('capital_risk_pct', 0.01),\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.order = None\n        self.entry_price = None\n        self.entry_window = None\n        self.sl_price = None\n        self.tp_price = None\n\n        self.asia_high = None\n        self.asia_low = None\n        self.in_asia = False\n        self.pending_window = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed]:\n            if self.position:\n                self.entry_price = order.executed.price\n                self.entry_window = self.pending_window\n                if self.position.size > 0:\n                    self.sl_price = self.entry_price * (1.0 - self.p.sl_pct)\n                    self.tp_price = self.entry_price * (1.0 + self.p.tp_pct)\n                else:\n                    self.sl_price = self.entry_price * (1.0 + self.p.sl_pct)\n                    self.tp_price = self.entry_price * (1.0 - self.p.tp_pct)\n            else:\n                self.entry_price = None\n                self.entry_window = None\n                self.sl_price = None\n                self.tp_price = None\n\n        self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        t = self.data.datetime.time(0)\n\n        # Track Asian session extremes (20:00 - 04:00 EDT)\n        is_asia_time = (t >= datetime.time(20, 0)) or (t < datetime.time(4, 0))\n        if is_asia_time:\n            if not self.in_asia or self.asia_high is None:\n                self.asia_high = self.data.high[0]\n                self.asia_low = self.data.low[0]\n                self.in_asia = True\n            else:\n                self.asia_high = max(self.asia_high, self.data.high[0])\n                self.asia_low = min(self.asia_low, self.data.low[0])\n        else:\n            self.in_asia = False\n\n        # Manage existing open position\n        if self.position:\n            # 1. Stop-Loss and Take-Profit Exits\n            if self.position.size > 0:\n                if self.data.low[0] <= self.sl_price or self.data.high[0] >= self.tp_price:\n                    self.order = self.close()\n                    return\n            elif self.position.size < 0:\n                if self.data.high[0] >= self.sl_price or self.data.low[0] <= self.tp_price:\n                    self.order = self.close()\n                    return\n\n            # 2. Time-Based Exit: 30 minutes before NY session open (09:00 - 09:30 EDT)\n            if datetime.time(9, 0) <= t < datetime.time(9, 30):\n                self.order = self.close()\n                return\n\n            # 3. Time-Based Exit: End of the defined entry window\n            if self.entry_window == 'NY_OPEN' and t >= datetime.time(11, 30):\n                self.order = self.close()\n                return\n            elif self.entry_window == 'NY_POWER' and t >= datetime.time(16, 0):\n                self.order = self.close()\n                return\n            elif self.entry_window == 'LONDON' and t >= datetime.time(12, 0):\n                self.order = self.close()\n                return\n\n            return\n\n        # Entry Filters\n        # Filter 1: Trading Ban 30m before NY open\n        if datetime.time(9, 0) <= t < datetime.time(9, 30):\n            return\n\n        # Filter 2: Session Filter (Do not trade during Asian session)\n        if is_asia_time:\n            return\n\n        # Filter 3: Volatility Filter\n        if self.atr[0] < self.p.atr_threshold:\n            return\n\n        # Evaluate Entry Windows\n        in_ny_open = datetime.time(9, 30) <= t < datetime.time(11, 30)\n        in_ny_power = datetime.time(15, 0) <= t < datetime.time(16, 0)\n        in_london = datetime.time(4, 0) <= t < datetime.time(12, 0)\n\n        buy_signal = False\n        sell_signal = False\n        selected_window = None\n\n        if in_ny_open:\n            if self.data.close[0] > self.data.open[0]:\n                buy_signal = True\n                selected_window = 'NY_OPEN'\n            elif self.data.close[0] < self.data.open[0]:\n                sell_signal = True\n                selected_window = 'NY_OPEN'\n        elif in_ny_power:\n            if self.data.close[0] > self.data.open[0]:\n                buy_signal = True\n                selected_window = 'NY_POWER'\n            elif self.data.close[0] < self.data.open[0]:\n                sell_signal = True\n                selected_window = 'NY_POWER'\n        elif in_london:\n            if self.asia_high is not None and self.asia_low is not None:\n                if self.data.low[0] < self.asia_low and self.data.close[0] > self.data.open[0]:\n                    buy_signal = True\n                    selected_window = 'LONDON'\n                elif self.data.high[0] > self.asia_high and self.data.close[0] < self.data.open[0]:\n                    sell_signal = True\n                    selected_window = 'LONDON'\n\n        if buy_signal or sell_signal:\n            capital = self.broker.getvalue()\n            size = int((capital * self.p.capital_risk_pct) / self.data.close[0])\n            size = max(1, size)\n\n            self.pending_window = selected_window\n            if buy_signal:\n                self.order = self.buy(size=size)\n            elif sell_signal:\n                self.order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "session_times",
+      "choice": "Asian session: 20:00-04:00 EDT, London session: 04:00-12:00 EDT, NY session: 09:30-16:00 EDT",
+      "reason": "Standard financial market trading hours mapped to New York EDT local time matching the feed timezone."
+    },
+    {
+      "topic": "entry_signals",
+      "choice": "NY windows enter on bar direction (bullish for long, bearish for short); London window enters on Asian extreme sweep followed by bar reversal",
+      "reason": "The specification states decisions rely strictly on time of day and price action, specifying Asian high/low sweeps and reversals for London."
+    },
+    {
+      "topic": "volatility_threshold",
+      "choice": "ATR(5) minimum threshold set to 0.05",
+      "reason": "Specification mandates filtering trades when ATR(5) is below a threshold without stating a specific numeric value."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position capital allocation set to 1% of total account value per trade",
+      "reason": "Specification explicitly mentions fixing position size to 1% of total trading capital per trade."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 8,
+  "tape": [
+    {
+      "dt": "2026-08-11T15:01:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 306.6199951171875
+    },
+    {
+      "dt": "2026-08-11T16:01:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 307.2799987792969
+    },
+    {
+      "dt": "2026-08-12T15:01:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 302.3550109863281
+    },
+    {
+      "dt": "2026-08-12T16:01:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 301.31500244140625
+    },
+    {
+      "dt": "2026-08-13T15:01:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 304.8999938964844
+    },
+    {
+      "dt": "2026-08-13T16:01:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 302.82000732421875
+    },
+    {
+      "dt": "2026-08-14T15:01:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 305.114990234375
+    },
+    {
+      "dt": "2026-08-14T16:01:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 305.67041015625
+    },
+    {
+      "dt": "2026-08-17T15:01:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 303.8900146484375
+    },
+    {
+      "dt": "2026-08-17T16:01:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 303.1000061035156
+    },
+    {
+      "dt": "2026-08-18T15:01:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 310.42999267578125
+    },
+    {
+      "dt": "2026-08-18T16:01:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 309.114990234375
+    },
+    {
+      "dt": "2026-08-19T15:01:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 318.2300109863281
+    },
+    {
+      "dt": "2026-08-19T15:39:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 316.8699951171875
+    },
+    {
+      "dt": "2026-08-19T15:40:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 317.010009765625
+    },
+    {
+      "dt": "2026-08-19T16:01:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 316.2200012207031
+    }
+  ]
+}

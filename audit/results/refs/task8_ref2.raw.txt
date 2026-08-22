@@ -1,0 +1,238 @@
+```python
+import collections
+import math
+import statistics
+import backtrader as bt
+
+
+class SimpleRNG:
+
+  def __init__(self, seed=42):
+    self.state = seed
+
+  def random(self):
+    self.state = (1103515245 * self.state + 12345) & 0x7FFFFFFF
+    return self.state / 2147483648.0
+
+  def randint(self, a, b):
+    r = self.random()
+    return a + int(r * (b - a + 1))
+
+
+class QNetwork:
+
+  def __init__(self, input_dim=3, hidden_dim=8, output_dim=7, lr=0.01):
+    self.input_dim = input_dim
+    self.hidden_dim = hidden_dim
+    self.output_dim = output_dim
+    self.lr = lr
+
+    rng = SimpleRNG(42)
+    self.w1 = [
+        [(rng.random() - 0.5) * 0.2 for _ in range(hidden_dim)]
+        for _ in range(input_dim)
+    ]
+    self.b1 = [0.0] * hidden_dim
+    self.w2 = [
+        [(rng.random() - 0.5) * 0.2 for _ in range(output_dim)]
+        for _ in range(hidden_dim)
+    ]
+    self.b2 = [0.0] * output_dim
+
+  def forward(self, x):
+    hidden = [0.0] * self.hidden_dim
+    for j in range(self.hidden_dim):
+      val = self.b1[j]
+      for i in range(self.input_dim):
+        val += x[i] * self.w1[i][j]
+      hidden[j] = math.tanh(val)
+
+    outputs = [0.0] * self.output_dim
+    for k in range(self.output_dim):
+      val = self.b2[k]
+      for j in range(self.hidden_dim):
+        val += hidden[j] * self.w2[j][k]
+      outputs[k] = val
+
+    return hidden, outputs
+
+  def train_step(self, x, action, target):
+    hidden, outputs = self.forward(x)
+
+    delta_out = [0.0] * self.output_dim
+    delta_out[action] = outputs[action] - target
+
+    delta_hidden = [0.0] * self.hidden_dim
+    for j in range(self.hidden_dim):
+      sum_err = 0.0
+      for k in range(self.output_dim):
+        sum_err += delta_out[k] * self.w2[j][k]
+      delta_hidden[j] = sum_err * (1.0 - hidden[j] * hidden[j])
+
+    for j in range(self.hidden_dim):
+      for k in range(self.output_dim):
+        self.w2[j][k] -= self.lr * delta_out[k] * hidden[j]
+    for k in range(self.output_dim):
+      self.b2[k] -= self.lr * delta_out[k]
+
+    for i in range(self.input_dim):
+      for j in range(self.hidden_dim):
+        self.w1[i][j] -= self.lr * delta_hidden[j] * x[i]
+    for j in range(self.hidden_dim):
+      self.b1[j] -= self.lr * delta_hidden[j]
+
+
+class DeepQLearningStrategy(bt.Strategy):
+
+  def __init__(self):
+    self.order = None
+    self.actions = [100, 50, 10, 0, -10, -50, -100]
+    self.q_net = QNetwork(
+        input_dim=3, hidden_dim=8, output_dim=len(self.actions), lr=0.01
+    )
+    self.base_price = 1.0
+    self.initial_cash = 1000.0
+
+  def notify_order(self, order):
+    if order.status in [
+        order.Completed,
+        order.Canceled,
+        order.Margin,
+        order.Rejected,
+    ]:
+      self.order = None
+
+  def start(self):
+    self.order = None
+    self.initial_cash = self.broker.getcash()
+
+    prices = list(self.data.close.array)
+    if not prices:
+      return
+
+    self.base_price = prices[0] if prices[0] > 0 else 1.0
+    train_prices = prices[:252] if len(prices) >= 252 else prices
+
+    if len(train_prices) < 2:
+      return
+
+    rng = SimpleRNG(123)
+    epsilon = 0.8
+    gamma = 0.95
+    num_episodes = 100
+
+    for ep in range(num_episodes):
+      cash = 1000.0
+      shares = 0
+      port_val = cash
+
+      for t in range(len(train_prices) - 1):
+        p_t = train_prices[t]
+        p_next = train_prices[t + 1]
+
+        state = [p_t / self.base_price, shares / 100.0, cash / 1000.0]
+
+        if rng.random() < epsilon:
+          action_idx = rng.randint(0, len(self.actions) - 1)
+        else:
+          _, q_vals = self.q_net.forward(state)
+          action_idx = max(
+              range(len(self.actions)), key=lambda i: q_vals[i]
+          )
+
+        act_qty = self.actions[action_idx]
+
+        sim_cash = cash
+        sim_shares = shares
+
+        if act_qty > 0:
+          max_buy = math.floor(sim_cash / p_t) if p_t > 0 else 0
+          actual_buy = min(act_qty, max_buy)
+          if actual_buy > 0:
+            sim_cash -= actual_buy * p_t
+            sim_shares += actual_buy
+        elif act_qty < 0:
+          actual_sell = min(abs(act_qty), sim_shares)
+          if actual_sell > 0:
+            sim_cash += actual_sell * p_t
+            sim_shares -= actual_sell
+
+        next_port_val = sim_cash + sim_shares * p_next
+        reward = next_port_val - port_val
+
+        next_state = [
+            p_next / self.base_price,
+            sim_shares / 100.0,
+            sim_cash / 1000.0,
+        ]
+
+        _, next_q = self.q_net.forward(next_state)
+        max_next_q = max(next_q)
+        target = reward + gamma * max_next_q
+
+        self.q_net.train_step(state, action_idx, target)
+
+        cash = sim_cash
+        shares = sim_shares
+        port_val = next_port_val
+
+      epsilon *= 0.99
+
+  def next(self):
+    if self.order:
+      return
+
+    price = self.data.close[0]
+    if price <= 0:
+      return
+
+    shares = self.position.size
+    cash = self.broker.getcash()
+
+    state = [
+        price / self.base_price,
+        shares / 100.0,
+        cash / (self.initial_cash if self.initial_cash > 0 else 1000.0),
+    ]
+
+    _, q_vals = self.q_net.forward(state)
+    action_idx = max(range(len(self.actions)), key=lambda i: q_vals[i])
+    act_qty = self.actions[action_idx]
+
+    if act_qty > 0:
+      max_buy = math.floor(cash / price)
+      actual_buy = min(act_qty, max_buy)
+      if actual_buy > 0:
+        self.order = self.buy(size=actual_buy)
+    elif act_qty < 0:
+      actual_sell = min(abs(act_qty), shares)
+      if actual_sell > 0:
+        self.order = self.sell(size=actual_sell)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "neural_network_architecture",
+      "choice": "Pure Python single-hidden-layer MLP (3 inputs, 8 hidden units, 7 outputs)",
+      "reason": "Execution environment restricts imports to standard library and backtrader, prohibiting external deep learning frameworks like PyTorch or TensorFlow."
+    },
+    {
+      "topic": "training_episodes",
+      "choice": "100 episodes for offline DQN training in start()",
+      "reason": "Specification dictates epsilon decay of 0.99 per episode starting from 0.8, but does not specify total episode count. 100 episodes provides sufficient convergence while executing quickly."
+    },
+    {
+      "topic": "action_space_discretization",
+      "choice": "7 discrete actions: [Buy 100, Buy 50, Buy 10, Hold (0), Sell 10, Sell 50, Sell 100]",
+      "reason": "Specification requires dynamic share quantities between 0 and 100 for buy/sell actions."
+    },
+    {
+      "topic": "training_dataset_length",
+      "choice": "First 252 daily bars used as 1 year of training data",
+      "reason": "Specification requests training on one year of historical daily timeframe data."
+    }
+  ]
+}
+```

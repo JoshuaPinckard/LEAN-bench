@@ -1,0 +1,214 @@
+```python
+import backtrader as bt
+
+
+class CupAndHandleQuarterly(bt.Strategy):
+    """
+    Reference implementation of a Quarterly Cup and Handle trading strategy.
+    
+    Filters:
+    - Asset must close the quarter at an All-Time High (ATH).
+    - Price above 200-period SMA on quarterly chart (or available quarters).
+    - Price above 20-period SMA on weekly chart.
+    
+    Entry:
+    - Breakout of the Cup and Handle resistance line at quarter close.
+    - Position sized so stop-loss risk does not exceed 2% of portfolio capital.
+    
+    Exit:
+    - Take-Profit: Breakout price + Cup Height.
+    - Stop-Loss: Weekly close below the handle low.
+    """
+
+    def __init__(self):
+        self.order = None
+
+        # Timeframe aggregation tracking
+        self.weekly_closes = []
+        self.quarterly_bars = []  # List of tuples: (open, high, low, close, date)
+        self.quarterly_closes = []
+
+        # Current quarter accumulators
+        self.cur_q_open = None
+        self.cur_q_high = float('-inf')
+        self.cur_q_low = float('inf')
+
+        # Trade exit levels
+        self.target_price = None
+        self.stop_loss_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def is_end_of_week(self):
+        if len(self.data) >= self.data.buflen():
+            return True
+        dt0 = self.data.datetime.date(0)
+        dt1 = self.data.datetime.date(1)
+        return dt0.isocalendar()[:2] != dt1.isocalendar()[:2]
+
+    def is_end_of_quarter(self):
+        if len(self.data) >= self.data.buflen():
+            return True
+        dt0 = self.data.datetime.date(0)
+        dt1 = self.data.datetime.date(1)
+        q0 = (dt0.month - 1) // 3 + 1
+        q1 = (dt1.month - 1) // 3 + 1
+        return (dt0.year != dt1.year) or (q0 != q1)
+
+    def _find_cup_and_handle(self, q_bars, current_close):
+        n = len(q_bars)
+        if n < 3:
+            return None
+
+        for i_left in range(n - 2):
+            R = q_bars[i_left][1]  # High of left rim quarter
+            if current_close <= R:
+                continue
+
+            min_low = float('inf')
+            i_bottom = -1
+            for j in range(i_left + 1, n - 1):
+                if q_bars[j][2] < min_low:
+                    min_low = q_bars[j][2]
+                    i_bottom = j
+
+            if i_bottom == -1 or min_low >= R:
+                continue
+
+            cup_height = R - min_low
+            if cup_height <= 0:
+                continue
+
+            handle_low = float('inf')
+            for j in range(i_bottom + 1, n):
+                if q_bars[j][2] < handle_low:
+                    handle_low = q_bars[j][2]
+
+            if handle_low <= min_low or handle_low >= R:
+                continue
+
+            return {
+                'resistance': R,
+                'cup_height': cup_height,
+                'handle_low': handle_low,
+                'breakout_price': current_close
+            }
+
+        return None
+
+    def next(self):
+        # Accumulate current quarter OHLC from daily bars
+        if self.cur_q_open is None:
+            self.cur_q_open = self.data.open[0]
+            self.cur_q_high = self.data.high[0]
+            self.cur_q_low = self.data.low[0]
+        else:
+            self.cur_q_high = max(self.cur_q_high, self.data.high[0])
+            self.cur_q_low = min(self.cur_q_low, self.data.low[0])
+
+        end_w = self.is_end_of_week()
+        end_q = self.is_end_of_quarter()
+
+        # Update weekly closes at end of week
+        if end_w:
+            self.weekly_closes.append(self.data.close[0])
+
+        # Manage open position exits
+        if self.position:
+            # 1. Take-Profit check (triggered if daily high reaches target)
+            if self.target_price is not None and self.data.high[0] >= self.target_price:
+                if self.order is None:
+                    self.order = self.close()
+                    return
+
+            # 2. Stop-Loss check (triggered if weekly close is below handle low)
+            if end_w and self.stop_loss_price is not None:
+                if self.data.close[0] < self.stop_loss_price:
+                    if self.order is None:
+                        self.order = self.close()
+                        return
+
+        # At quarter end, finalize quarterly bar and evaluate entry conditions
+        if end_q:
+            cur_q_close = self.data.close[0]
+            dt0 = self.data.datetime.date(0)
+
+            q_bar = (self.cur_q_open, self.cur_q_high, self.cur_q_low, cur_q_close, dt0)
+            self.quarterly_bars.append(q_bar)
+            self.quarterly_closes.append(cur_q_close)
+
+            # Reset quarter accumulators
+            self.cur_q_open = None
+            self.cur_q_high = float('-inf')
+            self.cur_q_low = float('inf')
+
+            # Check entry if no open position and no pending orders
+            if not self.position and self.order is None:
+                # Rule: Active only for assets closing the quarter at All-Time High
+                is_ath = cur_q_close >= max(self.quarterly_closes)
+
+                # Rule: Quarterly SMA 200 trend confirmation
+                q_period = min(200, len(self.quarterly_closes))
+                sma200_q = sum(self.quarterly_closes[-q_period:]) / q_period
+                q_trend_ok = cur_q_close > sma200_q
+
+                # Rule: Weekly SMA 20 entry filter
+                if len(self.weekly_closes) > 0:
+                    w_period = min(20, len(self.weekly_closes))
+                    sma20_w = sum(self.weekly_closes[-w_period:]) / w_period
+                    w_trend_ok = self.data.close[0] > sma20_w
+                else:
+                    w_trend_ok = True
+
+                if is_ath and q_trend_ok and w_trend_ok:
+                    pattern = self._find_cup_and_handle(self.quarterly_bars[:-1], cur_q_close)
+                    if pattern is not None:
+                        breakout_price = cur_q_close
+                        cup_height = pattern['cup_height']
+                        handle_low = pattern['handle_low']
+
+                        target_price = breakout_price + cup_height
+                        stop_loss_price = handle_low
+
+                        risk_per_share = breakout_price - stop_loss_price
+                        if risk_per_share > 0:
+                            equity = self.broker.getvalue()
+                            max_risk_amount = 0.02 * equity
+                            size = int(max_risk_amount / risk_per_share)
+                            cash_max_size = int(self.broker.getcash() / breakout_price)
+                            size = min(size, cash_max_size)
+
+                            if size > 0:
+                                self.target_price = target_price
+                                self.stop_loss_price = stop_loss_price
+                                self.order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Aggregated daily bars into weekly and quarterly bars dynamically in next(), and calculated SMA 200 across available quarterly closes.",
+      "reason": "The execution environment provides 1507 daily bars (~24 quarters). A 200-period quarterly SMA strictly requires 200 quarters (~50 years of data), which exceeds the dataset length. Averaging over available completed quarters allows trend confirmation within the dataset limits."
+    },
+    {
+      "topic": "cup_and_handle_algorithm",
+      "choice": "Identified Cup and Handle on historical quarterly bars by searching for a left rim peak, a subsequent cup trough, a handle trough higher than the cup trough, and a breakout quarter closing above the left rim peak.",
+      "reason": "The specification authorizes an algorithmic search for peaks and troughs corresponding to the pattern shape. Defining explicit structural relationships on quarterly bars provides a deterministic pattern detector."
+    },
+    {
+      "topic": "breakout_and_target_price",
+      "choice": "Set the breakout price equal to the breakout quarter close and calculated take-profit as breakout price plus cup height.",
+      "reason": "Matches the specification example where cup height is added directly to the breakout level to establish the take-profit level."
+    },
+    {
+      "topic": "stop_loss_execution",
+      "choice": "Evaluated the stop-loss exclusively at weekly close against the lower boundary (local low) of the handle.",
+      "reason": "The specification explicitly states to close the position 'if the price closes the week below the lower boundary of the pattern handle'."
+    }
+  ]
+}
+```

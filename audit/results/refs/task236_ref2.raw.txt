@@ -1,0 +1,247 @@
+```python
+import math
+import backtrader as bt
+
+
+class MultiStrategyDMABot(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("ema_fast", 10),
+        ("ema_slow", 30),
+        ("atr_period", 14),
+        ("breakout_k", 1.5),
+        ("tp_k", 2.0),
+        ("sl_k", 1.0),
+        ("risk_pct", 0.01),
+        ("nominal_cap", 10000.0),
+        ("min_price", 0.0),
+        ("max_price", 1000000.0),
+        ("cooldown_bars", 5),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_dev,
+        )
+        self.ema10 = bt.indicators.EMA(self.data.close, period=self.p.ema_fast)
+        self.ema30 = bt.indicators.EMA(self.data.close, period=self.p.ema_slow)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema_cross = bt.indicators.CrossOver(self.ema10, self.ema30)
+
+        self.order = None
+        self.last_order_bar = -999
+
+        self.entry_price = None
+        self.entry_atr = None
+        self.entry_bb = False
+        self.entry_ema = False
+        self.entry_atr_sub = False
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+        if order.status == order.Completed:
+            if self.position:
+                self.entry_price = self.position.price
+            else:
+                self.entry_price = None
+                self.entry_atr = None
+                self.entry_bb = False
+                self.entry_ema = False
+                self.entry_atr_sub = False
+
+    def _get_position_size(self):
+        close_p = self.data.close[0]
+        atr_val = self.atr[0]
+        equity = self.broker.getvalue()
+
+        if atr_val > 0 and close_p > 0:
+            size_risk = math.floor((self.p.risk_pct * equity) / atr_val)
+            size_cap = math.floor(self.p.nominal_cap / close_p)
+            size = min(size_risk, size_cap)
+        else:
+            size = 1
+        return max(1, int(size))
+
+    def next(self):
+        if self.order:
+            return
+
+        if (len(self) - self.last_order_bar) < self.p.cooldown_bars:
+            return
+
+        # 1) Mean Reversion (BB)
+        s_bb = 0
+        if self.data.close[0] < self.bb.lines.bot[0]:
+            s_bb = 1
+        elif self.data.close[0] > self.bb.lines.top[0]:
+            s_bb = -1
+
+        # 2) Moving Average Crossover (EMA)
+        s_ema = 0
+        if self.ema_cross[0] > 0:
+            s_ema = 1
+        elif self.ema_cross[0] < 0:
+            s_ema = -1
+
+        # 3) Volatility Breakout (ATR)
+        s_atr = 0
+        if self.data.close[0] > (
+            self.data.high[-1] + self.p.breakout_k * self.atr[0]
+        ):
+            s_atr = 1
+        elif self.data.close[0] < (
+            self.data.low[-1] - self.p.breakout_k * self.atr[0]
+        ):
+            s_atr = -1
+
+        sum_signals = s_bb + s_ema + s_atr
+
+        # No open position
+        if not self.position:
+            if not (
+                self.p.min_price <= self.data.close[0] <= self.p.max_price
+            ):
+                return
+
+            if sum_signals >= 2:
+                size = self._get_position_size()
+                self.order = self.buy(size=size)
+                self.entry_bb = s_bb == 1
+                self.entry_ema = s_ema == 1
+                self.entry_atr_sub = s_atr == 1
+                self.entry_atr = self.atr[0]
+                self.last_order_bar = len(self)
+            elif sum_signals <= -2:
+                size = self._get_position_size()
+                self.order = self.sell(size=size)
+                self.entry_bb = s_bb == -1
+                self.entry_ema = s_ema == -1
+                self.entry_atr_sub = s_atr == -1
+                self.entry_atr = self.atr[0]
+                self.last_order_bar = len(self)
+
+        # Long position open
+        elif self.position.size > 0:
+            reversal = sum_signals <= -2
+            bb_exit = self.entry_bb and (
+                self.data.close[0] > self.bb.lines.mid[0]
+            )
+            ema_exit = self.entry_ema and (self.ema_cross[0] < 0)
+
+            ref_price = (
+                self.entry_price
+                if self.entry_price is not None
+                else self.position.price
+            )
+            ref_atr = (
+                self.entry_atr if self.entry_atr is not None else self.atr[0]
+            )
+
+            atr_tp = self.entry_atr_sub and (
+                self.data.close[0] >= ref_price + self.p.tp_k * ref_atr
+            )
+            atr_sl = self.entry_atr_sub and (
+                self.data.close[0] <= ref_price - self.p.sl_k * ref_atr
+            )
+            atr_exit = atr_tp or atr_sl
+
+            if reversal:
+                if self.p.min_price <= self.data.close[0] <= self.p.max_price:
+                    new_size = self._get_position_size()
+                    total_size = self.position.size + new_size
+                    self.order = self.sell(size=total_size)
+                    self.entry_bb = s_bb == -1
+                    self.entry_ema = s_ema == -1
+                    self.entry_atr_sub = s_atr == -1
+                    self.entry_atr = self.atr[0]
+                    self.last_order_bar = len(self)
+                else:
+                    self.order = self.close()
+                    self.last_order_bar = len(self)
+            elif bb_exit or ema_exit or atr_exit:
+                self.order = self.close()
+                self.last_order_bar = len(self)
+
+        # Short position open
+        elif self.position.size < 0:
+            reversal = sum_signals >= 2
+            bb_exit = self.entry_bb and (
+                self.data.close[0] < self.bb.lines.mid[0]
+            )
+            ema_exit = self.entry_ema and (self.ema_cross[0] > 0)
+
+            ref_price = (
+                self.entry_price
+                if self.entry_price is not None
+                else self.position.price
+            )
+            ref_atr = (
+                self.entry_atr if self.entry_atr is not None else self.atr[0]
+            )
+
+            atr_tp = self.entry_atr_sub and (
+                self.data.close[0] <= ref_price - self.p.tp_k * ref_atr
+            )
+            atr_sl = self.entry_atr_sub and (
+                self.data.close[0] >= ref_price + self.p.sl_k * ref_atr
+            )
+            atr_exit = atr_tp or atr_sl
+
+            if reversal:
+                if self.p.min_price <= self.data.close[0] <= self.p.max_price:
+                    new_size = self._get_position_size()
+                    total_size = abs(self.position.size) + new_size
+                    self.order = self.buy(size=total_size)
+                    self.entry_bb = s_bb == 1
+                    self.entry_ema = s_ema == 1
+                    self.entry_atr_sub = s_atr == 1
+                    self.entry_atr = self.atr[0]
+                    self.last_order_bar = len(self)
+                else:
+                    self.order = self.close()
+                    self.last_order_bar = len(self)
+            elif bb_exit or ema_exit or atr_exit:
+                self.order = self.close()
+                self.last_order_bar = len(self)
+```
+```json
+{
+  "assumptions": [
+    {
+      "topic": "nominal_cap parameter default",
+      "choice": "nominal_cap = 10000.0",
+      "reason": "The specification leaves nominal_cap to be specified; 10000.0 matches starting portfolio cash."
+    },
+    {
+      "topic": "min_price and max_price defaults",
+      "choice": "min_price = 0.0, max_price = 1000000.0",
+      "reason": "The specification leaves price limits to be specified; setting standard non-restrictive bounds allows trades across normal equity price ranges."
+    },
+    {
+      "topic": "EMA subsystem signal evaluation",
+      "choice": "Evaluated using bt.indicators.CrossOver(EMA10, EMA30), producing +1 on cross up, -1 on cross down, and 0 otherwise",
+      "reason": "Matches literal wording 'CrossOver(EMA10, EMA30) > 0' and 'CrossOver(EMA10, EMA30) < 0'."
+    },
+    {
+      "topic": "ATR breakout reference high/low",
+      "choice": "high[-1] and low[-1] combined with current ATR14",
+      "reason": "Matches literal reading of 'prev. High + 1.5 * ATR14' and 'prev. Low - 1.5 * ATR14'."
+    },
+    {
+      "topic": "ATR stop-loss and take-profit evaluation",
+      "choice": "Evaluated against close[0]",
+      "reason": "Keeps subsystem exit decisions synchronized on bar close consistent with daily OHLCV bar execution."
+    }
+  ]
+}
+```

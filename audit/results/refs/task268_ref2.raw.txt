@@ -1,0 +1,147 @@
+```python
+import backtrader as bt
+
+
+class BullTrendBounceVolatilityFilter(bt.Strategy):
+    """
+    Reference implementation of 'Bull Trend Bounce with Volatility Filter' strategy.
+    """
+    params = (
+        ('sma_period', 20),
+        ('rsi_period', 14),
+        ('rsi_level', 40.0),
+        ('bb_period', 20),
+        ('bb_devfactor', 2.0),
+        ('limit_discount', 0.005),
+        ('tp_pct', 0.02),
+        ('sl_pct', 0.015),
+        ('max_bars_held', 5),
+        ('risk_pct', 0.02),
+        ('max_entries', 3),
+    )
+
+    def __init__(self):
+        self.sma = bt.ind.SMA(self.data.close, period=self.p.sma_period)
+        self.rsi = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+        self.bb = bt.ind.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor
+        )
+
+        self.pending_buy_orders = []
+        self.active_entries = []
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        # Process pending buy limit orders
+        if order in self.pending_buy_orders:
+            if order.status == order.Completed:
+                self.pending_buy_orders.remove(order)
+                fill_price = order.executed.price
+                fill_size = order.executed.size
+                fill_bar = len(self)
+
+                tp_price = fill_price * (1.0 + self.p.tp_pct)
+                sl_price = fill_price * (1.0 - self.p.sl_pct)
+
+                tp_order = self.sell(size=fill_size, price=tp_price, exectype=bt.Order.Limit)
+                sl_order = self.sell(size=fill_size, price=sl_price, exectype=bt.Order.Stop, oco=tp_order)
+
+                self.active_entries.append({
+                    'fill_price': fill_price,
+                    'fill_size': fill_size,
+                    'fill_bar': fill_bar,
+                    'tp_order': tp_order,
+                    'sl_order': sl_order,
+                    'close_order': None
+                })
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.pending_buy_orders.remove(order)
+
+        # Process exit orders for active entries
+        for entry in list(self.active_entries):
+            if order in (entry['tp_order'], entry['sl_order'], entry['close_order']):
+                if order.status == order.Completed:
+                    if entry in self.active_entries:
+                        self.active_entries.remove(entry)
+                elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                    if order == entry['close_order']:
+                        entry['close_order'] = None
+
+    def next(self):
+        # 1. Check time-based exit for open entries (forced close after 5 bars)
+        current_bar = len(self)
+        for entry in list(self.active_entries):
+            if current_bar - entry['fill_bar'] >= self.p.max_bars_held:
+                if entry['close_order'] is None:
+                    if entry['tp_order'] and entry['tp_order'].status in [bt.Order.Submitted, bt.Order.Accepted]:
+                        self.cancel(entry['tp_order'])
+                    if entry['sl_order'] and entry['sl_order'].status in [bt.Order.Submitted, bt.Order.Accepted]:
+                        self.cancel(entry['sl_order'])
+                    entry['close_order'] = self.sell(size=entry['fill_size'], exectype=bt.Order.Market)
+
+        # 2. Pyramiding check
+        total_open = len(self.pending_buy_orders) + len(self.active_entries)
+        if total_open >= self.p.max_entries:
+            return
+
+        # 3. Intraday time filter: active only between 10:00 and 16:00 local time
+        t = self.data.datetime.time(0)
+        time_active = (10 <= t.hour < 16) or (t.hour == 16 and t.minute == 0 and t.second == 0)
+        if not time_active:
+            return
+
+        # 4. Entry conditions
+        # Condition 1: Trend — Close > SMA(20)
+        trend_cond = self.data.close[0] > self.sma[0]
+
+        # Condition 2: Bounce — RSI(14) crosses level 40 from below upwards (RSI[-1] < 40 and RSI[0] >= 40)
+        rsi_bounce = (self.rsi[-1] < self.p.rsi_level) and (self.rsi[0] >= self.p.rsi_level)
+
+        # Condition 3: Near-OTM proxy — (Close - SMA(20)) / SMA(20) in range [5%, 10%]
+        sma_val = self.sma[0]
+        if sma_val == 0:
+            return
+        dist = (self.data.close[0] - sma_val) / sma_val
+        near_otm_cond = 0.05 <= dist <= 0.10
+
+        # Condition 4: Volatility filter — (BB.top - BB.bot) / BB.mid < 0.02
+        bb_mid = self.bb.mid[0]
+        if bb_mid == 0:
+            return
+        rel_bb_width = (self.bb.top[0] - self.bb.bot[0]) / bb_mid
+        vol_cond = rel_bb_width < 0.02
+
+        if trend_cond and rsi_bounce and near_otm_cond and vol_cond:
+            equity = self.broker.getvalue()
+            qty = int(self.p.risk_pct * equity / self.data.close[0])
+            if qty > 0:
+                limit_price = self.data.close[0] * (1.0 - self.p.limit_discount)
+                order = self.buy(price=limit_price, size=qty, exectype=bt.Order.Limit)
+                self.pending_buy_orders.append(order)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "RSI bounce condition",
+      "choice": "Implemented as RSI[-1] < 40 and RSI[0] >= 40.",
+      "reason": "Literal reading of 'RSI(14) crosses level 40 from below upwards (after RSI was < 40)'."
+    },
+    {
+      "topic": "Intraday time window bounds",
+      "choice": "Inclusive range from 10:00:00 to 16:00:00 local bar time.",
+      "reason": "Specification dictates signals are active only between 10:00 and 16:00 local time."
+    },
+    {
+      "topic": "Per-entry risk management & pyramiding",
+      "choice": "Track individual entry units up to maximum of 3 active total units (pending buy orders + filled positions). Each unit gets its own OCO limit (+2%) and stop (-1.5%) exit orders, plus a 5-bar timeout exit.",
+      "reason": "Spec demands pyramiding up to 3 units simultaneously while specifying per-entry TP (+2%), SL (-1.5%), and 5-bar timeout."
+    }
+  ]
+}
+```

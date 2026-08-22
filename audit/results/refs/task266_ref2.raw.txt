@@ -1,0 +1,201 @@
+```python
+import datetime
+import backtrader as bt
+
+
+class ORBStrategy(bt.Strategy):
+    """
+    Reference implementation of the Opening Range Breakout (ORB) Strategy on 15m timeframe.
+    """
+
+    def __init__(self):
+        # Indicators
+        self.ema9 = bt.indicators.EMA(self.data.close, period=9)
+        self.ema21 = bt.indicators.EMA(self.data.close, period=21)
+
+        # Order tracking
+        self.order = None
+
+        # Intraday state variables
+        self.current_date = None
+        self.orh = None
+        self.orl = None
+        self.orb_range = None
+        self.fib_382 = None
+        self.fib_618 = None
+
+        self.has_broken_above_orh = False
+        self.has_broken_below_orl = False
+        self.first_bar_of_day = False
+
+        # VWAP accumulators
+        self.sum_pv = 0.0
+        self.sum_vol = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        bar_date = self.data.datetime.date(0)
+        bar_time = self.data.datetime.time(0)
+
+        # 1. Check for session reset on a new day
+        if self.current_date != bar_date:
+            self.current_date = bar_date
+            self.orh = self.data.high[0]
+            self.orl = self.data.low[0]
+            self.orb_range = self.orh - self.orl
+            # 38.2% retracement from ORH (top down) = ORL + 0.618 * range
+            self.fib_382 = self.orl + 0.618 * self.orb_range
+            # 61.8% retracement from ORH (top down) = ORL + 0.382 * range
+            self.fib_618 = self.orl + 0.382 * self.orb_range
+
+            self.has_broken_above_orh = False
+            self.has_broken_below_orl = False
+            self.first_bar_of_day = True
+
+            self.sum_pv = 0.0
+            self.sum_vol = 0.0
+        else:
+            self.first_bar_of_day = False
+
+        # 2. Update intraday VWAP
+        tp = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0
+        vol = self.data.volume[0]
+        self.sum_pv += tp * vol
+        self.sum_vol += vol
+        vwap = (
+            self.sum_pv / self.sum_vol
+            if self.sum_vol > 0
+            else self.data.close[0]
+        )
+
+        # Strategy is inactive on the first 15-minute bar of the day
+        if self.first_bar_of_day:
+            return
+
+        # 3. Track breakout of ORB boundaries
+        if self.data.high[0] > self.orh:
+            self.has_broken_above_orh = True
+        if self.data.low[0] < self.orl:
+            self.has_broken_below_orl = True
+
+        # End of day session exit (15:45 bar or later)
+        is_eod = bar_time >= datetime.time(15, 45)
+
+        # 4. Manage open position exits
+        if self.position:
+            if is_eod:
+                self.close()
+                return
+
+            if self.position.size > 0:  # Long
+                if self.data.high[0] >= self.orh:  # Take Profit
+                    self.close()
+                elif self.data.low[0] <= self.orl:  # Stop Loss
+                    self.close()
+            elif self.position.size < 0:  # Short
+                if self.data.low[0] <= self.orl:  # Take Profit
+                    self.close()
+                elif self.data.high[0] >= self.orh:  # Stop Loss
+                    self.close()
+            return
+
+        # If an order is pending or it's end of day, do not open new trades
+        if self.order or is_eod:
+            return
+
+        # 5. Position Entry Logic
+        # Long Entry Conditions:
+        # - Price broke above ORH level
+        # - Pullback occurred to 38.2% or 61.8% level of ORB range (low <= fib_382 and low >= ORL)
+        # - Both EMAs (9 and 21) sloping upward
+        # - Price is above VWAP
+        long_cond = (
+            self.has_broken_above_orh
+            and (self.data.low[0] <= self.fib_382)
+            and (self.data.low[0] >= self.orl)
+            and (self.ema9[0] > self.ema9[-1])
+            and (self.ema21[0] > self.ema21[-1])
+            and (self.data.close[0] > vwap)
+        )
+
+        # Short Entry Conditions:
+        # - Price broke below ORL level
+        # - Pullback occurred to 38.2% or 61.8% level of ORB range (high >= fib_618 and high <= ORH)
+        # - Both EMAs (9 and 21) sloping downward
+        # - Price is below VWAP
+        short_cond = (
+            self.has_broken_below_orl
+            and (self.data.high[0] >= self.fib_618)
+            and (self.data.high[0] <= self.orh)
+            and (self.ema9[0] < self.ema9[-1])
+            and (self.ema21[0] < self.ema21[-1])
+            and (self.data.close[0] < vwap)
+        )
+
+        if long_cond:
+            risk_per_share = self.data.close[0] - self.orl
+            if risk_per_share > 0:
+                risk_amount = 0.01 * self.broker.getvalue()
+                size = int(risk_amount / risk_per_share)
+                cash = self.broker.getcash()
+                max_size = int(cash / self.data.close[0])
+                size = max(1, min(size, max_size))
+                self.order = self.buy(size=size)
+
+        elif short_cond:
+            risk_per_share = self.orh - self.data.close[0]
+            if risk_per_share > 0:
+                risk_amount = 0.01 * self.broker.getvalue()
+                size = int(risk_amount / risk_per_share)
+                cash = self.broker.getcash()
+                max_size = int(cash / self.data.close[0])
+                size = max(1, min(size, max_size))
+                self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "orb_definition",
+      "choice": "Opening Range High (ORH) and Low (ORL) are set by the High and Low of the first 15-minute bar of each trading day (09:30-09:45).",
+      "reason": "Since the feed timeframe is 15 minutes, the first bar of the day represents the first 15 minutes of the trading day."
+    },
+    {
+      "topic": "fib_levels",
+      "choice": "38.2% and 61.8% retracement levels inside [ORL, ORH] are calculated as ORL + 0.618 * ORB_range and ORL + 0.382 * ORB_range.",
+      "reason": "Standard Fibonacci retracement calculations applied to the Opening Range."
+    },
+    {
+      "topic": "tp_sl_logic",
+      "choice": "For Long positions, Take Profit is ORH and Stop Loss is ORL. For Short positions, Take Profit is ORL and Stop Loss is ORH.",
+      "reason": "The spec text states TP for long as ORL and SL for long as break of ORL, which is an inverted text typo (ORL is below entry for long). Setting TP to ORH for long and ORL for short target boundaries resolves this contradiction."
+    },
+    {
+      "topic": "vwap_calculation",
+      "choice": "Intraday VWAP is calculated cumulatively starting from the first bar of each trading day using typical price (High + Low + Close)/3.",
+      "reason": "Standard intraday VWAP calculation resetting daily."
+    },
+    {
+      "topic": "risk_management_sizing",
+      "choice": "Position size risks 1% of total portfolio value based on the distance between current close and the opposite ORB boundary (stop loss).",
+      "reason": "Spec mandates position size based on a standard risk per trade of 1-2% of trading capital."
+    },
+    {
+      "topic": "eod_exit",
+      "choice": "Open positions are closed at or after 15:45:00 on each trading day.",
+      "reason": "Spec states that trading is conducted within one trading day and all open positions are closed at the end of the trading session."
+    }
+  ]
+}
+```

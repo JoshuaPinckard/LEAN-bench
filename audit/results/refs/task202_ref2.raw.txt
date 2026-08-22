@@ -1,0 +1,144 @@
+```python
+import backtrader as bt
+import math
+import collections
+import statistics
+
+
+class FixedTrancheStrategy(bt.Strategy):
+    params = (
+        ('schedule', None),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.cash_flows = []
+        self.twr = 0.0
+        self.cagr = 0.0
+        self.initial_cash = 0.0
+        self.sched_dict = collections.defaultdict(list)
+
+        # SMA indicators for fallback signal if no schedule is provided
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.crossover = bt.indicators.CrossOver(self.sma20, self.sma50)
+
+        # Time-weighted return analyzer
+        self.addanalyzer(bt.analyzers.TimeWeightedReturn, _name='twr_analyzer')
+
+    def start(self):
+        self.initial_cash = self.broker.getvalue()
+        self._parse_schedule()
+
+    def _parse_schedule(self):
+        self.sched_dict.clear()
+        if not self.p.schedule:
+            return
+
+        items = []
+        if isinstance(self.p.schedule, dict):
+            items = list(self.p.schedule.items())
+        elif isinstance(self.p.schedule, (list, tuple)):
+            items = list(self.p.schedule)
+
+        for item in items:
+            if isinstance(self.p.schedule, dict):
+                dt_raw, val = item
+                if isinstance(val, (int, float)):
+                    action = 'buy' if val > 0 else 'sell'
+                    size = float(abs(val))
+                elif isinstance(val, (tuple, list)):
+                    action = str(val[0]).lower()
+                    size = float(val[1])
+                else:
+                    continue
+            else:
+                if len(item) == 2:
+                    dt_raw, val = item
+                    if isinstance(val, (int, float)):
+                        action = 'buy' if val > 0 else 'sell'
+                        size = float(abs(val))
+                    else:
+                        action = str(val).lower()
+                        size = 1.0
+                elif len(item) >= 3:
+                    dt_raw, action, size = item[0], item[1], item[2]
+                    action = str(action).lower()
+                    size = float(size)
+                else:
+                    continue
+
+            dt_str = dt_raw.isoformat() if hasattr(dt_raw, 'isoformat') else str(dt_raw)[:10]
+            self.sched_dict[dt_str].append((action, size))
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order.status == order.Completed:
+                sign = -1.0 if order.isbuy() else 1.0
+                cf_amount = sign * order.executed.value - order.executed.comm
+                exec_dt = self.data.num2date(order.executed.dt).date()
+                self.cash_flows.append((exec_dt, cf_amount))
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.sched_dict:
+            cur_date_str = self.data.datetime.date(0).isoformat()
+            if cur_date_str in self.sched_dict:
+                for action, size in self.sched_dict[cur_date_str]:
+                    if action == 'buy':
+                        self.order = self.buy(size=size)
+                    elif action == 'sell':
+                        self.order = self.sell(size=size)
+        else:
+            if not self.position:
+                if self.crossover[0] > 0:
+                    self.order = self.buy()
+            else:
+                if self.crossover[0] < 0:
+                    self.order = self.close()
+
+    def stop(self):
+        val_final = self.broker.getvalue()
+        val_initial = self.initial_cash if self.initial_cash > 0 else 10000.0
+
+        self.twr = (val_final / val_initial) - 1.0
+
+        if len(self.data) > 0:
+            start_date = self.data.datetime.date(-len(self.data) + 1)
+            end_date = self.data.datetime.date(0)
+            days = (end_date - start_date).days
+            if days > 0 and val_final > 0:
+                years = days / 365.25
+                self.cagr = (val_final / val_initial) ** (1.0 / years) - 1.0
+            else:
+                self.cagr = 0.0
+        else:
+            self.cagr = 0.0
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "schedule_input_format",
+      "choice": "Accept list of tuples (date, action, size) or (date, size), or dict mapping date to size or (action, size).",
+      "reason": "Specification permits arbitrary schedule structures without prescribing a concrete Python data container."
+    },
+    {
+      "topic": "twr_cagr_calculation",
+      "choice": "Calculate TWR as total portfolio growth ratio minus 1, CAGR as annual compounded return based on calendar days between first and last bar, and record explicit trade cash flows upon order execution.",
+      "reason": "Specification requires evaluating portfolio TWR, CAGR, and tracking actual cash flow dates for IRR proxy."
+    },
+    {
+      "topic": "execution_timing",
+      "choice": "Orders submitted when current bar date matches schedule target execute at next bar open per Backtrader default market order mechanics.",
+      "reason": "Specification states buys/sells execute at the opening price of the corresponding bar."
+    }
+  ]
+}
+```

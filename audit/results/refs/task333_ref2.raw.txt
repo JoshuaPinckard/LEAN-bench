@@ -1,0 +1,176 @@
+```python
+import math
+import backtrader as bt
+
+
+class HurstExponent(bt.Indicator):
+    lines = ('hurst',)
+    params = (('period', 100),)
+
+    def __init__(self):
+        self.addminperiod(self.p.period + 1)
+
+    def next(self):
+        prices = self.data.get(size=self.p.period + 1)
+        if len(prices) < self.p.period + 1:
+            self.lines.hurst[0] = 0.5
+            return
+
+        returns = []
+        for i in range(1, len(prices)):
+            p0 = prices[i - 1]
+            p1 = prices[i]
+            if p0 > 0 and p1 > 0:
+                returns.append(math.log(p1 / p0))
+            else:
+                returns.append(0.0)
+
+        N = len(returns)
+        if N < 20:
+            self.lines.hurst[0] = 0.5
+            return
+
+        sub_sizes = []
+        n = 8
+        while n <= N // 2:
+            sub_sizes.append(n)
+            n *= 2
+
+        if len(sub_sizes) < 2:
+            sub_sizes = [N // 4, N // 2]
+
+        x_vals = []
+        y_vals = []
+
+        for n_size in sub_sizes:
+            num_chunks = N // n_size
+            rs_list = []
+            for k in range(num_chunks):
+                chunk = returns[k * n_size : (k + 1) * n_size]
+                mean_chunk = sum(chunk) / n_size
+
+                cum = 0.0
+                max_cum = 0.0
+                min_cum = 0.0
+                for val in chunk:
+                    cum += (val - mean_chunk)
+                    if cum > max_cum:
+                        max_cum = cum
+                    if cum < min_cum:
+                        min_cum = cum
+
+                R = max_cum - min_cum
+
+                var = sum((val - mean_chunk) ** 2 for val in chunk) / n_size
+                S = math.sqrt(var) if var > 1e-12 else 1e-6
+
+                rs_list.append(R / S)
+
+            if rs_list:
+                mean_rs = sum(rs_list) / len(rs_list)
+                if mean_rs > 0:
+                    x_vals.append(math.log(n_size))
+                    y_vals.append(math.log(mean_rs))
+
+        if len(x_vals) < 2:
+            self.lines.hurst[0] = 0.5
+            return
+
+        mean_x = sum(x_vals) / len(x_vals)
+        mean_y = sum(y_vals) / len(y_vals)
+
+        num = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, y_vals))
+        den = sum((x - mean_x) ** 2 for x in x_vals)
+
+        if den == 0:
+            h = 0.5
+        else:
+            h = num / den
+
+        self.lines.hurst[0] = max(0.0, min(1.0, h))
+
+
+class HurstMeanReversion(bt.Strategy):
+    params = (
+        ('hurst_period', 100),
+        ('sma_period', 20),
+        ('stop_loss_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.sma_period)
+        self.hurst = HurstExponent(self.data.close, period=self.p.hurst_period)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.order = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self.order = None
+                if self.position:
+                    entry_price = order.executed.price
+                    if self.position.size > 0:
+                        stop_price = entry_price * (1.0 - self.p.stop_loss_pct)
+                        self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price)
+                    elif self.position.size < 0:
+                        stop_price = entry_price * (1.0 + self.p.stop_loss_pct)
+                        self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price)
+            elif order == self.stop_order:
+                self.stop_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            if self.hurst[0] < 0.5 and self.data.close[0] < self.sma[0]:
+                self.order = self.buy()
+            elif self.hurst[0] < 0.5 and self.data.close[0] > self.sma[0]:
+                self.order = self.sell()
+        else:
+            if self.position.size > 0:
+                if self.crossover[0] > 0 or self.hurst[0] >= 0.5:
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.order = self.close()
+            elif self.position.size < 0:
+                if self.crossover[0] < 0 or self.hurst[0] >= 0.5:
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "hurst_exponent_period",
+      "choice": "Default period N = 100 for HurstExponent custom indicator.",
+      "reason": "The specification references HurstExponent(period=N) without specifying a numerical parameter; N=100 is a standard lookback window for intraday R/S Hurst exponent analysis."
+    },
+    {
+      "topic": "hurst_exponent_input",
+      "choice": "Compute classic R/S rescaled range analysis on log returns of close prices.",
+      "reason": "R/S analysis evaluates the scaling behavior of series increments (returns) where H = 0.5 corresponds to a geometric Brownian motion random walk."
+    },
+    {
+      "topic": "stop_loss_execution",
+      "choice": "Submit a stop order immediately upon entry order completion in notify_order using executed fill price.",
+      "reason": "The exact entry price is confirmed upon order completion, allowing precise calculation of entry_price * 0.98 for longs and entry_price * 1.02 for shorts."
+    }
+  ]
+}
+```

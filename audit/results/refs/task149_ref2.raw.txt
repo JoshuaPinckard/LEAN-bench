@@ -1,0 +1,185 @@
+```python
+import backtrader as bt
+
+
+class PriceActionVolumeReversal(bt.Strategy):
+    params = (
+        ("period", 20),
+        ("vol_factor", 1.5),
+        ("range_factor", 1.5),
+        ("risk_pct", 0.01),
+        ("rr_ratio", 2.0),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.period)
+        self.bar_range = self.data.high - self.data.low
+        self.range_sma = bt.indicators.SMA(self.bar_range, period=self.p.period)
+
+        self.key_bar_idx = None
+        self.key_bar_high = None
+        self.key_bar_low = None
+
+        self.min_low_since_key = None
+        self.min_low_idx = None
+
+        self.max_high_since_key = None
+        self.max_high_idx = None
+
+        self.sl_price = None
+        self.tp_price = None
+        self.retest_low = None
+        self.retest_high = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            exec_price = order.executed.price
+            if order.isbuy():
+                sl = (
+                    self.retest_low
+                    if (self.retest_low is not None and self.retest_low < exec_price)
+                    else exec_price * 0.995
+                )
+                risk = exec_price - sl
+                tp = exec_price + self.p.rr_ratio * risk
+                self.sl_price = sl
+                self.tp_price = tp
+            elif order.issell():
+                sl = (
+                    self.retest_high
+                    if (self.retest_high is not None and self.retest_high > exec_price)
+                    else exec_price * 1.005
+                )
+                risk = sl - exec_price
+                tp = exec_price - self.p.rr_ratio * risk
+                self.sl_price = sl
+                self.tp_price = tp
+
+        self.order = None
+
+    def next(self):
+        curr_idx = len(self)
+        curr_vol = self.data.volume[0]
+        curr_range = self.bar_range[0]
+        avg_v = self.vol_sma[0]
+        avg_r = self.range_sma[0]
+
+        is_key = (curr_vol >= self.p.vol_factor * avg_v) and (
+            curr_range >= self.p.range_factor * avg_r
+        )
+
+        if is_key:
+            self.key_bar_idx = curr_idx
+            self.key_bar_high = self.data.high[0]
+            self.key_bar_low = self.data.low[0]
+            self.min_low_since_key = float("inf")
+            self.min_low_idx = None
+            self.max_high_since_key = float("-inf")
+            self.max_high_idx = None
+        elif self.key_bar_idx is not None:
+            prev_low = self.data.low[-1]
+            prev_high = self.data.high[-1]
+            prev_idx = curr_idx - 1
+
+            if prev_idx > self.key_bar_idx:
+                if prev_low < self.min_low_since_key:
+                    self.min_low_since_key = prev_low
+                    self.min_low_idx = prev_idx
+                if prev_high > self.max_high_since_key:
+                    self.max_high_since_key = prev_high
+                    self.max_high_idx = prev_idx
+
+        if self.position:
+            if self.position.size > 0:
+                if self.data.high[0] >= self.tp_price:
+                    self.close()
+                elif self.data.low[0] <= self.sl_price:
+                    self.close()
+            elif self.position.size < 0:
+                if self.data.low[0] <= self.tp_price:
+                    self.close()
+                elif self.data.high[0] >= self.sl_price:
+                    self.close()
+            return
+
+        if self.order is not None or self.key_bar_idx is None:
+            return
+
+        demand_level = self.key_bar_low
+        resistance_level = self.key_bar_high
+
+        mid_range = (self.data.high[0] + self.data.low[0]) / 2.0
+        close_top_half = self.data.close[0] > mid_range
+        close_bottom_half = self.data.close[0] < mid_range
+        vol_spike = curr_vol > avg_v
+
+        # Long Setup (Spring)
+        retest_demand = self.data.low[0] <= demand_level
+        if retest_demand and close_top_half and vol_spike:
+            if self.min_low_idx is not None and self.min_low_idx > self.key_bar_idx:
+                slope_long = (self.min_low_since_key - self.key_bar_high) / (
+                    self.min_low_idx - self.key_bar_idx
+                )
+                if slope_long < 0:
+                    rtl_val = self.key_bar_high + slope_long * (
+                        curr_idx - self.key_bar_idx
+                    )
+                    if self.data.close[0] > rtl_val:
+                        self.retest_low = self.data.low[0]
+                        risk_per_share = max(
+                            0.0001, self.data.close[0] - self.retest_low
+                        )
+                        cash_risk = self.broker.getvalue() * self.p.risk_pct
+                        size = int(cash_risk / risk_per_share)
+                        if size >= 1:
+                            self.order = self.buy(size=size)
+                        return
+
+        # Short Setup (Upthrust)
+        retest_resistance = self.data.high[0] >= resistance_level
+        if retest_resistance and close_bottom_half and vol_spike:
+            if self.max_high_idx is not None and self.max_high_idx > self.key_bar_idx:
+                slope_short = (self.max_high_since_key - self.key_bar_low) / (
+                    self.max_high_idx - self.key_bar_idx
+                )
+                if slope_short > 0:
+                    rtl_val = self.key_bar_low + slope_short * (
+                        curr_idx - self.key_bar_idx
+                    )
+                    if self.data.close[0] < rtl_val:
+                        self.retest_high = self.data.high[0]
+                        risk_per_share = max(
+                            0.0001, self.retest_high - self.data.close[0]
+                        )
+                        cash_risk = self.broker.getvalue() * self.p.risk_pct
+                        size = int(cash_risk / risk_per_share)
+                        if size >= 1:
+                            self.order = self.sell(size=size)
+                        return
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "key_bar_identification",
+      "choice": "An initial key bar is identified when volume >= 150% of 20-bar volume SMA and range >= 150% of 20-bar range SMA. Its Low is marked as demand level and High as resistance level.",
+      "reason": "Specification defines initial demand bar by 150% averages and references key bar high/low for both setups."
+    },
+    {
+      "topic": "rtl_calculation",
+      "choice": "RTL for Long connects initial key bar high to the subsequent lowest low before retest. RTL for Short connects initial key bar low to the subsequent highest high before retest.",
+      "reason": "Follows the downward-sloping trendline definition for Spring setups and upward-sloping trendline definition for Upthrust setups."
+    },
+    {
+      "topic": "position_sizing_and_exits",
+      "choice": "Risks 1% of total portfolio value per trade. Stop loss is set at the retest extreme (retest low for long, retest high for short) and take profit is set at 2:1 reward-to-risk ratio.",
+      "reason": "Directly implements the 1% risk default, 1:2 R/R defaults, and retest bar extreme stop loss instructions."
+    }
+  ]
+}
+```

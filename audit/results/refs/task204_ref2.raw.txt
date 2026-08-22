@@ -1,0 +1,194 @@
+```python
+import backtrader as bt
+
+
+class NXXTBaseBreakout(bt.Strategy):
+    """
+    NXXT Base Breakout Strategy
+
+    Trades a breakout after a constructive base: narrow Bollinger Band width,
+    20-bar range < 2.5 * ATR, higher 5-bar low, confirmed by MACD histogram,
+    RSI > 50, and elevated volume (> 1.5 * 20-period volume SMA).
+    """
+
+    def __init__(self):
+        # Indicators
+        self.sma200 = bt.ind.SMA(self.data.close, period=200)
+        self.sma20 = bt.ind.SMA(self.data.close, period=20)
+        self.bb = bt.ind.BollingerBands(self.data.close, period=20, devfactor=2.0)
+        self.bb_width = (self.bb.lines.top - self.bb.lines.bot) / self.bb.lines.mid
+
+        self.atr = bt.ind.ATR(self.data, period=14)
+        self.macd = bt.ind.MACDHisto(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.macd_histo = self.macd.lines.histo
+        self.rsi = bt.ind.RSI(self.data.close, period=14)
+        self.vol_sma = bt.ind.SMA(self.data.volume, period=20)
+
+        # Base levels over 20 bars
+        self.hh20 = bt.ind.Highest(self.data.high, period=20)
+        self.ll20 = bt.ind.Lowest(self.data.low, period=20)
+
+        # 5-bar rolling low for "Higher low" check
+        self.ll5 = bt.ind.Lowest(self.data.low, period=5)
+
+        # Order and position state tracking
+        self.order = None
+        self.entry_price = 0.0
+        self.entry_bar = 0
+        self.base_high = 0.0
+        self.base_low = 0.0
+        self.base_height = 0.0
+        self.sl_price = 0.0
+        self.tp1_price = 0.0
+        self.tp2_price = 0.0
+        self.tp1_hit = False
+
+        # Pending signal snapshot
+        self.pending_base_high = 0.0
+        self.pending_base_low = 0.0
+        self.pending_base_height = 0.0
+        self.pending_atr = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+                self.base_high = self.pending_base_high
+                self.base_low = self.pending_base_low
+                self.base_height = self.pending_base_height
+                self.sl_price = self.base_low - 1.0 * self.pending_atr
+                self.tp1_price = self.entry_price + self.base_height
+                self.tp2_price = self.entry_price + 2.0 * self.base_height
+                self.tp1_hit = False
+            self.order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        # Manage open position
+        if self.position:
+            # 1. Check Initial / Moved Stop Loss
+            if self.data.low[0] <= self.sl_price:
+                self.order = self.close()
+                return
+
+            # 2. Check Take Profit levels
+            if not self.tp1_hit:
+                if self.data.high[0] >= self.tp2_price:
+                    self.order = self.close()
+                    return
+                elif self.data.high[0] >= self.tp1_price:
+                    self.tp1_hit = True
+                    self.sl_price = self.base_high
+                    close_size = int(self.position.size * 0.5)
+                    if close_size > 0:
+                        self.order = self.sell(size=close_size)
+            else:
+                if self.data.high[0] >= self.tp2_price:
+                    self.order = self.close()
+                    return
+
+            # 3. Fail-safe exit: Close < SMA(20) and MACD histogram < 0
+            if self.data.close[0] < self.sma20[0] and self.macd_histo[0] < 0:
+                self.order = self.close()
+                return
+
+            # 4. Time exit: close after 30 trading days
+            if len(self) - self.entry_bar >= 30:
+                self.order = self.close()
+                return
+
+            return
+
+        # If a pending entry order was not filled, cancel it to re-evaluate on fresh bar
+        if self.order:
+            self.cancel(self.order)
+            return
+
+        # Entry logic evaluation
+        # 1) Trend filter
+        cond_trend = self.data.close[0] > self.sma200[0]
+
+        # 2) Consolidation
+        range_20 = self.hh20[0] - self.ll20[0]
+        cond_consolidation = (self.bb_width[0] < 0.08) and (
+            range_20 < 2.5 * self.atr[0]
+        )
+
+        # 3) Higher low: current Low(5) > Low(5) 5 bars ago
+        cond_higher_low = self.ll5[0] > self.ll5[-5]
+
+        # 4) Momentum: MACD histogram crosses 0 from below OR rises for last 3 bars; RSI > 50
+        macd_cross_up = (self.macd_histo[-1] <= 0) and (self.macd_histo[0] > 0)
+        macd_rising_3 = (
+            self.macd_histo[0]
+            > self.macd_histo[-1]
+            > self.macd_histo[-2]
+            > self.macd_histo[-3]
+        )
+        cond_momentum = (macd_cross_up or macd_rising_3) and (self.rsi[0] > 50)
+
+        # 5) Volume confirmation
+        cond_volume = self.data.volume[0] > 1.5 * self.vol_sma[0]
+
+        if (
+            cond_trend
+            and cond_consolidation
+            and cond_higher_low
+            and cond_momentum
+            and cond_volume
+        ):
+            base_high = self.hh20[0]
+            base_low = self.ll20[0]
+            base_height = base_high - base_low
+            atr_val = self.atr[0]
+
+            stop_price = base_high + 0.1 * atr_val
+            initial_sl = base_low - 1.0 * atr_val
+            risk_dist = stop_price - initial_sl
+
+            if risk_dist > 0:
+                capital = self.broker.getvalue()
+
+                # Risk-based sizing (0.5% of capital)
+                size_risk = (capital * 0.005) / risk_dist
+
+                # Exposure-based sizing (2% of capital)
+                size_exposure = (capital * 0.02) / stop_price
+
+                size = int(min(size_risk, size_exposure))
+
+                if size > 0:
+                    self.pending_base_high = base_high
+                    self.pending_base_low = base_low
+                    self.pending_base_height = base_height
+                    self.pending_atr = atr_val
+
+                    self.order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=size
+                    )
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "pending_entry_order_validity",
+      "choice": "Pending entry stop orders are cancelled if not executed on the following bar, allowing the strategy to re-evaluate all setup conditions on the subsequent bar.",
+      "reason": "Breakout conditions such as volume expansion and MACD momentum are bar-specific; stale orders remaining active after non-breakout bars would violate the entry specification."
+    },
+    {
+      "topic": "entry_price_for_tp_levels",
+      "choice": "TP1 and TP2 target prices are calculated relative to the actual fill price of the entry order (order.executed.price) plus base_height and 2*base_height respectively.",
+      "reason": "The specification defines Take Profit levels as 'Entry + base_height' and 'Entry + 2*base_height', which refers to the executed trade entry price."
+    }
+  ]
+}
+```

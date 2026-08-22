@@ -1,0 +1,177 @@
+```python
+import datetime
+import backtrader as bt
+
+
+class VolatilityScalpingStrategy(bt.Strategy):
+    params = (
+        ("rsi_period", 14),
+        ("atr_period", 14),
+        ("vol_sma_period", 5),
+        ("vol_mult", 1.2),
+        ("volatility_filter_min", 0.002),
+        ("tp_atr_mult", 1.5),
+        ("risk_pct", 0.01),
+        ("session_start", datetime.time(9, 30)),
+        ("session_end", datetime.time(16, 0)),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.vol_sma_period
+        )
+
+        self.order = None
+        self.tp_order = None
+        self.sl_order = None
+
+        self.signal_open = None
+        self.signal_atr = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                self.entry_bar = len(self)
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if order.isbuy():
+                    tp_price = (
+                        entry_price + self.p.tp_atr_mult * self.signal_atr
+                    )
+                    sl_price = self.signal_open
+                    self.sl_order = self.sell(
+                        size=size, exectype=bt.Order.Stop, price=sl_price
+                    )
+                    self.tp_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=tp_price,
+                        oco=self.sl_order,
+                    )
+                else:
+                    tp_price = (
+                        entry_price - self.p.tp_atr_mult * self.signal_atr
+                    )
+                    sl_price = self.signal_open
+                    self.sl_order = self.buy(
+                        size=size, exectype=bt.Order.Stop, price=sl_price
+                    )
+                    self.tp_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=tp_price,
+                        oco=self.sl_order,
+                    )
+
+            elif order in [self.tp_order, self.sl_order]:
+                self.tp_order = None
+                self.sl_order = None
+                self.order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.tp_order:
+                self.tp_order = None
+            if order == self.sl_order:
+                self.sl_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        current_time = self.data.datetime.time(0)
+        in_session = (
+            self.p.session_start <= current_time <= self.p.session_end
+        )
+
+        if self.position:
+            if self.entry_bar is not None and len(self) >= self.entry_bar:
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+                self.order = self.close()
+                self.entry_bar = None
+            return
+
+        if not in_session:
+            return
+
+        close_val = self.data.close[0]
+        open_val = self.data.open[0]
+        high_val = self.data.high[0]
+        low_val = self.data.low[0]
+        vol_val = self.data.volume[0]
+
+        rsi_val = self.rsi[0]
+        atr_val = self.atr[0]
+        vol_sma_val = self.vol_sma[0]
+
+        if (atr_val / close_val) < self.p.volatility_filter_min:
+            return
+
+        vol_spike = vol_val >= self.p.vol_mult * vol_sma_val
+        wide_range = (high_val - low_val) >= atr_val
+
+        if not (vol_spike and wide_range):
+            return
+
+        capital = self.broker.getvalue()
+        risk_amount = capital * self.p.risk_pct
+
+        if close_val > open_val and rsi_val > 50:
+            risk_per_share = close_val - open_val
+            if risk_per_share > 0:
+                size = int(risk_amount / risk_per_share)
+                if size > 0:
+                    self.signal_open = open_val
+                    self.signal_atr = atr_val
+                    self.order = self.buy(size=size)
+
+        elif close_val < open_val and rsi_val < 50:
+            risk_per_share = open_val - close_val
+            if risk_per_share > 0:
+                size = int(risk_amount / risk_per_share)
+                if size > 0:
+                    self.signal_open = open_val
+                    self.signal_atr = atr_val
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "session_hours",
+      "choice": "Define main trading session as 09:30 to 16:00 exchange time inclusive.",
+      "reason": "The specification states '09:30–16:00 exchange time'."
+    },
+    {
+      "topic": "position_sizing_risk",
+      "choice": "Calculate risk per share as abs(Close - Open) of the signal candle and position size as int(0.01 * capital / risk_per_share).",
+      "reason": "The signal candle Open is designated as the stop-loss level, and entry takes place at market close/next open, which is estimated by signal candle Close."
+    },
+    {
+      "topic": "tp_price_calculation",
+      "choice": "Calculate Take-Profit price relative to the executed entry price (entry_price +/- 1.5 * ATR(14) of the signal candle) upon entry completion in notify_order.",
+      "reason": "The specification explicitly states 'take-profit = 1.5 * ATR(14) from the entry price'."
+    },
+    {
+      "topic": "time_exit_execution",
+      "choice": "If TP/SL orders do not execute during the entry bar, cancel pending TP/SL orders at the bar close and issue a market close order.",
+      "reason": "The specification requires closing at market on the close of the next 1-minute bar if TP/SL did not trigger."
+    }
+  ]
+}
+```

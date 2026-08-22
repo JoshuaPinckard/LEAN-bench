@@ -1,0 +1,127 @@
+```python
+import backtrader as bt
+
+
+class SyntheticCoveredCall(bt.Strategy):
+    params = (
+        ('cycle_length', 21),
+        ('otm_pct', 0.15),
+        ('boll_period', 20),
+        ('boll_dev', 2.0),
+        ('atr_period', 14),
+        ('core_pct', 0.95),
+        ('rule1_sell_pct', 0.40),
+        ('min_core_pct', 0.50),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.boll_period)
+        self.boll = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.boll_period, devfactor=self.p.boll_dev
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.K = None
+        self.cycle_bar = 0
+        self.has_sold_partial = False
+        self.sold_size = 0
+        self.core_size = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        # 1. Establish core long position
+        if not self.position:
+            self.order = self.order_target_percent(target=self.p.core_pct)
+            self.K = max(self.data.close[0] * (1.0 + self.p.otm_pct), self.boll.top[0])
+            self.cycle_bar = 1
+            self.has_sold_partial = False
+            self.sold_size = 0
+            self.core_size = 0
+            return
+
+        # Record full core size when not in a partial sold state
+        if not self.has_sold_partial or self.core_size == 0:
+            self.core_size = self.position.size + self.sold_size
+
+        # 2. Rule 1: Buyback condition after partial sell
+        if self.has_sold_partial and self.sold_size > 0:
+            return_to_sma = self.data.low[0] <= self.sma[0]
+            touch_lower_bb = self.data.low[0] <= self.boll.bot[0]
+            if return_to_sma or touch_lower_bb:
+                self.order = self.buy(size=self.sold_size)
+                self.has_sold_partial = False
+                self.sold_size = 0
+                return
+
+        bars_remaining = self.p.cycle_length - self.cycle_bar
+
+        # 3. Rule 3: Deep ITM roll (Close > K + ATR(14) and <= 5 bars remaining)
+        if self.data.close[0] > self.K + self.atr[0] and bars_remaining <= 5:
+            max_allowed_total_sold = int(self.core_size * (1.0 - self.p.min_core_pct))
+            current_sold = self.sold_size
+            additional_sell = max(0, max_allowed_total_sold - current_sold)
+            sell_qty = min(additional_sell, self.position.size)
+
+            if sell_qty > 0:
+                self.order = self.sell(size=sell_qty)
+                self.sold_size += sell_qty
+                self.has_sold_partial = True
+
+            # Immediately start a new cycle and recalculate K
+            self.K = max(self.data.close[0] * (1.0 + self.p.otm_pct), self.boll.top[0])
+            self.cycle_bar = 1
+            return
+
+        # 4. Rule 1: Reaching K within cycle (Rule 2: block new sells if <= 2 bars remain)
+        reached_K = self.data.high[0] >= self.K
+        if reached_K and not self.has_sold_partial and bars_remaining > 2:
+            desired_sell = int(self.core_size * self.p.rule1_sell_pct)
+            max_allowed_total_sold = int(self.core_size * (1.0 - self.p.min_core_pct))
+            sell_qty = min(desired_sell, max_allowed_total_sold, self.position.size)
+
+            if sell_qty > 0:
+                self.order = self.sell(size=sell_qty)
+                self.sold_size = sell_qty
+                self.has_sold_partial = True
+
+        # 5. Cycle timing advancement / Rule 4 OTM expiration
+        if self.cycle_bar >= self.p.cycle_length:
+            self.K = max(self.data.close[0] * (1.0 + self.p.otm_pct), self.boll.top[0])
+            self.cycle_bar = 1
+        else:
+            self.cycle_bar += 1
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "initial_position_sizing",
+      "choice": "Target 95% of portfolio equity via order_target_percent(0.95) for the long-term core position.",
+      "reason": "The specification calls for holding a long-term core position and taking partial sells of 30-50% / up to 70%, which requires non-unit share position sizing."
+    },
+    {
+      "topic": "partial_sell_percentages",
+      "choice": "Sell 40% of core position size on Rule 1 triggers, and up to 50% total core position size on Rule 3 rolls.",
+      "reason": "Rule 1 specifies 30-50% (40% midpoint selected) and Rule 3 specifies up to 70%, while Risk Management dictates maintaining a minimum 50-70% core position (50% minimum core threshold selected)."
+    },
+    {
+      "topic": "reaching_K_condition",
+      "choice": "Evaluated as High[0] >= K.",
+      "reason": "In price-level and options assignment specifications, reaching a target price during a daily bar occurs when intraday High reaches or exceeds K."
+    },
+    {
+      "topic": "buyback_condition",
+      "choice": "Evaluated as Low[0] <= SMA(20)[0] or Low[0] <= Lower_Bollinger[0].",
+      "reason": "A return to SMA(20) or touch of the lower Bollinger Band during the bar is triggered when intraday Low touches or falls below those indicator lines."
+    }
+  ]
+}
+```

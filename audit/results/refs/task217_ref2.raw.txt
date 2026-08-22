@@ -1,0 +1,167 @@
+```python
+import backtrader as bt
+
+
+class MomentumVolumeStrategy(bt.Strategy):
+    params = (("risk_pct", 0.01),)
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.sl_price = None
+        self.tp_price = None
+        self.be_triggered = False
+
+        # Moving Averages
+        self.ema9 = bt.ind.EMA(self.data.close, period=9)
+        self.ema21 = bt.ind.EMA(self.data.close, period=21)
+        self.ema50 = bt.ind.EMA(self.data.close, period=50)
+        self.ema200 = bt.ind.EMA(self.data.close, period=200)
+
+        # Volatility & Momentum
+        self.bb = bt.ind.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.macd = bt.ind.MACD(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.atr = bt.ind.ATR(self.data, period=14)
+
+        # Volume
+        self.sma_vol = bt.ind.SMA(self.data.volume, period=20)
+        self.rvol = self.data.volume / self.sma_vol
+
+        # Crossovers
+        self.close_bb_cross = bt.ind.CrossOver(self.data.close, self.bb.top)
+        self.macd_cross = bt.ind.CrossOver(self.macd.macd, self.macd.signal)
+        self.close_ema9_cross = bt.ind.CrossOver(self.data.close, self.ema9)
+
+        self.ema21_close_cross = bt.ind.CrossOver(self.ema21, self.data.close)
+        self.macd_signal_cross = bt.ind.CrossOver(
+            self.macd.signal, self.macd.macd
+        )
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                atr_val = self.atr[0]
+                initial_sl = min(
+                    self.ema21[0], self.entry_price - max(0.02, atr_val)
+                )
+                clamp_atr = max(0.10, min(0.20, atr_val))
+                self.tp_price = self.entry_price + clamp_atr
+                self.sl_price = initial_sl
+                self.be_triggered = False
+            elif order.issell():
+                self.entry_price = None
+                self.sl_price = None
+                self.tp_price = None
+                self.be_triggered = False
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            # Filters
+            p_range = 0.75 <= self.data.close[0] <= 10.00
+            rvol_ok = self.rvol[0] >= 1.5
+            trend_ok = (
+                self.data.close[0]
+                > self.ema9[0]
+                > self.ema21[0]
+                > self.ema50[0]
+            ) and (self.data.close[0] > self.ema200[0])
+
+            if not (p_range and rvol_ok and trend_ok):
+                return
+
+            # Scenario A: Breakout with confirmation
+            scen_a = (self.close_bb_cross[0] > 0) and (
+                self.macd_cross[0] > 0
+                or self.macd_cross[-1] > 0
+                or self.macd_cross[-2] > 0
+            )
+
+            # Scenario B: Sniper-bounce
+            touch_recent = any(
+                self.data.low[-i] <= self.ema21[-i]
+                or self.data.close[-i] <= self.bb.mid[-i]
+                for i in range(3)
+            )
+            dist_bb = self.bb.top[0] - self.data.close[0]
+            scen_b = (
+                touch_recent
+                and (self.close_ema9_cross[0] > 0)
+                and (dist_bb <= 0.5 * self.atr[0])
+            )
+
+            if scen_a or scen_b:
+                entry = self.data.close[0]
+                atr_val = self.atr[0]
+                initial_sl = min(self.ema21[0], entry - max(0.02, atr_val))
+                risk_per_share = entry - initial_sl
+                if risk_per_share > 0:
+                    capital = self.broker.getvalue()
+                    r_amount = capital * self.p.risk_pct
+                    size = int(r_amount / risk_per_share)
+                    max_cash_size = int(self.broker.getcash() / entry)
+                    size = min(size, max_cash_size)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+        else:
+            if (
+                self.entry_price is None
+                or self.sl_price is None
+                or self.tp_price is None
+            ):
+                return
+
+            unrealized_profit = self.data.close[0] - self.entry_price
+            if unrealized_profit >= 0.10:
+                self.be_triggered = True
+
+            if self.be_triggered:
+                self.sl_price = max(
+                    self.sl_price, max(self.entry_price, self.ema9[0])
+                )
+
+            # Check exits
+            sl_hit = self.data.low[0] <= self.sl_price
+            tp_hit = self.data.high[0] >= self.tp_price
+            ind_exit = (self.ema21_close_cross[0] > 0) or (
+                self.macd_signal_cross[0] > 0
+            )
+            trail_exit = self.be_triggered and (
+                self.data.close[0] < self.ema9[0]
+            )
+
+            if sl_hit or tp_hit or ind_exit or trail_exit:
+                self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_price_execution",
+      "choice": "Used signal bar close for order sizing calculation and executed price in notify_order for setting initial SL and TP levels.",
+      "reason": "Signal bar close is the latest known price when calculating risk and position size, while execution price in notify_order reflects the actual position cost."
+    },
+    {
+      "topic": "pullback_touch_window",
+      "choice": "Evaluated the last 3 bars window for pullback touch using bars 0, -1, and -2 relative to current bar.",
+      "reason": "Specification states 'within the last 3 bars', which maps directly to the current bar and the preceding two bars."
+    },
+    {
+      "topic": "position_size_capping",
+      "choice": "Capped position size by available broker cash divided by entry price.",
+      "reason": "Ensures orders are not rejected by the broker due to insufficient capital while adhering strictly to risk-based sizing."
+    }
+  ]
+}
+```

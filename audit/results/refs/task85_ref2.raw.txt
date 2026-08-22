@@ -1,0 +1,151 @@
+```python
+import backtrader as bt
+
+
+class BreakAndRetest(bt.Strategy):
+    params = (
+        ("risk_pct", 0.01),
+        ("sl_pct", 0.005),
+        ("tp_pct", 0.015),
+        ("retest_max_bars", 5),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.tp_order = None
+        self.sl_order = None
+
+        self.current_date = None
+        self.day_highs = []
+        self.prev_day_high = None
+        self.first_5m_high = None
+        self.resistance_level = None
+
+        self.breakout_active = False
+        self.breakout_bar_count = 0
+        self.retested = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                entry_price = order.executed.price
+                entry_size = order.executed.size
+
+                tp_price = entry_price * (1.0 + self.p.tp_pct)
+                sl_price = entry_price * (1.0 - self.p.sl_pct)
+
+                self.tp_order = self.sell(
+                    size=entry_size, exectype=bt.Order.Limit, price=tp_price
+                )
+                self.sl_order = self.sell(
+                    size=entry_size,
+                    exectype=bt.Order.Stop,
+                    price=sl_price,
+                    oco=self.tp_order,
+                )
+            elif order in (self.tp_order, self.sl_order):
+                self.tp_order = None
+                self.sl_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.tp_order:
+                self.tp_order = None
+            if order == self.sl_order:
+                self.sl_order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+
+        # Handle day boundaries
+        if self.current_date is None:
+            self.current_date = dt
+            self.day_highs = [self.data.high[0]]
+            self.first_5m_high = self.data.high[0]
+        elif dt != self.current_date:
+            if self.day_highs:
+                self.prev_day_high = max(self.day_highs)
+            self.current_date = dt
+            self.day_highs = [self.data.high[0]]
+            self.first_5m_high = self.data.high[0]
+            self.breakout_active = False
+            self.breakout_bar_count = 0
+            self.retested = False
+
+            if self.prev_day_high is not None:
+                self.resistance_level = max(
+                    self.prev_day_high, self.first_5m_high
+                )
+            else:
+                self.resistance_level = None
+            return
+        else:
+            self.day_highs.append(self.data.high[0])
+
+        if self.resistance_level is None:
+            return
+
+        if self.position or self.order is not None:
+            return
+
+        if not self.breakout_active:
+            if self.data.close[0] > self.resistance_level:
+                self.breakout_active = True
+                self.breakout_bar_count = 0
+                self.retested = False
+        else:
+            self.breakout_bar_count += 1
+
+            if self.data.low[0] <= self.resistance_level:
+                self.retested = True
+
+            if (
+                self.retested
+                and self.data.close[0] > self.resistance_level
+                and self.data.close[0] > self.data.open[0]
+            ):
+                price = self.data.close[0]
+                total_value = self.broker.getvalue()
+                max_risk_amount = total_value * self.p.risk_pct
+                risk_per_share = price * self.p.sl_pct
+
+                if risk_per_share > 0:
+                    size = int(max_risk_amount / risk_per_share)
+                    max_cash_size = int(self.broker.getcash() / price)
+                    size = min(size, max_cash_size)
+
+                    if size > 0:
+                        self.order = self.buy(size=size)
+
+                self.breakout_active = False
+
+            elif self.breakout_bar_count >= self.p.retest_max_bars:
+                self.breakout_active = False
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Omit pre-market high from resistance level calculation, defining resistance level as max(Previous day high, First 5 minutes high).",
+      "reason": "The dataset provided in the execution environment consists strictly of regular market hours (09:30-15:55), so pre-market price data is absent."
+    },
+    {
+      "topic": "retest_and_bounce_definition",
+      "choice": "Retest is registered when low <= resistance_level within 5 bars following a breakout close; bounce confirmation requires close > resistance_level and close > open.",
+      "reason": "The specification requires a candle confirming the bounce after price returns to the resistance level."
+    },
+    {
+      "topic": "position_sizing_cash_cap",
+      "choice": "Position size derived from 1% risk at 0.5% stop-loss is capped by available cash.",
+      "reason": "Unleveraged 1% account risk at 0.5% stop-loss requires 200% equity position size, which exceeds available cash in standard 1x leverage accounts and causes order rejection."
+    }
+  ]
+}
+```

@@ -1,0 +1,307 @@
+```python
+import statistics
+import backtrader as bt
+
+
+class ScalpingRegimeStrategy(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('rsi_period', 14),
+        ('ema_fast', 9),
+        ('ema_slow', 21),
+        ('atr_period', 14),
+        ('lookback_sessions', 20),
+    )
+
+    def __init__(self):
+        self.order = None
+
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_dev
+        )
+        self.rsi = bt.indicators.RSI(
+            self.data.close,
+            period=self.p.rsi_period
+        )
+        self.ema9 = bt.indicators.EMA(
+            self.data.close,
+            period=self.p.ema_fast
+        )
+        self.ema21 = bt.indicators.EMA(
+            self.data.close,
+            period=self.p.ema_slow
+        )
+        self.atr = bt.indicators.ATR(
+            self.data,
+            period=self.p.atr_period
+        )
+
+        # Day tracking
+        self.current_day = None
+        self.day_bar_count = 0
+        self.day_open = None
+        self.prev_day_close = None
+        self.day_bb_widths = []
+
+        # Regime state
+        self.regime = None
+        self.regime_ready = False
+        self.return_30m = 0.0
+
+        # Proxy histories
+        self.gamma_history = []
+        self.spotvol_history = []
+
+        # Trade state tracking
+        self.trade_type = None  # 'MR' or 'TREND'
+        self.sl_mult = 1.0
+        self.tp_mult = 1.0
+        self.entry_price = None
+        self.sl_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.position.size != 0:
+                self.entry_price = order.executed.price
+                atr_val = self.atr[0]
+                if self.position.size > 0:
+                    self.sl_price = self.entry_price - self.sl_mult * atr_val
+                    self.tp_price = self.entry_price + self.tp_mult * atr_val
+                else:
+                    self.sl_price = self.entry_price + self.sl_mult * atr_val
+                    self.tp_price = self.entry_price - self.tp_mult * atr_val
+
+        self.order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+
+        # Detect start of a new session / trading day
+        if dt != self.current_day:
+            if self.current_day is not None:
+                self.prev_day_close = self.data.close[-1]
+            self.current_day = dt
+            self.day_bar_count = 0
+            self.day_open = self.data.open[0]
+            self.day_bb_widths = []
+            self.regime_ready = False
+            self.regime = None
+            self.return_30m = 0.0
+
+        self.day_bar_count += 1
+
+        # Accumulate metrics during the first 30 minutes of the day (first 30 1-min bars)
+        if self.day_bar_count <= 30:
+            bb_w = self.bb.lines.top[0] - self.bb.lines.bot[0]
+            self.day_bb_widths.append(bb_w)
+
+            if self.day_bar_count == 30:
+                avg_bb_w = sum(self.day_bb_widths) / len(self.day_bb_widths)
+
+                if self.prev_day_close is not None and self.prev_day_close > 0:
+                    spot_vol = abs(self.day_open - self.prev_day_close) / self.prev_day_close
+                else:
+                    spot_vol = 0.0
+
+                self.return_30m = (self.data.close[0] - self.day_open) / self.day_open if self.day_open > 0 else 0.0
+
+                # Compute medians over previous 20 sessions
+                if len(self.gamma_history) > 0:
+                    gamma_hist = self.gamma_history[-self.p.lookback_sessions:]
+                    gamma_median = statistics.median(gamma_hist)
+                else:
+                    gamma_median = avg_bb_w
+
+                if len(self.spotvol_history) > 0:
+                    spotvol_hist = self.spotvol_history[-self.p.lookback_sessions:]
+                    spotvol_median = statistics.median(spotvol_hist)
+                else:
+                    spotvol_median = spot_vol
+
+                # Gamma: low width = High Gamma
+                gamma_regime = 'H' if avg_bb_w < gamma_median else 'L'
+                # SpotVol: high width/gap = High SpotVol
+                spotvol_regime = 'H' if spot_vol > spotvol_median else 'L'
+
+                self.regime = gamma_regime + spotvol_regime
+                self.regime_ready = True
+
+                self.gamma_history.append(avg_bb_w)
+                self.spotvol_history.append(spot_vol)
+
+        # Manage open position exits
+        if self.position:
+            if self.order:
+                return
+
+            size = self.position.size
+
+            if size > 0:
+                # Stop loss
+                if self.sl_price is not None and self.data.low[0] <= self.sl_price:
+                    self.order = self.close()
+                    return
+                # Take profit
+                if self.tp_price is not None and self.data.high[0] >= self.tp_price:
+                    self.order = self.close()
+                    return
+                # Signal exit
+                if self.trade_type == 'MR':
+                    if self.data.high[0] >= self.bb.lines.mid[0] or self.rsi[0] > 70:
+                        self.order = self.close()
+                        return
+                elif self.trade_type == 'TREND':
+                    if self.ema9[0] < self.ema21[0]:
+                        self.order = self.close()
+                        return
+
+            elif size < 0:
+                # Stop loss
+                if self.sl_price is not None and self.data.high[0] >= self.sl_price:
+                    self.order = self.close()
+                    return
+                # Take profit
+                if self.tp_price is not None and self.data.low[0] <= self.tp_price:
+                    self.order = self.close()
+                    return
+                # Signal exit
+                if self.trade_type == 'MR':
+                    if self.data.low[0] <= self.bb.lines.mid[0] or self.rsi[0] < 30:
+                        self.order = self.close()
+                        return
+                elif self.trade_type == 'TREND':
+                    if self.ema9[0] > self.ema21[0]:
+                        self.order = self.close()
+                        return
+
+            return
+
+        # Entry logic evaluation (only after first 30 minutes regime is determined)
+        if not self.regime_ready or self.order:
+            return
+
+        rsi_cross_up_30 = (self.rsi[-1] < 30 and self.rsi[0] >= 30)
+        rsi_cross_dn_70 = (self.rsi[-1] > 70 and self.rsi[0] <= 70)
+
+        bb_touch_low = (self.data.low[0] <= self.bb.lines.bot[0])
+        bb_touch_high = (self.data.high[0] >= self.bb.lines.top[0])
+
+        ema_cross_up = (self.ema9[-1] < self.ema21[-1] and self.ema9[0] >= self.ema21[0])
+        ema_cross_dn = (self.ema9[-1] > self.ema21[-1] and self.ema9[0] <= self.ema21[0])
+
+        is_high_gamma = self.regime.startswith('H')
+        is_low_gamma = self.regime.startswith('L')
+        is_high_spotvol = self.regime.endswith('H')
+
+        # Check MR Long Signal
+        mr_long = False
+        mr_long_bb_touch = False
+
+        if is_high_gamma:
+            if rsi_cross_up_30:
+                mr_long = True
+                if bb_touch_low:
+                    mr_long_bb_touch = True
+            elif self.regime == 'HH' and bb_touch_low:
+                mr_long = True
+                mr_long_bb_touch = True
+        elif is_low_gamma:
+            if rsi_cross_up_30 and bb_touch_low:
+                if self.regime == 'LL':
+                    if self.ema9[0] > self.ema21[0]:
+                        mr_long = True
+                else:
+                    mr_long = True
+
+        # Check MR Short Signal
+        mr_short = False
+        mr_short_bb_touch = False
+
+        if is_high_gamma:
+            if rsi_cross_dn_70:
+                mr_short = True
+                if bb_touch_high:
+                    mr_short_bb_touch = True
+            elif self.regime == 'HH' and bb_touch_high:
+                mr_short = True
+                mr_short_bb_touch = True
+        elif is_low_gamma:
+            if rsi_cross_dn_70 and bb_touch_high:
+                if self.regime == 'LL':
+                    if self.ema9[0] < self.ema21[0]:
+                        mr_short = True
+                else:
+                    mr_short = True
+
+        # Check Trend Signals
+        trend_long = False
+        trend_short = False
+
+        if is_high_spotvol:
+            if self.regime == 'HH':
+                if ema_cross_up:
+                    trend_long = True
+                if ema_cross_dn:
+                    trend_short = True
+            elif self.regime == 'LH':
+                if ema_cross_up and self.return_30m > 0:
+                    trend_long = True
+                if ema_cross_dn and self.return_30m <= 0:
+                    trend_short = True
+
+        # Execute Entry Signals
+        if mr_long:
+            self.trade_type = 'MR'
+            self.sl_mult = 1.0
+            self.tp_mult = 0.75 if (self.regime == 'HH' and mr_long_bb_touch) else 1.0
+            self.order = self.buy()
+        elif mr_short:
+            self.trade_type = 'MR'
+            self.sl_mult = 1.0
+            self.tp_mult = 0.75 if (self.regime == 'HH' and mr_short_bb_touch) else 1.0
+            self.order = self.sell()
+        elif trend_long:
+            self.trade_type = 'TREND'
+            self.sl_mult = 1.5
+            self.tp_mult = 2.0
+            self.order = self.buy()
+        elif trend_short:
+            self.trade_type = 'TREND'
+            self.sl_mult = 1.5
+            self.tp_mult = 2.0
+            self.order = self.sell()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Operate directly on the provided 1-minute data feed self.data, defining the first 30 minutes of the day as the first 30 1-minute bars.",
+      "reason": "The execution environment supplies 1-minute AAPL data bars, while the spec references a 5-minute timeframe where 6 bars equal 30 minutes. Measuring regime proxies over the first 30 1-minute bars preserves the 30-minute opening regime window."
+    },
+    {
+      "topic": "regime_initialization",
+      "choice": "Compute the proxy medians over all available prior sessions when fewer than 20 sessions exist, and default median to current value on session 1.",
+      "reason": "The specification requires median metrics over the previous 20 sessions, but full 20-session history is not available at the start of backtesting."
+    },
+    {
+      "topic": "ll_mr_confirmation",
+      "choice": "Require EMA(9) > EMA(21) for long MR entries and EMA(9) < EMA(21) for short MR entries in the LL regime as confirmation.",
+      "reason": "The spec calls for 'requiring CrossOver(EMA9, EMA21) confirmation for MR entries', which is implemented as directional moving average alignment."
+    },
+    {
+      "topic": "signal_precedence",
+      "choice": "Evaluate Mean Reversion (MR) signals before Trend signals if both occur simultaneously on the same bar.",
+      "reason": "The specification details Mean Reversion entry rules prior to Trend rules, and the strategy is primarily structured around regime-filtered mean reversion."
+    }
+  ]
+}
+```

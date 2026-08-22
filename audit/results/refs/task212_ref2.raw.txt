@@ -1,0 +1,109 @@
+```python
+import backtrader as bt
+
+
+class SingleAssetVolatilityRotation(bt.Strategy):
+    """
+    Reference implementation of the 'Single-Asset Volatility Rotation' strategy.
+    
+    Maintains a base long position and performs tactical 5% portfolio rotations at extremes:
+    - Tactical sell 5% when Close >= Upper Bollinger Band (20, 2) and ATR(14) > 0.5 * SMA(ATR(14), 30).
+    - Exit tactical rotation (buy back 5%) on mean-reversion (-5% from anchor high) or protection (+3% from sell price).
+    - Cooldown of 30 trading days after completing a rotation cycle.
+    """
+
+    def __init__(self):
+        self.boll = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2.0)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.sma_atr = bt.indicators.SMA(self.atr, period=30)
+
+        self.order = None
+        self.base_established = False
+        self.in_rotation = False
+        self.pending_tactical_sell = False
+        self.anchor_high = None
+        self.sell_price = None
+        self.cooldown_until = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            if order.status == order.Completed:
+                if self.pending_tactical_sell:
+                    self.sell_price = order.executed.price
+                    self.pending_tactical_sell = False
+
+    def next(self):
+        if self.order:
+            return
+
+        # 1. Establish initial base long position if not yet created
+        if not self.base_established:
+            if self.position.size == 0:
+                self.order = self.order_target_percent(target=0.95)
+                self.base_established = True
+                return
+
+        # 2. Check tactical exit if currently in rotation
+        if self.in_rotation:
+            if self.anchor_high is not None:
+                mr_exit = self.data.close[0] <= self.anchor_high * 0.95
+                prot_exit = (self.sell_price is not None) and (self.data.close[0] >= self.sell_price * 1.03)
+
+                if mr_exit or prot_exit:
+                    portfolio_val = self.broker.getvalue()
+                    target_val = portfolio_val * 0.05
+                    size = int(target_val / self.data.close[0])
+                    if size > 0:
+                        self.order = self.buy(size=size)
+                    self.in_rotation = False
+                    self.cooldown_until = len(self) + 30
+                    self.anchor_high = None
+                    self.sell_price = None
+            return
+
+        # 3. Check tactical entry if not in rotation and cooldown has elapsed
+        if len(self) >= self.cooldown_until:
+            bb_touch = self.data.close[0] >= self.boll.lines.top[0]
+            vol_filter = self.atr[0] > (0.5 * self.sma_atr[0])
+
+            if bb_touch and vol_filter:
+                portfolio_val = self.broker.getvalue()
+                target_val = portfolio_val * 0.05
+                size = int(target_val / self.data.close[0])
+                if self.position.size > 0:
+                    size = min(size, self.position.size)
+
+                if size > 0:
+                    self.anchor_high = self.data.high[0]
+                    self.pending_tactical_sell = True
+                    self.in_rotation = True
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "base_long_position",
+      "choice": "Establish base long position at 95% of portfolio value using order_target_percent(0.95) on the first bar after indicator warm-up.",
+      "reason": "The strategy requires maintaining a base long position to perform partial tactical sales from. Using 95% allocation provides positive cash buffer for transaction costs while enabling rotation."
+    },
+    {
+      "topic": "sell_price_reference",
+      "choice": "Use order.executed.price of the completed tactical sell order as the sell price for protection exit monitoring.",
+      "reason": "Execution price represents the actual price at which the tactical sell was executed."
+    },
+    {
+      "topic": "exit_evaluation_price",
+      "choice": "Evaluate mean-reversion (-5% from anchor high) and protection (+3% from sell price) threshold triggers against daily close price.",
+      "reason": "Evaluating at daily close is standard practice for daily bar end-of-day strategies in Backtrader."
+    },
+    {
+      "topic": "cooldown_duration",
+      "choice": "Define 30 trading days cooldown as 30 daily bars from the bar on which the buy-back exit order is triggered.",
+      "reason": "With a 1d daily bar feed, each bar directly corresponds to one trading day."
+    }
+  ]
+}
+```

@@ -1,0 +1,128 @@
+```python
+import datetime
+import backtrader as bt
+
+
+class IntradayMiddayReversal(bt.Strategy):
+    params = (
+        ("morning_start", datetime.time(9, 30)),
+        ("morning_end", datetime.time(11, 30)),
+        ("midday_end", datetime.time(13, 30)),
+        ("eod_time", datetime.time(15, 45)),
+        ("sma_period", 20),
+        ("sma_mom_bars", 4),
+        ("rsi_period", 14),
+        ("rsi_level", 50.0),
+        ("stop_loss_pct", 0.02),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.sma_period
+        )
+        self.rsi = bt.indicators.RSI(
+            self.data.close, period=self.p.rsi_period
+        )
+        self.crossover = bt.indicators.CrossOver(
+            self.rsi, self.p.rsi_level
+        )
+
+        self.order = None
+        self.entry_price = None
+        self.current_date = None
+        self.morning_trend = 0  # 1: uptrend, -1: downtrend, 0: neutral/no trade
+        self.morning_trend_evaluated = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.position.size != 0:
+                self.entry_price = order.executed.price
+            else:
+                self.entry_price = None
+
+        self.order = None
+
+    def next(self):
+        dt_val = self.data.datetime.datetime(0)
+        curr_date = dt_val.date()
+        curr_time = dt_val.time()
+
+        # Reset daily state on new day
+        if curr_date != self.current_date:
+            self.current_date = curr_date
+            self.morning_trend = 0
+            self.morning_trend_evaluated = False
+
+        # Evaluate morning trend at 11:30 (first bar at or after 11:30)
+        if curr_time >= self.p.morning_end and not self.morning_trend_evaluated:
+            self.morning_trend_evaluated = True
+            close_val = self.data.close[0]
+            sma_val = self.sma[0]
+            sma_mom_val = self.sma[-self.p.sma_mom_bars]
+
+            if close_val > sma_val and sma_val > sma_mom_val:
+                self.morning_trend = 1
+            elif close_val < sma_val and sma_val < sma_mom_val:
+                self.morning_trend = -1
+            else:
+                self.morning_trend = 0
+
+        # Guard pending orders
+        if self.order:
+            return
+
+        # Position exit management
+        if self.position:
+            entry_p = self.entry_price if self.entry_price is not None else self.position.price
+
+            if self.position.size > 0:
+                stop_price = entry_p * (1.0 - self.p.stop_loss_pct)
+                stop_hit = self.data.low[0] <= stop_price
+                rsi_exit = self.crossover[0] < 0  # RSI crosses down through 50
+                eod_exit = curr_time >= self.p.eod_time
+
+                if stop_hit or rsi_exit or eod_exit:
+                    self.order = self.close()
+
+            elif self.position.size < 0:
+                stop_price = entry_p * (1.0 + self.p.stop_loss_pct)
+                stop_hit = self.data.high[0] >= stop_price
+                rsi_exit = self.crossover[0] > 0  # RSI crosses up through 50
+                eod_exit = curr_time >= self.p.eod_time
+
+                if stop_hit or rsi_exit or eod_exit:
+                    self.order = self.close()
+
+        # Entry logic during midday window
+        else:
+            if self.morning_trend != 0 and self.p.morning_end <= curr_time <= self.p.midday_end:
+                if self.morning_trend == 1 and self.crossover[0] < 0:
+                    self.order = self.sell()
+                elif self.morning_trend == -1 and self.crossover[0] > 0:
+                    self.order = self.buy()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "morning_trend_evaluation",
+      "choice": "Morning trend is evaluated on the first bar at or after 11:30 exchange time using current bar Close, SMA(20), and SMA(20) from 4 bars prior.",
+      "reason": "Ensures exact evaluation at the end of the morning window (11:30) in intraday 15-minute bars."
+    },
+    {
+      "topic": "stop_loss_execution",
+      "choice": "Stop-loss is checked in next() against bar Low (for long) or High (for short) using 2% off the order execution price.",
+      "reason": "Implements the spec requirement for a fixed 2% stop-loss checked each bar."
+    },
+    {
+      "topic": "midday_window_bounds",
+      "choice": "Midday entry window is evaluated between 11:30 and 13:30 inclusive.",
+      "reason": "Fulfills specification requirement to allow entries during midday window up to 13:30."
+    }
+  ]
+}
+```

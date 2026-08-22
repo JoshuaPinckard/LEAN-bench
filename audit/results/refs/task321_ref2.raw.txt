@@ -1,0 +1,166 @@
+```python
+import backtrader as bt
+
+
+class RSIFailureSwing(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('rsi_oversold', 30.0),
+        ('rsi_overbought', 70.0),
+        ('stop_loss_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+
+        self.order = None
+        self.stop_order = None
+        self.entry_price = None
+
+        # Long setup tracking
+        self.rsi_low1 = None
+        self.in_oversold = False
+        self.current_trough = None
+
+        # Short setup tracking
+        self.rsi_high1 = None
+        self.in_overbought = False
+        self.current_peak = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self.order = None
+                if self.position.size != 0:
+                    self.entry_price = order.executed.price
+                    if self.position.size > 0:
+                        stop_price = self.entry_price * (1.0 - self.p.stop_loss_pct)
+                        self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price)
+                    elif self.position.size < 0:
+                        stop_price = self.entry_price * (1.0 + self.p.stop_loss_pct)
+                        self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price)
+                else:
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.entry_price = None
+
+            elif order == self.stop_order:
+                self.stop_order = None
+                if self.order:
+                    self.cancel(self.order)
+                    self.order = None
+                self.entry_price = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        # 1. Track oversold troughs
+        if self.rsi[0] < self.p.rsi_oversold:
+            if not self.in_oversold:
+                self.in_oversold = True
+                self.current_trough = self.rsi[0]
+            else:
+                self.current_trough = min(self.current_trough, self.rsi[0])
+
+        # 2. Track overbought peaks
+        if self.rsi[0] > self.p.rsi_overbought:
+            if not self.in_overbought:
+                self.in_overbought = True
+                self.current_peak = self.rsi[0]
+            else:
+                self.current_peak = max(self.current_peak, self.rsi[0])
+
+        # 3. Detect exit from oversold zone -> Evaluate Long Failure Swing
+        long_signal = False
+        if self.in_oversold and self.rsi[0] >= self.p.rsi_oversold:
+            self.in_oversold = False
+            trough = self.current_trough
+            if self.rsi_low1 is None:
+                self.rsi_low1 = trough
+            else:
+                rsi_low2 = trough
+                if rsi_low2 > self.rsi_low1:
+                    long_signal = True
+                    self.rsi_low1 = None
+                else:
+                    self.rsi_low1 = rsi_low2
+
+        # 4. Detect exit from overbought zone -> Evaluate Short Failure Swing
+        short_signal = False
+        if self.in_overbought and self.rsi[0] <= self.p.rsi_overbought:
+            self.in_overbought = False
+            peak = self.current_peak
+            if self.rsi_high1 is None:
+                self.rsi_high1 = peak
+            else:
+                rsi_high2 = peak
+                if rsi_high2 < self.rsi_high1:
+                    short_signal = True
+                    self.rsi_high1 = None
+                else:
+                    self.rsi_high1 = rsi_high2
+
+        # 5. Invalidate pending setups if price reaches opposite extreme
+        if self.rsi[0] > self.p.rsi_overbought:
+            self.rsi_low1 = None
+        if self.rsi[0] < self.p.rsi_oversold:
+            self.rsi_high1 = None
+
+        # Guard pending primary orders
+        if self.order is not None:
+            return
+
+        # 6. Exits and Entries
+        if self.position.size > 0:
+            # Long Exit: RSI crosses above 70
+            if self.rsi[-1] <= self.p.rsi_overbought and self.rsi[0] > self.p.rsi_overbought:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+        elif self.position.size < 0:
+            # Short Exit: RSI crosses below 30
+            if self.rsi[-1] >= self.p.rsi_oversold and self.rsi[0] < self.p.rsi_oversold:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+        else:
+            # Flat: Enter on valid signals
+            if long_signal:
+                self.rsi_high1 = None
+                self.order = self.buy()
+            elif short_signal:
+                self.rsi_low1 = None
+                self.order = self.sell()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "stop_loss_implementation",
+      "choice": "Placed as a bt.Order.Stop order upon entry execution at entry_price * 0.98 for long and entry_price * 1.02 for short.",
+      "reason": "Standard Backtrader mechanism to execute stop-loss exits intra-bar at the specified percentage threshold."
+    },
+    {
+      "topic": "setup_state_reset",
+      "choice": "Reset setup tracking (rsi_low1 / rsi_high1) when RSI reaches the opposite extreme zone (>70 for long setup, <30 for short setup) or upon trade entry.",
+      "reason": "Prevents invalid or stale failure swing patterns from triggering trades after major trend changes or past trades."
+    },
+    {
+      "topic": "crossover_definition",
+      "choice": "RSI cross above 30 is defined as rsi[-1] < 30 and rsi[0] >= 30; cross below 70 is rsi[-1] > 70 and rsi[0] <= 70; cross above 70 is rsi[-1] <= 70 and rsi[0] > 70; cross below 30 is rsi[-1] >= 30 and rsi[0] < 30.",
+      "reason": "Provides exact discrete bar crossover boundaries matching standard Backtrader technical indicator interpretations."
+    }
+  ]
+}
+```

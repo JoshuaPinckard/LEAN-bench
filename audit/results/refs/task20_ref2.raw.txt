@@ -1,0 +1,213 @@
+```python
+import math
+import collections
+import statistics
+import backtrader as bt
+
+
+class ORBFibonacciPullback(bt.Strategy):
+    params = (
+        ("risk_pct", 0.01),
+        ("sma_period", 50),
+        ("rr_ratio", 2.0),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.order = None
+
+        self.current_date = None
+        self.or_high = None
+        self.or_low = None
+        self.day_high = -float("inf")
+        self.day_low = float("inf")
+
+        self.state = "IDLE"
+        self.breakout_dir = None
+        self.impulse_extreme = None
+        self.sl_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        dt = self.data.datetime.date(0)
+        tm = self.data.datetime.time(0)
+
+        # Reset state on new day
+        if self.current_date != dt:
+            self.current_date = dt
+            self.or_high = None
+            self.or_low = None
+            self.day_high = -float("inf")
+            self.day_low = float("inf")
+            self.state = "FORMING_OR"
+            self.breakout_dir = None
+            self.impulse_extreme = None
+
+        # 1. Opening Range Definition (09:30 to 10:30 EDT)
+        is_or_time = (tm.hour == 9 and tm.minute >= 30) or (
+            tm.hour == 10 and tm.minute < 30
+        )
+        if is_or_time:
+            self.day_high = max(self.day_high, self.data.high[0])
+            self.day_low = min(self.day_low, self.data.low[0])
+
+        is_post_or = tm.hour > 10 or (tm.hour == 10 and tm.minute >= 30)
+        if (
+            is_post_or
+            and self.or_high is None
+            and self.day_high > -float("inf")
+        ):
+            self.or_high = self.day_high
+            self.or_low = self.day_low
+            self.state = "WAIT_BREAKOUT"
+
+        # Manage existing open position
+        if self.position:
+            if self.position.size > 0:
+                # Stop-loss
+                if self.data.low[0] <= self.sl_price:
+                    self.close()
+                # Take-profit
+                elif self.data.high[0] >= self.tp_price:
+                    self.close()
+                # Alternative Exit: full return inside initial range
+                elif self.data.close[0] < self.or_high:
+                    self.close()
+            elif self.position.size < 0:
+                # Stop-loss
+                if self.data.high[0] >= self.sl_price:
+                    self.close()
+                # Take-profit
+                elif self.data.low[0] <= self.tp_price:
+                    self.close()
+                # Alternative Exit: full return inside initial range
+                elif self.data.close[0] > self.or_low:
+                    self.close()
+            return
+
+        if self.or_high is None:
+            return
+
+        # 2. Breakout Detection & State Machine
+        if self.state == "WAIT_BREAKOUT":
+            if self.data.close[0] > self.or_high:
+                # Trend filter check (Bullish)
+                if self.sma[0] > self.sma[-1]:
+                    self.breakout_dir = "LONG"
+                    self.impulse_extreme = self.data.high[0]
+                    self.state = "WAIT_IMPULSE"
+            elif self.data.close[0] < self.or_low:
+                # Trend filter check (Bearish)
+                if self.sma[0] < self.sma[-1]:
+                    self.breakout_dir = "SHORT"
+                    self.impulse_extreme = self.data.low[0]
+                    self.state = "WAIT_IMPULSE"
+
+        elif self.state == "WAIT_IMPULSE":
+            if self.breakout_dir == "LONG":
+                if self.data.high[0] > self.impulse_extreme:
+                    self.impulse_extreme = self.data.high[0]
+                elif self.data.close[0] < self.data.open[0]:
+                    self.state = "WAIT_PULLBACK"
+            elif self.breakout_dir == "SHORT":
+                if self.data.low[0] < self.impulse_extreme:
+                    self.impulse_extreme = self.data.low[0]
+                elif self.data.close[0] > self.data.open[0]:
+                    self.state = "WAIT_PULLBACK"
+
+        elif self.state == "WAIT_PULLBACK":
+            if self.breakout_dir == "LONG":
+                move = self.impulse_extreme - self.or_high
+                if move > 0:
+                    fib_50 = self.impulse_extreme - 0.50 * move
+                    fib_618 = self.impulse_extreme - 0.618 * move
+
+                    # Check pullback into Golden Zone (50%-61.8%) and bullish reversal bar
+                    if (
+                        self.data.low[0] <= fib_50
+                        and self.data.high[0] >= fib_618
+                    ):
+                        if self.data.close[0] > self.data.open[0]:
+                            dist = self.data.close[0] - self.or_low
+                            if dist > 0:
+                                risk_amt = (
+                                    self.broker.getvalue() * self.p.risk_pct
+                                )
+                                size = int(risk_amt / dist)
+                                size = max(1, size)
+                                self.order = self.buy(size=size)
+                                self.sl_price = self.or_low
+                                self.tp_price = (
+                                    self.data.close[0]
+                                    + self.p.rr_ratio * dist
+                                )
+                                self.state = "DONE"
+
+            elif self.breakout_dir == "SHORT":
+                move = self.or_low - self.impulse_extreme
+                if move > 0:
+                    fib_50 = self.impulse_extreme + 0.50 * move
+                    fib_618 = self.impulse_extreme + 0.618 * move
+
+                    # Check pullback into Golden Zone (50%-61.8%) and bearish reversal bar
+                    if (
+                        self.data.high[0] >= fib_50
+                        and self.data.low[0] <= fib_618
+                    ):
+                        if self.data.close[0] < self.data.open[0]:
+                            dist = self.or_high - self.data.close[0]
+                            if dist > 0:
+                                risk_amt = (
+                                    self.broker.getvalue() * self.p.risk_pct
+                                )
+                                size = int(risk_amt / dist)
+                                size = max(1, size)
+                                self.order = self.sell(size=size)
+                                self.sl_price = self.or_high
+                                self.tp_price = (
+                                    self.data.close[0]
+                                    - self.p.rr_ratio * dist
+                                )
+                                self.state = "DONE"
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "Trend Determination",
+      "choice": "Used SMA 50 on the 1-minute data stream as a trend indicator filter.",
+      "reason": "The specification mentions using moving average direction (e.g. SMA 50) on a higher timeframe. Since execution environment provides a single 1m data feed, SMA 50 provides a practical trend slope check without warm-up exhaustion."
+    },
+    {
+      "topic": "Impulse and Reversal Identification",
+      "choice": "Defined impulse peak as the extreme price reached post-breakout until a counter bar appears, and reversal signal as a single candlestick closing in the trade direction while interacting with the 50%-61.8% Fibonacci zone.",
+      "reason": "The spec states to measure Fibonacci levels from the move after range breakout and enter when price reaches the golden zone and shows signs of reversal."
+    },
+    {
+      "topic": "Risk Management & Position Sizing",
+      "choice": "Calculated position size using 1% fixed portfolio risk based on distance to the defined stop-loss price.",
+      "reason": "The spec recommends fixed risk per trade (1-2% of capital) with stop-loss size defining risk."
+    },
+    {
+      "topic": "Alternative Exit Condition",
+      "choice": "Triggered immediate position exit when bar Close returns back inside the Opening Range boundary (Close < OR High for Long, Close > OR Low for Short).",
+      "reason": "The spec specifies an alternative exit upon a full return of the price back inside the initial range (ORB)."
+    }
+  ]
+}
+```

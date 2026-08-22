@@ -1,0 +1,211 @@
+{
+  "task_id": 76,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import math\nimport collections\nimport statistics\nimport backtrader as bt\n\n\ndef solve_entropy_pooling(priors, returns, target_return, max_iter=100, tol=1e-8):\n    \"\"\"\n    Solves for posterior probabilities q minimizing KL divergence D(q || p)\n    subject to sum(q) = 1 and sum(q * returns) = target_return.\n    Returns (q, converged).\n    \"\"\"\n    n = len(returns)\n    min_r = min(returns)\n    max_r = max(returns)\n\n    if target_return <= min_r or target_return >= max_r:\n        return None, False\n\n    gamma_low = -100.0\n    gamma_high = 100.0\n\n    def get_q_and_mean(gamma):\n        weights = [-gamma * r for r in returns]\n        max_w = max(weights)\n        unnorm = [p * math.exp(w - max_w) for p, w in zip(priors, weights)]\n        total = sum(unnorm)\n        if total <= 0:\n            return None, 0.0\n        q = [u / total for u in unnorm]\n        mean = sum(q_i * r_i for q_i, r_i in zip(q, returns))\n        return q, mean\n\n    q_opt = None\n    converged = False\n\n    for _ in range(max_iter):\n        gamma_mid = 0.5 * (gamma_low + gamma_high)\n        q_mid, mean_mid = get_q_and_mean(gamma_mid)\n        if q_mid is None:\n            break\n\n        diff = mean_mid - target_return\n        if abs(diff) < tol:\n            q_opt = q_mid\n            converged = True\n            break\n\n        if diff > 0:\n            gamma_low = gamma_mid\n        else:\n            gamma_high = gamma_mid\n\n        q_opt = q_mid\n\n    if q_opt is not None:\n        actual_mean = sum(q_i * r_i for q_i, r_i in zip(q_opt, returns))\n        if abs(actual_mean - target_return) < 1e-3:\n            converged = True\n        else:\n            converged = False\n\n    return q_opt, converged\n\n\ndef weighted_percentile(values, weights, pct):\n    \"\"\"\n    Computes percentile of values given scenario weights.\n    pct is between 0.0 and 1.0.\n    \"\"\"\n    pairs = sorted(zip(values, weights), key=lambda x: x[0])\n    cum = 0.0\n    for val, w in pairs:\n        cum += w\n        if cum >= pct:\n            return val\n    return pairs[-1][0]\n\n\ndef is_abnormal_distribution(q, ens_min=5.0, max_prob_threshold=0.40):\n    \"\"\"\n    Filters strange posterior distributions (abnormal spikes / bimodal degeneracy).\n    \"\"\"\n    if q is None:\n        return True\n    if max(q) > max_prob_threshold:\n        return True\n    entropy = -sum(q_i * math.log(q_i) for q_i in q if q_i > 0)\n    ens = math.exp(entropy)\n    if ens < ens_min:\n        return True\n    return False\n\n\nclass EntropyPoolingStrategy(bt.Strategy):\n    params = (\n        ('lookback', 60),\n        ('target_return_long', 0.05),\n        ('target_return_short', -0.05),\n        ('shift_threshold', 0.05),\n        ('revert_threshold', 0.02),\n        ('volume_period', 20),\n        ('ens_min', 5.0),\n    )\n\n    def __init__(self):\n        self.order = None\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_period)\n        self.sl_price = None\n        self.tp_price = None\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n            if not self.position:\n                self.sl_price = None\n                self.tp_price = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if len(self) < self.p.lookback + 1:\n            return\n\n        # Build historical scenario returns over lookback\n        returns = []\n        for i in range(self.p.lookback, 0, -1):\n            p_prev = self.data.close[-i - 1]\n            p_curr = self.data.close[-i]\n            if p_prev > 0:\n                returns.append((p_curr - p_prev) / p_prev)\n            else:\n                returns.append(0.0)\n\n        n_scenarios = len(returns)\n        if n_scenarios == 0:\n            return\n\n        priors = [1.0 / n_scenarios] * n_scenarios\n        current_price = self.data.close[0]\n        scenario_prices = [current_price * (1.0 + r) for r in returns]\n\n        prior_median = weighted_percentile(scenario_prices, priors, 0.50)\n\n        high_volume = self.data.volume[0] > self.vol_sma[0]\n\n        # Long Stress Scenario Optimization\n        q_long, conv_long = solve_entropy_pooling(\n            priors, returns, self.p.target_return_long\n        )\n        valid_long = conv_long and not is_abnormal_distribution(q_long, ens_min=self.p.ens_min)\n\n        median_long = weighted_percentile(scenario_prices, q_long, 0.50) if valid_long else prior_median\n        shift_long = (median_long - prior_median) / prior_median if prior_median > 0 else 0.0\n\n        if valid_long:\n            mean_ret_long = sum(q_i * r_i for q_i, r_i in zip(q_long, returns))\n            var_long = sum(q_i * ((r_i - mean_ret_long) ** 2) for q_i, r_i in zip(q_long, returns))\n            vol_long = math.sqrt(max(var_long, 1e-8))\n        else:\n            vol_long = 0.02\n\n        # Short Stress Scenario Optimization\n        q_short, conv_short = solve_entropy_pooling(\n            priors, returns, self.p.target_return_short\n        )\n        valid_short = conv_short and not is_abnormal_distribution(q_short, ens_min=self.p.ens_min)\n\n        median_short = weighted_percentile(scenario_prices, q_short, 0.50) if valid_short else prior_median\n        shift_short = (prior_median - median_short) / prior_median if prior_median > 0 else 0.0\n\n        if valid_short:\n            mean_ret_short = sum(q_i * r_i for q_i, r_i in zip(q_short, returns))\n            var_short = sum(q_i * ((r_i - mean_ret_short) ** 2) for q_i, r_i in zip(q_short, returns))\n            vol_short = math.sqrt(max(var_short, 1e-8))\n        else:\n            vol_short = 0.02\n\n        # Manage Open Position Exits\n        if self.position:\n            if self.position.size > 0:\n                # Stop-Loss / Take-Profit for Long\n                if self.sl_price and current_price <= self.sl_price:\n                    self.order = self.close()\n                    return\n                if self.tp_price and current_price >= self.tp_price:\n                    self.order = self.close()\n                    return\n                # Reversion exit or opposite signal\n                if abs(shift_long) < self.p.revert_threshold or (high_volume and valid_short and shift_short >= self.p.shift_threshold):\n                    self.order = self.close()\n                    return\n\n            elif self.position.size < 0:\n                # Stop-Loss / Take-Profit for Short\n                if self.sl_price and current_price >= self.sl_price:\n                    self.order = self.close()\n                    return\n                if self.tp_price and current_price <= self.tp_price:\n                    self.order = self.close()\n                    return\n                # Reversion exit or opposite signal\n                if abs(shift_short) < self.p.revert_threshold or (high_volume and valid_long and shift_long >= self.p.shift_threshold):\n                    self.order = self.close()\n                    return\n\n        # Entry Signals\n        if not self.position and high_volume:\n            cash = self.broker.getcash()\n            max_shares = int(cash / current_price) if current_price > 0 else 0\n\n            if valid_long and shift_long >= self.p.shift_threshold:\n                raw_size = 1.0 / max(vol_long, 1e-5)\n                size = max(1, min(int(raw_size), max_shares))\n                if size > 0 and max_shares > 0:\n                    self.sl_price = weighted_percentile(scenario_prices, q_long, 0.05)\n                    self.tp_price = weighted_percentile(scenario_prices, q_long, 0.95)\n                    self.order = self.buy(size=size)\n\n            elif valid_short and shift_short >= self.p.shift_threshold:\n                raw_size = 1.0 / max(vol_short, 1e-5)\n                size = max(1, min(int(raw_size), max_shares))\n                if size > 0 and max_shares > 0:\n                    self.sl_price = weighted_percentile(scenario_prices, q_short, 0.95)\n                    self.tp_price = weighted_percentile(scenario_prices, q_short, 0.05)\n                    self.order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "lookback_window",
+      "choice": "60 trading days lookback window for historical scenario generation.",
+      "reason": "Provides a robust set of historical return scenarios while maintaining numerical stability for entropy pooling optimization."
+    },
+    {
+      "topic": "target_stress_returns",
+      "choice": "Long scenario target return set to +5% (+0.05) and Short scenario target return set to -5% (-0.05).",
+      "reason": "Specifies concrete target expected returns for the stress scenarios to generate non-trivial posterior probability shifts."
+    },
+    {
+      "topic": "distribution_shift_thresholds",
+      "choice": "Signal shift threshold Y% = 5% (0.05); Reversion threshold Z% = 2% (0.02).",
+      "reason": "Directly matches the specification's example values for significant shift confirmation and reversion exit."
+    },
+    {
+      "topic": "volume_filter",
+      "choice": "High volume condition evaluated as daily Volume > 20-day Simple Moving Average of Volume.",
+      "reason": "Implements the liquidity filter requirement using a standard 20-day volume moving average."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position size = min(int(1.0 / posterior_volatility), max_affordable_cash_shares).",
+      "reason": "Adheres to the spec formula size = 1 / (posterior volatility) while bounding units to available broker cash."
+    },
+    {
+      "topic": "quality_and_strange_behavior_filter",
+      "choice": "Distributions flagged abnormal if optimization fails, max probability > 0.40, or Effective Number of Scenarios (ENS) < 5.0.",
+      "reason": "Meets the requirement to skip trading signals when the optimizer fails to converge or when posterior distributions exhibit extreme spikes/bimodality."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 14,
+  "tape": [
+    {
+      "dt": "2020-05-01T04:00:00",
+      "side": "BUY",
+      "size": 20.0,
+      "price": 69.10174923798432
+    },
+    {
+      "dt": "2020-06-08T04:00:00",
+      "side": "SELL",
+      "size": -20.0,
+      "price": 79.93931540745123
+    },
+    {
+      "dt": "2020-09-21T04:00:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 101.40104892896447
+    },
+    {
+      "dt": "2020-09-22T04:00:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 109.29665396338974
+    },
+    {
+      "dt": "2020-10-13T04:00:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 121.50858655705257
+    },
+    {
+      "dt": "2020-10-29T04:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 108.99595640558233
+    },
+    {
+      "dt": "2020-10-30T04:00:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 107.72526275511105
+    },
+    {
+      "dt": "2020-11-06T05:00:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 114.96528648231298
+    },
+    {
+      "dt": "2020-11-10T05:00:00",
+      "side": "SELL",
+      "size": -34.0,
+      "price": 112.27383288243148
+    },
+    {
+      "dt": "2020-11-12T05:00:00",
+      "side": "BUY",
+      "size": 34.0,
+      "price": 116.22842646880996
+    },
+    {
+      "dt": "2020-11-24T05:00:00",
+      "side": "SELL",
+      "size": -34.0,
+      "price": 110.68032441615657
+    },
+    {
+      "dt": "2020-11-25T05:00:00",
+      "side": "BUY",
+      "size": 34.0,
+      "price": 112.27381743371453
+    },
+    {
+      "dt": "2020-12-01T05:00:00",
+      "side": "SELL",
+      "size": -34.0,
+      "price": 117.57902381222483
+    },
+    {
+      "dt": "2020-12-02T05:00:00",
+      "side": "BUY",
+      "size": 34.0,
+      "price": 118.56038101970898
+    },
+    {
+      "dt": "2022-11-30T05:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 139.04019702693043
+    },
+    {
+      "dt": "2022-12-16T05:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 134.4087776749108
+    },
+    {
+      "dt": "2022-12-19T05:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 132.85516655290323
+    },
+    {
+      "dt": "2022-12-20T05:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 129.19723960857664
+    },
+    {
+      "dt": "2022-12-22T05:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 132.10785363301125
+    },
+    {
+      "dt": "2022-12-23T05:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 128.73510883960984
+    },
+    {
+      "dt": "2022-12-29T05:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 125.85400119829049
+    },
+    {
+      "dt": "2023-01-23T05:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 135.81491475833332
+    },
+    {
+      "dt": "2023-01-24T05:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 137.96838472187488
+    },
+    {
+      "dt": "2023-01-30T05:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 142.5408222705282
+    },
+    {
+      "dt": "2025-05-05T04:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 202.0325139591839
+    },
+    {
+      "dt": "2025-05-13T04:00:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 209.59847136477597
+    },
+    {
+      "dt": "2025-05-19T04:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 207.0884445111699
+    },
+    {
+      "dt": "2025-07-03T04:00:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 211.31168447150716
+    }
+  ]
+}

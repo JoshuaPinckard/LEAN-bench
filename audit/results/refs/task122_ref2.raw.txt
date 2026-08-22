@@ -1,0 +1,151 @@
+```python
+import math
+import statistics
+import backtrader as bt
+
+
+class FinancialTurbulenceStrategy(bt.Strategy):
+    params = (
+        ('lookback_n', 24),
+        ('threshold_pct', 95.0),
+        ('ma_exit_period', 12),
+        ('stop_loss_pct', 0.02),
+        ('allocation_pct', 0.05),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.monthly_closes = []
+        self.ft_history = []
+        self.last_month = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+            elif order.issell():
+                self.entry_price = order.executed.price
+
+            if not self.position:
+                self.entry_price = None
+
+        self.order = None
+
+    def percentile(self, vals, p):
+        if not vals:
+            return 0.0
+        sorted_vals = sorted(vals)
+        k = (len(sorted_vals) - 1) * (p / 100.0)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return sorted_vals[int(k)]
+        return sorted_vals[int(f)] * (c - k) + sorted_vals[int(c)] * (k - f)
+
+    def next(self):
+        if self.order:
+            return
+
+        # Daily Stop-Loss Management
+        if self.position:
+            if self.position.size > 0 and self.entry_price is not None:
+                if self.data.low[0] <= self.entry_price * (1.0 - self.p.stop_loss_pct):
+                    self.order = self.close()
+                    return
+            elif self.position.size < 0 and self.entry_price is not None:
+                if self.data.high[0] >= self.entry_price * (1.0 + self.p.stop_loss_pct):
+                    self.order = self.close()
+                    return
+
+        current_date = self.data.datetime.date(0)
+        current_month = current_date.month
+
+        if self.last_month is None:
+            self.last_month = current_month
+            return
+
+        # Monthly update triggered on the first trading bar of a new month
+        if current_month != self.last_month:
+            # Previous bar (-1) was the month-end closing bar
+            month_end_close = self.data.close[-1]
+            self.monthly_closes.append(month_end_close)
+            self.last_month = current_month
+
+            # Require N lookback returns + 1 current return = N + 1 monthly closes
+            if len(self.monthly_closes) >= self.p.lookback_n + 1:
+                returns = [
+                    (self.monthly_closes[i] - self.monthly_closes[i - 1]) / self.monthly_closes[i - 1]
+                    for i in range(1, len(self.monthly_closes))
+                ]
+
+                r_t = returns[-1]
+                lookback_returns = returns[-(self.p.lookback_n + 1):-1]
+
+                mu = sum(lookback_returns) / float(len(lookback_returns))
+                try:
+                    var = statistics.variance(lookback_returns)
+                except Exception:
+                    var = 0.0
+
+                if var > 0:
+                    d_t = ((r_t - mu) ** 2) / var
+                    d_lookback = [((r - mu) ** 2) / var for r in lookback_returns]
+                    threshold = self.percentile(d_lookback, self.p.threshold_pct)
+                else:
+                    d_t = 0.0
+                    threshold = 0.0
+
+                self.ft_history.append(d_t)
+
+                # 12-month Moving Average of FT
+                recent_ft = self.ft_history[-self.p.ma_exit_period:]
+                ma12 = sum(recent_ft) / float(len(recent_ft))
+
+                # Exit logic
+                if self.position:
+                    if d_t < ma12:
+                        self.order = self.close()
+                else:
+                    # Entry logic
+                    if d_t > threshold:
+                        portfolio_value = self.broker.getvalue()
+                        target_cash = portfolio_value * self.p.allocation_pct
+                        size = int(target_cash / self.data.close[0])
+
+                        if size > 0:
+                            if r_t < mu:
+                                self.order = self.buy(size=size)
+                            elif r_t > mu:
+                                self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_direction",
+      "choice": "Trigger Long when R_t < mu and Short when R_t > mu upon FT crossing threshold",
+      "reason": "The specification states that both long and short entries trigger when FT crosses above the threshold to bet on mean reversion. A return below the lookback mean indicates downward stress (reversion up -> Long), while a return above the mean indicates upward stress (reversion down -> Short)."
+    },
+    {
+      "topic": "monthly_return_calculation",
+      "choice": "Record month-end close on the first trading bar of a new month using the previous bar close",
+      "reason": "Prevents lookahead bias on daily bar data while accurately capturing the completed month's closing price."
+    },
+    {
+      "topic": "stop_loss_execution",
+      "choice": "Evaluate 2% stop-loss on every daily bar against low[0] (for Long) and high[0] (for Short)",
+      "reason": "Ensures risk management is continuously enforced daily relative to the executed entry price."
+    },
+    {
+      "topic": "covariance_matrix_single_asset",
+      "choice": "Use sample variance over 24 historical monthly returns as the scalar 1x1 covariance matrix",
+      "reason": "For a single asset, the covariance matrix reduces to a scalar variance, so inverse covariance matrix multiplication reduces to division by variance."
+    }
+  ]
+}
+```

@@ -1,0 +1,133 @@
+```python
+import backtrader as bt
+
+
+class MarketMakerGridStrategy(bt.Strategy):
+    params = (
+        ("sma_period", 20),
+        ("atr_period", 14),
+        ("atr_threshold", 0.002),  # 0.2%
+        ("budget_pct", 0.10),  # 10% of capital total budget
+        ("level_weights", (0.20, 0.30, 0.50)),
+        ("buy_offsets", (-0.0005, -0.0010, -0.0015)),  # -0.05%, -0.10%, -0.15%
+        ("sell_offsets", (0.0005, 0.0010, 0.0015)),  # +0.05%, +0.10%, +0.15%
+        ("min_side_volume", 0.1),
+        ("slippage_threshold", 0.001),  # 0.1%
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.pending_orders = []
+        self.skip_next_cycle = False
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            limit_price = order.created.price
+            fill_price = order.executed.price
+            if limit_price and limit_price > 0:
+                deviation = abs(fill_price - limit_price) / limit_price
+                if deviation > self.p.slippage_threshold:
+                    self.skip_next_cycle = True
+                    self.cancel_all_pending()
+
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if order in self.pending_orders:
+                self.pending_orders.remove(order)
+
+    def cancel_all_pending(self):
+        for order in list(self.pending_orders):
+            self.cancel(order)
+        self.pending_orders.clear()
+
+    def next(self):
+        if self.skip_next_cycle:
+            self.skip_next_cycle = False
+            self.cancel_all_pending()
+            return
+
+        # Order TTL = 1 bar: cancel remaining pending orders from previous bar
+        self.cancel_all_pending()
+
+        # Dynamic liquidity adjustment check: ATR(14)/Close <= 0.2%
+        if self.data.close[0] == 0:
+            return
+        if (self.atr[0] / self.data.close[0]) > self.p.atr_threshold:
+            return
+
+        fair_price = self.sma[0]
+        capital = self.broker.getvalue()
+
+        # Total budget for open limit orders = 10% of capital, split 50/50 between sides
+        side_budget = (capital * self.p.budget_pct) / 2.0
+
+        # Calculate Buy Limit Prices and Volumes
+        buy_prices = [
+            fair_price * (1.0 + offset) for offset in self.p.buy_offsets
+        ]
+        buy_vols = [
+            (side_budget * w) / p
+            for w, p in zip(self.p.level_weights, buy_prices)
+        ]
+        total_buy_vol = sum(buy_vols)
+        if 0 < total_buy_vol < self.p.min_side_volume:
+            scale = self.p.min_side_volume / total_buy_vol
+            buy_vols = [v * scale for v in buy_vols]
+
+        # Calculate Sell Limit Prices and Volumes
+        sell_prices = [
+            fair_price * (1.0 + offset) for offset in self.p.sell_offsets
+        ]
+        sell_vols = [
+            (side_budget * w) / p
+            for w, p in zip(self.p.level_weights, sell_prices)
+        ]
+        total_sell_vol = sum(sell_vols)
+        if 0 < total_sell_vol < self.p.min_side_volume:
+            scale = self.p.min_side_volume / total_sell_vol
+            sell_vols = [v * scale for v in sell_vols]
+
+        # Submit 3 Limit Buy Orders
+        for price, vol in zip(buy_prices, buy_vols):
+            if vol > 0:
+                o = self.buy(exectype=bt.Order.Limit, price=price, size=vol)
+                self.pending_orders.append(o)
+
+        # Submit 3 Limit Sell Orders
+        for price, vol in zip(sell_prices, sell_vols):
+            if vol > 0:
+                o = self.sell(exectype=bt.Order.Limit, price=price, size=vol)
+                self.pending_orders.append(o)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "side_budget_split",
+      "choice": "Split total 10% capital budget equally (5% cash allocation to buy side, 5% to sell side).",
+      "reason": "The specification states that total budget allocated across both sides combined must not exceed 10% of capital, so dividing equally between buy and sell grids satisfies the combined 10% constraint."
+    },
+    {
+      "topic": "order_ttl",
+      "choice": "Cancel all unexecuted active limit orders at the start of each bar in next() before placing new orders.",
+      "reason": "The specification sets Order TTL = 1 bar, meaning unfilled orders expire after 1 bar and grid orders are replenished on the next bar."
+    },
+    {
+      "topic": "min_volume_scaling",
+      "choice": "Scale calculated level volumes proportionally up to meet the 0.1 asset units total side volume minimum if the initial budget calculation yields under 0.1 units.",
+      "reason": "The spec requires total volume per side to be not less than 0.1 units of the asset."
+    },
+    {
+      "topic": "slippage_control",
+      "choice": "Evaluate slippage in notify_order when an order completes as abs(fill_price - limit_price) / limit_price > 0.001. If triggered, set a flag to cancel open orders and skip placing orders on the subsequent bar.",
+      "reason": "This directly enforces the rule to cancel remaining orders and skip the next trading cycle upon a fill price deviation exceeding 0.1%."
+    }
+  ]
+}
+```

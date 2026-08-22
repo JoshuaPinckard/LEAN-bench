@@ -1,0 +1,278 @@
+```python
+import math
+import backtrader as bt
+
+
+class ThetaProxyStrategy(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("atr_period", 14),
+        ("ema_period", 14),
+        ("rsi_period", 14),
+        ("risk_pct", 0.015),
+        ("cooldown_bars", 24),
+        ("time_exit_bars", 3),
+        ("tp_factor", 0.7),
+        ("sl_factor", 1.5),
+        ("max_units", 3),
+    )
+
+    def __init__(self):
+        # Indicators
+        self.bb = bt.ind.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_dev,
+        )
+        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)
+        self.ema_atr = bt.ind.EMA(self.atr, period=self.p.ema_period)
+        self.rsi = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+
+        # BB Width (top - bottom) and its 20-period SMA
+        self.bb_width = self.bb.lines.top - self.bb.lines.bot
+        self.sma_bb_width = bt.ind.SMA(self.bb_width, period=self.p.bb_period)
+
+        # Crossovers
+        self.co_ema_atr = bt.ind.CrossOver(self.ema_atr, self.atr)
+        self.co_atr_ema = bt.ind.CrossOver(self.atr, self.ema_atr)
+
+        # Order & state management
+        self.order = None
+        self.last_entry_bar = None
+        self.units_count = 0
+        self.entry_bar = None
+        self.entry_price = None
+        self.last_unit_price = None
+        self.unit_risk = None
+        self.tp_price = None
+        self.sl_price = None
+        self.pending_unit_risk = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if not self.position:
+                # Position fully closed
+                self.units_count = 0
+                self.entry_bar = None
+                self.entry_price = None
+                self.last_unit_price = None
+                self.unit_risk = None
+                self.tp_price = None
+                self.sl_price = None
+            else:
+                if self.units_count == 0:
+                    # Initial unit fill
+                    self.units_count = 1
+                    self.entry_bar = len(self)
+                    self.entry_price = order.executed.price
+                    self.last_unit_price = order.executed.price
+                    self.last_entry_bar = len(self)
+
+                    if self.pending_unit_risk is not None:
+                        self.unit_risk = self.pending_unit_risk
+                    else:
+                        sma20 = self.bb.lines.mid[0]
+                        self.unit_risk = max(
+                            self.atr[0],
+                            0.5 * abs(self.entry_price - sma20),
+                        )
+
+                    sma20 = self.bb.lines.mid[0]
+                    dist_to_sma = abs(self.entry_price - sma20)
+
+                    if self.position.size > 0:
+                        self.tp_price = (
+                            self.entry_price + self.p.tp_factor * dist_to_sma
+                        )
+                        self.sl_price = (
+                            self.entry_price - self.p.sl_factor * self.unit_risk
+                        )
+                    else:
+                        self.tp_price = (
+                            self.entry_price - self.p.tp_factor * dist_to_sma
+                        )
+                        self.sl_price = (
+                            self.entry_price + self.p.sl_factor * self.unit_risk
+                        )
+                else:
+                    # Pyramid unit fill
+                    self.units_count += 1
+                    self.last_unit_price = order.executed.price
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            pass
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        # Filter 1: ATR < EMA(ATR) for last 2 bars OR CrossOver(EMA(ATR), ATR) = 1 in last 3 bars
+        f1_c1 = (self.atr[0] < self.ema_atr[0]) and (
+            self.atr[-1] < self.ema_atr[-1]
+        )
+        f1_c2 = (
+            (self.co_ema_atr[0] == 1)
+            or (self.co_ema_atr[-1] == 1)
+            or (self.co_ema_atr[-2] == 1)
+        )
+        filter1 = f1_c1 or f1_c2
+
+        # Filter 2: BB width <= 1.5 * SMA(20) of width AND ATR(14)/Close <= 4%
+        filter2 = (self.bb_width[0] <= 1.5 * self.sma_bb_width[0]) and (
+            (self.atr[0] / self.data.close[0]) <= 0.04
+        )
+
+        if self.position.size != 0:
+            close = self.data.close[0]
+            high = self.data.high[0]
+            low = self.data.low[0]
+
+            bars_held = len(self) - self.entry_bar if self.entry_bar else 0
+
+            # 1. Time-based exit: 3rd bar after entry
+            exit_time = bars_held >= self.p.time_exit_bars
+
+            # 2. Target / Stop exit
+            exit_tp_sl = False
+            if self.position.size > 0:
+                if self.tp_price and high >= self.tp_price:
+                    exit_tp_sl = True
+                elif self.sl_price and low <= self.sl_price:
+                    exit_tp_sl = True
+            else:
+                if self.tp_price and low <= self.tp_price:
+                    exit_tp_sl = True
+                elif self.sl_price and high >= self.sl_price:
+                    exit_tp_sl = True
+
+            # 3. Volatility-based exit
+            vol_exit_1 = self.co_atr_ema[0] == 1
+            if self.position.size > 0:
+                vol_exit_2 = close < (
+                    self.bb.lines.bot[0] - 0.5 * self.atr[0]
+                )
+            else:
+                vol_exit_2 = close > (
+                    self.bb.lines.top[0] + 0.5 * self.atr[0]
+                )
+
+            exit_vol = vol_exit_1 or vol_exit_2
+
+            if exit_time or exit_tp_sl or exit_vol:
+                self.order = self.close()
+                return
+
+            # Pyramiding logic
+            if self.units_count < self.p.max_units:
+                atr_declining = self.atr[0] < self.atr[-1]
+                if filter1 and filter2 and atr_declining:
+                    if self.position.size > 0:
+                        further_dev = close <= (
+                            self.last_unit_price - 0.5 * self.atr[0]
+                        )
+                        if further_dev:
+                            unit_risk = max(
+                                self.atr[0],
+                                0.5 * abs(close - self.bb.lines.mid[0]),
+                            )
+                            if unit_risk > 0:
+                                size = math.floor(
+                                    (
+                                        self.broker.getvalue()
+                                        * self.p.risk_pct
+                                    )
+                                    / unit_risk
+                                )
+                                if size >= 1:
+                                    self.order = self.buy(size=size)
+                    else:
+                        further_dev = close >= (
+                            self.last_unit_price + 0.5 * self.atr[0]
+                        )
+                        if further_dev:
+                            unit_risk = max(
+                                self.atr[0],
+                                0.5 * abs(close - self.bb.lines.mid[0]),
+                            )
+                            if unit_risk > 0:
+                                size = math.floor(
+                                    (
+                                        self.broker.getvalue()
+                                        * self.p.risk_pct
+                                    )
+                                    / unit_risk
+                                )
+                                if size >= 1:
+                                    self.order = self.sell(size=size)
+
+        else:
+            # Filter 3: At least 24 bars since the last initial entry
+            filter3 = (self.last_entry_bar is None) or (
+                len(self) - self.last_entry_bar >= self.p.cooldown_bars
+            )
+
+            if filter1 and filter2 and filter3:
+                close = self.data.close[0]
+                long_signal = (close <= self.bb.lines.bot[0]) and (
+                    self.rsi[0] < 35
+                )
+                short_signal = (close >= self.bb.lines.top[0]) and (
+                    self.rsi[0] > 65
+                )
+
+                if long_signal:
+                    unit_risk = max(
+                        self.atr[0],
+                        0.5 * abs(close - self.bb.lines.mid[0]),
+                    )
+                    if unit_risk > 0:
+                        size = math.floor(
+                            (self.broker.getvalue() * self.p.risk_pct)
+                            / unit_risk
+                        )
+                        if size >= 1:
+                            self.pending_unit_risk = unit_risk
+                            self.order = self.buy(size=size)
+
+                elif short_signal:
+                    unit_risk = max(
+                        self.atr[0],
+                        0.5 * abs(close - self.bb.lines.mid[0]),
+                    )
+                    if unit_risk > 0:
+                        size = math.floor(
+                            (self.broker.getvalue() * self.p.risk_pct)
+                            / unit_risk
+                        )
+                        if size >= 1:
+                            self.pending_unit_risk = unit_risk
+                            self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "filter3_pyramiding_cooldown",
+      "choice": "The 24-bar cooldown between entries applies to initiating a new trade sequence from flat, permitting pyramiding within the active 3-bar trade window.",
+      "reason": "Requiring a 24-bar gap for pyramiding entries would render pyramiding impossible due to the 3-bar time-based exit rule."
+    },
+    {
+      "topic": "tp_sl_calculation",
+      "choice": "Take-profit and stop-loss price levels are computed at initial entry fill using the executed price, SMA(20), and initial UnitRisk.",
+      "reason": "The specification specifies fixed target and stop offsets anchored to the entry price."
+    },
+    {
+      "topic": "intraday_tp_sl_evaluation",
+      "choice": "Take-profit and stop-loss levels are checked against bar High and Low prices.",
+      "reason": "Price targets and stop-losses trigger intraday when High or Low crosses the corresponding level."
+    }
+  ]
+}
+```

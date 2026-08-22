@@ -1,0 +1,242 @@
+{
+  "task_id": 50,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\nimport math\nimport collections\nimport statistics\n\n\nclass ATRIntradayReversal(bt.Strategy):\n    params = (\n        ('atr_period', 14),\n        ('range_pct', 0.80),\n        ('zone_pct', 0.25),\n        ('risk_pct', 0.01),\n        ('sl_buffer_atr', 0.10),\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.order = None\n\n        self.current_date = None\n        self.hod = None\n        self.lod = None\n        self.prev_close = None\n        self.daily_trs = []\n\n        self.sl_price = None\n        self.tp_price = None\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        tm = self.data.datetime.time(0)\n\n        # Handle Day Boundaries and Daily ATR Tracking\n        if self.current_date != dt:\n            if self.current_date is not None and self.hod is not None and self.lod is not None:\n                if self.prev_close is not None:\n                    tr = max(\n                        self.hod - self.lod,\n                        abs(self.hod - self.prev_close),\n                        abs(self.lod - self.prev_close)\n                    )\n                else:\n                    tr = self.hod - self.lod\n                self.daily_trs.append(tr)\n                if len(self.daily_trs) > self.p.atr_period:\n                    self.daily_trs.pop(0)\n\n            self.current_date = dt\n            self.hod = self.data.high[0]\n            self.lod = self.data.low[0]\n            self.prev_close = self.data.close[-1] if len(self) > 1 else self.data.close[0]\n        else:\n            self.hod = max(self.hod, self.data.high[0])\n            self.lod = min(self.lod, self.data.low[0])\n\n        # Compute Daily ATR\n        if len(self.daily_trs) > 0:\n            daily_atr = sum(self.daily_trs) / len(self.daily_trs)\n        else:\n            daily_atr = self.atr[0] * math.sqrt(78) if not math.isnan(self.atr[0]) else (self.hod - self.lod)\n\n        # Time-based Exit at End of Trading Day (15:50 or later)\n        is_eod = (tm.hour == 15 and tm.minute >= 50) or tm.hour > 15\n        if self.position:\n            if is_eod:\n                self.close()\n                return\n\n            # Intra-bar Take Profit and Stop Loss evaluation\n            if self.position.size > 0:\n                if self.data.high[0] >= self.tp_price or self.data.low[0] <= self.sl_price:\n                    self.close()\n                    return\n            elif self.position.size < 0:\n                if self.data.low[0] <= self.tp_price or self.data.high[0] >= self.sl_price:\n                    self.close()\n                    return\n\n        if self.order or self.position or is_eod:\n            return\n\n        # Check Range Condition: Intra-day covered range >= 80% Daily ATR\n        current_range = self.hod - self.lod\n        if daily_atr <= 0 or current_range < self.p.range_pct * daily_atr:\n            return\n\n        close = self.data.close[0]\n        open_p = self.data.open[0]\n        high = self.data.high[0]\n        low = self.data.low[0]\n\n        body = abs(close - open_p)\n        upper_shadow = high - max(open_p, close)\n        lower_shadow = min(open_p, close) - low\n\n        # Long Signal: In Support Zone + Bullish Pin Bar\n        in_support = (close - self.lod) <= (self.p.zone_pct * current_range)\n        bullish_pin = (lower_shadow >= 1.5 * body) and (lower_shadow > upper_shadow)\n\n        if in_support and bullish_pin:\n            sl = self.lod - (self.p.sl_buffer_atr * daily_atr)\n            tp = self.hod\n            risk_per_share = max(0.01, close - sl)\n            portfolio_value = self.broker.getvalue()\n            risk_amount = portfolio_value * self.p.risk_pct\n            size = max(1, int(risk_amount / risk_per_share))\n\n            self.sl_price = sl\n            self.tp_price = tp\n            self.order = self.buy(size=size)\n            return\n\n        # Short Signal: In Resistance Zone + Bearish Pin Bar\n        in_resistance = (self.hod - close) <= (self.p.zone_pct * current_range)\n        bearish_pin = (upper_shadow >= 1.5 * body) and (upper_shadow > lower_shadow)\n\n        if in_resistance and bearish_pin:\n            sl = self.hod + (self.p.sl_buffer_atr * daily_atr)\n            tp = self.lod\n            risk_per_share = max(0.01, sl - close)\n            portfolio_value = self.broker.getvalue()\n            risk_amount = portfolio_value * self.p.risk_pct\n            size = max(1, int(risk_amount / risk_per_share))\n\n            self.sl_price = sl\n            self.tp_price = tp\n            self.order = self.sell(size=size)\n            return",
+  "assumptions": [
+    {
+      "topic": "Daily ATR Computation",
+      "choice": "Calculate 14-period daily ATR dynamically by tracking daily True Ranges across session boundaries, with fallback to 14-period 5-minute ATR scaled by sqrt(78) for initial bars.",
+      "reason": "The specification explicitly references daily ATR values (e.g. $8.00) and standard ATR(14). Calculating daily True Ranges reflects daily volatility on intraday bar feeds."
+    },
+    {
+      "topic": "Support and Resistance Zones",
+      "choice": "Define support zone as bottom 25% of current daily high-low range, and resistance zone as top 25%.",
+      "reason": "The spec states 'close to daily low/high' for support/resistance zones without specifying explicit percentage thresholds."
+    },
+    {
+      "topic": "Reversal Pattern Recognition",
+      "choice": "Implement bullish pin bar (lower shadow >= 1.5x body and lower shadow > upper shadow) and bearish pin bar (upper shadow >= 1.5x body and upper shadow > lower shadow).",
+      "reason": "The spec explicitly lists pin bars as representative reversal signals."
+    },
+    {
+      "topic": "Stop Loss and Take Profit Levels",
+      "choice": "Set long SL at LOD - 0.10 * Daily ATR and TP at HOD; set short SL at HOD + 0.10 * Daily ATR and TP at LOD.",
+      "reason": "Matches specification requiring SL placed slightly outside HOD/LOD and TP at opposite range extreme."
+    },
+    {
+      "topic": "Time-based Exit",
+      "choice": "Close open positions at or after 15:50:00 EST.",
+      "reason": "Ensures all day trades are exited before market close at 16:00 to avoid gap/overnight risk as specified."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 17,
+  "tape": [
+    {
+      "dt": "2026-04-17T15:10:00",
+      "side": "SELL",
+      "size": -110.0,
+      "price": 271.4100036621094
+    },
+    {
+      "dt": "2026-04-17T15:55:00",
+      "side": "BUY",
+      "size": 110.0,
+      "price": 271.3900146484375
+    },
+    {
+      "dt": "2026-04-22T15:10:00",
+      "side": "SELL",
+      "size": -65.0,
+      "price": 271.7300109863281
+    },
+    {
+      "dt": "2026-04-22T15:45:00",
+      "side": "BUY",
+      "size": 65.0,
+      "price": 272.8500061035156
+    },
+    {
+      "dt": "2026-05-01T13:55:00",
+      "side": "SELL",
+      "size": -53.0,
+      "price": 283.54901123046875
+    },
+    {
+      "dt": "2026-05-01T14:05:00",
+      "side": "BUY",
+      "size": 53.0,
+      "price": 285.2598876953125
+    },
+    {
+      "dt": "2026-05-01T14:15:00",
+      "side": "SELL",
+      "size": -56.0,
+      "price": 286.114990234375
+    },
+    {
+      "dt": "2026-05-01T15:55:00",
+      "side": "BUY",
+      "size": 56.0,
+      "price": 285.05999755859375
+    },
+    {
+      "dt": "2026-05-06T14:20:00",
+      "side": "SELL",
+      "size": -103.0,
+      "price": 286.4700012207031
+    },
+    {
+      "dt": "2026-05-06T15:55:00",
+      "side": "BUY",
+      "size": 103.0,
+      "price": 285.4949951171875
+    },
+    {
+      "dt": "2026-05-15T15:25:00",
+      "side": "SELL",
+      "size": -91.0,
+      "price": 302.3900146484375
+    },
+    {
+      "dt": "2026-05-15T15:55:00",
+      "side": "BUY",
+      "size": 91.0,
+      "price": 300.9849853515625
+    },
+    {
+      "dt": "2026-05-22T15:45:00",
+      "side": "SELL",
+      "size": -76.0,
+      "price": 310.67999267578125
+    },
+    {
+      "dt": "2026-05-22T15:55:00",
+      "side": "BUY",
+      "size": 76.0,
+      "price": 310.1499938964844
+    },
+    {
+      "dt": "2026-05-27T14:45:00",
+      "side": "SELL",
+      "size": -97.0,
+      "price": 312.7300109863281
+    },
+    {
+      "dt": "2026-05-27T15:55:00",
+      "side": "BUY",
+      "size": 97.0,
+      "price": 310.95001220703125
+    },
+    {
+      "dt": "2026-06-02T15:15:00",
+      "side": "SELL",
+      "size": -122.0,
+      "price": 311.9700012207031
+    },
+    {
+      "dt": "2026-06-02T15:25:00",
+      "side": "BUY",
+      "size": 122.0,
+      "price": 312.8800048828125
+    },
+    {
+      "dt": "2026-06-08T15:20:00",
+      "side": "SELL",
+      "size": -60.0,
+      "price": 314.2799987792969
+    },
+    {
+      "dt": "2026-06-08T15:55:00",
+      "side": "BUY",
+      "size": 60.0,
+      "price": 314.0849914550781
+    },
+    {
+      "dt": "2026-06-23T13:50:00",
+      "side": "SELL",
+      "size": -47.0,
+      "price": 300.3599853515625
+    },
+    {
+      "dt": "2026-06-23T15:55:00",
+      "side": "BUY",
+      "size": 47.0,
+      "price": 297.9150085449219
+    },
+    {
+      "dt": "2026-06-25T14:35:00",
+      "side": "BUY",
+      "size": 34.0,
+      "price": 279.5350036621094
+    },
+    {
+      "dt": "2026-06-25T15:20:00",
+      "side": "SELL",
+      "size": -34.0,
+      "price": 276.8599853515625
+    },
+    {
+      "dt": "2026-07-01T15:45:00",
+      "side": "SELL",
+      "size": -39.0,
+      "price": 294.94000244140625
+    },
+    {
+      "dt": "2026-07-01T15:55:00",
+      "side": "BUY",
+      "size": 39.0,
+      "price": 295.17999267578125
+    },
+    {
+      "dt": "2026-07-02T13:45:00",
+      "side": "SELL",
+      "size": -59.0,
+      "price": 300.3800048828125
+    },
+    {
+      "dt": "2026-07-02T13:50:00",
+      "side": "BUY",
+      "size": 59.0,
+      "price": 302.1499938964844
+    },
+    {
+      "dt": "2026-07-02T14:05:00",
+      "side": "SELL",
+      "size": -78.0,
+      "price": 303.07000732421875
+    },
+    {
+      "dt": "2026-07-02T14:15:00",
+      "side": "BUY",
+      "size": 78.0,
+      "price": 303.7449951171875
+    },
+    {
+      "dt": "2026-07-02T14:25:00",
+      "side": "SELL",
+      "size": -68.0,
+      "price": 304.6064147949219
+    },
+    {
+      "dt": "2026-07-02T14:35:00",
+      "side": "BUY",
+      "size": 68.0,
+      "price": 305.7200012207031
+    },
+    {
+      "dt": "2026-07-02T15:05:00",
+      "side": "SELL",
+      "size": -46.0,
+      "price": 306.6300964355469
+    },
+    {
+      "dt": "2026-07-02T15:55:00",
+      "side": "BUY",
+      "size": 46.0,
+      "price": 305.9501037597656
+    }
+  ]
+}

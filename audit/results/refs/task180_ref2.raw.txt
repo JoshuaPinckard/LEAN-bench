@@ -1,0 +1,279 @@
+```python
+import datetime
+import backtrader as bt
+
+
+class ORBIntradayMomentum(bt.Strategy):
+    params = (
+        ("atr_period", 14),
+        ("sma_fast", 20),
+        ("sma_slow", 50),
+        ("macd_fast", 12),
+        ("macd_slow", 26),
+        ("macd_signal", 9),
+        ("rsi_period", 14),
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("risk_pct", 0.01),
+        ("addon_bb_factor", 0.7),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.AverageTrueRange(
+            self.data, period=self.p.atr_period
+        )
+        self.sma20 = bt.indicators.SMA(self.data.close, period=self.p.sma_fast)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_slow)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+
+        self.order = None
+        self.last_date = None
+        self.today_high = None
+        self.today_low = None
+        self.yesterday_high = None
+        self.yesterday_low = None
+
+        self.or_high = None
+        self.or_low = None
+        self.or_w = None
+        self.day_skipped = False
+        self.placed_initial_orders = False
+        self.daily_trade_count = 0
+        self.initial_pos_size = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            self.daily_trade_count += 1
+            if self.initial_pos_size == 0:
+                self.initial_pos_size = abs(order.executed.size)
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        cur_date = self.data.datetime.date(0)
+
+        # Session / Day boundary check
+        if self.last_date != cur_date:
+            if self.last_date is not None:
+                self.yesterday_high = self.today_high
+                self.yesterday_low = self.today_low
+
+            self.last_date = cur_date
+            self.today_high = self.data.high[0]
+            self.today_low = self.data.low[0]
+
+            # Rule 1: First 15-minute candle forms Opening Range (OR)
+            self.or_high = self.data.high[0]
+            self.or_low = self.data.low[0]
+            self.or_w = self.or_high - self.or_low
+            self.daily_trade_count = 0
+            self.placed_initial_orders = False
+            self.initial_pos_size = 0
+            self.day_skipped = False
+
+            atr_val = self.atr[0]
+            close_val = self.data.close[0]
+
+            # Low volatility filter skip check
+            if close_val > 0 and (
+                (atr_val / close_val < 0.008) or (self.or_w < 0.3 * atr_val)
+            ):
+                self.day_skipped = True
+        else:
+            self.today_high = max(self.today_high, self.data.high[0])
+            self.today_low = min(self.today_low, self.data.low[0])
+
+        # Rule 6: Time-exit check (Close all positions / cancel orders near EOD)
+        cur_time = self.data.datetime.time(0)
+        if cur_time >= datetime.time(15, 45):
+            if self.position:
+                self.close()
+            if self.order:
+                self.cancel(self.order)
+                self.order = None
+            return
+
+        if self.day_skipped:
+            return
+
+        atr_val = self.atr[0]
+
+        # Rule 2: Place breakout initial orders right after OR window closes
+        if (
+            not self.placed_initial_orders
+            and not self.position
+            and self.order is None
+        ):
+            sma20_val = self.sma20[0]
+            sma50_val = self.sma50[0]
+            macd_val = self.macd.macd[0]
+            rsi_val = self.rsi[0]
+
+            long_filter = (sma20_val > sma50_val) and (
+                macd_val > 0 or rsi_val > 55
+            )
+            short_filter = (sma20_val < sma50_val) and (
+                macd_val < 0 or rsi_val < 45
+            )
+
+            if long_filter:
+                stop_price = self.or_high + 0.1 * atr_val
+                limit_price = stop_price + 0.05 * atr_val
+                sl_price = self.or_low - 0.1 * atr_val
+                risk_per_share = max(0.01, stop_price - sl_price)
+                risk_amt = self.broker.getvalue() * self.p.risk_pct
+                size = max(1, int(risk_amt / risk_per_share))
+
+                self.order = self.buy(
+                    exectype=bt.Order.StopLimit,
+                    price=limit_price,
+                    stopprice=stop_price,
+                    size=size,
+                )
+                self.placed_initial_orders = True
+
+            elif short_filter:
+                stop_price = self.or_low - 0.1 * atr_val
+                limit_price = stop_price - 0.05 * atr_val
+                sl_price = self.or_high + 0.1 * atr_val
+                risk_per_share = max(0.01, sl_price - stop_price)
+                risk_amt = self.broker.getvalue() * self.p.risk_pct
+                size = max(1, int(risk_amt / risk_per_share))
+
+                self.order = self.sell(
+                    exectype=bt.Order.StopLimit,
+                    price=limit_price,
+                    stopprice=stop_price,
+                    size=size,
+                )
+                self.placed_initial_orders = True
+
+        # Management when in Position
+        if self.position:
+            pos_size = self.position.size
+
+            # Rule 4: Stop-loss
+            if pos_size > 0:
+                sl_price = self.or_low - 0.1 * atr_val
+                if self.data.low[0] <= sl_price:
+                    self.close()
+                    return
+            elif pos_size < 0:
+                sl_price = self.or_high + 0.1 * atr_val
+                if self.data.high[0] >= sl_price:
+                    self.close()
+                    return
+
+            # Rule 4: Loss of momentum exit (2 consecutive closes inside OR)
+            if len(self) >= 2:
+                inside_0 = self.or_low <= self.data.close[0] <= self.or_high
+                inside_1 = self.or_low <= self.data.close[-1] <= self.or_high
+                if inside_0 and inside_1:
+                    self.close()
+                    return
+
+            # Rule 5: Take-profit
+            if pos_size > 0:
+                if self.daily_trade_count <= 1:
+                    tp_price = self.position.price + 0.85 * self.or_w
+                else:
+                    tp_price = self.position.price + self.p.addon_bb_factor * (
+                        self.bb.lines.top[0] - self.position.price
+                    )
+                if self.data.high[0] >= tp_price:
+                    self.close()
+                    return
+            elif pos_size < 0:
+                if self.daily_trade_count <= 1:
+                    tp_price = self.position.price - 0.85 * self.or_w
+                else:
+                    tp_price = self.position.price - self.p.addon_bb_factor * (
+                        self.position.price - self.bb.lines.bot[0]
+                    )
+                if self.data.low[0] <= tp_price:
+                    self.close()
+                    return
+
+            # Rule 3: Add-on trades (up to 3 add-ons, max 4 trades per day)
+            if self.order is None and self.daily_trade_count < 4:
+                addon_size = max(1, int(0.5 * self.initial_pos_size))
+                macd_val = self.macd.macd[0]
+                rsi_val = self.rsi[0]
+
+                if pos_size > 0:
+                    momentum_ok = macd_val > 0 or rsi_val > 55
+                    retest = (self.data.low[0] <= self.or_high + 0.1 * atr_val) and (
+                        self.data.high[0] >= self.or_high - 0.1 * atr_val
+                    )
+                    breakout_prev = (
+                        self.yesterday_high is not None
+                        and self.data.high[0] > self.yesterday_high
+                    )
+
+                    if (retest or breakout_prev) and momentum_ok:
+                        stop_price = self.data.close[0] + 0.05 * atr_val
+                        limit_price = stop_price + 0.05 * atr_val
+                        self.order = self.buy(
+                            exectype=bt.Order.StopLimit,
+                            price=limit_price,
+                            stopprice=stop_price,
+                            size=addon_size,
+                        )
+
+                elif pos_size < 0:
+                    momentum_ok = macd_val < 0 or rsi_val < 45
+                    retest = (self.data.low[0] <= self.or_low + 0.1 * atr_val) and (
+                        self.data.high[0] >= self.or_low - 0.1 * atr_val
+                    )
+                    breakout_prev = (
+                        self.yesterday_low is not None
+                        and self.data.low[0] < self.yesterday_low
+                    )
+
+                    if (retest or breakout_prev) and momentum_ok:
+                        stop_price = self.data.close[0] - 0.05 * atr_val
+                        limit_price = stop_price - 0.05 * atr_val
+                        self.order = self.sell(
+                            exectype=bt.Order.StopLimit,
+                            price=limit_price,
+                            stopprice=stop_price,
+                            size=addon_size,
+                        )
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "Opening Range Period",
+      "choice": "First 15m candle of the day",
+      "reason": "The feed consists of 15-minute bars, so the first candle of each trading session directly represents the 15-minute Opening Range."
+    },
+    {
+      "topic": "Risk Percentage for Initial Sizing",
+      "choice": "1.0% of portfolio capital (risk_pct = 0.01)",
+      "reason": "Spec states initial risk R = 0.5-1.0% of capital; 1.0% is chosen within the specified range."
+    },
+    {
+      "topic": "Add-on Bollinger Band Distance Target",
+      "choice": "0.7 of distance to corresponding Bollinger Band (addon_bb_factor = 0.7)",
+      "reason": "Spec specifies target for add-on trades is 0.6-0.75 of the distance to the Bollinger Band; 0.7 is selected within that range."
+    },
+    {
+      "topic": "Time Exit Threshold",
+      "choice": "15:45 bar",
+      "reason": " regular US session closes at 16:00, making 15:45 the final 15-minute candle of the session."
+    }
+  ]
+}
+```

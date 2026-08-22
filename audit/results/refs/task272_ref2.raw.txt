@@ -1,0 +1,146 @@
+```python
+import math
+import backtrader as bt
+
+
+class ReferenceStrategy(bt.Strategy):
+    params = (
+        ('atr_period', 14),
+        ('sma_fast_period', 50),
+        ('sma_slow_period', 200),
+        ('ema_period', 50),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('risk_pct', 0.01),
+        ('atr_mult_sl', 1.5),
+        ('atr_mult_tp', 2.0),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_atr_50 = bt.indicators.SMA(self.atr, period=self.p.sma_fast_period)
+        self.sma_atr_200 = bt.indicators.SMA(self.atr, period=self.p.sma_slow_period)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period1=self.p.macd_fast,
+            period2=self.p.macd_slow,
+            period3=self.p.macd_signal
+        )
+
+        self.order = None
+        self.stop_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            if not self.position:
+                self.stop_price = None
+                self.tp_price = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0:
+                # Long position exit checks
+                if self.data.low[0] <= self.stop_price:
+                    self.order = self.close()
+                elif self.data.high[0] >= self.tp_price:
+                    self.order = self.close()
+                else:
+                    macd_cross_below = (self.macd.macd[-1] >= self.macd.signal[-1]) and (self.macd.macd[0] < self.macd.signal[0])
+                    ema_not_rising = self.ema50[0] <= self.ema50[-1]
+                    if macd_cross_below or ema_not_rising:
+                        self.order = self.close()
+                    else:
+                        self.stop_price = max(self.stop_price, self.data.close[0] - self.p.atr_mult_sl * self.atr[0])
+
+            elif self.position.size < 0:
+                # Short position exit checks
+                if self.data.high[0] >= self.stop_price:
+                    self.order = self.close()
+                elif self.data.low[0] <= self.tp_price:
+                    self.order = self.close()
+                else:
+                    macd_cross_above = (self.macd.macd[-1] <= self.macd.signal[-1]) and (self.macd.macd[0] > self.macd.signal[0])
+                    ema_not_falling = self.ema50[0] >= self.ema50[-1]
+                    if macd_cross_above or ema_not_falling:
+                        self.order = self.close()
+                    else:
+                        self.stop_price = min(self.stop_price, self.data.close[0] + self.p.atr_mult_sl * self.atr[0])
+        else:
+            # Entry checks
+            not_flat = self.sma_atr_50[0] >= 0.75 * self.sma_atr_200[0]
+            if not not_flat:
+                return
+
+            close = self.data.close[0]
+            low = self.data.low[0]
+            high = self.data.high[0]
+            atr_val = self.atr[0]
+
+            long_cond = (
+                close > self.ema50[0] and
+                self.ema50[0] > self.ema50[-1] and
+                self.macd.macd[0] > self.macd.signal[0]
+            )
+
+            short_cond = (
+                close < self.ema50[0] and
+                self.ema50[0] < self.ema50[-1] and
+                self.macd.macd[0] < self.macd.signal[0]
+            )
+
+            if long_cond:
+                initial_stop = min(low, close) - self.p.atr_mult_sl * atr_val
+                stop_distance = close - initial_stop
+                if stop_distance > 0:
+                    equity = self.broker.getvalue()
+                    risk_amount = equity * self.p.risk_pct
+                    size = math.floor(risk_amount / stop_distance)
+                    if size > 0:
+                        self.stop_price = initial_stop
+                        self.tp_price = close + self.p.atr_mult_tp * atr_val
+                        self.order = self.buy(size=size)
+
+            elif short_cond:
+                initial_stop = max(high, close) + self.p.atr_mult_sl * atr_val
+                stop_distance = initial_stop - close
+                if stop_distance > 0:
+                    equity = self.broker.getvalue()
+                    risk_amount = equity * self.p.risk_pct
+                    size = math.floor(risk_amount / stop_distance)
+                    if size > 0:
+                        self.stop_price = initial_stop
+                        self.tp_price = close - self.p.atr_mult_tp * atr_val
+                        self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_price_reference",
+      "choice": "Use signal bar close price for calculating position sizing, initial stop loss distance, and take-profit target.",
+      "reason": "When sizing positions in next(), execution occurs on the following bar open, so signal bar close provides the deterministic reference price available at order creation."
+    },
+    {
+      "topic": "macd_crossover",
+      "choice": "Implement MACD line crossover as strict line transition between consecutive bars (macd[-1] >= signal[-1] and macd[0] < signal[0] for long exit, and vice versa for short exit).",
+      "reason": "Spec specifies 'MACD.macd crosses below/above MACD.signal' which indicates an active crossover occurrence."
+    },
+    {
+      "topic": "exit_evaluation_order",
+      "choice": "Evaluate intraday high/low against stop-loss and take-profit targets before checking bar-close trend weakening conditions and trailing stop updates.",
+      "reason": "Price movements reaching exit thresholds during the bar take priority over end-of-bar trend indicator checks and trailing stop adjustments."
+    }
+  ]
+}
+```

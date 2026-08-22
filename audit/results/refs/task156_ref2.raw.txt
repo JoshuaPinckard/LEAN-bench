@@ -1,0 +1,204 @@
+```python
+import collections
+import math
+import statistics
+import backtrader as bt
+
+
+class MomentumStrategy(bt.Strategy):
+    params = (
+        ("ema_period", 50),
+        ("atr_period", 14),
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("sma_width_period", 100),
+        ("squeeze_lookback", 5),
+        ("tp_mult", 1.5),
+        ("stop_mult", 0.5),
+        ("base_risk", 0.01),
+        ("min_kelly", 0.005),
+        ("max_kelly", 0.02),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.wins = []
+        self.losses = []
+
+        self.ema = bt.ind.EMA(self.data.close, period=self.p.ema_period)
+        self.macd = bt.ind.MACDHisto(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.bb = bt.ind.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)
+
+        self.bb_width = self.bb.top - self.bb.bot
+        self.bb_width_sma = bt.ind.SMA(
+            self.bb_width, period=self.p.sma_width_period
+        )
+        self.squeeze = self.bb_width <= (self.bb_width_sma * 0.85)
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+        if order.status == order.Completed:
+            if self.position.size != 0:
+                self.entry_price = order.executed.price
+                self.entry_atr = self.atr[0]
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            pnl = trade.pnlcomm
+            if pnl > 0:
+                self.wins.append(pnl)
+            elif pnl < 0:
+                self.losses.append(abs(pnl))
+
+    def get_position_size(self, is_long, is_half):
+        capital = self.broker.getvalue()
+
+        total_trades = len(self.wins) + len(self.losses)
+        if total_trades >= 5:
+            w = len(self.wins) / total_trades
+            avg_win = sum(self.wins) / len(self.wins) if self.wins else 0.0
+            avg_loss = (
+                sum(self.losses) / len(self.losses) if self.losses else 0.0
+            )
+            r = (avg_win / avg_loss) if avg_loss > 0 else 1.0
+            kelly = w - ((1.0 - w) / r) if r > 0 else self.p.base_risk
+            risk_frac = max(self.p.min_kelly, min(self.p.max_kelly, kelly))
+        else:
+            risk_frac = self.p.base_risk
+
+        if is_half:
+            risk_frac /= 2.0
+
+        if is_long:
+            stop_level = self.ema[0] - self.p.stop_mult * self.atr[0]
+            risk_per_share = max(0.01, self.data.close[0] - stop_level)
+        else:
+            stop_level = self.ema[0] + self.p.stop_mult * self.atr[0]
+            risk_per_share = max(0.01, stop_level - self.data.close[0])
+
+        risk_amount = capital * risk_frac
+        size = int(risk_amount / risk_per_share)
+
+        max_shares = int(self.broker.getcash() / self.data.close[0])
+        size = min(size, max_shares)
+        return max(1, size) if max_shares >= 1 else 0
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        is_end_of_rth = (dt.hour > 15) or (dt.hour == 15 and dt.minute >= 30)
+
+        if self.order:
+            return
+
+        if self.position.size > 0:
+            stop_hit = self.data.close[0] < (
+                self.ema[0] - self.p.stop_mult * self.atr[0]
+            )
+            tp_hit = (
+                self.entry_price is not None
+                and self.data.high[0]
+                >= (self.entry_price + self.p.tp_mult * self.entry_atr)
+            )
+
+            if stop_hit or tp_hit or is_end_of_rth:
+                self.order = self.close()
+
+        elif self.position.size < 0:
+            stop_hit = self.data.close[0] > (
+                self.ema[0] + self.p.stop_mult * self.atr[0]
+            )
+            tp_hit = (
+                self.entry_price is not None
+                and self.data.low[0]
+                <= (self.entry_price - self.p.tp_mult * self.entry_atr)
+            )
+
+            if stop_hit or tp_hit or is_end_of_rth:
+                self.order = self.close()
+
+        else:
+            if is_end_of_rth:
+                return
+
+            uptrend = (self.data.close[0] > self.ema[0]) and (
+                (self.data.close[0] - self.ema[0]) > 0.5 * self.atr[0]
+            )
+            downtrend = (self.data.close[0] < self.ema[0]) and (
+                (self.ema[0] - self.data.close[0]) > 0.5 * self.atr[0]
+            )
+
+            squeeze_recent = any(
+                self.squeeze[-i] for i in range(self.p.squeeze_lookback)
+            )
+            expansion = self.bb_width[0] > self.bb_width[-1]
+
+            macd_long = (self.macd.histo[0] > 0) and (
+                self.macd.histo[0] > self.macd.histo[-1]
+            )
+            macd_short = (self.macd.histo[0] < 0) and (
+                self.macd.histo[0] < self.macd.histo[-1]
+            )
+
+            volatility_long = squeeze_recent and expansion and macd_long
+            volatility_short = squeeze_recent and expansion and macd_short
+
+            if uptrend:
+                if volatility_long:
+                    size = self.get_position_size(is_long=True, is_half=False)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+                else:
+                    size = self.get_position_size(is_long=True, is_half=True)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+            elif downtrend:
+                if volatility_short:
+                    size = self.get_position_size(is_long=False, is_half=False)
+                    if size > 0:
+                        self.order = self.sell(size=size)
+                else:
+                    size = self.get_position_size(is_long=False, is_half=True)
+                    if size > 0:
+                        self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Execute on provided 30m single data feed self.data",
+      "reason": "The specification mentions evaluating metrics across 30m, 1h, and 2h timeframes, but the environment specifies a fixed single 30m data feed self.data."
+    },
+    {
+      "topic": "rth_session_end",
+      "choice": "Define end of RTH as bars with time >= 15:30 US/Eastern",
+      "reason": "Regular Trading Hours for US equities end at 16:00 ET. On 30m bars, the 15:30 bar represents the final bar of the RTH session."
+    },
+    {
+      "topic": "take_profit_execution",
+      "choice": "Evaluate take-profit hit using current bar High for Longs and Low for Shorts",
+      "reason": "Take-profit is defined as a fixed price target of 1.5 * ATR(14) from entry price. Evaluating intrabar High/Low accurately checks if the target price was reached during the bar."
+    },
+    {
+      "topic": "risk_per_share",
+      "choice": "Calculate distance to stop level EMA(50) +/- 0.5 * ATR(14) for position sizing",
+      "reason": "Position sizing risks 1% of capital per trade (or capped Kelly fraction), so risk per share is calculated as current close minus stop level."
+    }
+  ]
+}
+```

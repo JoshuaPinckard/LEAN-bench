@@ -1,0 +1,141 @@
+```python
+import backtrader as bt
+
+
+class FVGTradingStrategy(bt.Strategy):
+    params = (
+        ('wick_ratio', 0.35),
+        ('sl_offset', 0.05),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.bullish_fvgs = []
+        self.bearish_fvgs = []
+
+        self.curr_date = None
+        self.curr_session_high = None
+        self.curr_session_low = None
+        self.prev_session_high = None
+        self.prev_session_low = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        # Update session tracking for NY Session high/low
+        dt = self.data.datetime.date(0)
+        if dt != self.curr_date:
+            self.prev_session_high = self.curr_session_high
+            self.prev_session_low = self.curr_session_low
+            self.curr_date = dt
+            self.curr_session_high = self.data.high[0]
+            self.curr_session_low = self.data.low[0]
+        else:
+            if self.curr_session_high is None or self.data.high[0] > self.curr_session_high:
+                self.curr_session_high = self.data.high[0]
+            if self.curr_session_low is None or self.data.low[0] < self.curr_session_low:
+                self.curr_session_low = self.data.low[0]
+
+        # 1. Detect new FVGs on 30m chart (3-candle sequence)
+        if len(self) >= 3:
+            # Bullish FVG: Low of candle 3 > High of candle 1
+            if self.data.low[0] > self.data.high[-2]:
+                self.bullish_fvgs.append({
+                    'lower': self.data.high[-2],
+                    'upper': self.data.low[0]
+                })
+
+            # Bearish FVG: High of candle 3 < Low of candle 1
+            if self.data.high[0] < self.data.low[-2]:
+                self.bearish_fvgs.append({
+                    'lower': self.data.high[0],
+                    'upper': self.data.low[-2]
+                })
+
+        # Guard pending orders
+        if self.order:
+            return
+
+        # 2. Check Entry conditions if flat
+        if not self.position:
+            total_range = self.data.high[0] - self.data.low[0]
+            if total_range > 0:
+                open_p = self.data.open[0]
+                close_p = self.data.close[0]
+                high_p = self.data.high[0]
+                low_p = self.data.low[0]
+
+                lower_wick = min(open_p, close_p) - low_p
+                upper_wick = high_p - max(open_p, close_p)
+
+                # Bullish Entry Check
+                for fvg in self.bullish_fvgs:
+                    if low_p <= fvg['upper'] and high_p >= fvg['lower']:
+                        if (lower_wick / total_range) >= self.p.wick_ratio:
+                            sl = fvg['lower'] - self.p.sl_offset
+                            if self.prev_session_high and self.prev_session_high > close_p:
+                                tp = self.prev_session_high
+                            else:
+                                tp = close_p + 2.0 * (close_p - sl)
+
+                            orders = self.buy_bracket(
+                                exectype=bt.Order.Market,
+                                stopprice=sl,
+                                limitprice=tp
+                            )
+                            self.order = orders[0]
+                            break
+
+                # Bearish Entry Check
+                if not self.order:
+                    for fvg in self.bearish_fvgs:
+                        if high_p >= fvg['lower'] and low_p <= fvg['upper']:
+                            if (upper_wick / total_range) >= self.p.wick_ratio:
+                                sl = fvg['upper'] + self.p.sl_offset
+                                if self.prev_session_low and self.prev_session_low < close_p:
+                                    tp = self.prev_session_low
+                                else:
+                                    tp = close_p - 2.0 * (sl - close_p)
+
+                                orders = self.sell_bracket(
+                                    exectype=bt.Order.Market,
+                                    stopprice=sl,
+                                    limitprice=tp
+                                )
+                                self.order = orders[0]
+                                break
+
+        # 3. Mitigate/Close active FVGs ("By Close" criterion)
+        # Price must close inside or beyond the FVG area to consider it filled/closed
+        self.bullish_fvgs = [f for f in self.bullish_fvgs if not (self.data.close[0] <= f['upper'])]
+        self.bearish_fvgs = [f for f in self.bearish_fvgs if not (self.data.close[0] >= f['lower'])]
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "reversal_signal",
+      "choice": "Reversal signal defined as lower wick >= 35% of total bar range for bullish entries and upper wick >= 35% of total bar range for bearish entries.",
+      "reason": "Spec mentions confirmation signals such as hammer/shooting star or long wicks without specifying a hard numerical threshold; wick-to-range ratio is a standard quantifiable definition."
+    },
+    {
+      "topic": "sl_offset",
+      "choice": "Placed stop loss $0.05 below the lower boundary of bullish FVG for long trades, and $0.05 above the upper boundary of bearish FVG for short trades.",
+      "reason": "Spec specifies placing stop loss 'a few points' beyond the FVG boundary."
+    },
+    {
+      "topic": "tp_fallback",
+      "choice": "Target profit uses previous session high for long trades and previous session low for short trades. If previous session high/low is not yet available, fallback is a 2:1 risk-reward ratio based on SL distance.",
+      "reason": "Spec states TP level is set at the previous session high/low, with fallback handling the initial trading session before historical session boundaries exist."
+    },
+    {
+      "topic": "session_filtering",
+      "choice": "All input bars are assumed to belong to the NY Session (9:30-16:00 ET) as specified by the test environment feed configuration.",
+      "reason": "The execution environment specifies a 30m dataset restricted strictly to trading session timestamps."
+    }
+  ]
+}
+```

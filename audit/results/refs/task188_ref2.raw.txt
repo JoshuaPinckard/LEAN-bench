@@ -1,0 +1,206 @@
+```python
+import datetime
+import backtrader as bt
+
+
+class OnePercentPlaybook(bt.Strategy):
+    def __init__(self):
+        self.current_date = None
+        self.day_start_capital = 0.0
+        self.daily_losing_trades = 0
+        self.stop_trading_today = False
+        self.entry_order = None
+        self.open_orders = set()
+
+        self.pclose = None
+        self.day_open = None
+        self.orh = None
+        self.orl = None
+        self.day_bar_count = 0
+
+        self.ema_curr = None
+        self.ema_prev = None
+        self.had_below_ema = False
+        self.had_above_ema = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            self.open_orders.add(order)
+        elif order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.open_orders.discard(order)
+            if order == self.entry_order:
+                self.entry_order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            if trade.pnlcomm < 0:
+                self.daily_losing_trades += 1
+                if self.daily_losing_trades >= 2:
+                    self.stop_trading_today = True
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        cur_date = dt.date()
+        cur_time = dt.time()
+
+        # Session reset at the start of a new trading day
+        if cur_date != self.current_date:
+            self.current_date = cur_date
+            self.day_start_capital = self.broker.getvalue()
+            self.daily_losing_trades = 0
+            self.stop_trading_today = False
+            self.pclose = self.data.close[-1] if len(self) > 1 else None
+            self.day_open = self.data.open[0]
+            self.orh = None
+            self.orl = None
+            self.day_bar_count = 0
+            self.ema_curr = None
+            self.ema_prev = None
+            self.had_below_ema = False
+            self.had_above_ema = False
+
+        self.day_bar_count += 1
+
+        # Check cumulative daily loss limit (-0.5% of starting day capital)
+        if self.day_start_capital > 0:
+            daily_pnl_pct = (
+                self.broker.getvalue() - self.day_start_capital
+            ) / self.day_start_capital
+            if daily_pnl_pct <= -0.005:
+                self.stop_trading_today = True
+
+        # End of day auto-close at 15:55 ET
+        if cur_time >= datetime.time(15, 55):
+            self.stop_trading_today = True
+            for o in list(self.open_orders):
+                self.cancel(o)
+            if self.position:
+                self.close()
+            return
+
+        # Calculate session-level intraday EMA(20)
+        close_val = self.data.close[0]
+        if self.day_bar_count == 1:
+            ema_val = close_val
+        else:
+            k = 2.0 / (20.0 + 1.0)
+            ema_val = close_val * k + self.ema_curr * (1.0 - k)
+
+        self.ema_prev = self.ema_curr
+        self.ema_curr = ema_val
+
+        # Update historical state for EMA Reclaim signal
+        if self.ema_prev is not None:
+            if self.data.close[-1] < self.ema_prev:
+                self.had_below_ema = True
+            if self.data.close[-1] > self.ema_prev:
+                self.had_above_ema = True
+
+        # Record Opening Range (ORH/ORL) during 09:30-09:34 inclusive (< 09:35 ET)
+        if cur_time < datetime.time(9, 35):
+            if self.orh is None or self.data.high[0] > self.orh:
+                self.orh = self.data.high[0]
+            if self.orl is None or self.data.low[0] < self.orl:
+                self.orl = self.data.low[0]
+
+        # 1) ORB Signal Check (after 09:35 ET)
+        orb_long = False
+        orb_short = False
+        if (
+            cur_time >= datetime.time(9, 35)
+            and self.orh is not None
+            and self.orl is not None
+        ):
+            orb_long = (self.data.close[-1] <= self.orh) and (
+                self.data.close[0] > self.orh
+            )
+            orb_short = (self.data.close[-1] >= self.orl) and (
+                self.data.close[0] < self.orl
+            )
+
+        # 2) EMA Reclaim Signal Check
+        ema_long = False
+        ema_short = False
+        if self.ema_prev is not None:
+            ema_long = (
+                self.had_below_ema
+                and (self.data.close[-1] <= self.ema_prev)
+                and (self.data.close[0] > self.ema_curr)
+            )
+            ema_short = (
+                self.had_above_ema
+                and (self.data.close[-1] >= self.ema_prev)
+                and (self.data.close[0] < self.ema_curr)
+            )
+
+        # 3) Gap-and-Go Signal Check (after open)
+        gap_long = False
+        gap_short = False
+        if self.pclose is not None and self.day_bar_count > 1:
+            if self.day_open > self.pclose:
+                gap_long = (self.data.close[-1] <= self.pclose) and (
+                    self.data.close[0] > self.pclose
+                )
+            elif self.day_open < self.pclose:
+                gap_short = (self.data.close[-1] >= self.pclose) and (
+                    self.data.close[0] < self.pclose
+                )
+
+        long_signal = orb_long or ema_long or gap_long
+        short_signal = orb_short or ema_short or gap_short
+
+        # Order Execution
+        if (
+            not self.stop_trading_today
+            and not self.position
+            and self.entry_order is None
+        ):
+            if long_signal:
+                price = self.data.close[0]
+                stop_price = price * 0.99
+                limit_price = price * 1.02
+                orders = self.buy_bracket(
+                    stopprice=stop_price, limitprice=limit_price
+                )
+                self.entry_order = orders[0]
+            elif short_signal:
+                price = self.data.close[0]
+                stop_price = price * 1.01
+                limit_price = price * 0.98
+                orders = self.sell_bracket(
+                    stopprice=stop_price, limitprice=limit_price
+                )
+                self.entry_order = orders[0]
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "EMA Computation",
+      "choice": "Intraday EMA(20) is initialized on the first bar of each trading day with Close[0] and updated recursively with smoothing multiplier k = 2 / 21.",
+      "reason": "The specification requires EMA(20) calculated strictly from the current day's bars."
+    },
+    {
+      "topic": "ORB Time Window",
+      "choice": "The first 5 minutes (09:30-09:35 ET) are defined as bars with timestamps strictly before 09:35:00 (09:30-09:34 inclusive), and signals are evaluated starting at 09:35:00.",
+      "reason": "Standard 1-minute bars starting at 09:30 through 09:34 span 5 full one-minute periods."
+    },
+    {
+      "topic": "Daily Loss Calculation",
+      "choice": "Cumulative daily loss is calculated as percentage change from total portfolio equity (broker value) captured at the start of the current trading session.",
+      "reason": "Specification dictates stopping trading when cumulative daily loss is <= -0.5% of capital."
+    },
+    {
+      "topic": "Bracket Pricing Reference",
+      "choice": "Bracket stop-loss (1%) and take-profit (2%) levels are calculated relative to the signal bar close price at order submission time.",
+      "reason": "Bracket orders in Backtrader require absolute price thresholds computed when submitting the order."
+    }
+  ]
+}
+```

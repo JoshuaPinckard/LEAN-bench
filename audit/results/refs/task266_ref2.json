@@ -1,0 +1,331 @@
+{
+  "task_id": 266,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import datetime\nimport backtrader as bt\n\n\nclass ORBStrategy(bt.Strategy):\n    \"\"\"\n    Reference implementation of the Opening Range Breakout (ORB) Strategy on 15m timeframe.\n    \"\"\"\n\n    def __init__(self):\n        # Indicators\n        self.ema9 = bt.indicators.EMA(self.data.close, period=9)\n        self.ema21 = bt.indicators.EMA(self.data.close, period=21)\n\n        # Order tracking\n        self.order = None\n\n        # Intraday state variables\n        self.current_date = None\n        self.orh = None\n        self.orl = None\n        self.orb_range = None\n        self.fib_382 = None\n        self.fib_618 = None\n\n        self.has_broken_above_orh = False\n        self.has_broken_below_orl = False\n        self.first_bar_of_day = False\n\n        # VWAP accumulators\n        self.sum_pv = 0.0\n        self.sum_vol = 0.0\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n        if order.status in [\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        ]:\n            self.order = None\n\n    def next(self):\n        bar_date = self.data.datetime.date(0)\n        bar_time = self.data.datetime.time(0)\n\n        # 1. Check for session reset on a new day\n        if self.current_date != bar_date:\n            self.current_date = bar_date\n            self.orh = self.data.high[0]\n            self.orl = self.data.low[0]\n            self.orb_range = self.orh - self.orl\n            # 38.2% retracement from ORH (top down) = ORL + 0.618 * range\n            self.fib_382 = self.orl + 0.618 * self.orb_range\n            # 61.8% retracement from ORH (top down) = ORL + 0.382 * range\n            self.fib_618 = self.orl + 0.382 * self.orb_range\n\n            self.has_broken_above_orh = False\n            self.has_broken_below_orl = False\n            self.first_bar_of_day = True\n\n            self.sum_pv = 0.0\n            self.sum_vol = 0.0\n        else:\n            self.first_bar_of_day = False\n\n        # 2. Update intraday VWAP\n        tp = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0\n        vol = self.data.volume[0]\n        self.sum_pv += tp * vol\n        self.sum_vol += vol\n        vwap = (\n            self.sum_pv / self.sum_vol\n            if self.sum_vol > 0\n            else self.data.close[0]\n        )\n\n        # Strategy is inactive on the first 15-minute bar of the day\n        if self.first_bar_of_day:\n            return\n\n        # 3. Track breakout of ORB boundaries\n        if self.data.high[0] > self.orh:\n            self.has_broken_above_orh = True\n        if self.data.low[0] < self.orl:\n            self.has_broken_below_orl = True\n\n        # End of day session exit (15:45 bar or later)\n        is_eod = bar_time >= datetime.time(15, 45)\n\n        # 4. Manage open position exits\n        if self.position:\n            if is_eod:\n                self.close()\n                return\n\n            if self.position.size > 0:  # Long\n                if self.data.high[0] >= self.orh:  # Take Profit\n                    self.close()\n                elif self.data.low[0] <= self.orl:  # Stop Loss\n                    self.close()\n            elif self.position.size < 0:  # Short\n                if self.data.low[0] <= self.orl:  # Take Profit\n                    self.close()\n                elif self.data.high[0] >= self.orh:  # Stop Loss\n                    self.close()\n            return\n\n        # If an order is pending or it's end of day, do not open new trades\n        if self.order or is_eod:\n            return\n\n        # 5. Position Entry Logic\n        # Long Entry Conditions:\n        # - Price broke above ORH level\n        # - Pullback occurred to 38.2% or 61.8% level of ORB range (low <= fib_382 and low >= ORL)\n        # - Both EMAs (9 and 21) sloping upward\n        # - Price is above VWAP\n        long_cond = (\n            self.has_broken_above_orh\n            and (self.data.low[0] <= self.fib_382)\n            and (self.data.low[0] >= self.orl)\n            and (self.ema9[0] > self.ema9[-1])\n            and (self.ema21[0] > self.ema21[-1])\n            and (self.data.close[0] > vwap)\n        )\n\n        # Short Entry Conditions:\n        # - Price broke below ORL level\n        # - Pullback occurred to 38.2% or 61.8% level of ORB range (high >= fib_618 and high <= ORH)\n        # - Both EMAs (9 and 21) sloping downward\n        # - Price is below VWAP\n        short_cond = (\n            self.has_broken_below_orl\n            and (self.data.high[0] >= self.fib_618)\n            and (self.data.high[0] <= self.orh)\n            and (self.ema9[0] < self.ema9[-1])\n            and (self.ema21[0] < self.ema21[-1])\n            and (self.data.close[0] < vwap)\n        )\n\n        if long_cond:\n            risk_per_share = self.data.close[0] - self.orl\n            if risk_per_share > 0:\n                risk_amount = 0.01 * self.broker.getvalue()\n                size = int(risk_amount / risk_per_share)\n                cash = self.broker.getcash()\n                max_size = int(cash / self.data.close[0])\n                size = max(1, min(size, max_size))\n                self.order = self.buy(size=size)\n\n        elif short_cond:\n            risk_per_share = self.orh - self.data.close[0]\n            if risk_per_share > 0:\n                risk_amount = 0.01 * self.broker.getvalue()\n                size = int(risk_amount / risk_per_share)\n                cash = self.broker.getcash()\n                max_size = int(cash / self.data.close[0])\n                size = max(1, min(size, max_size))\n                self.order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "orb_definition",
+      "choice": "Opening Range High (ORH) and Low (ORL) are set by the High and Low of the first 15-minute bar of each trading day (09:30-09:45).",
+      "reason": "Since the feed timeframe is 15 minutes, the first bar of the day represents the first 15 minutes of the trading day."
+    },
+    {
+      "topic": "fib_levels",
+      "choice": "38.2% and 61.8% retracement levels inside [ORL, ORH] are calculated as ORL + 0.618 * ORB_range and ORL + 0.382 * ORB_range.",
+      "reason": "Standard Fibonacci retracement calculations applied to the Opening Range."
+    },
+    {
+      "topic": "tp_sl_logic",
+      "choice": "For Long positions, Take Profit is ORH and Stop Loss is ORL. For Short positions, Take Profit is ORL and Stop Loss is ORH.",
+      "reason": "The spec text states TP for long as ORL and SL for long as break of ORL, which is an inverted text typo (ORL is below entry for long). Setting TP to ORH for long and ORL for short target boundaries resolves this contradiction."
+    },
+    {
+      "topic": "vwap_calculation",
+      "choice": "Intraday VWAP is calculated cumulatively starting from the first bar of each trading day using typical price (High + Low + Close)/3.",
+      "reason": "Standard intraday VWAP calculation resetting daily."
+    },
+    {
+      "topic": "risk_management_sizing",
+      "choice": "Position size risks 1% of total portfolio value based on the distance between current close and the opposite ORB boundary (stop loss).",
+      "reason": "Spec mandates position size based on a standard risk per trade of 1-2% of trading capital."
+    },
+    {
+      "topic": "eod_exit",
+      "choice": "Open positions are closed at or after 15:45:00 on each trading day.",
+      "reason": "Spec states that trading is conducted within one trading day and all open positions are closed at the end of the trading session."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 24,
+  "tape": [
+    {
+      "dt": "2026-05-27T14:00:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 311.8800048828125
+    },
+    {
+      "dt": "2026-05-27T14:15:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 312.5899963378906
+    },
+    {
+      "dt": "2026-05-29T15:00:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 311.3599853515625
+    },
+    {
+      "dt": "2026-05-29T15:15:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 310.8500061035156
+    },
+    {
+      "dt": "2026-06-01T14:30:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 307.80999755859375
+    },
+    {
+      "dt": "2026-06-01T14:45:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 307.8299865722656
+    },
+    {
+      "dt": "2026-06-02T14:30:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 310.375
+    },
+    {
+      "dt": "2026-06-02T14:45:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 309.7799987792969
+    },
+    {
+      "dt": "2026-06-04T14:30:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 310.260009765625
+    },
+    {
+      "dt": "2026-06-04T14:45:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 310.42999267578125
+    },
+    {
+      "dt": "2026-06-05T14:00:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 313.6700134277344
+    },
+    {
+      "dt": "2026-06-05T14:30:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 313.4200134277344
+    },
+    {
+      "dt": "2026-06-05T14:45:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 314.1499938964844
+    },
+    {
+      "dt": "2026-06-05T15:00:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 313.0
+    },
+    {
+      "dt": "2026-06-11T14:15:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 290.2200012207031
+    },
+    {
+      "dt": "2026-06-11T14:30:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 290.6099853515625
+    },
+    {
+      "dt": "2026-06-11T15:45:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 292.69000244140625
+    },
+    {
+      "dt": "2026-06-11T16:00:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 293.409912109375
+    },
+    {
+      "dt": "2026-06-16T14:00:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 297.0849914550781
+    },
+    {
+      "dt": "2026-06-16T14:15:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 297.43499755859375
+    },
+    {
+      "dt": "2026-06-22T15:45:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 301.0899963378906
+    },
+    {
+      "dt": "2026-06-22T16:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 300.885009765625
+    },
+    {
+      "dt": "2026-06-23T14:00:00",
+      "side": "BUY",
+      "size": 24.0,
+      "price": 299.0849914550781
+    },
+    {
+      "dt": "2026-06-23T14:45:00",
+      "side": "SELL",
+      "size": -24.0,
+      "price": 300.3699951171875
+    },
+    {
+      "dt": "2026-06-30T14:00:00",
+      "side": "BUY",
+      "size": 21.0,
+      "price": 285.30999755859375
+    },
+    {
+      "dt": "2026-06-30T14:15:00",
+      "side": "SELL",
+      "size": -21.0,
+      "price": 285.8500061035156
+    },
+    {
+      "dt": "2026-07-01T14:30:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 293.05999755859375
+    },
+    {
+      "dt": "2026-07-01T14:45:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 294.82000732421875
+    },
+    {
+      "dt": "2026-07-06T14:00:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 309.6300048828125
+    },
+    {
+      "dt": "2026-07-06T14:15:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 309.8699951171875
+    },
+    {
+      "dt": "2026-07-08T14:30:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 308.82000732421875
+    },
+    {
+      "dt": "2026-07-08T16:00:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 310.25
+    },
+    {
+      "dt": "2026-07-16T14:00:00",
+      "side": "BUY",
+      "size": 22.0,
+      "price": 331.07501220703125
+    },
+    {
+      "dt": "2026-07-16T14:15:00",
+      "side": "SELL",
+      "size": -22.0,
+      "price": 328.67010498046875
+    },
+    {
+      "dt": "2026-07-17T14:00:00",
+      "side": "SELL",
+      "size": -24.0,
+      "price": 330.94000244140625
+    },
+    {
+      "dt": "2026-07-17T14:15:00",
+      "side": "BUY",
+      "size": 24.0,
+      "price": 330.42999267578125
+    },
+    {
+      "dt": "2026-07-23T14:15:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 320.80499267578125
+    },
+    {
+      "dt": "2026-07-23T14:30:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 321.4649963378906
+    },
+    {
+      "dt": "2026-07-29T15:15:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 339.9700012207031
+    },
+    {
+      "dt": "2026-07-29T16:00:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 341.1000061035156
+    },
+    {
+      "dt": "2026-07-30T14:15:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 331.4049987792969
+    },
+    {
+      "dt": "2026-07-30T14:45:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 332.07000732421875
+    },
+    {
+      "dt": "2026-07-30T15:15:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 331.489990234375
+    },
+    {
+      "dt": "2026-07-30T16:00:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 331.75
+    },
+    {
+      "dt": "2026-08-07T14:30:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 314.0899963378906
+    },
+    {
+      "dt": "2026-08-07T14:45:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 314.2449951171875
+    },
+    {
+      "dt": "2026-08-18T14:15:00",
+      "side": "BUY",
+      "size": 24.0,
+      "price": 309.92498779296875
+    },
+    {
+      "dt": "2026-08-18T14:30:00",
+      "side": "SELL",
+      "size": -24.0,
+      "price": 309.6400146484375
+    }
+  ]
+}

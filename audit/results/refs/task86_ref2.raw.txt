@@ -1,0 +1,147 @@
+```python
+import backtrader as bt
+
+
+class TrendFibonacciStrategy(bt.Strategy):
+    params = (
+        ("sma_period", 50),
+        ("lookback", 100),
+        ("risk_pct", 0.015),
+        ("rr_ratio", 2.0),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.sma_period
+        )
+        self.order = None
+        self.swing_lows = []
+        self.breakout_occurred = False
+        self.sl_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        # Record local swing lows (5-bar pivot low confirmed at bar -2)
+        if len(self) >= 5:
+            if (
+                self.data.low[-2] < self.data.low[-4]
+                and self.data.low[-2] < self.data.low[-3]
+                and self.data.low[-2] < self.data.low[-1]
+                and self.data.low[-2] < self.data.low[0]
+            ):
+                bar_idx = len(self) - 2
+                if not self.swing_lows or self.swing_lows[-1][0] != bar_idx:
+                    self.swing_lows.append((bar_idx, float(self.data.low[-2])))
+
+        # Construct dynamic support trendline
+        tl_curr = None
+        tl_prev = None
+        if len(self.swing_lows) >= 2:
+            t1, y1 = self.swing_lows[-2]
+            t2, y2 = self.swing_lows[-1]
+            if y2 > y1:  # Uptrend line
+                m = (y2 - y1) / float(t2 - t1)
+                tl_curr = y2 + m * (len(self) - t2)
+                tl_prev = y2 + m * (len(self) - 1 - t2)
+
+        if tl_curr is None:
+            win_curr = [self.data.low[-i] for i in range(min(len(self), 20))]
+            win_prev = [self.data.low[-i - 1] for i in range(min(len(self) - 1, 20))]
+            tl_curr = min(win_curr) if win_curr else float(self.data.low[0])
+            tl_prev = min(win_prev) if win_prev else float(self.data.low[-1])
+
+        # Calculate Fibonacci 0.618 retracement level over recent lookback window
+        window_size = min(len(self), self.p.lookback)
+        recent_highs = [self.data.high[-i] for i in range(window_size)]
+        recent_lows = [self.data.low[-i] for i in range(window_size)]
+        h = max(recent_highs)
+        l = min(recent_lows)
+        fib_0618 = h - 0.618 * (h - l)
+
+        # Detect trendline breakout from below to above
+        if self.data.close[-1] <= tl_prev and self.data.close[0] > tl_curr:
+            self.breakout_occurred = True
+
+        # Position Exits & Entries
+        if self.position:
+            # Exit Condition 1: Stop-loss or Take-profit reached
+            if self.sl_price is not None and self.data.low[0] <= self.sl_price:
+                self.order = self.close()
+                self.breakout_occurred = False
+            elif self.tp_price is not None and self.data.high[0] >= self.tp_price:
+                self.order = self.close()
+                self.breakout_occurred = False
+            # Exit Condition 2: Support trendline broken from above to below
+            elif self.data.close[-1] >= tl_prev and self.data.close[0] < tl_curr:
+                self.order = self.close()
+                self.breakout_occurred = False
+        else:
+            if self.breakout_occurred:
+                # Invalidate breakout if price drops back below trendline
+                if self.data.close[0] < tl_curr:
+                    self.breakout_occurred = False
+                # Entry Condition: Decline to touch Fibonacci 0.618 level after breakout
+                elif self.data.low[0] <= fib_0618:
+                    # Filter: Moving average must be pointing upward
+                    if self.sma[0] > self.sma[-1]:
+                        sl_price = min(float(self.data.low[0]), tl_curr) * 0.99
+                        if sl_price >= float(self.data.close[0]):
+                            sl_price = float(self.data.close[0]) * 0.99
+
+                        risk_per_share = float(self.data.close[0]) - sl_price
+                        tp_price = float(self.data.close[0]) + (
+                            self.p.rr_ratio * risk_per_share
+                        )
+
+                        capital_at_risk = self.broker.getvalue() * self.p.risk_pct
+                        size = int(capital_at_risk / risk_per_share)
+                        max_size = int(
+                            self.broker.getcash() / float(self.data.close[0])
+                        )
+                        size = min(size, max_size)
+
+                        if size > 0:
+                            self.order = self.buy(size=size)
+                            self.sl_price = sl_price
+                            self.tp_price = tp_price
+                            self.breakout_occurred = False
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Dynamic Fibonacci 0.618 level calculation over lookback window",
+      "reason": "The exact price levels mentioned in the spec (74,500 to 124,000) correspond to a different asset class and do not fit AAPL historical daily prices ($50-$250). Computed Fib 0.618 level dynamically as High - 0.618 * (High - Low) over a 100-bar lookback window."
+    },
+    {
+      "topic": "trendline_construction",
+      "choice": "Two-pivot linear trendline from local lows",
+      "reason": "Constructed uptrend support trendline using line equation through the two most recent 5-bar pivot lows where low2 > low1. Fallback to 20-bar lowest low when fewer than 2 valid upward swing lows exist."
+    },
+    {
+      "topic": "trend_filter",
+      "choice": "50-period SMA slope filter",
+      "reason": "Implemented the optional SMA direction filter using a 50-bar SMA where sma[0] > sma[-1] confirms the global uptrend."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "1.5% equity risk per trade with 2:1 Reward-to-Risk TP",
+      "reason": "Spec specifies risk of 1-2% of total capital per trade (used midpoint 1.5%) and a 2:1 risk-to-reward ratio for take-profit targeting relative to the stop-loss level placed 1% below the trendline/low."
+    }
+  ]
+}
+```

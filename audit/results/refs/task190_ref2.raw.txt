@@ -1,0 +1,168 @@
+```python
+import math
+import backtrader as bt
+
+
+class ShortVolatilityStrategy(bt.Strategy):
+    def __init__(self):
+        # Indicators
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2.0)
+        self.sma20 = self.bb.mid
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+
+        bw = (self.bb.top - self.bb.bot) / self.bb.mid
+        self.sma_bw100 = bt.indicators.SMA(bw, period=100)
+        self.sma_vol20 = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.crossover_top = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.crossover_bot = bt.indicators.CrossOver(self.data.close, self.bb.bot)
+
+        # Order and position tracking
+        self.main_order = None
+        self.tp_order = None
+        self.sl_order = None
+        self.entry_bar = None
+        self.entry_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if self.main_order and order.ref == self.main_order.ref:
+                if order.status == order.Completed:
+                    self.entry_bar = len(self)
+                    self.entry_price = order.executed.price
+                else:
+                    self._reset_orders()
+
+            elif self.tp_order and order.ref == self.tp_order.ref:
+                if order.status == order.Completed:
+                    self._reset_orders()
+
+            elif self.sl_order and order.ref == self.sl_order.ref:
+                if order.status == order.Completed:
+                    self._reset_orders()
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self._reset_orders()
+
+    def _reset_orders(self):
+        self.main_order = None
+        self.tp_order = None
+        self.sl_order = None
+        self.entry_bar = None
+        self.entry_price = None
+
+    def _cancel_child_orders(self):
+        if self.tp_order:
+            self.cancel(self.tp_order)
+        if self.sl_order:
+            self.cancel(self.sl_order)
+
+    def next(self):
+        if self.position:
+            # Time management: close if held >= 45 bars
+            if self.entry_bar is not None:
+                bars_held = len(self) - self.entry_bar
+                if bars_held >= 45:
+                    self._cancel_child_orders()
+                    self.close()
+                    return
+
+            # Emergency exit check (±5% from actual executed entry price)
+            if self.entry_price is not None:
+                if self.position.size > 0 and self.data.close[0] <= self.entry_price * 0.95:
+                    self._cancel_child_orders()
+                    self.close()
+                    return
+                elif self.position.size < 0 and self.data.close[0] >= self.entry_price * 1.05:
+                    self._cancel_child_orders()
+                    self.close()
+                    return
+            return
+
+        # Do not open new position if main entry order is pending
+        if self.main_order is not None:
+            return
+
+        # Volatility filter
+        bw_val = (self.bb.top[0] - self.bb.bot[0]) / self.bb.mid[0]
+        sma_bw_val = self.sma_bw100[0]
+        vol_filter = (bw_val > sma_bw_val) and (bw_val < 1.5 * sma_bw_val)
+
+        # Liquidity filter
+        liq_filter = self.data.volume[0] < 1.5 * self.sma_vol20[0]
+
+        if not (vol_filter and liq_filter):
+            return
+
+        equity = self.broker.getvalue()
+        entry = self.data.close[0]
+        atr = self.atr14[0]
+        sma = self.sma20[0]
+
+        # Check Long signal
+        if self.crossover_bot[0] > 0:
+            tp = entry + 0.5 * (sma - entry)
+            sl_atr = entry - 1.5 * atr
+            sl_emerg = entry * 0.95
+            sl = max(sl_atr, sl_emerg)
+
+            risk_dist = 1.5 * atr
+            target_dist = 0.5 * abs(sma - entry)
+
+            if risk_dist <= 0 or target_dist <= 0:
+                return
+
+            size_risk = math.floor((equity * 0.01) / risk_dist)
+            size_target = math.floor((equity * 0.005) / target_dist)
+            size = int(min(size_risk, size_target))
+
+            if size > 0 and tp > entry and sl < entry:
+                orders = self.buy_bracket(size=size, limitprice=tp, stopprice=sl)
+                self.main_order = orders[0]
+                self.tp_order = orders[1]
+                self.sl_order = orders[2]
+
+        # Check Short signal
+        elif self.crossover_top[0] < 0:
+            tp = entry - 0.5 * (entry - sma)
+            sl_atr = entry + 1.5 * atr
+            sl_emerg = entry * 1.05
+            sl = min(sl_atr, sl_emerg)
+
+            risk_dist = 1.5 * atr
+            target_dist = 0.5 * abs(entry - sma)
+
+            if risk_dist <= 0 or target_dist <= 0:
+                return
+
+            size_risk = math.floor((equity * 0.01) / risk_dist)
+            size_target = math.floor((equity * 0.005) / target_dist)
+            size = int(min(size_risk, size_target))
+
+            if size > 0 and tp < entry and sl > entry:
+                orders = self.sell_bracket(size=size, limitprice=tp, stopprice=sl)
+                self.main_order = orders[0]
+                self.tp_order = orders[1]
+                self.sl_order = orders[2]
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_price_proxy_for_sizing",
+      "choice": "Used signal bar close (self.data.close[0]) as the entry price proxy when calculating TP, SL, and position sizing prior to placing bracket orders.",
+      "reason": "Market orders execute on the next open bar; at signal evaluation time in next(), the current close is the only available price reference for placing immediate bracket orders."
+    },
+    {
+      "topic": "emergency_exit_handling",
+      "choice": "Incorporated the ±5% emergency stop level into the stop loss price calculation of the bracket order and added an explicit check against actual fill price in next().",
+      "reason": "This guarantees that if the 5% adverse move is tighter than 1.5 * ATR, the stop order triggers at 5%, while also guarding against gap risk relative to the executed fill price."
+    }
+  ]
+}
+```

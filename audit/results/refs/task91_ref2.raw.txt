@@ -1,0 +1,158 @@
+```python
+import backtrader as bt
+
+
+class SignificantMoveDetection(bt.Strategy):
+    """
+    Reference implementation of the Significant Move Detection trading strategy.
+    
+    Indicators:
+    - ATR(14) for volatility filter and risk management.
+    - EMA(50) for trend confirmation and trend reversal exit.
+    
+    Entry Rules:
+    - Long: Close > EMA(50) AND Close - PrevClose >= 1.5 * ATR(14) AND allowed direction flag.
+    - Short: Close < EMA(50) AND PrevClose - Close >= 1.5 * ATR(14) AND allowed direction flag.
+    - Consecutive trade restriction: Disallow re-entry in the same direction until price moves to the opposite side of EMA(50).
+    
+    Exit Rules:
+    - Take Profit: 2.0 * ATR(14) from entry price (Limit order).
+    - Stop Loss: 1.0 * ATR(14) from entry price (Stop order).
+    - Trend Reversal: Close position if price crosses back over EMA(50).
+    
+    Position Sizing:
+    - Risk 1% of total account equity divided by stop distance (1.0 * ATR(14)).
+    """
+
+    params = (
+        ('atr_period', 14),
+        ('ema_period', 50),
+        ('move_mult', 1.5),
+        ('tp_mult', 2.0),
+        ('sl_mult', 1.0),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+
+        self.order = None
+        self.sl_order = None
+        self.tp_order = None
+
+        self.long_allowed = True
+        self.short_allowed = True
+        self.entry_atr = 0.0
+        self.entry_price = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                self.entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if order.isbuy():
+                    self.long_allowed = False
+                    sl_price = self.entry_price - self.p.sl_mult * self.entry_atr
+                    tp_price = self.entry_price + self.p.tp_mult * self.entry_atr
+                    self.sl_order = self.sell(exectype=bt.Order.Stop, price=sl_price, size=size)
+                    self.tp_order = self.sell(exectype=bt.Order.Limit, price=tp_price, size=size, oco=self.sl_order)
+                else:
+                    self.short_allowed = False
+                    sl_price = self.entry_price + self.p.sl_mult * self.entry_atr
+                    tp_price = self.entry_price - self.p.tp_mult * self.entry_atr
+                    self.sl_order = self.buy(exectype=bt.Order.Stop, price=sl_price, size=size)
+                    self.tp_order = self.buy(exectype=bt.Order.Limit, price=tp_price, size=size, oco=self.sl_order)
+
+            elif order in (self.sl_order, self.tp_order):
+                self.sl_order = None
+                self.tp_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order in (self.sl_order, self.tp_order):
+                self.sl_order = None
+                self.tp_order = None
+
+    def next(self):
+        # Update direction permission flags based on price position relative to EMA(50)
+        if self.data.close[0] < self.ema[0]:
+            self.long_allowed = True
+        if self.data.close[0] > self.ema[0]:
+            self.short_allowed = True
+
+        # Check Trend Reversal exit for active position
+        if self.position:
+            if self.position.size > 0 and self.data.close[0] < self.ema[0]:
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                self.close()
+                return
+            elif self.position.size < 0 and self.data.close[0] > self.ema[0]:
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                self.close()
+                return
+
+        # Check Entry conditions when flat and no order pending
+        if not self.position and self.order is None:
+            close_diff = self.data.close[0] - self.data.close[-1]
+            atr_val = self.atr[0]
+            ema_val = self.ema[0]
+
+            if atr_val <= 0:
+                return
+
+            # Long Entry
+            if (self.data.close[0] > ema_val and
+                    close_diff >= self.p.move_mult * atr_val and
+                    self.long_allowed):
+
+                risk_amount = self.broker.getvalue() * self.p.risk_pct
+                stop_dist = self.p.sl_mult * atr_val
+                size = int(risk_amount / stop_dist) if stop_dist > 0 else 0
+
+                if size > 0:
+                    self.entry_atr = atr_val
+                    self.order = self.buy(size=size)
+
+            # Short Entry
+            elif (self.data.close[0] < ema_val and
+                  -close_diff >= self.p.move_mult * atr_val and
+                  self.short_allowed):
+
+                risk_amount = self.broker.getvalue() * self.p.risk_pct
+                stop_dist = self.p.sl_mult * atr_val
+                size = int(risk_amount / stop_dist) if stop_dist > 0 else 0
+
+                if size > 0:
+                    self.entry_atr = atr_val
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "stop_loss_and_take_profit_execution",
+      "choice": "Placed Stop (SL) and Limit (TP) OCO orders in notify_order upon entry order fill using the actual executed entry price and signal-time ATR.",
+      "reason": "Ensures initial stop loss and take profit distances are exact multiples of ATR relative to actual entry fill price."
+    },
+    {
+      "topic": "consecutive_entry_restriction",
+      "choice": "Tracked direction permission via long_allowed and short_allowed flags that are cleared upon trade entry and set to True whenever close crosses to the opposite side of the 50 EMA.",
+      "reason": "Directly implements the rule that new trades in the same direction require price moving to the other side of 50 EMA first."
+    }
+  ]
+}
+```

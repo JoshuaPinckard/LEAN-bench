@@ -1,0 +1,191 @@
+```python
+import backtrader as bt
+
+
+class SentimentProxyStrategy(bt.Strategy):
+    params = (
+        ("rsi_period", 14),
+        ("macd_me1", 12),
+        ("macd_me2", 26),
+        ("macd_signal", 9),
+        ("atr_period", 14),
+        ("vol_sma_period", 20),
+        ("atr_sma_period", 100),
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("capital_perc", 0.01),
+        ("tp_perc", 0.05),
+        ("sl_perc", 0.03),
+    )
+
+    def __init__(self):
+        self.rsi = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.ind.MACD(
+            self.data.close,
+            period_me1=self.p.macd_me1,
+            period_me2=self.p.macd_me2,
+            period_signal=self.p.macd_signal,
+        )
+        self.crossover = bt.ind.CrossOver(self.macd.macd, self.macd.signal)
+        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)
+        self.sma_vol = bt.ind.SMA(self.data.volume, period=self.p.vol_sma_period)
+        self.sma_atr = bt.ind.SMA(self.atr, period=self.p.atr_sma_period)
+        self.bb = bt.ind.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+
+        self.main_order = None
+        self.tp_order = None
+        self.sl_order = None
+
+        self.highest_rsi = None
+        self.lowest_rsi = None
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if self.main_order and order.ref == self.main_order.ref:
+                if order.status == order.Completed:
+                    if self.position.size > 0:
+                        self.highest_rsi = self.rsi[0]
+                    elif self.position.size < 0:
+                        self.lowest_rsi = self.rsi[0]
+                else:
+                    self.main_order = None
+                    self.tp_order = None
+                    self.sl_order = None
+
+        if self.position.size == 0:
+            if not (
+                self.main_order
+                and self.main_order.status in [order.Submitted, order.Accepted]
+            ):
+                self.main_order = None
+                self.tp_order = None
+                self.sl_order = None
+                self.highest_rsi = None
+                self.lowest_rsi = None
+
+    def next(self):
+        if self.position.size > 0:
+            if self.highest_rsi is not None:
+                self.highest_rsi = max(self.highest_rsi, self.rsi[0])
+                if self.rsi[0] <= self.highest_rsi - 10.0:
+                    self.close()
+                    if self.tp_order:
+                        self.cancel(self.tp_order)
+                    if self.sl_order:
+                        self.cancel(self.sl_order)
+            return
+
+        if self.position.size < 0:
+            if self.lowest_rsi is not None:
+                self.lowest_rsi = min(self.lowest_rsi, self.rsi[0])
+                if self.rsi[0] >= self.lowest_rsi + 10.0:
+                    self.close()
+                    if self.tp_order:
+                        self.cancel(self.tp_order)
+                    if self.sl_order:
+                        self.cancel(self.sl_order)
+            return
+
+        if self.main_order is not None:
+            return
+
+        high_vol = self.atr[0] > 1.5 * self.sma_atr[0]
+        delta_rsi = self.rsi[0] - self.rsi[-3]
+
+        if high_vol:
+            gen_long = (
+                (delta_rsi >= 10.0)
+                and (self.crossover[0] == 1)
+                and (self.data.volume[0] > 1.3 * self.sma_vol[0])
+            )
+        else:
+            gen_long = delta_rsi >= 15.0
+
+        band_width = self.bb.top[0] - self.bb.bot[0]
+        price_filter_long = (
+            all(self.data.close[i] <= self.bb.top[i] for i in (0, -1, -2))
+            and (self.data.close[0] <= self.bb.mid[0] + 0.5 * band_width)
+        )
+
+        long_gen_signal = gen_long and price_filter_long
+        long_pol_signal = (
+            self.data.open[0] > self.data.high[-1] + 0.5 * self.atr[0]
+        ) and (self.data.volume[0] > 1.5 * self.sma_vol[0])
+
+        long_signal = long_gen_signal or long_pol_signal
+
+        if high_vol:
+            gen_short = (
+                (delta_rsi <= -10.0)
+                and (self.crossover[0] == -1)
+                and (self.data.volume[0] > 1.3 * self.sma_vol[0])
+            )
+        else:
+            gen_short = delta_rsi <= -15.0
+
+        price_filter_short = (
+            all(self.data.close[i] >= self.bb.bot[i] for i in (0, -1, -2))
+            and (self.data.close[0] >= self.bb.mid[0] - 0.5 * band_width)
+        )
+
+        short_gen_signal = gen_short and price_filter_short
+        short_pol_signal = (
+            self.data.open[0] < self.data.low[-1] - 0.5 * self.atr[0]
+        ) and (self.data.volume[0] > 1.5 * self.sma_vol[0])
+
+        short_signal = short_gen_signal or short_pol_signal
+
+        price = self.data.close[0]
+        if price <= 0:
+            return
+
+        size = (self.broker.getvalue() * self.p.capital_perc) / price
+
+        if long_signal:
+            tp_price = price * (1.0 + self.p.tp_perc)
+            sl_price = price * (1.0 - self.p.sl_perc)
+            orders = self.buy_bracket(
+                size=size, limitprice=tp_price, stopprice=sl_price
+            )
+            self.main_order = orders[0]
+            self.tp_order = orders[1]
+            self.sl_order = orders[2]
+        elif short_signal:
+            tp_price = price * (1.0 - self.p.tp_perc)
+            sl_price = price * (1.0 + self.p.sl_perc)
+            orders = self.sell_bracket(
+                size=size, limitprice=tp_price, stopprice=sl_price
+            )
+            self.main_order = orders[0]
+            self.tp_order = orders[1]
+            self.sl_order = orders[2]
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "position_sizing",
+      "choice": "Calculate float trade size as 1% of total portfolio value divided by current bar close price: size = (self.broker.getvalue() * 0.01) / self.data.close[0].",
+      "reason": "Literal implementation of 'position size — 1% of capital per trade'."
+    },
+    {
+      "topic": "bracket_order_pricing",
+      "choice": "Set take-profit (+5% long / -5% short) and stop-loss (-3% long / +3% short) target prices based on the close price at the signal bar when submitting the bracket order.",
+      "reason": "Backtrader buy_bracket/sell_bracket require explicit target prices at submission time before execution."
+    },
+    {
+      "topic": "sentiment_reversal_order_cleanup",
+      "choice": "When sentiment reversal exit triggers self.close(), explicitly cancel remaining pending bracket TP and SL orders.",
+      "reason": "Prevents orphaned limit/stop orders from remaining active after manual exit."
+    }
+  ]
+}
+```

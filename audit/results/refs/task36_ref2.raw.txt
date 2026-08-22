@@ -1,0 +1,135 @@
+```python
+import math
+import backtrader as bt
+
+
+class BreakoutAfterDoubleBottom(bt.Strategy):
+    params = (
+        ('resistance', 191.8),
+        ('support', 135.0),
+        ('db_tol', 0.1),
+        ('sl_pct', 0.02),
+        ('risk_pct', 0.015),
+        ('vol_period', 20),
+        ('vol_mult', 1.2),
+        ('consolidation_min', 134.2),
+        ('consolidation_max', 191.8),
+        ('consolidation_period', 20),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.volume_sma = bt.indicators.SimpleMovingAverage(self.data.volume, period=self.p.vol_period)
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def _has_double_bottom(self):
+        lows = self.data.low.get(size=len(self))
+        highs = self.data.high.get(size=len(self))
+        min_val = self.p.support - self.p.db_tol
+        max_val = self.p.support + self.p.db_tol
+
+        troughs = []
+        for idx in range(len(lows)):
+            if min_val <= lows[idx] <= max_val:
+                troughs.append(idx)
+
+        if len(troughs) < 2:
+            return False, self.p.support
+
+        for i in range(len(troughs)):
+            for j in range(i + 1, len(troughs)):
+                t1 = troughs[i]
+                t2 = troughs[j]
+                if t2 - t1 >= 2:
+                    between_highs = highs[t1 + 1:t2]
+                    if max(between_highs) > max_val:
+                        pattern_low = min(lows[t1], lows[t2])
+                        return True, pattern_low
+        return False, self.p.support
+
+    def _is_consolidated(self):
+        if len(self) < self.p.consolidation_period:
+            return False
+        highs = self.data.high.get(size=self.p.consolidation_period)
+        lows = self.data.low.get(size=self.p.consolidation_period)
+        return max(highs) <= self.p.consolidation_max and min(lows) >= self.p.consolidation_min
+
+    def next(self):
+        if self.order:
+            return
+
+        sl_level = self.p.support * (1.0 - self.p.sl_pct)  # $132.30
+
+        if self.position:
+            if self.data.low[0] <= sl_level or self.data.close[0] < self.p.support:
+                self.order = self.close()
+            elif self.tp_price is not None and self.data.high[0] >= self.tp_price:
+                self.order = self.close()
+            return
+
+        dt = self.data.datetime.date(0)
+        after_oct_2023 = (dt.year > 2023) or (dt.year == 2023 and dt.month >= 11)
+        active = after_oct_2023 or self._is_consolidated()
+        if not active:
+            return
+
+        has_db, pattern_low = self._has_double_bottom()
+        if not has_db:
+            return
+
+        breakout = (self.data.close[0] > self.p.resistance) and (self.data.close[-1] <= self.p.resistance)
+        if not breakout:
+            return
+
+        vol_confirmed = self.data.volume[0] >= self.p.vol_mult * self.volume_sma[0]
+        if not vol_confirmed:
+            return
+
+        h = self.p.resistance - pattern_low
+        self.tp_price = self.p.resistance + h
+
+        capital = self.broker.getvalue()
+        max_risk = capital * self.p.risk_pct
+        risk_per_share = self.data.close[0] - sl_level
+
+        if risk_per_share <= 0:
+            return
+
+        size = math.floor(max_risk / risk_per_share)
+        max_affordable = math.floor(self.broker.getcash() / self.data.close[0])
+        size = min(size, max_affordable)
+
+        if size > 0:
+            self.order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "double_bottom_detection",
+      "choice": "Scan available price history for at least two distinct troughs whose lows fall in $135.0 ± 0.1 ($134.9 to $135.1) separated by at least one period reaching above $135.1",
+      "reason": "The specification defines the double bottom pattern as two lows formed in the $135.0 ± 0.1 zone with a local high between them."
+    },
+    {
+      "topic": "active_period_filter",
+      "choice": "Check if current date is after October 2023 (>= 2023-11-01) or if price was in range $134.2-$191.8 over the last 20 periods",
+      "reason": "The specification mentions the strategy is active after a prolonged downtrend has ended (after October 2023) and gives 20 periods of consolidation between $134.2 and $191.8 as the automated rule."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Calculate position size as floor(0.015 * portfolio_value / (entry_price - 132.3)), bounded by cash availability",
+      "reason": "The specification mandates limiting potential stop-loss loss to 1.5% of total capital per trade, using the fixed stop-loss level of $132.3."
+    },
+    {
+      "topic": "exit_execution",
+      "choice": "Evaluate exit conditions in next() checking bar extremes and close price",
+      "reason": "Handles the three specified exit rules (stop-loss at $132.3, take-profit at $191.8 + H, and alternative exit below $135.0 support) without pending order conflicts."
+    }
+  ]
+}
+```

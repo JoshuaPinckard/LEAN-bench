@@ -1,0 +1,175 @@
+```python
+import backtrader as bt
+
+
+class LLY1hBullFlag(bt.Strategy):
+    params = (
+        ("impulse_period", 15),
+        ("flag_period", 10),
+        ("weekly_support", 774.48),
+        ("risk_pct", 0.01),
+        ("rr_ratio", 2.0),
+        ("sl_buffer", 0.5),
+    )
+
+    def __init__(self):
+        # 1D SMAs approximated on 1h bars (7 trading hours per US stock market day)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50 * 7)
+        self.sma100 = bt.indicators.SMA(self.data.close, period=100 * 7)
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200 * 7)
+
+        self.order = None
+        self.sl_price = None
+        self.tp_price = None
+        self.pending_sl = None
+        self.pending_tp = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.sl_price = self.pending_sl
+                self.tp_price = self.pending_tp
+            elif order.issell():
+                self.sl_price = None
+                self.tp_price = None
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            self.pending_sl = None
+            self.pending_tp = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            # Monitor Stop-Loss and Take-Profit exits
+            if self.sl_price is not None and self.data.low[0] <= self.sl_price:
+                self.order = self.close()
+            elif (
+                self.tp_price is not None and self.data.high[0] >= self.tp_price
+            ):
+                self.order = self.close()
+            return
+
+        # 1. Trend Filter (1D chart): Price > 50D, 100D, 200D SMAs
+        if not (
+            self.data.close[0] > self.sma50[0]
+            and self.data.close[0] > self.sma100[0]
+            and self.data.close[0] > self.sma200[0]
+        ):
+            return
+
+        # 2. Support Filter (1W chart): Price > weekly lower high level 774.48
+        if self.data.close[0] <= self.p.weekly_support:
+            return
+
+        # 3. Pattern Signal (1h chart)
+        flag_len = self.p.flag_period
+        imp_len = self.p.impulse_period
+
+        # Lookback arrays for consolidation (flag) and impulse
+        flag_highs = [self.data.high[-i] for i in range(1, flag_len + 1)]
+        flag_lows = [self.data.low[-i] for i in range(1, flag_len + 1)]
+        flag_vols = [self.data.volume[-i] for i in range(1, flag_len + 1)]
+
+        imp_highs = [
+            self.data.high[-i]
+            for i in range(flag_len + 1, flag_len + imp_len + 1)
+        ]
+        imp_lows = [
+            self.data.low[-i]
+            for i in range(flag_len + 1, flag_len + imp_len + 1)
+        ]
+        imp_vols = [
+            self.data.volume[-i]
+            for i in range(flag_len + 1, flag_len + imp_len + 1)
+        ]
+
+        flag_high = max(flag_highs)
+        flag_low = min(flag_lows)
+        flag_vol_avg = sum(flag_vols) / float(flag_len)
+
+        imp_high = max(imp_highs)
+        imp_low = min(imp_lows)
+        imp_vol_avg = sum(imp_vols) / float(imp_len)
+
+        imp_move = imp_high - imp_low
+        if imp_move <= 0:
+            return
+
+        # Fibonacci 0.382 retracement level from impulse high
+        fib_382 = imp_high - 0.382 * imp_move
+
+        # Flag pattern validation checks
+        holds_above_fib = flag_low >= fib_382
+        reduced_volume = flag_vol_avg < imp_vol_avg
+        valid_consolidation = flag_high <= imp_high
+
+        if not (holds_above_fib and reduced_volume and valid_consolidation):
+            return
+
+        # 4. Entry Trigger: Price breaks above upper boundary of flag
+        if self.data.close[0] > flag_high:
+            # Determine Stop-Loss level (closer level to entry price)
+            sl_1 = flag_low - self.p.sl_buffer
+            sl_2 = fib_382
+            sl_cand = max(sl_1, sl_2)
+
+            risk = self.data.close[0] - sl_cand
+            if risk <= 0:
+                risk = self.data.close[0] * 0.01
+                sl_cand = self.data.close[0] - risk
+
+            # Fixed 1:2 Risk/Reward Take-Profit target
+            tp_cand = self.data.close[0] + self.p.rr_ratio * risk
+
+            # Position Sizing: Risk per trade = 1% of equity
+            equity = self.broker.getvalue()
+            max_risk_amt = equity * self.p.risk_pct
+            size = int(max_risk_amt / risk)
+
+            cash = self.broker.getcash()
+            max_shares = int(cash / self.data.close[0])
+            size = min(size, max_shares)
+
+            if size > 0:
+                self.pending_sl = sl_cand
+                self.pending_tp = tp_cand
+                self.order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "daily_sma_approximation",
+      "choice": "Approximating 50-day, 100-day, and 200-day SMAs on 1h data using period multipliers of 7 trading hours per day (350, 700, 1400 bars).",
+      "reason": "The harness provides a single 1h data feed, requiring daily moving averages to be calculated over the equivalent number of 1h periods."
+    },
+    {
+      "topic": "pattern_window_definition",
+      "choice": "Set the consolidation (flag) window to 10 hourly bars and the prior upward impulse window to 15 hourly bars preceding the flag.",
+      "reason": "The specification requires identifying a bull flag pattern on 1h data but leaves exact window lengths unstated."
+    },
+    {
+      "topic": "stop_loss_selection",
+      "choice": "Set stop-loss to max(flag_low - 0.5, fib_382) to pick the level closer to the entry price while keeping it below entry.",
+      "reason": "The specification states to place the stop-loss a few points below the lower boundary of the flag channel or at the 0.382 retracement level, depending on which level is closer."
+    },
+    {
+      "topic": "take_profit_target",
+      "choice": "Used fixed 1:2 risk/reward ratio relative to the stop-loss distance.",
+      "reason": "The specification explicitly permits using a fixed 1:2 (risk/reward) take-profit relative to the stop-loss."
+    },
+    {
+      "topic": "risk_management_percentage",
+      "choice": "Set risk per trade to 1% of current account equity.",
+      "reason": "The specification specifies position sizing risk per trade within 1-2% of trading capital; 1% is chosen as the standard risk level."
+    }
+  ]
+}
+```

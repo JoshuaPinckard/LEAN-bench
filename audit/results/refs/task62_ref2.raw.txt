@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+
+
+class MarketSegmentationStrategy(bt.Strategy):
+    """
+    Market Segmentation by Volatility and Trend Strategy.
+    Identifies market regimes based on ATR volatility and EMA trend directions,
+    trading pullbacks and pin bars with strict risk management.
+    """
+
+    def __init__(self):
+        self.order = None
+        self.signal_atr = 0.0
+        self.entry_atr = 0.0
+
+        # Indicators
+        self.atr = bt.ind.ATR(self.data, period=14)
+        self.atr_sma = bt.ind.SMA(self.atr, period=50)
+
+        self.ema20 = bt.ind.EMA(self.data.close, period=20)
+        self.ema50 = bt.ind.EMA(self.data.close, period=50)
+        self.ema200 = bt.ind.EMA(self.data.close, period=200)
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            if order.status == order.Completed and self.position.size != 0:
+                self.entry_atr = getattr(self, 'signal_atr', self.atr[0])
+
+    def get_segment(self, idx=0):
+        atr_val = self.atr[idx]
+        atr_sma_val = self.atr_sma[idx]
+        is_high_vol = atr_val > 1.5 * atr_sma_val
+
+        if not is_high_vol:
+            return 1
+
+        ema20_val = self.ema20[idx]
+        ema50_val = self.ema50[idx]
+
+        ema20_slope_up = self.ema20[idx] > self.ema20[idx - 1]
+        ema50_slope_up = self.ema50[idx] > self.ema50[idx - 1]
+
+        ema20_slope_dn = self.ema20[idx] < self.ema20[idx - 1]
+        ema50_slope_dn = self.ema50[idx] < self.ema50[idx - 1]
+
+        if ema20_val > ema50_val and ema20_slope_up and ema50_slope_up:
+            return 3
+        elif ema20_val < ema50_val and ema20_slope_dn and ema50_slope_dn:
+            return 2
+        else:
+            return 1
+
+    def next(self):
+        if self.order:
+            return
+
+        curr_seg = self.get_segment(0)
+
+        # Handle Exits for open positions
+        if self.position:
+            entry_p = self.position.price
+            if self.position.size > 0:  # Long position
+                sl_p = entry_p - 2.0 * self.entry_atr
+                tp_p = entry_p + 4.0 * self.entry_atr
+                if self.data.low[0] <= sl_p or self.data.high[0] >= tp_p:
+                    self.order = self.close()
+                elif curr_seg == 2:  # Switched to opposite regime
+                    self.order = self.close()
+            elif self.position.size < 0:  # Short position
+                sl_p = entry_p + 2.0 * self.entry_atr
+                tp_p = entry_p - 4.0 * self.entry_atr
+                if self.data.high[0] >= sl_p or self.data.low[0] <= tp_p:
+                    self.order = self.close()
+                elif curr_seg == 3:  # Switched to opposite regime
+                    self.order = self.close()
+            return
+
+        # Regime confirmation rule: segment confirmed for 5 consecutive bars
+        seg_confirmed_3 = all(self.get_segment(-i) == 3 for i in range(5))
+        seg_confirmed_2 = all(self.get_segment(-i) == 2 for i in range(5))
+
+        # Bar characteristics for pin bar detection
+        op = self.data.open[0]
+        cl = self.data.close[0]
+        hi = self.data.high[0]
+        lo = self.data.low[0]
+        total_range = hi - lo
+        body = abs(cl - op)
+        lower_wick = min(op, cl) - lo
+        upper_wick = hi - max(op, cl)
+
+        # Global trend slopes
+        ema200_up = self.ema200[0] > self.ema200[-1]
+        ema200_dn = self.ema200[0] < self.ema200[-1]
+
+        # Entry logic for Segment 3 (High volatility / Uptrend)
+        if seg_confirmed_3 and ema200_up:
+            pullback_down = (lo <= self.ema20[0]) and (hi >= self.ema50[0])
+            bullish_pin = (total_range > 0) and (lower_wick >= 2.0 * body) and (lower_wick >= 0.5 * total_range)
+
+            if pullback_down or bullish_pin:
+                risk_amount = self.broker.getvalue() * 0.01
+                stop_dist = 2.0 * self.atr[0]
+                if stop_dist > 0:
+                    size = int(risk_amount / stop_dist)
+                    if size > 0:
+                        self.signal_atr = self.atr[0]
+                        self.order = self.buy(size=size)
+
+        # Entry logic for Segment 2 (High volatility / Downtrend)
+        elif seg_confirmed_2 and ema200_dn:
+            pullback_up = (hi >= self.ema20[0]) and (lo <= self.ema50[0])
+            bearish_pin = (total_range > 0) and (upper_wick >= 2.0 * body) and (upper_wick >= 0.5 * total_range)
+
+            if pullback_up or bearish_pin:
+                risk_amount = self.broker.getvalue() * 0.01
+                stop_dist = 2.0 * self.atr[0]
+                if stop_dist > 0:
+                    size = int(risk_amount / stop_dist)
+                    if size > 0:
+                        self.signal_atr = self.atr[0]
+                        self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "EMA Slope Determination",
+      "choice": "Slope is measured over 1 bar (value[0] > value[-1] for up, value[0] < value[-1] for down).",
+      "reason": "The spec states 'angle of their slope' without specifying a period. 1-bar slope is the standard discrete derivative in technical analysis."
+    },
+    {
+      "topic": "Pullback Zone Definition",
+      "choice": "Pullback into the zone between EMA 20 and EMA 50 is satisfied when the bar's High-Low range intersects both EMAs.",
+      "reason": "A price pullback entering the zone between EMA 20 and EMA 50 means price reaches below the upper EMA and above the lower EMA during the bar."
+    },
+    {
+      "topic": "Pin Bar Identification",
+      "choice": "Bullish pin bar defined as lower wick >= 2 * body and lower wick >= 0.5 * total range; Bearish pin bar defined as upper wick >= 2 * body and upper wick >= 0.5 * total range.",
+      "reason": "This is the canonical technical definition for pin bar candlestick patterns."
+    },
+    {
+      "topic": "Stop-Loss and Take-Profit Execution",
+      "choice": "Evaluated on bar Low and High against entry price +/- ATR multiples in next().",
+      "reason": "Allows clean monitoring of stop-loss, take-profit, and segment switch exits without order cancellation side-effects."
+    }
+  ]
+}
+```

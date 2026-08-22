@@ -2,71 +2,117 @@
 import backtrader as bt
 
 
-class BreakoutRetestStrategy(bt.Strategy):
+class BreakoutRetest(bt.Strategy):
+    """
+    Breakout Retest Strategy Reference Implementation.
+
+    Trades breakouts from a 50-day high followed by a retest of the 10-day EMA
+    within 5 trading days with above-average volume confirmation.
+    """
+
+    params = (
+        ("ema_period", 10),
+        ("breakout_period", 50),
+        ("vol_period", 50),
+        ("retest_window", 5),
+        ("capital_pct", 0.02),
+        ("tp_pct", 0.10),
+    )
 
     def __init__(self):
-        # 10-period EMA: support level and dynamic stop
-        self.ema10 = bt.indicators.EMA(self.data.close, period=10)
-        # Highest HIGH over the 50 bars strictly BEFORE the current bar
-        # Using data.high(-1) delays the series by 1 so Highest(period=50)
-        # computes max(high[t-1], ..., high[t-50]) at bar t; minperiod = 51
-        self.breakout_level = bt.indicators.Highest(self.data.high(-1), period=50)
-        # 50-bar average volume for demand confirmation
-        self.avg_vol50 = bt.indicators.SMA(self.data.volume, period=50)
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.highest50 = bt.indicators.Highest(
+            self.data.high, period=self.p.breakout_period
+        )
+        self.vol_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.vol_period
+        )
 
         self.order = None
         self.entry_price = None
-        self.in_breakout_watch = False
-        self.breakout_bar = None
+        self.days_since_breakout = None
 
     def notify_order(self, order):
-        if order.status in [order.Completed]:
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
             if order.isbuy():
                 self.entry_price = order.executed.price
-            self.order = None
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.order = None
+            elif order.issell():
+                self.entry_price = None
+
+        self.order = None
 
     def next(self):
+        # Increment breakout tracker
+        if self.days_since_breakout is not None:
+            self.days_since_breakout += 1
+
+        # Breakout condition: close exceeds 50-day highest prior high
+        if self.data.close[0] > self.highest50[-1]:
+            self.days_since_breakout = 0
+
         if self.order:
             return
 
         if not self.position:
-            if not self.in_breakout_watch:
-                # Condition 1: today's close exceeds the highest HIGH of the prior 50 bars
-                if self.data.close[0] > self.breakout_level[0]:
-                    self.in_breakout_watch = True
-                    self.breakout_bar = len(self)
-            else:
-                bars_after = len(self) - self.breakout_bar
-                if bars_after > 5:
-                    # 5-day retest window expired; reset and look for new breakout
-                    self.in_breakout_watch = False
-                    self.breakout_bar = None
-                else:
-                    ema_val = self.ema10[0]
-                    # Retest: low touches or pierces EMA (pullback reached EMA)
-                    # but close is at or above EMA (did not close below it)
-                    # Demand: volume above 50-bar average
-                    if (self.data.low[0] <= ema_val
-                            and self.data.close[0] >= ema_val
-                            and self.data.volume[0] > self.avg_vol50[0]):
-                        size = int(0.02 * self.broker.getvalue() / self.data.close[0])
-                        if size > 0:
-                            self.order = self.buy(size=size)
-                        self.in_breakout_watch = False
-                        self.breakout_bar = None
+            # Retest window check (within 1 to 5 days after breakout)
+            if (
+                self.days_since_breakout is not None
+                and 1 <= self.days_since_breakout <= self.p.retest_window
+            ):
+                # Retest: price pulls back to 10-day EMA but does not close below it
+                retest = (self.data.low[0] <= self.ema[0]) and (
+                    self.data.close[0] >= self.ema[0]
+                )
+                # Demand confirmation: volume > 50-day average volume
+                demand = self.data.volume[0] > self.vol_sma[0]
+
+                if retest and demand:
+                    capital = self.broker.getvalue()
+                    size = int(
+                        (capital * self.p.capital_pct) / self.data.close[0]
+                    )
+                    if size > 0:
+                        self.order = self.buy(size=size)
+                        self.days_since_breakout = None
         else:
-            ema_val = self.ema10[0]
-            # Stop-loss: price closes below the 10-day EMA
-            if self.data.close[0] < ema_val:
-                self.order = self.close()
-            # Take-profit: 10% gain from entry price
-            elif (self.entry_price is not None
-                  and self.data.close[0] >= self.entry_price * 1.10):
+            # Exit condition 1: Stop-loss if price closes below 10-day EMA
+            stop_loss = self.data.close[0] < self.ema[0]
+
+            # Exit condition 2: Take-profit of 10% from entry price
+            take_profit = (self.entry_price is not None) and (
+                self.data.high[0] >= self.entry_price * (1.0 + self.p.tp_pct)
+            )
+
+            if stop_loss or take_profit:
                 self.order = self.close()
 ```
 
 ```json
-{"assumptions": [{"topic": "infeasible — sector/sub-industry filter", "choice": "Filter omitted; AAPL assumed to satisfy the technology-sector requirement.", "reason": "Only a single AAPL data feed is available. No sector metadata or peer universe exists to screen on cybersecurity/AI sub-industry. AAPL is a technology-sector stock, so the sector condition is treated as satisfied."}, {"topic": "infeasible — volatility filter (ATR > market average)", "choice": "Filter omitted entirely; no ATR indicator is instantiated for this purpose.", "reason": "No market-index or peer-basket data feed is available to compute a 'market average ATR'. Without a benchmark, the relative comparison is impossible. ATR(14) is not computed since there is nothing valid to compare it against."}, {"topic": "breakout level — 'highest price' definition", "choice": "Highest HIGH (not highest close) over the 50 bars strictly prior to the current bar.", "reason": "In technical analysis, a breakout level is canonically the highest peak (intraday high) resistance zone. The spec compares the day's close against this level; using highest HIGH is the standard interpretation. Implemented via Highest(self.data.high(-1), period=50) so the current bar's high is excluded, matching 'prior to the current day'."}, {"topic": "retest definition — 'price pulls back to EMA'", "choice": "Retest bar satisfies: low[0] <= EMA[0] AND close[0] >= EMA[0].", "reason": "The spec states price must pull back to the EMA but not close below it. 'Pulls back to' is interpreted as the bar's low touching or crossing the EMA intraday; 'must not close below it' is the explicit close condition. The demand confirmation clause ('touches or closes near the EMA') aligns with this reading."}, {"topic": "stop-loss — dynamic vs. fixed at entry EMA", "choice": "Dynamic trailing stop: close < current EMA(10) triggers exit on each bar.", "reason": "The exit conditions section explicitly states 'close below the 10-day EMA' without qualification. The risk management note ('stop-loss at EMA at time of entry') is treated as a description of where the stop sits at inception, not a fixed-price stop. A trailing EMA stop is consistent with both statements and is the standard application of this pattern."}, {"topic": "5-day retest window boundary", "choice": "Window covers bars 1 through 5 after the breakout bar (breakout day is bar 0, excluded).", "reason": "The spec says 'within the next 5 trading days after the breakout', where 'after' excludes the breakout day itself. bars_after = len(self) - self.breakout_bar; entry allowed when 1 <= bars_after <= 5."}, {"topic": "position sizing — '2% of total trading capital'", "choice": "size = floor(0.02 * broker.getvalue() / close[0]) shares.", "reason": "broker.getvalue() returns the current total portfolio value (cash + open positions). Dividing the 2% allocation by the current close gives the number of shares. Integer floor ensures no fractional shares."}, {"topic": "concurrent breakout signals during retest watch", "choice": "New breakout signals are ignored while an active 5-day retest watch is open.", "reason": "The spec defines one state machine step: breakout → retest → entry. No guidance is given for overlapping breakouts. Ignoring secondary signals until the current window resolves or expires is the simplest faithful reading."}]}
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Bypass sector and market volatility filters",
+      "reason": "The execution environment provides only single-asset OHLCV data (AAPL) without sector metadata or a market-wide index feed. AAPL is assumed to satisfy both the technology sector and volatility filter requirements."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Calculate share quantity as int((total_equity * 0.02) / current_close)",
+      "reason": "The specification dictates position size as 2% of total trading capital per trade."
+    },
+    {
+      "topic": "stop_loss_implementation",
+      "choice": "Close position when bar close is strictly below the current 10-day EMA",
+      "reason": "Condition 1 under Exiting explicitly states 'Close the position if price closes below the 10-day EMA'."
+    },
+    {
+      "topic": "take_profit_trigger",
+      "choice": "Trigger market close order when bar high reaches or exceeds 10% above entry price",
+      "reason": "Condition 2 under Exiting specifies closing upon reaching 10% profit from the entry price."
+    }
+  ]
+}
 ```

@@ -1,0 +1,148 @@
+```python
+import backtrader as bt
+
+
+class IntradayOptimizationStrategy(bt.Strategy):
+    params = (
+        ('ema_period', 20),
+        ('sma_period', 50),
+        ('rsi_period', 14),
+        ('rsi_entry_low', 40.0),
+        ('rsi_entry_high', 60.0),
+        ('rsi_exit_high', 70.0),
+        ('stop_loss_pct', 0.01),
+        ('take_profit_pct', 0.02),
+        ('position_size_pct', 0.02),
+        ('vol_mult', 1.20),
+        ('vol_sma_period', 20),
+    )
+
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.crossover = bt.indicators.CrossOver(self.ema20, self.sma50)
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+        self.entry_price = None
+
+        self.current_day = None
+        self.current_day_vol = 0.0
+        self.daily_volumes = []
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                stop_price = self.entry_price * (1.0 - self.p.stop_loss_pct)
+                limit_price = self.entry_price * (1.0 + self.p.take_profit_pct)
+                self.stop_order = self.sell(
+                    size=order.executed.size,
+                    exectype=bt.Order.Stop,
+                    price=stop_price
+                )
+                self.limit_order = self.sell(
+                    size=order.executed.size,
+                    exectype=bt.Order.Limit,
+                    price=limit_price,
+                    oco=self.stop_order
+                )
+                self.order = None
+            elif order.issell():
+                self.order = None
+                self.stop_order = None
+                self.limit_order = None
+                self.entry_price = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if self.order and order.ref == self.order.ref:
+                self.order = None
+            if self.stop_order and order.ref == self.stop_order.ref:
+                self.stop_order = None
+            if self.limit_order and order.ref == self.limit_order.ref:
+                self.limit_order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        vol = self.data.volume[0]
+
+        if self.current_day is None:
+            self.current_day = dt
+            self.current_day_vol = vol
+        elif dt != self.current_day:
+            self.daily_volumes.append(self.current_day_vol)
+            self.current_day = dt
+            self.current_day_vol = vol
+        else:
+            self.current_day_vol += vol
+
+        if self.order:
+            return
+
+        volume_ok = False
+        if len(self.daily_volumes) >= self.p.vol_sma_period:
+            avg_20d_vol = sum(self.daily_volumes[-self.p.vol_sma_period:]) / float(self.p.vol_sma_period)
+            prev_day_vol = self.daily_volumes[-1]
+            if prev_day_vol >= self.p.vol_mult * avg_20d_vol:
+                volume_ok = True
+
+        t = self.data.datetime.time(0)
+        time_in_mins = t.hour * 60 + t.minute
+
+        if not self.position:
+            entry_time_ok = (600 <= time_in_mins <= 870)
+            ema_cross_up = self.crossover[0] > 0
+            rsi_ok = (self.p.rsi_entry_low <= self.rsi[0] <= self.p.rsi_entry_high)
+
+            if ema_cross_up and rsi_ok and entry_time_ok and volume_ok:
+                value = self.broker.getvalue()
+                cash_to_use = value * self.p.position_size_pct
+                size = int(cash_to_use / self.data.close[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
+        else:
+            ema_cross_down = self.crossover[0] < 0
+            rsi_overbought = self.rsi[0] > self.p.rsi_exit_high
+            time_exit = time_in_mins >= 930
+
+            if ema_cross_down or rsi_overbought or time_exit:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                if self.limit_order:
+                    self.cancel(self.limit_order)
+                    self.limit_order = None
+                self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "daily_volume_filter",
+      "choice": "Compute daily volume using the total aggregated volume of the previous completed trading day and compare it to the 20-day simple moving average of previous completed trading days' volumes.",
+      "reason": "Intraday 5-minute bars cannot know the current day's full trading volume prior to market close. Using the completed previous trading day's volume and the prior 20 completed trading days' average volume avoids lookahead bias while faithfully implementing the daily volume regime filter."
+    },
+    {
+      "topic": "time_window_interpretation",
+      "choice": "Permit trade entries between 10:00 AM EST (inclusive) and 2:30 PM EST (inclusive), combining the 9:30 AM - 2:30 PM entry condition with the additional rule prohibiting entries in the first 30 minutes of trading (9:30-10:00 AM).",
+      "reason": "Restricting entries to 10:00 AM - 2:30 PM EST satisfies both the 9:30 AM to 2:30 PM specification and the explicit exclusion of the first 30 minutes of trading."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Calculate position size as int((account_value * 0.02) / current_close), representing position capital allocation equal to 2% of total portfolio value.",
+      "reason": "The specification states position size should be 2% of total account value per trade. Integer share allocation based on total account portfolio value satisfies this requirement directly."
+    },
+    {
+      "topic": "stop_loss_take_profit_execution",
+      "choice": "Place Backtrader OCO Stop and Limit orders based on the actual executed entry price immediately upon buy order completion.",
+      "reason": "SL at 1% below entry price and TP at 2% above entry price require the true executed entry price. Submitting OCO stop and limit orders upon execution provides exact intrabar execution at the mandated thresholds."
+    }
+  ]
+}
+```

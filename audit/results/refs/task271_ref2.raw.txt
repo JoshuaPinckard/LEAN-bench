@@ -1,0 +1,146 @@
+```python
+import math
+import backtrader as bt
+
+
+class SingleAssetBreakout(bt.Strategy):
+    params = (
+        ('vol_sma_short', 30),
+        ('vol_sma_long', 90),
+        ('atr_period', 14),
+        ('bb_period', 7),
+        ('bb_devfactor', 2.0),
+        ('tp_pct', 0.05),
+        ('sl_pct', 0.02),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.sma_vol30 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_short)
+        self.sma_vol90 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_long)
+        self.atr14 = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+
+        self.crossover_upper = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.crossover_lower = bt.indicators.CrossOver(self.bb.bot, self.data.close)
+
+        self.initial_capital = None
+        self.order = None
+        self.tp_order = None
+        self.sl_order = None
+
+    def start(self):
+        self.initial_capital = self.broker.get_cash()
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+            elif order == self.tp_order:
+                self.tp_order = None
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+            elif order == self.sl_order:
+                self.sl_order = None
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.tp_order:
+                self.tp_order = None
+            if order == self.sl_order:
+                self.sl_order = None
+
+    def next(self):
+        # Exit condition: Close below Lower Bollinger Band
+        if self.position:
+            if self.crossover_lower[0] > 0:
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+                self.close()
+            return
+
+        # Do not issue new entry if an order is pending
+        if self.order is not None:
+            return
+
+        # Filter 1: Entry allowed on Monday, Wednesday, Friday only
+        current_weekday = self.data.datetime.date(0).weekday()
+        if current_weekday not in (0, 2, 4):
+            return
+
+        # Filter 2a: Volume filter
+        if not (self.data.volume[0] > self.sma_vol30[0] > self.sma_vol90[0]):
+            return
+
+        # Filter 2b: 7-day return filter [-10%, +20%]
+        ret7 = (self.data.close[0] / self.data.close[-7]) - 1.0
+        if not (-0.10 <= ret7 <= 0.20):
+            return
+
+        # Filter 2c: Volatility filter ATR(14)/Close > 1%
+        if (self.atr14[0] / self.data.close[0]) <= 0.01:
+            return
+
+        # Entry Signal: CrossOver(Close, UpperBand)
+        if self.crossover_upper[0] <= 0:
+            return
+
+        # Position Sizing
+        entry_price = self.data.close[0]
+        denom = entry_price * self.p.sl_pct
+        if denom == 0:
+            return
+
+        size = math.floor((self.initial_capital * self.p.risk_pct) / denom)
+        if size <= 0:
+            return
+
+        # Bracket Order Generation (+5% TP, -2% SL)
+        limit_price = entry_price * (1.0 + self.p.tp_pct)
+        stop_price = entry_price * (1.0 - self.p.sl_pct)
+
+        orders = self.buy_bracket(
+            size=size,
+            limitprice=limit_price,
+            stopprice=stop_price
+        )
+        self.order = orders[0]
+        self.tp_order = orders[1]
+        self.sl_order = orders[2]
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_price_for_sizing",
+      "choice": "Use signal bar close price (self.data.close[0]) as EntryPrice for size and bracket price calculation.",
+      "reason": "The exact entry price for market execution is not known at signal calculation time; close price serves as the deterministic reference."
+    },
+    {
+      "topic": "trading_days_filter",
+      "choice": "Apply Monday/Wednesday/Friday rule specifically to new trade entry evaluation.",
+      "reason": "Position exits via bracket limits/stops or lower band crossover execute when conditions trigger regardless of day of week."
+    },
+    {
+      "topic": "initial_capital_reinvestment",
+      "choice": "Capture initial cash balance at strategy start() and use it for all fixed risk size calculations.",
+      "reason": "Specification explicitly disables reinvestment and mandates using initial capital across all trade calculations."
+    }
+  ]
+}
+```

@@ -1,0 +1,377 @@
+```python
+import backtrader as bt
+
+
+class ORBStrategy(bt.Strategy):
+    params = (
+        ("orb_mins", 60),
+        ("k_atr", 0.5),
+        ("risk_pct", 0.01),
+        ("atr_mult", 1.5),
+    )
+
+    def __init__(self):
+        self.ema = bt.indicators.EMA(self.data.close, period=21)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.current_date = None
+
+        # Daily state variables
+        self.orh = None
+        self.orl = None
+        self.r = None
+        self.orb_complete = False
+        self.orb_valid = False
+        self.orb_breakout_long = False
+        self.orb_breakout_short = False
+        self.orb_breakout_before_12 = False
+
+        self.long_trades_today = 0
+        self.short_trades_today = 0
+        self.morning_trade_closed_at_loss = False
+
+        self.bounce_bar_high = None
+        self.bounce_bar_low = None
+
+        # Active trade tracking
+        self.entry_price = None
+        self.sl_price = None
+        self.tp_price = None
+        self.trailing_active = False
+        self.trailing_stop = None
+        self.highest_since_entry = None
+        self.lowest_since_entry = None
+        self.trade_entry_time = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                if self.position.size > 0:
+                    self.entry_price = order.executed.price
+                    self.highest_since_entry = self.entry_price
+            elif order.issell():
+                if self.position.size < 0:
+                    self.entry_price = order.executed.price
+                    self.lowest_since_entry = self.entry_price
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            if trade.pnlcomm < 0:
+                if (
+                    self.trade_entry_time is not None
+                    and self.trade_entry_time.hour < 13
+                    or (
+                        self.trade_entry_time.hour == 13
+                        and self.trade_entry_time.minute < 30
+                    )
+                ):
+                    self.morning_trade_closed_at_loss = True
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        date = dt.date()
+        time = dt.time()
+
+        # Day rollover reset
+        if self.current_date != date:
+            self.current_date = date
+            self.orh = None
+            self.orl = None
+            self.r = None
+            self.orb_complete = False
+            self.orb_valid = False
+            self.orb_breakout_long = False
+            self.orb_breakout_short = False
+            self.orb_breakout_before_12 = False
+            self.long_trades_today = 0
+            self.short_trades_today = 0
+            self.morning_trade_closed_at_loss = False
+            self.bounce_bar_high = None
+            self.bounce_bar_low = None
+
+        session_start = dt.replace(
+            hour=9, minute=30, second=0, microsecond=0
+        ).time()
+        window_end = dt.replace(
+            hour=10, minute=30, second=0, microsecond=0
+        ).time()
+        cutoff_12 = dt.replace(
+            hour=12, minute=0, second=0, microsecond=0
+        ).time()
+        timeout_time = dt.replace(
+            hour=15, minute=30, second=0, microsecond=0
+        ).time()
+
+        # 1. ORB Window Collection
+        if time >= session_start and time < window_end:
+            if self.orh is None:
+                self.orh = self.data.high[0]
+                self.orl = self.data.low[0]
+            else:
+                self.orh = max(self.orh, self.data.high[0])
+                self.orl = min(self.orl, self.data.low[0])
+
+        if time >= window_end and not self.orb_complete:
+            self.orb_complete = True
+            if self.orh is not None and self.orl is not None:
+                self.r = self.orh - self.orl
+                if self.atr[0] > 0 and self.r >= self.p.k_atr * self.atr[0]:
+                    self.orb_valid = True
+                else:
+                    self.orb_valid = False
+
+        # Track breakout before 12:00
+        if self.orb_complete and time <= cutoff_12:
+            if self.data.high[0] > self.orh:
+                self.orb_breakout_long = True
+                self.orb_breakout_before_12 = True
+            if self.data.low[0] < self.orl:
+                self.orb_breakout_short = True
+                self.orb_breakout_before_12 = True
+
+        # 2. Position Management & Exit Check
+        if self.position:
+            if self.position.size > 0:
+                if self.highest_since_entry is None:
+                    self.highest_since_entry = self.data.high[0]
+                else:
+                    self.highest_since_entry = max(
+                        self.highest_since_entry, self.data.high[0]
+                    )
+
+                if not self.trailing_active and self.entry_price and self.r:
+                    if (
+                        self.highest_since_entry
+                        >= self.entry_price + 1.0 * self.r
+                    ):
+                        self.trailing_active = True
+                        self.trailing_stop = (
+                            self.highest_since_entry
+                            - self.p.atr_mult * self.atr[0]
+                        )
+
+                if self.trailing_active:
+                    new_stop = (
+                        self.highest_since_entry - self.p.atr_mult * self.atr[0]
+                    )
+                    self.trailing_stop = max(self.trailing_stop, new_stop)
+
+                hit_tp = (
+                    self.tp_price is not None
+                    and self.data.high[0] >= self.tp_price
+                )
+                hit_sl = (
+                    self.sl_price is not None
+                    and self.data.low[0] <= self.sl_price
+                )
+                hit_trail = (
+                    self.trailing_active
+                    and self.data.low[0] <= self.trailing_stop
+                )
+                time_out = time >= timeout_time
+
+                if hit_tp or hit_sl or hit_trail or time_out:
+                    self.close()
+                    return
+
+            elif self.position.size < 0:
+                if self.lowest_since_entry is None:
+                    self.lowest_since_entry = self.data.low[0]
+                else:
+                    self.lowest_since_entry = min(
+                        self.lowest_since_entry, self.data.low[0]
+                    )
+
+                if not self.trailing_active and self.entry_price and self.r:
+                    if (
+                        self.lowest_since_entry
+                        <= self.entry_price - 1.0 * self.r
+                    ):
+                        self.trailing_active = True
+                        self.trailing_stop = (
+                            self.lowest_since_entry
+                            + self.p.atr_mult * self.atr[0]
+                        )
+
+                if self.trailing_active:
+                    new_stop = (
+                        self.lowest_since_entry + self.p.atr_mult * self.atr[0]
+                    )
+                    self.trailing_stop = min(self.trailing_stop, new_stop)
+
+                hit_tp = (
+                    self.tp_price is not None
+                    and self.data.low[0] <= self.tp_price
+                )
+                hit_sl = (
+                    self.sl_price is not None
+                    and self.data.high[0] >= self.sl_price
+                )
+                hit_trail = (
+                    self.trailing_active
+                    and self.data.high[0] >= self.trailing_stop
+                )
+                time_out = time >= timeout_time
+
+                if hit_tp or hit_sl or hit_trail or time_out:
+                    self.close()
+                    return
+
+            return
+
+        # 3. Entry Logic
+        if self.order:
+            return
+
+        if (
+            not self.orb_complete
+            or not self.orb_valid
+            or not self.orb_breakout_before_12
+        ):
+            return
+
+        if time >= timeout_time:
+            return
+
+        fib_382 = self.orl + 0.382 * self.r
+        fib_618 = self.orl + 0.618 * self.r
+
+        close = self.data.close[0]
+        open_p = self.data.open[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        ema_val = self.ema[0]
+        bb_mid = self.bb.lines.mid[0]
+        rsi_val = self.rsi[0]
+
+        bb_width_curr = self.bb.lines.top[0] - self.bb.lines.bot[0]
+        bb_width_prev = self.bb.lines.top[-1] - self.bb.lines.bot[-1]
+
+        ny_start = dt.replace(hour=13, minute=30, second=0, microsecond=0).time()
+        is_ny_session = time >= ny_start
+
+        # LONG ENTRY
+        if self.orb_breakout_long and self.long_trades_today < 1:
+            is_pullback = (low <= fib_618) and (high >= fib_382)
+            is_bounce = close > open_p
+            trend_confirm = (
+                (close > ema_val) and (close > bb_mid) and (rsi_val > 50)
+            )
+
+            crossover_up = (self.data.close[-1] <= self.ema[-1]) and (
+                close > ema_val
+            )
+
+            if is_pullback and is_bounce and trend_confirm:
+                self.bounce_bar_high = high
+
+            trigger_long = False
+            if trend_confirm:
+                if is_pullback and is_bounce and crossover_up:
+                    trigger_long = True
+                elif (
+                    self.bounce_bar_high is not None
+                    and high > self.bounce_bar_high
+                ):
+                    trigger_long = True
+
+            if trigger_long:
+                q = 0
+                if rsi_val >= 55:
+                    q += 1
+                if bb_width_curr > bb_width_prev:
+                    q += 1
+                if self.ema[0] > self.ema[-1]:
+                    q += 1
+
+                if is_ny_session and self.morning_trade_closed_at_loss:
+                    tp_mult = 1.5
+                else:
+                    tp_mult = 1.5 if q >= 2 else 1.0
+
+                sl = self.orl
+                risk_per_share = close - sl
+                if risk_per_share > 0:
+                    equity = self.broker.getvalue()
+                    size = int((self.p.risk_pct * equity) / risk_per_share)
+                    if size > 0:
+                        self.sl_price = sl
+                        self.tp_price = close + tp_mult * self.r
+                        self.trailing_active = False
+                        self.trailing_stop = None
+                        self.highest_since_entry = close
+                        self.trade_entry_time = time
+                        self.order = self.buy(size=size)
+                        self.long_trades_today += 1
+                        self.bounce_bar_high = None
+                        return
+
+        # SHORT ENTRY
+        if self.orb_breakout_short and self.short_trades_today < 1:
+            is_pullback = (high >= fib_382) and (low <= fib_618)
+            is_bounce = close < open_p
+            trend_confirm = (
+                (close < ema_val) and (close < bb_mid) and (rsi_val < 50)
+            )
+
+            crossover_down = (self.data.close[-1] >= self.ema[-1]) and (
+                close < ema_val
+            )
+
+            if is_pullback and is_bounce and trend_confirm:
+                self.bounce_bar_low = low
+
+            trigger_short = False
+            if trend_confirm:
+                if is_pullback and is_bounce and crossover_down:
+                    trigger_short = True
+                elif (
+                    self.bounce_bar_low is not None
+                    and low < self.bounce_bar_low
+                ):
+                    trigger_short = True
+
+            if trigger_short:
+                q = 0
+                if rsi_val <= 45:
+                    q += 1
+                if bb_width_curr > bb_width_prev:
+                    q += 1
+                if self.ema[0] < self.ema[-1]:
+                    q += 1
+
+                if is_ny_session and self.morning_trade_closed_at_loss:
+                    tp_mult = 1.5
+                else:
+                    tp_mult = 1.5 if q >= 2 else 1.0
+
+                sl = self.orh
+                risk_per_share = sl - close
+                if risk_per_share > 0:
+                    equity = self.broker.getvalue()
+                    size = int((self.p.risk_pct * equity) / risk_per_share)
+                    if size > 0:
+                        self.sl_price = sl
+                        self.tp_price = close - tp_mult * self.r
+                        self.trailing_active = False
+                        self.trailing_stop = None
+                        self.lowest_since_entry = close
+                        self.trade_entry_time = time
+                        self.order = self.sell(size=size)
+                        self.short_trades_today += 1
+                        self.bounce_bar_low = None
+                        return
+```
+```json
+{"assumptions": [{"topic": "session_hours", "choice": "Main session assumed from 09:30 to 16:00 EST with ORB window defined as 09:30-10:30 (first 60 mins).", "reason": "Standard US equities trading hours fit the 5-minute bar dataset context."}, {"topic": "fib_pullback_definition", "choice": "Defined pullback to Fib zone as bar intersecting range [ORL + 0.382*R, ORL + 0.618*R] with close > open (long) or close < open (short).", "reason": "Literal translation of bounce bar occurring within/from the Fib range specified."}, {"topic": "atr_trailing_multiplier", "choice": "Set ATR trailing stop multiplier to 1.5.", "reason": "Spec states multiplier range 1.0–1.5; 1.5 provides conservative trailing protection."}, {"topic": "morning_trade_definition", "choice": "Defined morning trade as any trade entered before 13:30.", "reason": "Aligns with the specification separating London/morning window (<12:00 / early day) from New York afternoon window (after 13:30)."}]}
+```

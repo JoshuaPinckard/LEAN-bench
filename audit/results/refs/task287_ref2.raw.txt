@@ -1,0 +1,205 @@
+```python
+import backtrader as bt
+
+
+class SwingTrendStrategy(bt.Strategy):
+    params = dict(
+        sma_fast=50,
+        sma_slow=200,
+        sma_vol=20,
+        atr_period=14,
+        sma_atr=50,
+        pullback_lookback=20,
+        sl_lookback=20,
+        tp_lookback=30,
+        risk_pct=0.01,
+        max_sl_pct=0.05,
+        be_trigger_r=1.5,
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_fast)
+        self.sma200 = bt.indicators.SMA(
+            self.data.close, period=self.p.sma_slow
+        )
+        self.sma_vol = bt.indicators.SMA(
+            self.data.volume, period=self.p.sma_vol
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_atr = bt.indicators.SMA(self.atr, period=self.p.sma_atr)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma50)
+
+        self.order = None
+        self.entry_price = None
+        self.pending_sl = None
+        self.pending_tp = None
+        self.current_sl = None
+        self.tp_price = None
+        self.R = None
+        self.be_triggered = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.order == order:
+                self.entry_price = order.executed.price
+                if order.isbuy():
+                    self.R = max(self.entry_price - self.pending_sl, 1e-5)
+                else:
+                    self.R = max(self.pending_sl - self.entry_price, 1e-5)
+                self.current_sl = self.pending_sl
+                self.tp_price = self.pending_tp
+                self.be_triggered = False
+
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if self.order == order:
+                self.order = None
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        # Manage open position exits
+        if self.position.size != 0:
+            if self.position.size > 0:
+                # Long breakeven trailing check
+                if not self.be_triggered and self.R is not None:
+                    if (
+                        self.data.high[0]
+                        >= self.entry_price + self.p.be_trigger_r * self.R
+                    ):
+                        self.be_triggered = True
+                        self.current_sl = max(
+                            self.current_sl, self.entry_price
+                        )
+
+                # Check Stop-Loss
+                if self.data.low[0] <= self.current_sl:
+                    self.order = self.close()
+                    return
+
+                # Check Take-Profit
+                if self.data.high[0] >= self.tp_price:
+                    self.order = self.close()
+                    return
+
+            elif self.position.size < 0:
+                # Short breakeven trailing check
+                if not self.be_triggered and self.R is not None:
+                    if (
+                        self.data.low[0]
+                        <= self.entry_price - self.p.be_trigger_r * self.R
+                    ):
+                        self.be_triggered = True
+                        self.current_sl = min(
+                            self.current_sl, self.entry_price
+                        )
+
+                # Check Stop-Loss
+                if self.data.high[0] >= self.current_sl:
+                    self.order = self.close()
+                    return
+
+                # Check Take-Profit
+                if self.data.low[0] <= self.tp_price:
+                    self.order = self.close()
+                    return
+
+            return
+
+        # Reset exit parameters when out of position
+        self.entry_price = None
+        self.current_sl = None
+        self.tp_price = None
+        self.R = None
+        self.be_triggered = False
+
+        # Filters common to both long and short
+        vol_confirm = self.data.volume[0] >= 1.5 * self.sma_vol[0]
+        volatility_confirm = self.atr[0] > self.sma_atr[0]
+
+        if not (vol_confirm and volatility_confirm):
+            return
+
+        # Long entry logic
+        trend_long = self.data.close[0] > self.sma200[0]
+        pullback_long = (self.crossover[0] > 0) and any(
+            self.data.close[-i] < self.sma50[-i]
+            for i in range(1, self.p.pullback_lookback + 1)
+        )
+
+        if trend_long and pullback_long:
+            sl_price = min(
+                self.data.low[-i] for i in range(1, self.p.sl_lookback + 1)
+            )
+            dist = self.data.close[0] - sl_price
+            if dist > 0 and (dist / self.data.close[0]) <= self.p.max_sl_pct:
+                tp_price = max(
+                    self.data.high[-i] for i in range(1, self.p.tp_lookback + 1)
+                )
+                allowed_risk = self.broker.getvalue() * self.p.risk_pct
+                size = int(allowed_risk / dist)
+                if size > 0:
+                    self.pending_sl = sl_price
+                    self.pending_tp = tp_price
+                    self.order = self.buy(size=size)
+            return
+
+        # Short entry logic
+        trend_short = self.data.close[0] < self.sma200[0]
+        pullback_short = (self.crossover[0] < 0) and any(
+            self.data.close[-i] > self.sma50[-i]
+            for i in range(1, self.p.pullback_lookback + 1)
+        )
+
+        if trend_short and pullback_short:
+            sl_price = max(
+                self.data.high[-i] for i in range(1, self.p.sl_lookback + 1)
+            )
+            dist = sl_price - self.data.close[0]
+            if dist > 0 and (dist / self.data.close[0]) <= self.p.max_sl_pct:
+                tp_price = min(
+                    self.data.low[-i] for i in range(1, self.p.tp_lookback + 1)
+                )
+                allowed_risk = self.broker.getvalue() * self.p.risk_pct
+                size = int(allowed_risk / dist)
+                if size > 0:
+                    self.pending_sl = sl_price
+                    self.pending_tp = tp_price
+                    self.order = self.sell(size=size)
+            return
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "risk_percentage",
+      "choice": "1% of total portfolio value (0.01)",
+      "reason": "Spec states 'risk 1–2% of capital per trade'; 1% chosen within the specified range."
+    },
+    {
+      "topic": "pullback_lookback",
+      "choice": "Lookback window of 20 bars prior to crossover (bars -20 to -1)",
+      "reason": "Spec states 'first the price was below SMA(50) in the last 10–20 bars'. Checking if close was on the opposite side of SMA(50) within the prior 20 bars."
+    },
+    {
+      "topic": "swing_tp_lookback",
+      "choice": "30 bars lookback prior to current bar (bars -30 to -1)",
+      "reason": "Spec specifies 'previous high over 20–30 bars' for long and low for short. The prior 30 bars window was selected to cover this period."
+    },
+    {
+      "topic": "exit_execution",
+      "choice": "Exits and breakeven adjustment evaluated in next() via High/Low price checks, issuing market close orders when hit",
+      "reason": "Ensures precise evaluation of SL, TP, and 1.5R breakeven targets without edge cases from multi-leg OCO order cancellations in Backtrader."
+    }
+  ]
+}
+```

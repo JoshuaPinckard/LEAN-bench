@@ -1,0 +1,172 @@
+```python
+import backtrader as bt
+
+
+class ScalpingStrategy(bt.Strategy):
+    params = (
+        ('symbol', 'SNAP'),
+        ('atr_threshold', 0.03),
+        ('volume_ma_threshold', 0.0),
+        ('pdt_rule', False),
+        ('stake', 100),
+    )
+
+    def __init__(self):
+        self.stoch = bt.indicators.Stochastic(
+            self.data, period=5, period_dfast=3, period_dslow=3
+        )
+        self.stoch_crossover = bt.indicators.CrossOver(
+            self.stoch.percK, self.stoch.percD
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=3)
+        self.sma_vol = bt.indicators.SMA(self.data.volume, period=20)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.tp_order = None
+        self.sl_order = None
+        self.entry_price = 0.0
+        self.entry_bar = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                if self.position.size != 0:
+                    self.entry_price = order.executed.price
+                    self.entry_bar = len(self)
+                    size = abs(self.position.size)
+                    if self.position.size > 0:
+                        self.tp_order = self.sell(
+                            size=size,
+                            exectype=bt.Order.Limit,
+                            price=self.entry_price + 0.01,
+                        )
+                        self.sl_order = self.sell(
+                            size=size,
+                            exectype=bt.Order.Stop,
+                            price=self.entry_price - 0.02,
+                        )
+                    elif self.position.size < 0:
+                        self.tp_order = self.buy(
+                            size=size,
+                            exectype=bt.Order.Limit,
+                            price=self.entry_price - 0.01,
+                        )
+                        self.sl_order = self.buy(
+                            size=size,
+                            exectype=bt.Order.Stop,
+                            price=self.entry_price + 0.02,
+                        )
+            elif order == self.tp_order:
+                self.tp_order = None
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+            elif order == self.sl_order:
+                self.sl_order = None
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.tp_order:
+                self.tp_order = None
+            if order == self.sl_order:
+                self.sl_order = None
+
+    def next(self):
+        if not self.position:
+            if self.order is not None:
+                return
+
+            dt = self.data.datetime.datetime(0)
+            t_num = dt.hour * 60 + dt.minute
+            session_valid = 573 <= t_num <= 960
+
+            liquidity_valid = self.sma_vol[0] > self.p.volume_ma_threshold
+            pdt_valid = (not self.p.pdt_rule) or (self.broker.getvalue() > 25000)
+
+            if not (session_valid and liquidity_valid and pdt_valid):
+                return
+
+            size = min(max(self.p.stake, 100), 500)
+
+            long_cond = (
+                (self.stoch_crossover[0] > 0)
+                and (self.stoch.percK[0] > 80)
+                and (self.rsi[0] > 55)
+                and (self.data.volume[0] > 1.2 * self.sma_vol[0])
+                and (self.atr[0] >= self.p.atr_threshold)
+            )
+
+            short_cond = (
+                (self.stoch_crossover[0] < 0)
+                and (self.stoch.percK[0] < 20)
+                and (self.rsi[0] < 45)
+                and (self.data.volume[0] > 1.2 * self.sma_vol[0])
+                and (self.atr[0] >= self.p.atr_threshold)
+            )
+
+            if long_cond:
+                self.order = self.buy(size=size)
+            elif short_cond:
+                self.order = self.sell(size=size)
+
+        else:
+            if self.order is not None:
+                return
+
+            bars_held = len(self) - self.entry_bar
+
+            if self.position.size > 0:
+                reversal = (self.stoch_crossover[0] < 0) or (self.stoch.percK[0] < 50)
+                timeout = bars_held >= 3
+                if reversal or timeout:
+                    if self.tp_order:
+                        self.cancel(self.tp_order)
+                        self.tp_order = None
+                    if self.sl_order:
+                        self.cancel(self.sl_order)
+                        self.sl_order = None
+                    self.order = self.close()
+
+            elif self.position.size < 0:
+                reversal = (self.stoch_crossover[0] > 0) or (self.stoch.percK[0] > 50)
+                timeout = bars_held >= 3
+                if reversal or timeout:
+                    if self.tp_order:
+                        self.cancel(self.tp_order)
+                        self.tp_order = None
+                    if self.sl_order:
+                        self.cancel(self.sl_order)
+                        self.sl_order = None
+                    self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "session_hours",
+      "choice": "Main session defined as 09:30 to 16:00 ET; skipping the first 3 minutes restricts entry times to 09:33 through 16:00 ET.",
+      "reason": "Standard US equity market hours are 09:30 to 16:00 ET; skipping 3 minutes means trades start at 09:33."
+    },
+    {
+      "topic": "bracket_execution",
+      "choice": "Take-profit (+0.01) and Stop-loss (-0.02) orders are submitted as Limit and Stop orders upon entry order completion, while signal reversal and 3-bar timeout are checked dynamically in next().",
+      "reason": "Limit and Stop orders allow exact intra-bar execution matching price limits, while dynamic conditions cancel active bracket exit orders and close market on signal reversal or timeout."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position size is specified by parameter 'stake' with default 100, clamped between 100 and 500 shares.",
+      "reason": "Matches the specification requiring position size from 100 to 500 shares."
+    }
+  ]
+}
+```

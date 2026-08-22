@@ -1,0 +1,194 @@
+```python
+import math
+import backtrader as bt
+
+
+class SimpleMLP:
+    """Multi-Layer Perceptron classifier implemented in pure Python."""
+
+    def __init__(self, input_dim=3, hidden_dim=8, output_dim=3):
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+
+        # Deterministic weight initialization
+        self.W1 = [
+            [math.sin(i * input_dim + j + 1) * 0.1 for j in range(input_dim)]
+            for i in range(hidden_dim)
+        ]
+        self.b1 = [0.0 for _ in range(hidden_dim)]
+
+        self.W2 = [
+            [math.cos(k * hidden_dim + i + 1) * 0.1 for i in range(hidden_dim)]
+            for k in range(output_dim)
+        ]
+        self.b2 = [0.0 for _ in range(output_dim)]
+
+    def forward(self, x):
+        # Hidden layer with ReLU
+        z1 = [
+            self.b1[i] + sum(self.W1[i][j] * x[j] for j in range(self.input_dim))
+            for i in range(self.hidden_dim)
+        ]
+        a1 = [max(0.0, val) for val in z1]
+
+        # Output layer
+        z2 = [
+            self.b2[k] + sum(self.W2[k][i] * a1[i] for i in range(self.hidden_dim))
+            for k in range(self.output_dim)
+        ]
+
+        # Softmax
+        max_z2 = max(z2)
+        exps = [math.exp(val - max_z2) for val in z2]
+        sum_exps = sum(exps)
+        probs = [val / sum_exps for val in exps]
+
+        return z1, a1, z2, probs
+
+    def train(self, X, Y, epochs=50, lr=0.01):
+        for _ in range(epochs):
+            for x, y_idx in zip(X, Y):
+                y = [1.0 if k == y_idx else 0.0 for k in range(self.output_dim)]
+
+                z1, a1, z2, probs = self.forward(x)
+
+                dz2 = [probs[k] - y[k] for k in range(self.output_dim)]
+
+                dW2 = [
+                    [dz2[k] * a1[i] for i in range(self.hidden_dim)]
+                    for k in range(self.output_dim)
+                ]
+                db2 = [dz2[k] for k in range(self.output_dim)]
+
+                da1 = [
+                    sum(self.W2[k][i] * dz2[k] for k in range(self.output_dim))
+                    for i in range(self.hidden_dim)
+                ]
+                dz1 = [da1[i] if z1[i] > 0 else 0.0 for i in range(self.hidden_dim)]
+
+                dW1 = [
+                    [dz1[i] * x[j] for j in range(self.input_dim)]
+                    for i in range(self.hidden_dim)
+                ]
+                db1 = [dz1[i] for i in range(self.hidden_dim)]
+
+                for k in range(self.output_dim):
+                    for i in range(self.hidden_dim):
+                        self.W2[k][i] -= lr * dW2[k][i]
+                    self.b2[k] -= lr * db2[k]
+
+                for i in range(self.hidden_dim):
+                    for j in range(self.input_dim):
+                        self.W1[i][j] -= lr * dW1[i][j]
+                    self.b1[i] -= lr * db1[i]
+
+    def predict(self, x):
+        _, _, _, probs = self.forward(x)
+        max_p = -1.0
+        best_class = 2
+        for k in range(self.output_dim):
+            if probs[k] > max_p:
+                max_p = probs[k]
+                best_class = k
+        return best_class
+
+
+class NeuralNetworkClassifierStrategy(bt.Strategy):
+    """
+    Trading Strategy based on a Neural Network Classifier.
+    Uses Open Price, RSI(14), and Williams %R(14) to classify market states into BUY, SELL, or HOLD.
+    Model is trained on the first 2 years (504 daily bars) of historical data.
+    """
+
+    def __init__(self):
+        self.order = None
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.willr = bt.indicators.WilliamsR(self.data, period=14)
+
+        self.nn = SimpleMLP(input_dim=3, hidden_dim=8, output_dim=3)
+        self.train_data_x = []
+        self.train_data_y = []
+        self.trained = False
+        self.train_period = 504  # ~2 years of trading days
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if math.isnan(self.rsi[0]) or math.isnan(self.willr[0]):
+            return
+
+        # Feature preparation
+        f1_rsi = self.rsi[0] / 100.0
+        f2_willr = (self.willr[0] + 100.0) / 100.0
+        f3_open_ret = (
+            (self.data.open[0] - self.data.open[-1]) / self.data.open[-1]
+            if len(self) > 1
+            else 0.0
+        )
+        features = [f1_rsi, f2_willr, f3_open_ret]
+
+        # Training data collection during initial 2 years
+        if not self.trained:
+            ret = (self.data.close[0] - self.data.open[0]) / self.data.open[0]
+            label = 0 if ret > 0.001 else (1 if ret < -0.001 else 2)
+            self.train_data_x.append(features)
+            self.train_data_y.append(label)
+
+            if len(self) >= self.train_period:
+                self.nn.train(self.train_data_x, self.train_data_y, epochs=50, lr=0.01)
+                self.trained = True
+            return
+
+        if self.order:
+            return
+
+        pred = self.nn.predict(features)
+        signal = "BUY" if pred == 0 else ("SELL" if pred == 1 else "HOLD")
+
+        pos_size = self.position.size
+
+        if pos_size > 0:  # Currently Long
+            if signal in ["SELL", "HOLD"]:
+                self.order = self.close()
+        elif pos_size < 0:  # Currently Short
+            if signal in ["BUY", "HOLD"]:
+                self.order = self.close()
+        else:  # Currently Flat
+            if signal == "BUY":
+                cash = self.broker.getcash()
+                size = int(cash / self.data.close[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
+            elif signal == "SELL":
+                cash = self.broker.getcash()
+                size = int(cash / self.data.close[0])
+                if size > 0:
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "Neural Network Implementation & Training",
+      "choice": "Implemented a 2-layer Multi-Layer Perceptron (3 inputs, 8 hidden ReLU neurons, 3 softmax outputs) trained via SGD for 50 epochs on the first 504 bars (2 years) of data.",
+      "reason": "The specification requires a neural network classifier using 2 years of historical data to categorize market states into BUY, SELL, and HOLD."
+    },
+    {
+      "topic": "Target Labeling for Training Data",
+      "choice": "Assigned BUY (class 0) for current intraday return > 0.1%, SELL (class 1) for return < -0.1%, and HOLD (class 2) otherwise.",
+      "reason": "The specification requires training a 3-class classifier without explicitly defining the label threshold."
+    },
+    {
+      "topic": "Feature Normalization",
+      "choice": "Normalized RSI by 100, Williams %R to [0,1], and Open price to 1-period percentage change.",
+      "reason": "Raw Open price is non-stationary over multi-year periods, so percentage returns ensure stable feature inputs for the neural network."
+    }
+  ]
+}
+```

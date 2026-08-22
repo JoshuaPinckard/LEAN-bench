@@ -1,0 +1,181 @@
+```python
+import backtrader as bt
+
+
+class TrendlineBreakoutStrategy(bt.Strategy):
+    params = (
+        ('N', 5),             # Pivot window size
+        ('M', 10),            # Active trendline unbroken window
+        ('cushion', 10.0),    # SL cushion distance in points
+        ('risk_pct', 0.01),   # 1% capital risk per position
+        ('vol_atr_short', 10),
+        ('vol_atr_long', 50),
+        ('vol_mult', 1.5),
+        ('vol_sma_len', 10),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.local_lows = []   # List of (bar_index, price)
+        self.local_highs = []  # List of (bar_index, price)
+
+        # Indicators
+        self.atr_short = bt.indicators.ATR(self.data, period=self.p.vol_atr_short)
+        self.atr_long = bt.indicators.ATR(self.data, period=self.p.vol_atr_long)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_len)
+
+        self.sl_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        current_bar = len(self) - 1
+        N = self.p.N
+
+        # Detect local extremums at bar -N
+        if len(self) >= 2 * N + 1:
+            low_val = self.data.low[-N]
+            window_lows = [self.data.low[-N + j] for j in range(-N, N + 1)]
+            if low_val == min(window_lows):
+                idx = current_bar - N
+                if not self.local_lows or self.local_lows[-1][0] != idx:
+                    self.local_lows.append((idx, low_val))
+
+            high_val = self.data.high[-N]
+            window_highs = [self.data.high[-N + j] for j in range(-N, N + 1)]
+            if high_val == max(window_highs):
+                idx = current_bar - N
+                if not self.local_highs or self.local_highs[-1][0] != idx:
+                    self.local_highs.append((idx, high_val))
+
+        # Manage existing position (Trailing Stop & SL/TP exits)
+        if self.position:
+            if self.position.size > 0:  # Long
+                if self.local_lows:
+                    latest_low_idx, latest_low_val = self.local_lows[-1]
+                    new_sl = latest_low_val - self.p.cushion
+                    if new_sl > self.sl_price:
+                        self.sl_price = new_sl
+
+                if self.data.low[0] <= self.sl_price or self.data.high[0] >= self.tp_price:
+                    self.close()
+                    return
+            else:  # Short
+                if self.local_highs:
+                    latest_high_idx, latest_high_val = self.local_highs[-1]
+                    new_sl = latest_high_val + self.p.cushion
+                    if new_sl < self.sl_price:
+                        self.sl_price = new_sl
+
+                if self.data.high[0] >= self.sl_price or self.data.low[0] <= self.tp_price:
+                    self.close()
+                    return
+
+            return
+
+        # Volatility Filter
+        if self.atr_short[0] > self.p.vol_mult * self.atr_long[0]:
+            return
+
+        # Volume Filter
+        if self.data.volume[0] <= self.vol_sma[0]:
+            return
+
+        # Check Long Entry Condition (Ascending trendline through last two local lows)
+        if len(self.local_lows) >= 2:
+            t1, y1 = self.local_lows[-2]
+            t2, y2 = self.local_lows[-1]
+            if y2 > y1 and (current_bar - t2) >= 1:
+                slope = (y2 - y1) / (t2 - t1)
+                M = min(self.p.M, current_bar - t2)
+                active = True
+                for i in range(1, M + 1):
+                    bar_i = current_bar - i
+                    line_y = y1 + slope * (bar_i - t1)
+                    if self.data.low[-i] < line_y:
+                        active = False
+                        break
+
+                line_curr = y1 + slope * (current_bar - t1)
+                if active and self.data.close[0] > line_curr:
+                    sl_dist = max(self.p.cushion, self.data.close[0] - (y2 - self.p.cushion))
+                    capital = self.broker.getvalue()
+                    risk_amt = capital * self.p.risk_pct
+                    size = max(1, int(risk_amt / sl_dist))
+
+                    self.sl_price = y2 - self.p.cushion
+                    self.tp_price = self.data.close[0] + 2.0 * sl_dist
+                    self.order = self.buy(size=size)
+                    return
+
+        # Check Short Entry Condition (Descending trendline through last two local highs)
+        if len(self.local_highs) >= 2:
+            t1, y1 = self.local_highs[-2]
+            t2, y2 = self.local_highs[-1]
+            if y2 < y1 and (current_bar - t2) >= 1:
+                slope = (y2 - y1) / (t2 - t1)
+                M = min(self.p.M, current_bar - t2)
+                active = True
+                for i in range(1, M + 1):
+                    bar_i = current_bar - i
+                    line_y = y1 + slope * (bar_i - t1)
+                    if self.data.high[-i] > line_y:
+                        active = False
+                        break
+
+                line_curr = y1 + slope * (current_bar - t1)
+                if active and self.data.close[0] < line_curr:
+                    sl_dist = max(self.p.cushion, (y2 + self.p.cushion) - self.data.close[0])
+                    capital = self.broker.getvalue()
+                    risk_amt = capital * self.p.risk_pct
+                    size = max(1, int(risk_amt / sl_dist))
+
+                    self.sl_price = y2 + self.p.cushion
+                    self.tp_price = self.data.close[0] - 2.0 * sl_dist
+                    self.order = self.sell(size=size)
+                    return
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Operate strategy directly on provided 1h data feed.",
+      "reason": "The execution environment provides a single 1h data feed self.data; trendline calculations and signal checks run directly on each feed bar."
+    },
+    {
+      "topic": "local_extremum_window",
+      "choice": "Set N = 5 candles for rolling pivot high/low detection window.",
+      "reason": "The specification suggests N = 5-10; N = 5 provides responsive detection of local extremums."
+    },
+    {
+      "topic": "active_line_lookback",
+      "choice": "Set M = 10 candles for testing whether a trendline remains unbroken.",
+      "reason": "The specification suggests M = 10 as example lookback value."
+    },
+    {
+      "topic": "stop_loss_cushion",
+      "choice": "Set SL cushion distance to 10.0 points below/above the local extremum.",
+      "reason": "The specification suggests a cushion of 10-15 points."
+    },
+    {
+      "topic": "risk_percent",
+      "choice": "Risk 1% (0.01) of account equity per trade for position sizing.",
+      "reason": "The specification indicates a capital risk range of 1-2%."
+    },
+    {
+      "topic": "optional_trend_filter",
+      "choice": "Omit higher-timeframe trend filter.",
+      "reason": "The higher-timeframe daily trend filter is explicitly designated as optional in the specification."
+    }
+  ]
+}
+```

@@ -1,0 +1,151 @@
+```python
+import backtrader as bt
+
+
+class TrueStrengthIndex(bt.Indicator):
+    """
+    True Strength Index (TSI) Indicator.
+    Formula:
+        m = Close - Close(-1)
+        TSI = 100 * EMA(EMA(m, fast), slow) / EMA(EMA(|m|, fast), slow)
+        Signal = EMA(TSI, smooth)
+    """
+    lines = ('tsi', 'signal')
+    params = (
+        ('fast', 25),
+        ('slow', 13),
+        ('smooth', 2),
+    )
+
+    def __init__(self):
+        m = self.data.close - self.data.close(-1)
+        abs_m = bt.abs(m)
+
+        # First smoothing (fast EMA 25)
+        ema_m1 = bt.ind.EMA(m, period=self.p.fast)
+        ema_abs1 = bt.ind.EMA(abs_m, period=self.p.fast)
+
+        # Second smoothing (slow EMA 13)
+        ema_m2 = bt.ind.EMA(ema_m1, period=self.p.slow)
+        ema_abs2 = bt.ind.EMA(ema_abs1, period=self.p.slow)
+
+        # TSI line
+        tsi_raw = 100.0 * (ema_m2 / ema_abs2)
+        self.lines.tsi = tsi_raw
+
+        # Signal line (smoothing EMA 2)
+        self.lines.signal = bt.ind.EMA(tsi_raw, period=self.p.smooth)
+
+
+class TSIDivergenceStrategy(bt.Strategy):
+    """
+    Trading strategy based on bullish divergence between price and the TSI indicator.
+    """
+    params = (
+        ('fast', 25),
+        ('slow', 13),
+        ('smooth', 2),
+        ('pivot_lookback', 30),
+    )
+
+    def __init__(self):
+        self.tsi = TrueStrengthIndex(
+            self.data,
+            fast=self.p.fast,
+            slow=self.p.slow,
+            smooth=self.p.smooth
+        )
+        self.order = None
+        self.stop_order = None
+        self.stop_price = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_bar = len(self)
+                if self.stop_price is not None:
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=self.stop_price
+                    )
+            elif order.issell():
+                if self.stop_order and order.ref == self.stop_order.ref:
+                    self.stop_order = None
+
+            self.order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if self.order and order.ref == self.order.ref:
+                self.order = None
+            if self.stop_order and order.ref == self.stop_order.ref:
+                self.stop_order = None
+
+    def next(self):
+        # Manage open position
+        if self.position:
+            # Close at the end of the trading day
+            if self.entry_bar is not None and len(self) >= self.entry_bar:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.close()
+            return
+
+        # Do not enter new trade if an order is pending
+        if self.order:
+            return
+
+        if len(self) < self.p.pivot_lookback + 2:
+            return
+
+        # Check if bar -1 is a pivot low (confirmed on bar 0)
+        is_pivot_low = (self.data.low[-1] < self.data.low[-2]) and (self.data.low[-1] < self.data.low[0])
+
+        if is_pivot_low:
+            curr_price_low = self.data.low[-1]
+            curr_tsi_low = self.tsi.tsi[-1]
+
+            # Find previous pivot low in lookback window
+            for k in range(3, min(self.p.pivot_lookback, len(self) - 2)):
+                if (self.data.low[-k] < self.data.low[-k - 1]) and (self.data.low[-k] < self.data.low[-k + 1]):
+                    prev_price_low = self.data.low[-k]
+                    prev_tsi_low = self.tsi.tsi[-k]
+
+                    # Bullish divergence: lower low in price, higher low in TSI
+                    if curr_price_low < prev_price_low and curr_tsi_low > prev_tsi_low:
+                        # Stop loss at lower shadow wick preceding entry
+                        self.stop_price = min(self.data.low[0], self.data.low[-1])
+                        self.order = self.buy()
+                        break
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "TSI Indicator",
+      "choice": "Implemented custom TrueStrengthIndex indicator using double EMA smoothing (25, 13) and 2-period signal EMA smoothing.",
+      "reason": "Backtrader does not include a built-in TSI indicator, so standard double-smoothed momentum TSI formulas were implemented."
+    },
+    {
+      "topic": "Divergence Detection",
+      "choice": "Identified pivot lows using a 1-bar left/right trough comparison (Low[-1] < Low[-2] and Low[-1] < Low[0]) and evaluated against prior pivot lows within a 30-bar lookback window.",
+      "reason": "Provides a objective definition for identifying price and TSI troughs on daily bars without lookahead bias."
+    },
+    {
+      "topic": "Stop Loss Level",
+      "choice": "Set stop-loss price to min(Low[0], Low[-1]), representing the lowest point of the lower shadow wick preceding entry.",
+      "reason": "Satisfies the rule to place stop-loss at the low price of the candle wick preceding the market entry."
+    },
+    {
+      "topic": "Position Exit",
+      "choice": "Position is closed via self.close() on the bar following entry.",
+      "reason": "Implements the requirement to close the long position at the end of the trading day on a daily timeframe feed."
+    }
+  ]
+}
+```

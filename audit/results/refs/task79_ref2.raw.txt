@@ -1,0 +1,216 @@
+```python
+import backtrader as bt
+
+
+class BreakoutMomentumSOFI(bt.Strategy):
+    params = (
+        ("weekly_period", 52),
+        ("daily_sma_period", 200),
+        ("hourly_breakout_period", 20),
+        ("hourly_vol_period", 20),
+        ("atr_period", 14),
+        ("atr_mult", 2.0),
+        ("pct_stop", 0.05),
+        ("tp_pct", 0.05),
+        ("near_high_pct", 0.02),
+        ("risk_pct", 0.015),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.hourly_vol_period
+        )
+
+        self.daily_closes = []
+        self.current_day_date = None
+        self.current_day_close = None
+
+        self.weekly_highs = []
+        self.current_week_key = None
+        self.current_week_high = None
+
+        self.order = None
+        self.pending_trade_type = None
+        self.trade_type = None
+        self.entry_price = None
+        self.stop_price = None
+        self.tp_taken = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                if self.entry_price is None:
+                    self.entry_price = order.executed.price
+                    self.trade_type = self.pending_trade_type
+                    sl_atr = self.entry_price - self.p.atr_mult * self.atr[0]
+                    sl_pct = self.entry_price * (1.0 - self.p.pct_stop)
+                    self.stop_price = max(sl_atr, sl_pct)
+                    self.tp_taken = False
+            elif order.issell():
+                if self.position.size == 0:
+                    self.trade_type = None
+                    self.entry_price = None
+                    self.stop_price = None
+                    self.tp_taken = False
+                    self.pending_trade_type = None
+
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        week_key = self.data.datetime.date(0).isocalendar()[:2]
+
+        if self.current_day_date is None:
+            self.current_day_date = dt
+            self.current_day_close = self.data.close[0]
+        elif dt != self.current_day_date:
+            self.daily_closes.append(self.current_day_close)
+            self.current_day_date = dt
+            self.current_day_close = self.data.close[0]
+        else:
+            self.current_day_close = self.data.close[0]
+
+        if self.current_week_key is None:
+            self.current_week_key = week_key
+            self.current_week_high = self.data.high[0]
+        elif week_key != self.current_week_key:
+            self.weekly_highs.append(self.current_week_high)
+            self.current_week_key = week_key
+            self.current_week_high = self.data.high[0]
+        else:
+            self.current_week_high = max(
+                self.current_week_high, self.data.high[0]
+            )
+
+        if self.position.size > 0:
+            if self.order is not None:
+                return
+
+            if len(self.weekly_highs) >= self.p.weekly_period:
+                weekly_high_52 = max(
+                    self.weekly_highs[-self.p.weekly_period :]
+                )
+                if (
+                    self.trade_type == "short_term"
+                    and self.data.close[0] > weekly_high_52
+                ):
+                    self.trade_type = "long_term"
+                    sl_atr = self.entry_price - self.p.atr_mult * self.atr[0]
+                    sl_pct = self.entry_price * (1.0 - self.p.pct_stop)
+                    self.stop_price = max(sl_atr, sl_pct)
+
+            if self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+                return
+
+            if self.trade_type == "short_term" and not self.tp_taken:
+                if self.data.high[0] >= self.entry_price * (1.0 + self.p.tp_pct):
+                    tp_size = max(1, self.position.size // 2)
+                    self.order = self.sell(size=tp_size)
+                    self.tp_taken = True
+                    self.stop_price = max(self.stop_price, self.entry_price)
+            return
+
+        if self.order is not None:
+            return
+
+        if (
+            len(self.daily_closes) < self.p.daily_sma_period
+            or len(self.weekly_highs) < self.p.weekly_period
+        ):
+            return
+
+        sma_200_day = sum(
+            self.daily_closes[-self.p.daily_sma_period :]
+        ) / float(self.p.daily_sma_period)
+        daily_uptrend = self.data.close[0] > sma_200_day
+
+        weekly_high_52 = max(self.weekly_highs[-self.p.weekly_period :])
+
+        long_term_signal = daily_uptrend and (
+            self.data.close[0] > weekly_high_52
+        )
+
+        hourly_high_20 = max(
+            [
+                self.data.high[-i]
+                for i in range(1, self.p.hourly_breakout_period + 1)
+            ]
+        )
+        hourly_breakout = self.data.close[0] > hourly_high_20
+        increased_volume = self.data.volume[0] > self.vol_sma[0]
+        not_near_weekly_high = self.data.close[0] < (
+            1.0 - self.p.near_high_pct
+        ) * weekly_high_52
+
+        short_term_signal = (
+            daily_uptrend
+            and hourly_breakout
+            and increased_volume
+            and not_near_weekly_high
+        )
+
+        signal_type = None
+        if long_term_signal:
+            signal_type = "long_term"
+        elif short_term_signal:
+            signal_type = "short_term"
+
+        if signal_type is not None:
+            entry_price = self.data.close[0]
+            sl_atr = entry_price - self.p.atr_mult * self.atr[0]
+            sl_pct = entry_price * (1.0 - self.p.pct_stop)
+            stop_price = max(sl_atr, sl_pct)
+
+            risk_per_share = entry_price - stop_price
+            if risk_per_share <= 0:
+                return
+
+            capital = self.broker.getvalue()
+            max_risk_amount = capital * self.p.risk_pct
+            size = int(max_risk_amount / risk_per_share)
+
+            max_cash_size = int(self.broker.getcash() / entry_price)
+            size = min(size, max_cash_size)
+
+            if size > 0:
+                self.pending_trade_type = signal_type
+                self.order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "timeframe_aggregation",
+      "choice": "Aggregate daily and weekly historical bars manually from 1h bars by tracking date and calendar week boundaries",
+      "reason": "The execution environment supplies a single hourly data feed (self.data); tracking completed daily closes and weekly highs manually ensures exact multi-timeframe calculations without lookahead bias."
+    },
+    {
+      "topic": "parameter_defaults",
+      "choice": "N=52 weeks for weekly breakout high, 200 days for daily SMA, 20 hours for hourly resistance breakout and volume SMA, 14-period ATR with 2.0x multiplier, 5% percentage stop, 5% short-term take profit, 2% threshold for 'near historical weekly high' filter, and 1.5% capital risk per trade",
+      "reason": "The specification explicitly references these example parameter values in parenthetical notes."
+    },
+    {
+      "topic": "stop_loss_conservative_definition",
+      "choice": "More conservative stop loss is defined as the tighter stop loss (higher stop price for long positions, i.e., max(entry - 2*ATR, entry * 0.95))",
+      "reason": "A higher stop price limits the maximum dollar loss per share per trade, preserving capital strictly."
+    },
+    {
+      "topic": "increased_volume_definition",
+      "choice": "Volume is defined as increased if current 1h volume exceeds the 20-period 1h volume SMA",
+      "reason": "The specification states 'breaks a resistance level... with increased volume'."
+    }
+  ]
+}
+```

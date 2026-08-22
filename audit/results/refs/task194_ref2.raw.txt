@@ -1,0 +1,165 @@
+```python
+import backtrader as bt
+
+
+class DownwardReversalStrategy(bt.Strategy):
+    params = (
+        ('ema_period', 50),
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('atr_period', 14),
+        ('sma_atr_period', 50),
+        ('vol_sma_period', 20),
+        ('rsi_period', 14),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.ema = bt.ind.EMA(self.data.close, period=self.p.ema_period)
+        self.bb = bt.ind.BollingerBands(self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev)
+        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)
+        self.sma_atr = bt.ind.SMA(self.atr, period=self.p.sma_atr_period)
+        self.vol_sma = bt.ind.SMA(self.data.volume, period=self.p.vol_sma_period)
+        self.rsi = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+
+        self.entry_order = None
+        self.sl_order = None
+        self.tp_order = None
+        self.pending_sl_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.entry_order:
+                self.entry_order = None
+                entry_price = order.executed.price
+                sl_price = self.pending_sl_price
+                if sl_price is not None:
+                    risk = sl_price - entry_price
+                    if risk > 0:
+                        tp_price = entry_price - risk
+                        size = abs(order.executed.size)
+                        self.sl_order = self.buy(size=size, price=sl_price, exectype=bt.Order.Stop)
+                        self.tp_order = self.buy(size=size, price=tp_price, exectype=bt.Order.Limit, oco=self.sl_order)
+            elif order in [self.sl_order, self.tp_order]:
+                self.sl_order = None
+                self.tp_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.entry_order:
+                self.entry_order = None
+            if order == self.sl_order:
+                self.sl_order = None
+            if order == self.tp_order:
+                self.tp_order = None
+
+    def next(self):
+        if self.entry_order:
+            return
+
+        if self.position:
+            open_val = self.data.open[0]
+            close_val = self.data.close[0]
+            high_val = self.data.high[0]
+            low_val = self.data.low[0]
+            candle_range = high_val - low_val
+
+            if candle_range > 0:
+                is_bullish = close_val > open_val
+                close_in_upper_third = (high_val - close_val) / candle_range <= 0.33
+                lower_wick = min(open_val, close_val) - low_val
+                body = abs(close_val - open_val)
+                long_lower_wick = lower_wick >= 2.0 * body
+                near_lower_bb = low_val <= self.bb.lines.bot[0]
+                volume_spike = self.data.volume[0] >= 1.5 * self.vol_sma[0]
+
+                if is_bullish and close_in_upper_third and long_lower_wick and near_lower_bb and volume_spike:
+                    if self.sl_order:
+                        self.cancel(self.sl_order)
+                        self.sl_order = None
+                    if self.tp_order:
+                        self.cancel(self.tp_order)
+                        self.tp_order = None
+                    self.close()
+            return
+
+        open_val = self.data.open[0]
+        close_val = self.data.close[0]
+        high_val = self.data.high[0]
+        low_val = self.data.low[0]
+        candle_range = high_val - low_val
+
+        if candle_range <= 0:
+            return
+
+        # 1) Trend: close < EMA(50)
+        c1 = close_val < self.ema[0]
+
+        # 2) Volatility: ATR(14) > SMA(ATR(14), 50)
+        c2 = self.atr[0] > self.sma_atr[0]
+
+        # 3) Local extreme: high >= upper Bollinger(20,2) band
+        c3 = high_val >= self.bb.lines.top[0]
+
+        # 4) Candlestick pattern of buyer absorption
+        upper_wick = high_val - max(open_val, close_val)
+        body = abs(close_val - open_val)
+        lower_wick = min(open_val, close_val) - low_val
+
+        is_bearish = close_val < open_val
+        close_lower_third = (close_val - low_val) / candle_range <= 0.33
+        long_upper_wick = (upper_wick >= 2.0 * body) and (upper_wick >= 1.5 * lower_wick)
+        c4 = is_bearish and close_lower_third and long_upper_wick
+
+        # 5) Volume: volume >= 1.5 * SMA(volume, 20)
+        c5 = self.data.volume[0] >= 1.5 * self.vol_sma[0]
+
+        # 6) Signal strengthening: upper wick >= 50% of entire candle
+        c6 = (upper_wick / candle_range) >= 0.5
+
+        # Quality filters (optional)
+        f1 = self.rsi[0] >= 35.0
+
+        mid = self.bb.lines.mid
+        bb_mid_rising_3 = (mid[0] > mid[-1]) and (mid[-1] > mid[-2]) and (mid[-2] > mid[-3])
+        f2 = not bb_mid_rising_3
+
+        if c1 and c2 and c3 and c4 and c5 and c6 and f1 and f2:
+            sl_price = high_val + 0.5 * self.atr[0]
+            risk_per_share = sl_price - close_val
+            if risk_per_share > 0:
+                allowed_risk = self.broker.getvalue() * self.p.risk_pct
+                size = int(allowed_risk / risk_per_share)
+                if size > 0:
+                    self.pending_sl_price = sl_price
+                    self.entry_order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "risk_percentage",
+      "choice": "1% of portfolio value (0.01 * self.broker.getvalue())",
+      "reason": "Specification allows 1-2% risk per trade; 1% was selected as standard conservative risk management."
+    },
+    {
+      "topic": "take_profit_choice",
+      "choice": "Base take-profit at 1R (1 * risk distance from entry price to stop-loss)",
+      "reason": "Spec designates 1R as the primary base take-profit model."
+    },
+    {
+      "topic": "rsi_filter_threshold",
+      "choice": "RSI(14) >= 35",
+      "reason": "Spec states 'Avoid entry when RSI(14) < 35', requiring RSI(14) >= 35 for valid entries."
+    },
+    {
+      "topic": "entry_price_proxy_for_sizing",
+      "choice": "Signal candle close price (self.data.close[0])",
+      "reason": "At the time of signal generation in next(), signal candle close is the available proxy for distance to SL calculation before execution at next bar's open."
+    }
+  ]
+}
+```

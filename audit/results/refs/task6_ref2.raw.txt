@@ -1,0 +1,219 @@
+```python
+import datetime
+import backtrader as bt
+
+
+class StreakStrategy(bt.Strategy):
+    params = (
+        ("mode", "swing"),  # 'swing' or 'day'
+        ("color_method", "prev_close"),  # 'prev_close' or 'open_close'
+        ("streak_len", 2),  # Min consecutive days in streak
+        ("risk_pct", 0.01),  # 1% risk per trade
+        ("stop_loss_pct", 0.01),  # 1% stop loss distance
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+
+        self.current_date = None
+        self.day_open = 0.0
+        self.day_high = 0.0
+        self.day_low = 0.0
+        self.day_close = 0.0
+        self.completed_days = []
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                exec_price = order.executed.price
+                pos_size = abs(self.position.size)
+                if self.position.size > 0:
+                    stop_price = exec_price * (1.0 - self.p.stop_loss_pct)
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=pos_size
+                    )
+                elif self.position.size < 0:
+                    stop_price = exec_price * (1.0 + self.p.stop_loss_pct)
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=pos_size
+                    )
+            elif order == self.stop_order:
+                self.stop_order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if len(self.data) < 2:
+            return
+
+        cur_date = self.data.datetime.date(0)
+
+        # Track and finalize daily candles
+        if self.current_date is None:
+            self.current_date = cur_date
+            self.day_open = self.data.open[0]
+            self.day_high = self.data.high[0]
+            self.day_low = self.data.low[0]
+            self.day_close = self.data.close[0]
+            return
+
+        if cur_date != self.current_date:
+            # Finalize previous day
+            prev_open = self.day_open
+            prev_close = self.day_close
+
+            # Open-Close method
+            if prev_close > prev_open:
+                color_oc = "green"
+            elif prev_close < prev_open:
+                color_oc = "red"
+            else:
+                color_oc = "neutral"
+
+            # Prev Close - Current Close method
+            if len(self.completed_days) > 0:
+                last_close = self.completed_days[-1]["close"]
+                if prev_close > last_close:
+                    color_cc = "green"
+                elif prev_close < last_close:
+                    color_cc = "red"
+                else:
+                    color_cc = "neutral"
+            else:
+                color_cc = color_oc
+
+            self.completed_days.append(
+                {
+                    "date": self.current_date,
+                    "open": prev_open,
+                    "close": prev_close,
+                    "color_oc": color_oc,
+                    "color_cc": color_cc,
+                }
+            )
+
+            # Reset for new session day
+            self.current_date = cur_date
+            self.day_open = self.data.open[0]
+            self.day_high = self.data.high[0]
+            self.day_low = self.data.low[0]
+            self.day_close = self.data.close[0]
+
+            # Swing trade take-profit exit check on new day start
+            if self.position and self.p.mode == "swing":
+                last_day = self.completed_days[-1]
+                key = (
+                    "color_cc"
+                    if self.p.color_method == "prev_close"
+                    else "color_oc"
+                )
+                last_color = last_day[key]
+
+                if self.position.size > 0 and last_color == "red":
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.order = self.close()
+                    return
+                elif self.position.size < 0 and last_color == "green":
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.order = self.close()
+                    return
+        else:
+            self.day_high = max(self.day_high, self.data.high[0])
+            self.day_low = min(self.day_low, self.data.low[0])
+            self.day_close = self.data.close[0]
+
+        # Day trade exit check (end of session)
+        if self.position and self.p.mode == "day":
+            current_time = self.data.datetime.time(0)
+            if current_time >= datetime.time(15, 55):
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+                return
+
+        # Do not open new trades if an order is pending or position exists
+        if self.order or self.position:
+            return
+
+        if len(self.completed_days) < 1:
+            return
+
+        key = (
+            "color_cc" if self.p.color_method == "prev_close" else "color_oc"
+        )
+        recent_color = self.completed_days[-1][key]
+        if recent_color not in ("green", "red"):
+            return
+
+        streak_count = 0
+        for d in reversed(self.completed_days):
+            if d[key] == recent_color:
+                streak_count += 1
+            else:
+                break
+
+        bullish_streak = (
+            recent_color == "red" and streak_count >= self.p.streak_len
+        )
+        bearish_streak = (
+            recent_color == "green" and streak_count >= self.p.streak_len
+        )
+
+        # Price action confirmation (breakout of previous 5m bar)
+        price_action_buy = self.data.close[0] > self.data.high[-1]
+        price_action_sell = self.data.close[0] < self.data.low[-1]
+
+        price = self.data.close[0]
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        stop_dist = price * self.p.stop_loss_pct
+
+        if stop_dist <= 0:
+            return
+
+        calc_size = int(risk_amount / stop_dist)
+        max_cash_size = int(self.broker.getcash() / price)
+        size = min(calc_size, max_cash_size)
+
+        if size <= 0:
+            return
+
+        if bullish_streak and price_action_buy:
+            self.order = self.buy(size=size)
+        elif bearish_streak and price_action_sell:
+            self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "trading_mode_and_color_method",
+      "choice": "Default mode set to 'swing' using 'prev_close' color calculation, with 'day' mode and 'open_close' calculation configurable via strategy parameters.",
+      "reason": "The specification describes logic for both swing and day trading modes; using swing with previous-close color as the default provides a standard baseline while preserving full parameter support for day trading."
+    },
+    {
+      "topic": "price_action_confirmation",
+      "choice": "Price action confirmation requires current 5m Close to break above previous 5m High for Long, and break below previous 5m Low for Short.",
+      "reason": "The specification states that entry must be accompanied by price action confirmation (giving a breakout as an explicit example), which is implemented as a 1-bar high/low breakout."
+    },
+    {
+      "topic": "risk_management_and_stop_loss",
+      "choice": "Fixed stop-loss distance set at 1% of entry price; position size calculated to risk 1% of account equity per trade.",
+      "reason": "The specification requires predefined risk management with a mandatory stop-loss and standard fixed-percentage capital risk (1-2%)."
+    }
+  ]
+}
+```

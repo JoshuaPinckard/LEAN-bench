@@ -1,0 +1,263 @@
+```python
+import backtrader as bt
+
+
+class ModularScalpingStrategy(bt.Strategy):
+    params = (
+        ("use_module_a", True),
+        ("use_module_b", True),
+        ("use_rsi_filter", True),
+        ("use_macd_filter", True),
+        ("use_atr_vol_filter", True),
+        ("use_bbands_squeeze", True),
+        ("risk_pct", 0.01),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.take_profit = None
+        self.local_extremum = None
+        self.bars_in_trade = 0
+        self.initial_atr = None
+
+        # Module A & B EMAs
+        self.ema5 = bt.ind.EMA(self.data.close, period=5)
+        self.ema8 = bt.ind.EMA(self.data.close, period=8)
+        self.ema13 = bt.ind.EMA(self.data.close, period=13)
+        self.ema9 = bt.ind.EMA(self.data.close, period=9)
+        self.ema21 = bt.ind.EMA(self.data.close, period=21)
+
+        # Oscillators & Indicators
+        self.rsi = bt.ind.RSI(self.data.close, period=14)
+        self.macd = bt.ind.MACDHisto(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.bb = bt.ind.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.bb_width = self.bb.top - self.bb.bot
+        self.sma_bb_width = bt.ind.SMA(self.bb_width, period=20)
+        self.atr = bt.ind.ATR(self.data, period=14)
+        self.sma_atr = bt.ind.SMA(self.atr, period=50)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            self.order = None
+            self.entry_price = order.executed.price
+            self.local_extremum = self.entry_price
+            self.bars_in_trade = 0
+            self.initial_atr = self.atr[0]
+
+            risk_dist = 1.5 * self.initial_atr
+            if self.position.size > 0:
+                self.stop_price = self.entry_price - risk_dist
+                self.take_profit = self.entry_price + (2.0 * risk_dist)
+            elif self.position.size < 0:
+                self.stop_price = self.entry_price + risk_dist
+                self.take_profit = self.entry_price - (2.0 * risk_dist)
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        # Manage open position
+        if self.position:
+            self.bars_in_trade += 1
+
+            if self.position.size > 0:
+                self.local_extremum = max(
+                    self.local_extremum, self.data.high[0]
+                )
+                trail_level = max(
+                    self.ema21[0], self.local_extremum - 1.0 * self.atr[0]
+                )
+                self.stop_price = max(self.stop_price, trail_level)
+
+                # Check exits
+                if self.data.low[0] <= self.stop_price:
+                    self.close()
+                    return
+                if self.data.high[0] >= self.take_profit:
+                    self.close()
+                    return
+                if self.bars_in_trade >= 10:
+                    self.close()
+                    return
+                if self.data.close[0] < self.ema13[0]:
+                    self.close()
+                    return
+
+            elif self.position.size < 0:
+                self.local_extremum = min(self.local_extremum, self.data.low[0])
+                trail_level = min(
+                    self.ema21[0], self.local_extremum + 1.0 * self.atr[0]
+                )
+                self.stop_price = min(self.stop_price, trail_level)
+
+                # Check exits
+                if self.data.high[0] >= self.stop_price:
+                    self.close()
+                    return
+                if self.data.low[0] <= self.take_profit:
+                    self.close()
+                    return
+                if self.bars_in_trade >= 10:
+                    self.close()
+                    return
+                if self.data.close[0] > self.ema13[0]:
+                    self.close()
+                    return
+            return
+
+        # Guard pending entry order
+        if self.order:
+            self.cancel(self.order)
+
+        # Global optional filters
+        atr_filter_ok = (not self.p.use_atr_vol_filter) or (
+            self.atr[0] > self.sma_atr[0]
+        )
+        bb_squeeze_ok = (not self.p.use_bbands_squeeze) or (
+            self.bb_width[0] < self.sma_bb_width[0]
+        )
+
+        if not (atr_filter_ok and bb_squeeze_ok):
+            return
+
+        mod_a_long = False
+        mod_a_short = False
+        mod_b_long = False
+        mod_b_short = False
+
+        # Module A (Pseudo-Alligator)
+        if self.p.use_module_a:
+            # Long setup
+            a_trend_long = (
+                self.ema5[0] > self.ema8[0] > self.ema13[0]
+                and (self.ema5[0] - self.ema8[0])
+                > (self.ema5[-1] - self.ema8[-1])
+                and (self.ema8[0] - self.ema13[0])
+                > (self.ema8[-1] - self.ema13[-1])
+            )
+            a_pullback_long = self.data.low[0] <= self.ema5[0]
+            a_rsi_long = (not self.p.use_rsi_filter) or (self.rsi[0] < 70)
+            a_macd_long = (not self.p.use_macd_filter) or (
+                self.macd.histo[0] > 0
+            )
+
+            if a_trend_long and a_pullback_long and a_rsi_long and a_macd_long:
+                mod_a_long = True
+
+            # Short setup
+            a_trend_short = (
+                self.ema5[0] < self.ema8[0] < self.ema13[0]
+                and (self.ema8[0] - self.ema5[0])
+                > (self.ema8[-1] - self.ema5[-1])
+                and (self.ema13[0] - self.ema8[0])
+                > (self.ema13[-1] - self.ema8[-1])
+            )
+            a_pullback_short = self.data.high[0] >= self.ema5[0]
+            a_rsi_short = (not self.p.use_rsi_filter) or (self.rsi[0] > 30)
+            a_macd_short = (not self.p.use_macd_filter) or (
+                self.macd.histo[0] < 0
+            )
+
+            if (
+                a_trend_short
+                and a_pullback_short
+                and a_rsi_short
+                and a_macd_short
+            ):
+                mod_a_short = True
+
+        # Module B (EMA Reversal / Flag)
+        if self.p.use_module_b:
+            # Long setup
+            b_spread_0 = self.ema9[0] - self.ema21[0]
+            b_spread_1 = self.ema9[-1] - self.ema21[-1]
+            b_spread_2 = self.ema9[-2] - self.ema21[-2]
+            b_spread_3 = self.ema9[-3] - self.ema21[-3]
+
+            b_trend_long = (
+                self.ema9[0] > self.ema21[0]
+                and b_spread_0 > b_spread_1 > b_spread_2 > b_spread_3
+            )
+            b_flag = self.bb_width[0] < self.sma_bb_width[0]
+            b_touch_long = (self.data.low[0] <= self.ema9[0]) or (
+                self.data.low[0] <= self.ema21[0]
+            )
+            b_rsi_long = (not self.p.use_rsi_filter) or (
+                40 <= self.rsi[0] <= 65
+            )
+            b_macd_long = (not self.p.use_macd_filter) or (
+                self.macd.histo[0] > 0
+            )
+
+            if (
+                b_trend_long
+                and b_flag
+                and b_touch_long
+                and b_rsi_long
+                and b_macd_long
+            ):
+                mod_b_long = True
+
+            # Short setup
+            b_short_spread_0 = self.ema21[0] - self.ema9[0]
+            b_short_spread_1 = self.ema21[-1] - self.ema9[-1]
+            b_short_spread_2 = self.ema21[-2] - self.ema9[-2]
+            b_short_spread_3 = self.ema21[-3] - self.ema9[-3]
+
+            b_trend_short = (
+                self.ema9[0] < self.ema21[0]
+                and b_short_spread_0
+                > b_short_spread_1
+                > b_short_spread_2
+                > b_short_spread_3
+            )
+            b_touch_short = (self.data.high[0] >= self.ema9[0]) or (
+                self.data.high[0] >= self.ema21[0]
+            )
+            b_rsi_short = (not self.p.use_rsi_filter) or (
+                35 <= self.rsi[0] <= 60
+            )
+            b_macd_short = (not self.p.use_macd_filter) or (
+                self.macd.histo[0] < 0
+            )
+
+            if (
+                b_trend_short
+                and b_flag
+                and b_touch_short
+                and b_rsi_short
+                and b_macd_short
+            ):
+                mod_b_short = True
+
+        long_signal = mod_a_long or mod_b_long
+        short_signal = mod_a_short or mod_b_short
+
+        if long_signal:
+            risk_amount = self.broker.getvalue() * self.p.risk_pct
+            risk_per_share = 1.5 * self.atr[0]
+            size = max(1, int(risk_amount / risk_per_share))
+            self.order = self.buy(
+                exectype=bt.Order.Stop, price=self.data.high[0], size=size
+            )
+        elif short_signal:
+            risk_amount = self.broker.getvalue() * self.p.risk_pct
+            risk_per_share = 1.5 * self.atr[0]
+            size = max(1, int(risk_amount / risk_per_share))
+            self.order = self.sell(
+                exectype=bt.Order.Stop, price=self.data.low[0], size=size
+            )
+```
+
+```json
+{"assumptions": [{"topic": "breakout_order_expiration", "choice": "Breakout stop entry orders are placed for execution on the next bar and canceled if unfilled by the end of that bar", "reason": "The specification states entry on a breakout of the signal bar's high/low, which is standardly implemented as a Stop order valid for the bar following the signal."}, {"topic": "spread_growth_definition", "choice": "Increasing spread over the last 3 bars in Module B is interpreted as strictly increasing across 3 bar transitions: spread[0] > spread[-1] > spread[-2] > spread[-3]", "reason": "Literal interpretation of monotonic expansion over a 3-bar window."}, {"topic": "filter_switches", "choice": "Filter switches (use_rsi_filter, use_macd_filter, use_atr_vol_filter, use_bbands_squeeze) gate the module-specific RSI/MACD logic and global ATR/BB-squeeze conditions when enabled", "reason": "Ensures full modular toggling of indicators as requested by the switchable modules and filters specification."}, {"topic": "risk_position_sizing", "choice": "Fixed risk R per trade is calculated as 1% of total portfolio value divided by the initial stop loss distance (1.5 * ATR(14))", "reason": "Provides exact position sizing proportional to volatility risk while respecting portfolio equity."}]}
+```

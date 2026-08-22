@@ -1,0 +1,146 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionStochastic(bt.Strategy):
+    params = (
+        ("stoch_period", 14),
+        ("stoch_k_period", 3),
+        ("stoch_d_period", 3),
+        ("sma_period", 20),
+        ("std_period", 20),
+        ("slope_period", 20),
+        ("z_long_thresh", -2.0),
+        ("z_short_thresh", 2.0),
+        ("stop_loss_pct", 0.02),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+
+        self.stoch = bt.indicators.Stochastic(
+            self.data,
+            period=self.p.stoch_period,
+            period_dfast=self.p.stoch_k_period,
+            period_dslow=self.p.stoch_d_period,
+        )
+
+        self.sma20 = bt.indicators.SMA(
+            self.stoch.percK, period=self.p.sma_period
+        )
+        self.std20 = bt.indicators.StandardDeviation(
+            self.stoch.percK, period=self.p.std_period
+        )
+        self.z = (self.stoch.percK - self.sma20) / self.std20
+
+    def _calc_slope(self, values):
+        n = len(values)
+        sum_x = n * (n - 1) / 2.0
+        sum_x2 = (n - 1) * n * (2 * n - 1) / 6.0
+        denom = n * sum_x2 - sum_x**2
+        sum_y = sum(values)
+        sum_xy = sum(i * values[i] for i in range(n))
+        return (n * sum_xy - sum_x * sum_y) / denom
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                if self.position:
+                    if self.position.size > 0:
+                        stop_price = order.executed.price * (
+                            1.0 - self.p.stop_loss_pct
+                        )
+                        self.stop_order = self.sell(
+                            exectype=bt.Order.Stop,
+                            price=stop_price,
+                            size=abs(self.position.size),
+                        )
+                    elif self.position.size < 0:
+                        stop_price = order.executed.price * (
+                            1.0 + self.p.stop_loss_pct
+                        )
+                        self.stop_order = self.buy(
+                            exectype=bt.Order.Stop,
+                            price=stop_price,
+                            size=abs(self.position.size),
+                        )
+            elif order == self.stop_order:
+                self.stop_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if len(self.stoch.percK) < self.p.slope_period + 1:
+            return
+
+        curr_k = [self.stoch.percK[-19 + i] for i in range(20)]
+        prev_k = [self.stoch.percK[-20 + i] for i in range(20)]
+
+        curr_slope = self._calc_slope(curr_k)
+        prev_slope = self._calc_slope(prev_k)
+
+        z_val = self.z[0]
+
+        if not self.position:
+            if z_val < self.p.z_long_thresh and (
+                curr_slope > 0 and prev_slope <= 0
+            ):
+                self.order = self.buy()
+            elif z_val > self.p.z_short_thresh and (
+                curr_slope < 0 and prev_slope >= 0
+            ):
+                self.order = self.sell()
+        else:
+            if self.position.size > 0:
+                k_cross_above = (
+                    self.stoch.percK[0] > 50 and self.stoch.percK[-1] <= 50
+                )
+                if k_cross_above or z_val >= 0:
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.order = self.close()
+            elif self.position.size < 0:
+                k_cross_below = (
+                    self.stoch.percK[0] < 50 and self.stoch.percK[-1] >= 50
+                )
+                if k_cross_below or z_val <= 0:
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "slope_calculation",
+      "choice": "Calculated 20-bar ordinary least squares (OLS) linear regression slope on %K over the window [t-19, t] for current slope and [t-20, t-1] for previous slope.",
+      "reason": "The specification specifies a 20-bar slope of %K using linear regression slope over the last 20 bars."
+    },
+    {
+      "topic": "exit_condition_logic",
+      "choice": "Evaluated exit triggers as boolean OR between %K crossing 50 and z-score reaching zero (z >= 0 for Long, z <= 0 for Short).",
+      "reason": "The spec states 'close LONG when %K crosses above 50 (or z >= 0)' and 'close SHORT when %K crosses below 50 (or z <= 0)'."
+    },
+    {
+      "topic": "protective_stop_execution",
+      "choice": "Placed stop-loss order dynamically in notify_order when entry order executes using order.executed.price * 0.98 for Long and order.executed.price * 1.02 for Short.",
+      "reason": "The entry price is only known upon order execution, so exact 2% stop-loss calculation requires using order.executed.price."
+    }
+  ]
+}
+```

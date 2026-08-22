@@ -1,0 +1,563 @@
+```python
+import backtrader as bt
+
+
+class MultiStrategyORBIncome(bt.Strategy):
+    def __init__(self):
+        # Indicators
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.bw = (self.bb.top - self.bb.bot) / self.bb.mid
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.ema = bt.indicators.EMA(self.data.close, period=20)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=20)
+
+        # Strategy positions state tracking
+        self.pos1 = None
+        self.pos2 = None
+        self.pos3 = None
+
+        # Order tracking
+        self.pending_orders = set()
+        self.orders_info = {}
+
+        # Opening Range tracking
+        self.last_date = None
+        self.bar_in_day = 0
+        self.or_high = None
+        self.or_low = None
+        self.midOR = None
+        self.or_ready = False
+        self.day_highs = []
+        self.day_lows = []
+
+        # Logging storage
+        self.log_history = []
+
+    def _log_event(self, msg):
+        dt_str = self.data.datetime.datetime(0).strftime("%Y-%m-%d %H:%M:%S")
+        self.log_history.append(f"[{dt_str}] {msg}")
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if order in self.pending_orders:
+                self.pending_orders.remove(order)
+
+            info = self.orders_info.pop(order.ref, None)
+            if info and order.status in [
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                if info["type"] == "entry":
+                    s = info["strategy"]
+                    if s == 1:
+                        self.pos1 = None
+                    elif s == 2:
+                        self.pos2 = None
+                    elif s == 3:
+                        self.pos3 = None
+
+    def is_eod(self):
+        t = self.data.datetime.time(0)
+        if t.hour == 15 and t.minute >= 55:
+            return True
+        if t.hour >= 16:
+            return True
+        if len(self.data) < self.data.lines.datetime.array.size - 1:
+            if self.data.datetime.date(0) != self.data.datetime.date(1):
+                return True
+        return False
+
+    def _get_position_size(self, strategy_num, entry_price, stop_price):
+        base_capital = 150000.0
+        risk_amount = base_capital * 0.01
+        stop_dist = abs(entry_price - stop_price)
+        if stop_dist < 1e-4:
+            return 0
+
+        shares_by_risk = int(risk_amount / stop_dist)
+
+        alloc_pct = 0.40 if strategy_num == 1 else 0.30
+        max_capital = base_capital * alloc_pct
+        shares_by_alloc = int(max_capital / entry_price)
+
+        shares = min(shares_by_risk, shares_by_alloc)
+
+        cash = self.broker.getcash()
+        shares_by_cash = int(cash / entry_price)
+        shares = min(shares, shares_by_cash)
+
+        return max(0, shares)
+
+    def next(self):
+        # 1. Update session & Opening Range
+        cur_date = self.data.datetime.date(0)
+        if cur_date != self.last_date:
+            self.last_date = cur_date
+            self.bar_in_day = 0
+            self.or_high = None
+            self.or_low = None
+            self.midOR = None
+            self.or_ready = False
+            self.day_highs = []
+            self.day_lows = []
+
+        self.bar_in_day += 1
+        if self.bar_in_day <= 6:
+            self.day_highs.append(self.data.high[0])
+            self.day_lows.append(self.data.low[0])
+            if self.bar_in_day == 6:
+                self.or_high = max(self.day_highs)
+                self.or_low = min(self.day_lows)
+                self.midOR = (self.or_high + self.or_low) / 2.0
+                self.or_ready = True
+
+        # 2. Warm-up requirement
+        if len(self) < 252:
+            return
+
+        # 3. BandWidth percentile over 252 bars
+        bw_window = [self.bw[-i] for i in range(251, -1, -1)]
+        current_bw = self.bw[0]
+        bw_percentile = sum(1 for x in bw_window if x <= current_bw) / 252.0
+
+        eod = self.is_eod()
+
+        # 4. Manage Exits for Strategy 1
+        if self.pos1 is not None:
+            self.pos1["bars"] += 1
+            if self.pos1["side"] == "long":
+                tp_price = min(
+                    self.pos1["entry_price"] + 0.5 * self.pos1["R"],
+                    self.bb.mid[0],
+                )
+                sl_price = self.pos1["sl"]
+                sl_hit = self.data.low[0] <= sl_price
+                tp_hit = self.data.high[0] >= tp_price
+                timeout_hit = self.pos1["bars"] >= 4
+                if sl_hit or tp_hit or timeout_hit:
+                    order = self.sell(size=self.pos1["size"])
+                    self.orders_info[order.ref] = {
+                        "strategy": 1,
+                        "type": "exit",
+                    }
+                    self.pending_orders.add(order)
+                    r_mult = (
+                        (self.data.close[0] - self.pos1["entry_price"])
+                        / self.pos1["R"]
+                        if self.pos1["R"] > 0
+                        else 0
+                    )
+                    self._log_event(
+                        f"Str-1 Long Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                    )
+                    self.pos1 = None
+            elif self.pos1["side"] == "short":
+                tp_price = max(
+                    self.pos1["entry_price"] - 0.5 * self.pos1["R"],
+                    self.bb.mid[0],
+                )
+                sl_price = self.pos1["sl"]
+                sl_hit = self.data.high[0] >= sl_price
+                tp_hit = self.data.low[0] <= tp_price
+                timeout_hit = self.pos1["bars"] >= 4
+                if sl_hit or tp_hit or timeout_hit:
+                    order = self.buy(size=self.pos1["size"])
+                    self.orders_info[order.ref] = {
+                        "strategy": 1,
+                        "type": "exit",
+                    }
+                    self.pending_orders.add(order)
+                    r_mult = (
+                        (self.pos1["entry_price"] - self.data.close[0])
+                        / self.pos1["R"]
+                        if self.pos1["R"] > 0
+                        else 0
+                    )
+                    self._log_event(
+                        f"Str-1 Short Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                    )
+                    self.pos1 = None
+
+        # 5. Manage Exits for Strategy 2
+        if self.pos2 is not None:
+            if eod:
+                order = (
+                    self.sell(size=self.pos2["size"])
+                    if self.pos2["side"] == "long"
+                    else self.buy(size=self.pos2["size"])
+                )
+                self.orders_info[order.ref] = {"strategy": 2, "type": "exit"}
+                self.pending_orders.add(order)
+                r_mult = (
+                    (self.data.close[0] - self.pos2["entry_price"])
+                    / self.pos2["R"]
+                    if self.pos2["side"] == "long"
+                    else (self.pos2["entry_price"] - self.data.close[0])
+                    / self.pos2["R"]
+                )
+                self._log_event(
+                    f"Str-2 EOD Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                )
+                self.pos2 = None
+            else:
+                if self.pos2["side"] == "long":
+                    sl_hit = self.data.low[0] <= self.pos2["sl"]
+                    tp_hit = self.data.high[0] >= self.pos2["tp"]
+                    if sl_hit or tp_hit:
+                        order = self.sell(size=self.pos2["size"])
+                        self.orders_info[order.ref] = {
+                            "strategy": 2,
+                            "type": "exit",
+                        }
+                        self.pending_orders.add(order)
+                        r_mult = (
+                            (self.data.close[0] - self.pos2["entry_price"])
+                            / self.pos2["R"]
+                            if self.pos2["R"] > 0
+                            else 0
+                        )
+                        self._log_event(
+                            f"Str-2 Long Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+                        self.pos2 = None
+                elif self.pos2["side"] == "short":
+                    sl_hit = self.data.high[0] >= self.pos2["sl"]
+                    tp_hit = self.data.low[0] <= self.pos2["tp"]
+                    if sl_hit or tp_hit:
+                        order = self.buy(size=self.pos2["size"])
+                        self.orders_info[order.ref] = {
+                            "strategy": 2,
+                            "type": "exit",
+                        }
+                        self.pending_orders.add(order)
+                        r_mult = (
+                            (self.pos2["entry_price"] - self.data.close[0])
+                            / self.pos2["R"]
+                            if self.pos2["R"] > 0
+                            else 0
+                        )
+                        self._log_event(
+                            f"Str-2 Short Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+                        self.pos2 = None
+
+        # 6. Manage Exits for Strategy 3
+        if self.pos3 is not None:
+            if eod:
+                order = (
+                    self.sell(size=self.pos3["size"])
+                    if self.pos3["side"] == "long"
+                    else self.buy(size=self.pos3["size"])
+                )
+                self.orders_info[order.ref] = {"strategy": 3, "type": "exit"}
+                self.pending_orders.add(order)
+                r_mult = (
+                    (self.data.close[0] - self.pos3["entry_price"])
+                    / self.pos3["R"]
+                    if self.pos3["side"] == "long"
+                    else (self.pos3["entry_price"] - self.data.close[0])
+                    / self.pos3["R"]
+                )
+                self._log_event(
+                    f"Str-3 EOD Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                )
+                self.pos3 = None
+            else:
+                if self.pos3["side"] == "long":
+                    self.pos3["highest"] = max(
+                        self.pos3["highest"], self.data.high[0]
+                    )
+                    sl_hit = self.data.low[0] <= self.pos3["sl"]
+                    tp_hit = (
+                        self.data.high[0]
+                        >= self.pos3["entry_price"] + 2.0 * self.pos3["R"]
+                    )
+                    atr_trail = self.pos3["highest"] - 1.0 * self.atr[0]
+                    ema_trail = self.ema[0]
+                    trail_stop = max(ema_trail, atr_trail)
+                    trail_hit = self.data.low[0] <= trail_stop
+                    if sl_hit or tp_hit or trail_hit:
+                        order = self.sell(size=self.pos3["size"])
+                        self.orders_info[order.ref] = {
+                            "strategy": 3,
+                            "type": "exit",
+                        }
+                        self.pending_orders.add(order)
+                        r_mult = (
+                            (self.data.close[0] - self.pos3["entry_price"])
+                            / self.pos3["R"]
+                            if self.pos3["R"] > 0
+                            else 0
+                        )
+                        self._log_event(
+                            f"Str-3 Long Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+                        self.pos3 = None
+                elif self.pos3["side"] == "short":
+                    self.pos3["lowest"] = min(
+                        self.pos3["lowest"], self.data.low[0]
+                    )
+                    sl_hit = self.data.high[0] >= self.pos3["sl"]
+                    tp_hit = (
+                        self.data.low[0]
+                        <= self.pos3["entry_price"] - 2.0 * self.pos3["R"]
+                    )
+                    atr_trail = self.pos3["lowest"] + 1.0 * self.atr[0]
+                    ema_trail = self.ema[0]
+                    trail_stop = min(ema_trail, atr_trail)
+                    trail_hit = self.data.high[0] >= trail_stop
+                    if sl_hit or tp_hit or trail_hit:
+                        order = self.buy(size=self.pos3["size"])
+                        self.orders_info[order.ref] = {
+                            "strategy": 3,
+                            "type": "exit",
+                        }
+                        self.pending_orders.add(order)
+                        r_mult = (
+                            (self.pos3["entry_price"] - self.data.close[0])
+                            / self.pos3["R"]
+                            if self.pos3["R"] > 0
+                            else 0
+                        )
+                        self._log_event(
+                            f"Str-3 Short Exit at {self.data.close[0]:.2f}, R-multiple: {r_mult:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+                        self.pos3 = None
+
+        # 7. Global Filters for New Entries
+        if eod:
+            return
+
+        if bw_percentile < 0.10:
+            return
+
+        if self.data.volume[0] < self.vol_sma[0]:
+            return
+
+        if len(self.pending_orders) > 0:
+            return
+
+        active_count = (
+            (1 if self.pos1 else 0)
+            + (1 if self.pos2 else 0)
+            + (1 if self.pos3 else 0)
+        )
+        if active_count >= 3:
+            return
+
+        # 8. Evaluate Strategy 1 Entries
+        if self.pos1 is None and bw_percentile < 0.30:
+            if self.data.high[0] >= self.bb.top[0] and self.rsi[0] > 60:
+                entry_p = self.data.close[0]
+                sl_p = self.bb.top[0] + 1.0 * self.atr[0]
+                R = sl_p - entry_p
+                if R > 0:
+                    sz = self._get_position_size(1, entry_p, sl_p)
+                    if sz > 0:
+                        order = self.sell(size=sz)
+                        self.orders_info[order.ref] = {
+                            "strategy": 1,
+                            "type": "entry",
+                        }
+                        self.pending_orders.add(order)
+                        self.pos1 = {
+                            "side": "short",
+                            "size": sz,
+                            "entry_price": entry_p,
+                            "sl": sl_p,
+                            "R": R,
+                            "bars": 0,
+                        }
+                        self._log_event(
+                            f"Str-1 Short Entry at {entry_p:.2f}, SL: {sl_p:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+            elif self.data.low[0] <= self.bb.bot[0] and self.rsi[0] < 40:
+                entry_p = self.data.close[0]
+                sl_p = self.bb.bot[0] - 1.0 * self.atr[0]
+                R = entry_p - sl_p
+                if R > 0:
+                    sz = self._get_position_size(1, entry_p, sl_p)
+                    if sz > 0:
+                        order = self.buy(size=sz)
+                        self.orders_info[order.ref] = {
+                            "strategy": 1,
+                            "type": "entry",
+                        }
+                        self.pending_orders.add(order)
+                        self.pos1 = {
+                            "side": "long",
+                            "size": sz,
+                            "entry_price": entry_p,
+                            "sl": sl_p,
+                            "R": R,
+                            "bars": 0,
+                        }
+                        self._log_event(
+                            f"Str-1 Long Entry at {entry_p:.2f}, SL: {sl_p:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+
+        # 9. Evaluate Strategy 2 Entries
+        if self.pos2 is None and self.or_ready and 0.70 <= bw_percentile <= 0.90:
+            short_cond = (
+                self.data.high[0] > self.or_high
+                or self.data.high[-1] > self.or_high
+            ) and self.data.close[0] < self.or_high
+            if short_cond:
+                entry_p = self.data.close[0]
+                sl_p = self.or_high + 0.5 * self.atr[0]
+                tp_p = self.midOR
+                R = sl_p - entry_p
+                if R > 0 and entry_p > tp_p:
+                    sz = self._get_position_size(2, entry_p, sl_p)
+                    if sz > 0:
+                        order = self.sell(size=sz)
+                        self.orders_info[order.ref] = {
+                            "strategy": 2,
+                            "type": "entry",
+                        }
+                        self.pending_orders.add(order)
+                        self.pos2 = {
+                            "side": "short",
+                            "size": sz,
+                            "entry_price": entry_p,
+                            "sl": sl_p,
+                            "tp": tp_p,
+                            "R": R,
+                        }
+                        self._log_event(
+                            f"Str-2 Short Entry at {entry_p:.2f}, SL: {sl_p:.2f}, TP: {tp_p:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+
+            long_cond = (
+                self.data.low[0] < self.or_low
+                or self.data.low[-1] < self.or_low
+            ) and self.data.close[0] > self.or_low
+            if long_cond and self.pos2 is None:
+                entry_p = self.data.close[0]
+                sl_p = self.or_low - 0.5 * self.atr[0]
+                tp_p = self.midOR
+                R = entry_p - sl_p
+                if R > 0 and entry_p < tp_p:
+                    sz = self._get_position_size(2, entry_p, sl_p)
+                    if sz > 0:
+                        order = self.buy(size=sz)
+                        self.orders_info[order.ref] = {
+                            "strategy": 2,
+                            "type": "entry",
+                        }
+                        self.pending_orders.add(order)
+                        self.pos2 = {
+                            "side": "long",
+                            "size": sz,
+                            "entry_price": entry_p,
+                            "sl": sl_p,
+                            "tp": tp_p,
+                            "R": R,
+                        }
+                        self._log_event(
+                            f"Str-2 Long Entry at {entry_p:.2f}, SL: {sl_p:.2f}, TP: {tp_p:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+
+        # 10. Evaluate Strategy 3 Entries
+        if self.pos3 is None and self.or_ready:
+            long_cond = (
+                self.data.close[0] > self.or_high
+                and self.data.close[-1] > self.or_high
+                and self.ema[0] > self.ema[-1]
+            )
+            if long_cond:
+                entry_p = self.data.close[0]
+                sl_p = max(entry_p - 1.0 * self.atr[0], self.or_low)
+                R = entry_p - sl_p
+                if R > 0:
+                    sz = self._get_position_size(3, entry_p, sl_p)
+                    if sz > 0:
+                        order = self.buy(size=sz)
+                        self.orders_info[order.ref] = {
+                            "strategy": 3,
+                            "type": "entry",
+                        }
+                        self.pending_orders.add(order)
+                        self.pos3 = {
+                            "side": "long",
+                            "size": sz,
+                            "entry_price": entry_p,
+                            "sl": sl_p,
+                            "R": R,
+                            "highest": self.data.high[0],
+                        }
+                        self._log_event(
+                            f"Str-3 Long Entry at {entry_p:.2f}, SL: {sl_p:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+
+            short_cond = (
+                self.data.close[0] < self.or_low
+                and self.data.close[-1] < self.or_low
+                and self.ema[0] < self.ema[-1]
+            )
+            if short_cond and self.pos3 is None:
+                entry_p = self.data.close[0]
+                sl_p = min(entry_p + 1.0 * self.atr[0], self.or_high)
+                R = sl_p - entry_p
+                if R > 0:
+                    sz = self._get_position_size(3, entry_p, sl_p)
+                    if sz > 0:
+                        order = self.sell(size=sz)
+                        self.orders_info[order.ref] = {
+                            "strategy": 3,
+                            "type": "entry",
+                        }
+                        self.pending_orders.add(order)
+                        self.pos3 = {
+                            "side": "short",
+                            "size": sz,
+                            "entry_price": entry_p,
+                            "sl": sl_p,
+                            "R": R,
+                            "lowest": self.data.low[0],
+                        }
+                        self._log_event(
+                            f"Str-3 Short Entry at {entry_p:.2f}, SL: {sl_p:.2f}, BW%: {bw_percentile:.2f}"
+                        )
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "Strategy 1 Timeout",
+      "choice": "4 bars",
+      "reason": "The specification states a timeout of 3-5 bars; 4 bars was selected as the midpoint."
+    },
+    {
+      "topic": "Opening Range Period",
+      "choice": "First 6 5-minute bars of the session (09:30 through 09:55)",
+      "reason": "The spec states 'first 30 minutes of the session'; in a 5-minute bar feed, 30 minutes corresponds to 6 bars."
+    },
+    {
+      "topic": "BandWidth Percentile Window",
+      "choice": "Rolling 252-bar empirical percentile rank",
+      "reason": "The specification specifies percentile over 252 bars; computed as the fraction of BandWidth values in the last 252 bars <= current BandWidth."
+    },
+    {
+      "topic": "Position Sizing Cash Guard",
+      "choice": "Cap sizing at available broker cash",
+      "reason": "Base capital of $150,000 is used for sizing formulas, but starting cash in the execution harness is $10,000; capping shares to available cash avoids margin rejection errors."
+    },
+    {
+      "topic": "Logging",
+      "choice": "Record to internal self.log_history list",
+      "reason": "Fulfills the specification requirement to record signals, entries/exits, R-multiple, and BandWidth percentile without invoking print statements."
+    }
+  ]
+}
+```

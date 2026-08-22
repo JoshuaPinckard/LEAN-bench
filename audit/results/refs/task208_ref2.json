@@ -1,0 +1,202 @@
+{
+  "task_id": 208,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import math\nimport backtrader as bt\n\n\nclass ThetaProxyStrategy(bt.Strategy):\n    params = (\n        (\"bb_period\", 20),\n        (\"bb_dev\", 2.0),\n        (\"atr_period\", 14),\n        (\"ema_period\", 14),\n        (\"rsi_period\", 14),\n        (\"risk_pct\", 0.015),\n        (\"cooldown_bars\", 24),\n        (\"time_exit_bars\", 3),\n        (\"tp_factor\", 0.7),\n        (\"sl_factor\", 1.5),\n        (\"max_units\", 3),\n    )\n\n    def __init__(self):\n        # Indicators\n        self.bb = bt.ind.BollingerBands(\n            self.data.close,\n            period=self.p.bb_period,\n            devfactor=self.p.bb_dev,\n        )\n        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)\n        self.ema_atr = bt.ind.EMA(self.atr, period=self.p.ema_period)\n        self.rsi = bt.ind.RSI(self.data.close, period=self.p.rsi_period)\n\n        # BB Width (top - bottom) and its 20-period SMA\n        self.bb_width = self.bb.lines.top - self.bb.lines.bot\n        self.sma_bb_width = bt.ind.SMA(self.bb_width, period=self.p.bb_period)\n\n        # Crossovers\n        self.co_ema_atr = bt.ind.CrossOver(self.ema_atr, self.atr)\n        self.co_atr_ema = bt.ind.CrossOver(self.atr, self.ema_atr)\n\n        # Order & state management\n        self.order = None\n        self.last_entry_bar = None\n        self.units_count = 0\n        self.entry_bar = None\n        self.entry_price = None\n        self.last_unit_price = None\n        self.unit_risk = None\n        self.tp_price = None\n        self.sl_price = None\n        self.pending_unit_risk = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed]:\n            if not self.position:\n                # Position fully closed\n                self.units_count = 0\n                self.entry_bar = None\n                self.entry_price = None\n                self.last_unit_price = None\n                self.unit_risk = None\n                self.tp_price = None\n                self.sl_price = None\n            else:\n                if self.units_count == 0:\n                    # Initial unit fill\n                    self.units_count = 1\n                    self.entry_bar = len(self)\n                    self.entry_price = order.executed.price\n                    self.last_unit_price = order.executed.price\n                    self.last_entry_bar = len(self)\n\n                    if self.pending_unit_risk is not None:\n                        self.unit_risk = self.pending_unit_risk\n                    else:\n                        sma20 = self.bb.lines.mid[0]\n                        self.unit_risk = max(\n                            self.atr[0],\n                            0.5 * abs(self.entry_price - sma20),\n                        )\n\n                    sma20 = self.bb.lines.mid[0]\n                    dist_to_sma = abs(self.entry_price - sma20)\n\n                    if self.position.size > 0:\n                        self.tp_price = (\n                            self.entry_price + self.p.tp_factor * dist_to_sma\n                        )\n                        self.sl_price = (\n                            self.entry_price - self.p.sl_factor * self.unit_risk\n                        )\n                    else:\n                        self.tp_price = (\n                            self.entry_price - self.p.tp_factor * dist_to_sma\n                        )\n                        self.sl_price = (\n                            self.entry_price + self.p.sl_factor * self.unit_risk\n                        )\n                else:\n                    # Pyramid unit fill\n                    self.units_count += 1\n                    self.last_unit_price = order.executed.price\n\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            pass\n\n        self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        # Filter 1: ATR < EMA(ATR) for last 2 bars OR CrossOver(EMA(ATR), ATR) = 1 in last 3 bars\n        f1_c1 = (self.atr[0] < self.ema_atr[0]) and (\n            self.atr[-1] < self.ema_atr[-1]\n        )\n        f1_c2 = (\n            (self.co_ema_atr[0] == 1)\n            or (self.co_ema_atr[-1] == 1)\n            or (self.co_ema_atr[-2] == 1)\n        )\n        filter1 = f1_c1 or f1_c2\n\n        # Filter 2: BB width <= 1.5 * SMA(20) of width AND ATR(14)/Close <= 4%\n        filter2 = (self.bb_width[0] <= 1.5 * self.sma_bb_width[0]) and (\n            (self.atr[0] / self.data.close[0]) <= 0.04\n        )\n\n        if self.position.size != 0:\n            close = self.data.close[0]\n            high = self.data.high[0]\n            low = self.data.low[0]\n\n            bars_held = len(self) - self.entry_bar if self.entry_bar else 0\n\n            # 1. Time-based exit: 3rd bar after entry\n            exit_time = bars_held >= self.p.time_exit_bars\n\n            # 2. Target / Stop exit\n            exit_tp_sl = False\n            if self.position.size > 0:\n                if self.tp_price and high >= self.tp_price:\n                    exit_tp_sl = True\n                elif self.sl_price and low <= self.sl_price:\n                    exit_tp_sl = True\n            else:\n                if self.tp_price and low <= self.tp_price:\n                    exit_tp_sl = True\n                elif self.sl_price and high >= self.sl_price:\n                    exit_tp_sl = True\n\n            # 3. Volatility-based exit\n            vol_exit_1 = self.co_atr_ema[0] == 1\n            if self.position.size > 0:\n                vol_exit_2 = close < (\n                    self.bb.lines.bot[0] - 0.5 * self.atr[0]\n                )\n            else:\n                vol_exit_2 = close > (\n                    self.bb.lines.top[0] + 0.5 * self.atr[0]\n                )\n\n            exit_vol = vol_exit_1 or vol_exit_2\n\n            if exit_time or exit_tp_sl or exit_vol:\n                self.order = self.close()\n                return\n\n            # Pyramiding logic\n            if self.units_count < self.p.max_units:\n                atr_declining = self.atr[0] < self.atr[-1]\n                if filter1 and filter2 and atr_declining:\n                    if self.position.size > 0:\n                        further_dev = close <= (\n                            self.last_unit_price - 0.5 * self.atr[0]\n                        )\n                        if further_dev:\n                            unit_risk = max(\n                                self.atr[0],\n                                0.5 * abs(close - self.bb.lines.mid[0]),\n                            )\n                            if unit_risk > 0:\n                                size = math.floor(\n                                    (\n                                        self.broker.getvalue()\n                                        * self.p.risk_pct\n                                    )\n                                    / unit_risk\n                                )\n                                if size >= 1:\n                                    self.order = self.buy(size=size)\n                    else:\n                        further_dev = close >= (\n                            self.last_unit_price + 0.5 * self.atr[0]\n                        )\n                        if further_dev:\n                            unit_risk = max(\n                                self.atr[0],\n                                0.5 * abs(close - self.bb.lines.mid[0]),\n                            )\n                            if unit_risk > 0:\n                                size = math.floor(\n                                    (\n                                        self.broker.getvalue()\n                                        * self.p.risk_pct\n                                    )\n                                    / unit_risk\n                                )\n                                if size >= 1:\n                                    self.order = self.sell(size=size)\n\n        else:\n            # Filter 3: At least 24 bars since the last initial entry\n            filter3 = (self.last_entry_bar is None) or (\n                len(self) - self.last_entry_bar >= self.p.cooldown_bars\n            )\n\n            if filter1 and filter2 and filter3:\n                close = self.data.close[0]\n                long_signal = (close <= self.bb.lines.bot[0]) and (\n                    self.rsi[0] < 35\n                )\n                short_signal = (close >= self.bb.lines.top[0]) and (\n                    self.rsi[0] > 65\n                )\n\n                if long_signal:\n                    unit_risk = max(\n                        self.atr[0],\n                        0.5 * abs(close - self.bb.lines.mid[0]),\n                    )\n                    if unit_risk > 0:\n                        size = math.floor(\n                            (self.broker.getvalue() * self.p.risk_pct)\n                            / unit_risk\n                        )\n                        if size >= 1:\n                            self.pending_unit_risk = unit_risk\n                            self.order = self.buy(size=size)\n\n                elif short_signal:\n                    unit_risk = max(\n                        self.atr[0],\n                        0.5 * abs(close - self.bb.lines.mid[0]),\n                    )\n                    if unit_risk > 0:\n                        size = math.floor(\n                            (self.broker.getvalue() * self.p.risk_pct)\n                            / unit_risk\n                        )\n                        if size >= 1:\n                            self.pending_unit_risk = unit_risk\n                            self.order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "filter3_pyramiding_cooldown",
+      "choice": "The 24-bar cooldown between entries applies to initiating a new trade sequence from flat, permitting pyramiding within the active 3-bar trade window.",
+      "reason": "Requiring a 24-bar gap for pyramiding entries would render pyramiding impossible due to the 3-bar time-based exit rule."
+    },
+    {
+      "topic": "tp_sl_calculation",
+      "choice": "Take-profit and stop-loss price levels are computed at initial entry fill using the executed price, SMA(20), and initial UnitRisk.",
+      "reason": "The specification specifies fixed target and stop offsets anchored to the entry price."
+    },
+    {
+      "topic": "intraday_tp_sl_evaluation",
+      "choice": "Take-profit and stop-loss levels are checked against bar High and Low prices.",
+      "reason": "Price targets and stop-losses trigger intraday when High or Low crosses the corresponding level."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 14,
+  "tape": [
+    {
+      "dt": "2020-05-11T04:00:00",
+      "side": "SELL",
+      "size": -50.0,
+      "price": 74.57775171164975
+    },
+    {
+      "dt": "2020-05-15T04:00:00",
+      "side": "BUY",
+      "size": 50.0,
+      "price": 72.70178701263482
+    },
+    {
+      "dt": "2020-07-09T04:00:00",
+      "side": "SELL",
+      "size": -53.0,
+      "price": 93.20401878936576
+    },
+    {
+      "dt": "2020-07-14T04:00:00",
+      "side": "BUY",
+      "size": 53.0,
+      "price": 91.82674120591236
+    },
+    {
+      "dt": "2021-04-12T04:00:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 128.9551224869681
+    },
+    {
+      "dt": "2021-04-16T04:00:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 130.68718234573052
+    },
+    {
+      "dt": "2021-08-17T04:00:00",
+      "side": "SELL",
+      "size": -62.0,
+      "price": 146.65636676617194
+    },
+    {
+      "dt": "2021-08-19T04:00:00",
+      "side": "BUY",
+      "size": 62.0,
+      "price": 141.5800696426097
+    },
+    {
+      "dt": "2022-07-22T04:00:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 152.3320525114364
+    },
+    {
+      "dt": "2022-07-28T04:00:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 153.8907653704556
+    },
+    {
+      "dt": "2022-12-20T05:00:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 129.19723960857664
+    },
+    {
+      "dt": "2022-12-27T05:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 129.18743096288975
+    },
+    {
+      "dt": "2023-03-22T04:00:00",
+      "side": "SELL",
+      "size": -38.0,
+      "price": 156.88061300312046
+    },
+    {
+      "dt": "2023-03-23T04:00:00",
+      "side": "BUY",
+      "size": 38.0,
+      "price": 156.41773262448348
+    },
+    {
+      "dt": "2023-05-01T04:00:00",
+      "side": "SELL",
+      "size": -55.0,
+      "price": 166.70906903109534
+    },
+    {
+      "dt": "2023-05-05T04:00:00",
+      "side": "BUY",
+      "size": 55.0,
+      "price": 168.38322333782398
+    },
+    {
+      "dt": "2023-11-13T05:00:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 183.74018560328048
+    },
+    {
+      "dt": "2023-11-17T05:00:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 188.12057839811112
+    },
+    {
+      "dt": "2024-07-11T04:00:00",
+      "side": "SELL",
+      "size": -18.0,
+      "price": 229.40281699319425
+    },
+    {
+      "dt": "2024-07-12T04:00:00",
+      "side": "BUY",
+      "size": 18.0,
+      "price": 226.9540066999144
+    },
+    {
+      "dt": "2024-12-02T05:00:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 235.76369091824088
+    },
+    {
+      "dt": "2024-12-03T05:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 238.28756099978403
+    },
+    {
+      "dt": "2024-12-04T05:00:00",
+      "side": "BUY",
+      "size": 58.0,
+      "price": 241.32814402991647
+    },
+    {
+      "dt": "2025-07-03T04:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 211.31168447150716
+    },
+    {
+      "dt": "2025-07-07T04:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 211.83958469799765
+    },
+    {
+      "dt": "2025-09-05T04:00:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 239.3229322237051
+    },
+    {
+      "dt": "2025-09-10T04:00:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 231.53496736029473
+    },
+    {
+      "dt": "2025-12-01T05:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 277.4944549964911
+    },
+    {
+      "dt": "2025-12-02T05:00:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 282.47518456741903
+    }
+  ]
+}

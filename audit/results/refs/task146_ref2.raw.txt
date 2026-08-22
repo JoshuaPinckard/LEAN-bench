@@ -4,165 +4,128 @@ import backtrader as bt
 
 class CupAndHandleStrategy(bt.Strategy):
     params = (
-        ('cup_period', 200),          # bars for cup formation
-        ('handle_period', 50),        # bars for handle formation (cup+handle >= 250)
-        ('vol_avg_period', 50),       # spec states 50 candles for average volume
-        ('risk_pct', 0.01),           # 1% risk per trade (spec: 1-2%)
-        ('cup_sym_tol', 0.05),        # max fractional difference between left/right rim heights
-        ('handle_pullback_max', 0.30),# handle depth must not exceed 30% of cup height
+        ("volume_period", 50),
+        ("pattern_min_len", 250),
+        ("risk_pct", 0.01),
     )
 
     def __init__(self):
-        self.order = None
-        self.stop_price = None
-        self.vol_avg = bt.indicators.SimpleMovingAverage(
-            self.data.volume, period=self.p.vol_avg_period
+        self.vol_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.volume_period
         )
+        self.order = None
+        self.stop_loss = None
 
     def notify_order(self, order):
-        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
             self.order = None
 
-    def _detect_pattern(self):
-        """Return (neckline, handle_low) if a valid Cup-and-Handle is found, else (None, None)."""
-        cp = self.p.cup_period
-        hp = self.p.handle_period
+    def _detect_cup_and_handle(self):
+        if len(self) < self.p.pattern_min_len + 1:
+            return False, None, None
 
-        # Need cp+hp bars of history plus current bar
-        if len(self.data) < cp + hp + 1:
-            return None, None
+        highs = [
+            self.data.high[-i] for i in range(self.p.pattern_min_len, 0, -1)
+        ]
+        lows = [self.data.low[-i] for i in range(self.p.pattern_min_len, 0, -1)]
 
-        # Cup: cp bars ending at -(hp+1), ordered oldest-to-newest
-        # Index -(cp+hp)+i goes from -(cp+hp) (oldest) to -(hp+1) (most recent cup bar)
-        cup_highs = [self.data.high[-(cp + hp) + i] for i in range(cp)]
-        cup_lows  = [self.data.low[ -(cp + hp) + i] for i in range(cp)]
+        for h_len in range(10, 41):
+            c_len = self.p.pattern_min_len - h_len
+            cup_highs = highs[:c_len]
+            cup_lows = lows[:c_len]
 
-        # Divide cup into thirds to locate left rim, bottom, right rim
-        third = cp // 3
-        left_rim  = max(cup_highs[:third])
-        cup_bot   = min(cup_lows[third: 2 * third])
-        right_rim = max(cup_highs[2 * third:])
+            left_idx = int(c_len * 0.3)
+            right_idx = int(c_len * 0.7)
 
-        # U-shape: bottom must be below both rims
-        if cup_bot >= left_rim or cup_bot >= right_rim:
-            return None, None
+            if left_idx < 1 or right_idx <= left_idx or right_idx >= c_len:
+                continue
 
-        # Rims must be approximately equal in height
-        rim_diff = abs(left_rim - right_rim) / max(left_rim, right_rim)
-        if rim_diff > self.p.cup_sym_tol:
-            return None, None
+            left_rim = max(cup_highs[:left_idx])
+            right_rim = max(cup_highs[right_idx:])
+            bottom = min(cup_lows[left_idx:right_idx])
 
-        neckline   = max(left_rim, right_rim)
-        cup_height = neckline - cup_bot
+            max_rim = max(left_rim, right_rim)
+            min_rim = min(left_rim, right_rim)
 
-        # Handle: hp bars ending at -1, ordered oldest-to-newest
-        # Index -hp+i goes from -hp (oldest) to -1 (bar just before current)
-        handle_highs = [self.data.high[-hp + i] for i in range(hp)]
-        handle_lows  = [self.data.low[ -hp + i] for i in range(hp)]
+            if max_rim <= 0:
+                continue
 
-        handle_high = max(handle_highs)
-        handle_low  = min(handle_lows)
+            if (max_rim - min_rim) / max_rim > 0.15:
+                continue
 
-        # Handle must not break meaningfully above resistance (2% tolerance)
-        if handle_high > neckline * 1.02:
-            return None, None
+            if bottom >= min_rim * 0.92:
+                continue
 
-        # Handle depth must be a modest retracement of the cup
-        handle_depth = neckline - handle_low
-        if cup_height > 0 and handle_depth / cup_height > self.p.handle_pullback_max:
-            return None, None
+            cup_depth = max_rim - bottom
+            handle_highs = highs[c_len:]
+            handle_lows = lows[c_len:]
 
-        return neckline, handle_low
+            handle_low = min(handle_lows)
+            handle_high = max(handle_highs)
+
+            if handle_low <= bottom + 0.5 * cup_depth:
+                continue
+
+            if handle_high > max_rim * 1.02:
+                continue
+
+            return True, max_rim, handle_low
+
+        return False, None, None
 
     def next(self):
         if self.order:
             return
 
-        # Exit: close below handle low (stop-loss)
-        if self.position:
-            if self.data.close[0] < self.stop_price:
+        if not self.position:
+            is_pattern, resistance, handle_low = self._detect_cup_and_handle()
+            if is_pattern:
+                if (
+                    self.data.close[0] > resistance
+                    and self.data.volume[0] > self.vol_sma[0]
+                ):
+                    entry_price = self.data.close[0]
+                    risk_per_share = entry_price - handle_low
+                    if risk_per_share > 0:
+                        capital = self.broker.getvalue()
+                        risk_amount = capital * self.p.risk_pct
+                        size = int(risk_amount / risk_per_share)
+
+                        cash = self.broker.getcash()
+                        max_shares = int(cash / entry_price)
+                        size = min(size, max_shares)
+
+                        if size > 0:
+                            self.stop_loss = handle_low
+                            self.order = self.buy(size=size)
+        else:
+            if self.data.close[0] < self.stop_loss:
                 self.order = self.close()
-            return
-
-        neckline, handle_low = self._detect_pattern()
-        if neckline is None:
-            return
-
-        # Entry condition: closing price above resistance (neckline) — satisfies rules 1, 2, and 4
-        if self.data.close[0] <= neckline:
-            return
-
-        # Entry condition: volume above 50-bar average (rule 3)
-        if self.data.volume[0] <= self.vol_avg[0]:
-            return
-
-        # Position sizing: risk 1% of capital, stop at handle low
-        entry_price    = self.data.close[0]
-        risk_per_share = entry_price - handle_low
-        if risk_per_share <= 0:
-            return
-
-        capital     = self.broker.getvalue()
-        risk_amount = capital * self.p.risk_pct
-        size        = int(risk_amount / risk_per_share)
-        if size <= 0:
-            return
-
-        self.stop_price = handle_low
-        self.order      = self.buy(size=size)
 ```
 
 ```json
-{"assumptions": [
-  {
-    "topic": "cup_period and handle_period split",
-    "choice": "cup_period=200 bars, handle_period=50 bars (total=250)",
-    "reason": "Spec mandates pattern formation >= 1 year (~250 daily bars) but does not split that budget between cup and handle. 200+50=250 meets the minimum; 50-bar handle matches the stated volume-average period and represents ~2 months of daily trading, a conventional handle length."
-  },
-  {
-    "topic": "risk_pct = 1%",
-    "choice": "1% of total capital per trade",
-    "reason": "Spec states '1-2%'. The lower bound (1%) is chosen as the conservative, unambiguous value."
-  },
-  {
-    "topic": "cup detection algorithm (thirds scan)",
-    "choice": "Cup divided into three equal segments: left rim = max high of first third, bottom = min low of middle third, right rim = max high of final third",
-    "reason": "Spec requires a U-shaped cup but gives no numerical detection algorithm. A three-segment scan is the simplest method that captures the defining structural features (high–low–high) of the cup."
-  },
-  {
-    "topic": "cup_sym_tol = 5%",
-    "choice": "Left and right rim heights must be within 5% of each other",
-    "reason": "Spec requires the cup to be U-shaped (implying approximately equal rims) but provides no numerical threshold. 5% is a conservative tolerance that rejects clearly asymmetric formations."
-  },
-  {
-    "topic": "handle_pullback_max = 30%",
-    "choice": "Handle low may not be more than 30% of cup height below the neckline",
-    "reason": "Spec calls the handle a 'consolidation or small decline' without quantifying 'small'. 30% of cup height is a widely cited conventional guideline for Cup-and-Handle patterns."
-  },
-  {
-    "topic": "handle ceiling tolerance = 2%",
-    "choice": "Handle high must not exceed neckline × 1.02",
-    "reason": "The handle should remain below resistance, but minor intraday wicks slightly above the neckline are common. A 2% ceiling tolerance is declared to allow for this without invalidating otherwise valid patterns."
-  },
-  {
-    "topic": "neckline definition",
-    "choice": "neckline = max(left_rim_high, right_rim_high)",
-    "reason": "Spec describes the neckline as 'the upper boundary of the cup'. When the two rims differ (within the symmetry tolerance), the higher peak is the binding resistance level."
-  },
-  {
-    "topic": "stop-loss check uses closing price",
-    "choice": "Exit triggered when self.data.close[0] < handle_low",
-    "reason": "Spec says 'close the position when price drops below the lowest point of the handle'. Checked on the bar's closing price, consistent with how entry is also evaluated on close."
-  },
-  {
-    "topic": "stop_price frozen at entry",
-    "choice": "Handle low is recorded at entry and not updated while in position",
-    "reason": "Spec defines the stop as 'the lowest point of the handle of the pattern' — the handle that triggered entry — with no mention of trailing or updating the stop."
-  },
-  {
-    "topic": "infeasible — timeframe mismatch",
-    "choice": "Pattern lookback window of 250 bars used on the 1-day feed provided by the harness",
-    "reason": "Spec says the strategy should operate on '1 year or higher timeframe'. The harness supplies only 1-day bars; a 250-bar (~1-year) lookback window is the closest literal implementation on this feed."
-  }
-]}
+{
+  "assumptions": [
+    {
+      "topic": "pattern_detection_definition",
+      "choice": "250-bar rolling window evaluating handle lengths from 10 to 40 bars and cup segmentation into left rim (0-30%), bottom trough (30-70%), and right rim (70-100%).",
+      "reason": "The spec requires pattern formation of at least 1 year (~250 daily candles) with a U-shaped cup and handle consolidation. Parameterized geometric constraints allow deterministic pattern evaluation."
+    },
+    {
+      "topic": "risk_percentage",
+      "choice": "1% (0.01) risk per trade relative to portfolio capital.",
+      "reason": "The spec mandates risk per trade not exceeding 1-2% of total capital; 1% is selected as the standard baseline."
+    },
+    {
+      "topic": "exit_condition_trigger",
+      "choice": "Execute self.close() in next() when current bar closing price drops below handle_low.",
+      "reason": "The specification designates the lowest point of the handle as the default stop-loss level."
+    }
+  ]
+}
 ```

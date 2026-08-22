@@ -1,0 +1,263 @@
+```python
+import collections
+import math
+import statistics
+import backtrader as bt
+
+
+class MultiTimeframeForexSwingStrategy(bt.Strategy):
+    """
+    Reference implementation of Multi-Level Timeframe Swing Trading Strategy.
+    Aggregates 1h feed into Daily and H4 candles to evaluate higher and lower
+    timeframe filters, support/resistance levels, and Stochastic/RSI momentum.
+    """
+
+    def __init__(self):
+        # Order tracking
+        self.order = None
+
+        # Position tracking details
+        self.entry_price = None
+        self.sl_price = None
+        self.tp_price = None
+        self.position_type = None  # 'long' or 'short'
+
+        # Target support/resistance levels at signal time
+        self.target_support = None
+        self.target_resistance = None
+
+        # Bar aggregators from 1h data
+        self.daily_bars = []
+        self.current_daily_bar = None
+
+        self.h4_bars = []
+        self.current_h4_accumulator = []
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                if self.position.size > 0:
+                    self.entry_price = order.executed.price
+                    self.position_type = 'long'
+                    support = getattr(self, 'target_support', self.entry_price * 0.99)
+                    self.sl_price = min(support * 0.99, self.entry_price * 0.98)
+                    self.tp_price = self.entry_price * 1.02
+            elif order.issell():
+                if self.position.size < 0:
+                    self.entry_price = order.executed.price
+                    self.position_type = 'short'
+                    resistance = getattr(self, 'target_resistance', self.entry_price * 1.01)
+                    self.sl_price = max(resistance * 1.01, self.entry_price * 1.02)
+                    self.tp_price = self.entry_price * 0.98
+
+            if self.position.size == 0:
+                self.position_type = None
+                self.entry_price = None
+                self.sl_price = None
+                self.tp_price = None
+
+        self.order = None
+
+    def _calc_stochastic(self, h4_bars, k_period=14, k_smooth=3, d_smooth=3):
+        if len(h4_bars) < k_period + k_smooth + d_smooth - 2:
+            return [], []
+
+        fast_k_list = []
+        for i in range(k_period - 1, len(h4_bars)):
+            window = h4_bars[i - k_period + 1 : i + 1]
+            hh = max(b['high'] for b in window)
+            ll = min(b['low'] for b in window)
+            c = h4_bars[i]['close']
+            fk = 100.0 * (c - ll) / (hh - ll) if hh != ll else 50.0
+            fast_k_list.append(fk)
+
+        k_list = []
+        for i in range(k_smooth - 1, len(fast_k_list)):
+            k_val = sum(fast_k_list[i - k_smooth + 1 : i + 1]) / float(k_smooth)
+            k_list.append(k_val)
+
+        d_list = []
+        for i in range(d_smooth - 1, len(k_list)):
+            d_val = sum(k_list[i - d_smooth + 1 : i + 1]) / float(d_smooth)
+            d_list.append(d_val)
+
+        return k_list, d_list
+
+    def _calc_rsi(self, h4_bars, period=14):
+        if len(h4_bars) < period + 1:
+            return []
+
+        closes = [b['close'] for b in h4_bars]
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            if diff > 0:
+                gains.append(diff)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(-diff)
+
+        if len(gains) < period:
+            return []
+
+        avg_gain = sum(gains[:period]) / float(period)
+        avg_loss = sum(losses[:period]) / float(period)
+
+        rsi_list = []
+        rs = avg_gain / avg_loss if avg_loss != 0 else 1e10
+        rsi_list.append(100.0 - (100.0 / (1.0 + rs)))
+
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / float(period)
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / float(period)
+            rs = avg_gain / avg_loss if avg_loss != 0 else 1e10
+            rsi_list.append(100.0 - (100.0 / (1.0 + rs)))
+
+        return rsi_list
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        date = dt.date()
+
+        p_open = self.data.open[0]
+        p_high = self.data.high[0]
+        p_low = self.data.low[0]
+        p_close = self.data.close[0]
+
+        # 1. Update Daily Bar Aggregation
+        if self.current_daily_bar is None:
+            self.current_daily_bar = {'open': p_open, 'high': p_high, 'low': p_low, 'close': p_close, 'date': date}
+        elif self.current_daily_bar['date'] == date:
+            self.current_daily_bar['high'] = max(self.current_daily_bar['high'], p_high)
+            self.current_daily_bar['low'] = min(self.current_daily_bar['low'], p_low)
+            self.current_daily_bar['close'] = p_close
+        else:
+            self.daily_bars.append(self.current_daily_bar)
+            self.current_daily_bar = {'open': p_open, 'high': p_high, 'low': p_low, 'close': p_close, 'date': date}
+
+        # 2. Update H4 Bar Aggregation (4 1h bars per H4 bar)
+        self.current_h4_accumulator.append({'open': p_open, 'high': p_high, 'low': p_low, 'close': p_close})
+        if len(self.current_h4_accumulator) == 4:
+            h4_o = self.current_h4_accumulator[0]['open']
+            h4_h = max(b['high'] for b in self.current_h4_accumulator)
+            h4_l = min(b['low'] for b in self.current_h4_accumulator)
+            h4_c = self.current_h4_accumulator[-1]['close']
+            self.h4_bars.append({'open': h4_o, 'high': h4_h, 'low': h4_l, 'close': h4_c})
+            self.current_h4_accumulator = []
+
+        if self.order:
+            return
+
+        # Warmup requirements
+        if len(self.daily_bars) < 200 or len(self.h4_bars) < 20:
+            return
+
+        # Calculate Daily Indicators
+        daily_closes = [b['close'] for b in self.daily_bars]
+        daily_sma200 = sum(daily_closes[-200:]) / 200.0
+
+        recent_50_daily = self.daily_bars[-50:]
+        support_level = min(b['low'] for b in recent_50_daily)
+        resistance_level = max(b['high'] for b in recent_50_daily)
+
+        # Calculate H4 Indicators
+        stoch_k, stoch_d = self._calc_stochastic(self.h4_bars, 14, 3, 3)
+        rsi_vals = self._calc_rsi(self.h4_bars, 14)
+
+        if len(stoch_k) < 2 or len(rsi_vals) < 1:
+            return
+
+        stoch_cross_up_20 = stoch_k[-2] < 20.0 and stoch_k[-1] >= 20.0
+        stoch_cross_down_80 = stoch_k[-2] > 80.0 and stoch_k[-1] <= 80.0
+        rsi_current = rsi_vals[-1]
+
+        # Handle Existing Position Exits
+        if self.position:
+            if self.position_type == 'long':
+                if (
+                    (self.sl_price and p_low <= self.sl_price)
+                    or (self.tp_price and p_high >= self.tp_price)
+                    or stoch_cross_down_80
+                ):
+                    self.order = self.close()
+            elif self.position_type == 'short':
+                if (
+                    (self.sl_price and p_high >= self.sl_price)
+                    or (self.tp_price and p_low <= self.tp_price)
+                    or stoch_cross_up_20
+                ):
+                    self.order = self.close()
+            return
+
+        # Evaluate Entry Conditions
+        recent_daily_low = min(b['low'] for b in self.daily_bars[-3:])
+        recent_daily_high = max(b['high'] for b in self.daily_bars[-3:])
+
+        # Long Entry Conditions
+        long_trend = p_close > daily_sma200
+        long_retrace = recent_daily_low <= support_level * 1.01 and p_close > support_level
+        long_stoch = stoch_cross_up_20
+        long_rsi = rsi_current > 50.0
+
+        if long_trend and long_retrace and long_stoch and long_rsi:
+            self.target_support = support_level
+            sl_est = min(support_level * 0.99, p_close * 0.98)
+            risk_per_share = max(p_close - sl_est, p_close * 0.01)
+            equity = self.broker.getvalue()
+            risk_amount = equity * 0.01
+            size = int(risk_amount / risk_per_share)
+            max_size = int(self.broker.getcash() / p_close)
+            size = max(1, min(size, max_size))
+            self.order = self.buy(size=size)
+            return
+
+        # Short Entry Conditions
+        short_trend = p_close < daily_sma200
+        short_retrace = recent_daily_high >= resistance_level * 0.99 and p_close < resistance_level
+        short_stoch = stoch_cross_down_80
+        short_rsi = rsi_current < 50.0
+
+        if short_trend and short_retrace and short_stoch and short_rsi:
+            self.target_resistance = resistance_level
+            sl_est = max(resistance_level * 1.01, p_close * 1.02)
+            risk_per_share = max(sl_est - p_close, p_close * 0.01)
+            equity = self.broker.getvalue()
+            risk_amount = equity * 0.01
+            size = int(risk_amount / risk_per_share)
+            max_size = int(self.broker.getcash() / p_close)
+            size = max(1, min(size, max_size))
+            self.order = self.sell(size=size)
+            return
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Aggregate 1h input feed bars into Daily and H4 bars inside strategy next()",
+      "reason": "The execution environment provides a single 1h data feed self.data. Higher timeframe (Daily) and lower timeframe (H4) bars and indicators are computed by aggregating 1h OHLC bars into Daily and H4 candles on the fly."
+    },
+    {
+      "topic": "support_resistance_and_bounce",
+      "choice": "Support/Resistance defined as min low/max high of last 50 completed daily bars. Bounce requires price to touch within 1% of level and close beyond it.",
+      "reason": "Specification calls for key levels from local highs/lows over last 50 daily candles and retracing/bouncing from them."
+    },
+    {
+      "topic": "stop_loss_choice",
+      "choice": "For Long, SL is min(support * 0.99, entry * 0.98); For Short, SL is max(resistance * 1.01, entry * 1.02)",
+      "reason": "Spec specifies SL as 1% beyond key level or 2% from entry point. Choosing the tighter structural/fixed stop guarantees SL is always placed on the loss side of entry price."
+    },
+    {
+      "topic": "stochastic_line",
+      "choice": "Use %K line (3-period SMA of fast %K) crossing 20/80 levels for entry/exit signals",
+      "reason": "Spec states Stochastic crosses 20/80 level. %K is the standard main line of the Stochastic oscillator."
+    }
+  ]
+}
+```

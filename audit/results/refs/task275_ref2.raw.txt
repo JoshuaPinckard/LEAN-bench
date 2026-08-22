@@ -1,0 +1,130 @@
+```python
+import math
+import backtrader as bt
+
+
+class SyntheticStraddleOpenGapVolatility(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("ema_period", 50),
+        ("vol_mult", 1.2),
+        ("gap_pct", 0.01),
+        ("atr_period", 14),
+        ("entry_atr_mult", 0.8),
+        ("stop_atr_mult", 1.5),
+        ("giveback_factor", 0.6),
+        ("risk_pct", 0.02),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_dev,
+        )
+        self.bandwidth = self.bb.top - self.bb.bot
+        self.bw_ema = bt.indicators.EMA(self.bandwidth, period=self.p.ema_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order_buy = None
+        self.order_sell = None
+        self.order_exit = None
+
+        self.entry_price = None
+        self.entry_atr = None
+        self.peak_high = None
+        self.peak_low = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order in (self.order_buy, self.order_sell):
+                self.entry_price = order.executed.price
+                self.entry_atr = self.atr[0]
+                self.peak_high = max(order.executed.price, self.data.high[0])
+                self.peak_low = min(order.executed.price, self.data.low[0])
+            elif order is self.order_exit:
+                self.entry_price = None
+                self.entry_atr = None
+                self.peak_high = None
+                self.peak_low = None
+
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if order is self.order_buy:
+                self.order_buy = None
+            if order is self.order_sell:
+                self.order_sell = None
+            if order is self.order_exit:
+                self.order_exit = None
+
+    def next(self):
+        if self.position:
+            if self.position.size > 0:
+                self.peak_high = max(self.peak_high, self.data.high[0])
+            elif self.position.size < 0:
+                self.peak_low = min(self.peak_low, self.data.low[0])
+
+            if self.order_exit is None:
+                self.order_exit = self.close()
+            return
+
+        if self.order_buy is not None:
+            self.cancel(self.order_buy)
+            self.order_buy = None
+        if self.order_sell is not None:
+            self.cancel(self.order_sell)
+            self.order_sell = None
+
+        vol_filter = (self.bandwidth[0] / self.bw_ema[0]) > self.p.vol_mult
+        gap_filter = (
+            abs(self.data.open[0] - self.data.close[-1]) / self.data.close[-1]
+        ) >= self.p.gap_pct
+
+        if vol_filter and gap_filter:
+            equity = self.broker.getvalue()
+            risk_amount = self.p.risk_pct * equity
+            risk_per_share = self.p.stop_atr_mult * self.atr[0]
+            if risk_per_share <= 0:
+                return
+            size = math.floor(risk_amount / risk_per_share)
+            if size <= 0:
+                return
+
+            buy_price = self.data.open[0] + self.p.entry_atr_mult * self.atr[0]
+            sell_price = self.data.open[0] - self.p.entry_atr_mult * self.atr[0]
+
+            self.order_buy = self.buy(
+                exectype=bt.Order.Stop, price=buy_price, size=size
+            )
+            self.order_sell = self.sell(
+                exectype=bt.Order.Stop,
+                price=sell_price,
+                size=size,
+                oco=self.order_buy,
+            )
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Evaluate day filters and place OCO stop orders in next() based on the current daily bar's Open and ATR, with orders active for the subsequent daily bar.",
+      "reason": "Standard daily OHLCV data feeds in backtrader do not provide intraday tick/minute resolution to place orders prior to market open or execute same-bar straddle entries."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Exit open positions via self.close() at the end of the entry bar's next() processing, executing at market on the following open.",
+      "reason": "1D daily bars execute next() at bar close; intra-bar execution of 0DTE market exits at session close cannot be simulated on daily resolution without next-bar execution."
+    }
+  ]
+}
+```

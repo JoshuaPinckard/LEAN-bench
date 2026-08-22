@@ -1,0 +1,166 @@
+```python
+import backtrader as bt
+import math
+import collections
+import statistics
+
+
+class ATRIntradayReversal(bt.Strategy):
+    params = (
+        ('atr_period', 14),
+        ('range_pct', 0.80),
+        ('zone_pct', 0.25),
+        ('risk_pct', 0.01),
+        ('sl_buffer_atr', 0.10),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.order = None
+
+        self.current_date = None
+        self.hod = None
+        self.lod = None
+        self.prev_close = None
+        self.daily_trs = []
+
+        self.sl_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        tm = self.data.datetime.time(0)
+
+        # Handle Day Boundaries and Daily ATR Tracking
+        if self.current_date != dt:
+            if self.current_date is not None and self.hod is not None and self.lod is not None:
+                if self.prev_close is not None:
+                    tr = max(
+                        self.hod - self.lod,
+                        abs(self.hod - self.prev_close),
+                        abs(self.lod - self.prev_close)
+                    )
+                else:
+                    tr = self.hod - self.lod
+                self.daily_trs.append(tr)
+                if len(self.daily_trs) > self.p.atr_period:
+                    self.daily_trs.pop(0)
+
+            self.current_date = dt
+            self.hod = self.data.high[0]
+            self.lod = self.data.low[0]
+            self.prev_close = self.data.close[-1] if len(self) > 1 else self.data.close[0]
+        else:
+            self.hod = max(self.hod, self.data.high[0])
+            self.lod = min(self.lod, self.data.low[0])
+
+        # Compute Daily ATR
+        if len(self.daily_trs) > 0:
+            daily_atr = sum(self.daily_trs) / len(self.daily_trs)
+        else:
+            daily_atr = self.atr[0] * math.sqrt(78) if not math.isnan(self.atr[0]) else (self.hod - self.lod)
+
+        # Time-based Exit at End of Trading Day (15:50 or later)
+        is_eod = (tm.hour == 15 and tm.minute >= 50) or tm.hour > 15
+        if self.position:
+            if is_eod:
+                self.close()
+                return
+
+            # Intra-bar Take Profit and Stop Loss evaluation
+            if self.position.size > 0:
+                if self.data.high[0] >= self.tp_price or self.data.low[0] <= self.sl_price:
+                    self.close()
+                    return
+            elif self.position.size < 0:
+                if self.data.low[0] <= self.tp_price or self.data.high[0] >= self.sl_price:
+                    self.close()
+                    return
+
+        if self.order or self.position or is_eod:
+            return
+
+        # Check Range Condition: Intra-day covered range >= 80% Daily ATR
+        current_range = self.hod - self.lod
+        if daily_atr <= 0 or current_range < self.p.range_pct * daily_atr:
+            return
+
+        close = self.data.close[0]
+        open_p = self.data.open[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+
+        body = abs(close - open_p)
+        upper_shadow = high - max(open_p, close)
+        lower_shadow = min(open_p, close) - low
+
+        # Long Signal: In Support Zone + Bullish Pin Bar
+        in_support = (close - self.lod) <= (self.p.zone_pct * current_range)
+        bullish_pin = (lower_shadow >= 1.5 * body) and (lower_shadow > upper_shadow)
+
+        if in_support and bullish_pin:
+            sl = self.lod - (self.p.sl_buffer_atr * daily_atr)
+            tp = self.hod
+            risk_per_share = max(0.01, close - sl)
+            portfolio_value = self.broker.getvalue()
+            risk_amount = portfolio_value * self.p.risk_pct
+            size = max(1, int(risk_amount / risk_per_share))
+
+            self.sl_price = sl
+            self.tp_price = tp
+            self.order = self.buy(size=size)
+            return
+
+        # Short Signal: In Resistance Zone + Bearish Pin Bar
+        in_resistance = (self.hod - close) <= (self.p.zone_pct * current_range)
+        bearish_pin = (upper_shadow >= 1.5 * body) and (upper_shadow > lower_shadow)
+
+        if in_resistance and bearish_pin:
+            sl = self.hod + (self.p.sl_buffer_atr * daily_atr)
+            tp = self.lod
+            risk_per_share = max(0.01, sl - close)
+            portfolio_value = self.broker.getvalue()
+            risk_amount = portfolio_value * self.p.risk_pct
+            size = max(1, int(risk_amount / risk_per_share))
+
+            self.sl_price = sl
+            self.tp_price = tp
+            self.order = self.sell(size=size)
+            return
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "Daily ATR Computation",
+      "choice": "Calculate 14-period daily ATR dynamically by tracking daily True Ranges across session boundaries, with fallback to 14-period 5-minute ATR scaled by sqrt(78) for initial bars.",
+      "reason": "The specification explicitly references daily ATR values (e.g. $8.00) and standard ATR(14). Calculating daily True Ranges reflects daily volatility on intraday bar feeds."
+    },
+    {
+      "topic": "Support and Resistance Zones",
+      "choice": "Define support zone as bottom 25% of current daily high-low range, and resistance zone as top 25%.",
+      "reason": "The spec states 'close to daily low/high' for support/resistance zones without specifying explicit percentage thresholds."
+    },
+    {
+      "topic": "Reversal Pattern Recognition",
+      "choice": "Implement bullish pin bar (lower shadow >= 1.5x body and lower shadow > upper shadow) and bearish pin bar (upper shadow >= 1.5x body and upper shadow > lower shadow).",
+      "reason": "The spec explicitly lists pin bars as representative reversal signals."
+    },
+    {
+      "topic": "Stop Loss and Take Profit Levels",
+      "choice": "Set long SL at LOD - 0.10 * Daily ATR and TP at HOD; set short SL at HOD + 0.10 * Daily ATR and TP at LOD.",
+      "reason": "Matches specification requiring SL placed slightly outside HOD/LOD and TP at opposite range extreme."
+    },
+    {
+      "topic": "Time-based Exit",
+      "choice": "Close open positions at or after 15:50:00 EST.",
+      "reason": "Ensures all day trades are exited before market close at 16:00 to avoid gap/overnight risk as specified."
+    }
+  ]
+}
+```

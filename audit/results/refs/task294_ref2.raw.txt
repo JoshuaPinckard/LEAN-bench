@@ -1,0 +1,117 @@
+```python
+import backtrader as bt
+
+
+class TimeSeriesMomentum(bt.Strategy):
+    params = (
+        ("N", 90),
+        ("R", 21),
+        ("w", 0.20),
+        ("dollar_vol_period", 21),
+        ("dollar_vol_thresh", 1000000.0),
+        ("eps", 1e-6),
+    )
+
+    def __init__(self):
+        self.order = None
+
+        # Momentum M = Close / Close[-N] - 1
+        self.close_N = self.data.close(-self.p.N)
+        self.momentum = (self.data.close / self.close_N) - 1.0
+
+        # CrossOver(close, close(-N)) to track changes in the sign of momentum
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.close_N)
+
+        # Liquidity filter: SMA(21) of dollar volume (Close * Volume)
+        dollar_volume = self.data.close * self.data.volume
+        self.sma_dv = bt.indicators.SMA(
+            dollar_volume, period=self.p.dollar_vol_period
+        )
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        # Liquidity filter & history requirement
+        liquidity_ok = (self.sma_dv[0] >= self.p.dollar_vol_thresh) and (
+            len(self) >= self.p.N
+        )
+
+        # Periodic rebalancing schedule
+        is_rebal_day = len(self) % self.p.R == 0
+
+        if is_rebal_day:
+            if liquidity_ok:
+                m_val = self.momentum[0]
+                alloc = min(
+                    self.p.w if self.p.w <= 1.0 else self.p.w / 100.0, 0.10
+                )
+                capital = self.broker.getvalue()
+                price = self.data.close[0]
+
+                s_target = 0
+                if price > 0:
+                    raw_size = int((capital * alloc) / price)
+                    if m_val > self.p.eps:
+                        s_target = raw_size
+                    elif m_val < -self.p.eps:
+                        s_target = -raw_size
+                    else:
+                        s_target = 0
+
+                pos_size = self.position.size
+                if s_target != pos_size:
+                    if s_target == 0:
+                        self.order = self.close()
+                    elif s_target > pos_size:
+                        self.order = self.buy(size=s_target - pos_size)
+                    else:
+                        self.order = self.sell(size=pos_size - s_target)
+            else:
+                # Liquidity filter failed: stay out / close position
+                if self.position.size != 0:
+                    self.order = self.close()
+        else:
+            # Between rebalancings: close open position on zero crossing
+            if self.position.size != 0:
+                if self.crossover[0] != 0:
+                    self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "rebalancing_schedule",
+      "choice": "Rebalance dates occur when `len(self) % R == 0`.",
+      "reason": "The specification defines periodic rebalancing frequency R days. Evaluating `len(self) % R == 0` provides a deterministic periodic rebalancing schedule every R bars."
+    },
+    {
+      "topic": "close_to_zero_threshold",
+      "choice": "Use epsilon threshold parameter `eps = 1e-6`. If `abs(M) <= eps`, momentum is treated as close to 0.",
+      "reason": "The specification specifies 'if |M| is close to 0 — stay out of the position' without giving a numerical threshold. A small epsilon accounts for floating-point values near zero."
+    },
+    {
+      "topic": "rebalancing_order_execution",
+      "choice": "Adjust existing position directly to the target rebalance size using a single net delta order.",
+      "reason": "The specification states 'at each rebalancing, all positions are closed and the signal is re-evaluated'. Calculating net position adjustment directly achieves the target rebalance allocation while preventing margin/cash rejections caused by submitting simultaneous close and re-open orders in Backtrader."
+    },
+    {
+      "topic": "target_capital_allocation",
+      "choice": "Position sizing uses `min(w, 0.10)` fraction of total portfolio equity `self.broker.getvalue()`.",
+      "reason": "The specification sets target capital allocation w (default 20%) and position sizing as `min(w, 10%)` of capital. For default w=0.20, min(0.20, 0.10) equals 0.10 (10%)."
+    }
+  ]
+}
+```

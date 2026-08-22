@@ -1,0 +1,197 @@
+```python
+import backtrader as bt
+
+
+class DailyORBBollingerStrategy(bt.Strategy):
+    params = (
+        ('ema_fast', 20),
+        ('ema_slow', 50),
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('atr_period', 14),
+        ('trade1_tp', 0.005),
+        ('trade1_sl', 0.003),
+        ('trade2_tp', 0.006),
+        ('atr_mult', 1.0),
+    )
+
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_fast)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=self.p.ema_slow)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.episode_state = 'IDLE'  # 'IDLE', 'TRADE1', 'WAIT_RETEST', 'TRADE2'
+        self.trade_dir = 0  # 1 for Long, -1 for Short
+        self.tp_price = 0.0
+        self.sl_price = 0.0
+        self.retest_days_left = 0
+        self.retest_extreme = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            if self.position.size == 0:
+                self.episode_state = 'IDLE'
+
+        elif order.status == order.Completed:
+            self.order = None
+            price = order.executed.price
+            if self.episode_state == 'TRADE1' and self.position.size != 0:
+                if self.trade_dir == 1:
+                    self.tp_price = price * (1.0 + self.p.trade1_tp)
+                    self.sl_price = price * (1.0 - self.p.trade1_sl)
+                elif self.trade_dir == -1:
+                    self.tp_price = price * (1.0 - self.p.trade1_tp)
+                    self.sl_price = price * (1.0 + self.p.trade1_sl)
+            elif self.episode_state == 'TRADE2' and self.position.size != 0:
+                if self.trade_dir == 1:
+                    self.tp_price = price * (1.0 + self.p.trade2_tp)
+                    self.sl_price = self.retest_extreme
+                elif self.trade_dir == -1:
+                    self.tp_price = price * (1.0 - self.p.trade2_tp)
+                    self.sl_price = self.retest_extreme
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.episode_state == 'IDLE':
+            if self.position.size == 0:
+                if self.ema20[0] > self.ema50[0]:
+                    self.trade_dir = 1
+                    self.episode_state = 'TRADE1'
+                    self.order = self.buy(size=1)
+                elif self.ema20[0] < self.ema50[0]:
+                    self.trade_dir = -1
+                    self.episode_state = 'TRADE1'
+                    self.order = self.sell(size=1)
+
+        elif self.episode_state == 'TRADE1':
+            if self.position.size != 0:
+                if self.trade_dir == 1:
+                    tp_hit = self.data.high[0] >= self.tp_price
+                    sl_hit = self.data.low[0] <= self.sl_price
+                    if tp_hit and sl_hit:
+                        # Simultaneous hit: conservatively assume SL triggers first
+                        self.order = self.close()
+                        self.episode_state = 'WAIT_RETEST'
+                        self.retest_days_left = 3
+                    elif sl_hit:
+                        self.order = self.close()
+                        self.episode_state = 'WAIT_RETEST'
+                        self.retest_days_left = 3
+                    elif tp_hit:
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+                elif self.trade_dir == -1:
+                    tp_hit = self.data.low[0] <= self.tp_price
+                    sl_hit = self.data.high[0] >= self.sl_price
+                    if tp_hit and sl_hit:
+                        # Simultaneous hit: conservatively assume SL triggers first
+                        self.order = self.close()
+                        self.episode_state = 'WAIT_RETEST'
+                        self.retest_days_left = 3
+                    elif sl_hit:
+                        self.order = self.close()
+                        self.episode_state = 'WAIT_RETEST'
+                        self.retest_days_left = 3
+                    elif tp_hit:
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+
+        elif self.episode_state == 'WAIT_RETEST':
+            if self.position.size == 0:
+                retest_hit = False
+                if self.trade_dir == 1:
+                    if (
+                        self.data.low[0] <= self.bb.mid[0]
+                        and self.data.close[0] > self.bb.mid[0]
+                    ):
+                        retest_hit = True
+                        self.retest_extreme = self.data.low[0]
+                elif self.trade_dir == -1:
+                    if (
+                        self.data.high[0] >= self.bb.mid[0]
+                        and self.data.close[0] < self.bb.mid[0]
+                    ):
+                        retest_hit = True
+                        self.retest_extreme = self.data.high[0]
+
+                if retest_hit:
+                    if self.trade_dir == 1:
+                        self.order = self.buy(size=1)
+                    else:
+                        self.order = self.sell(size=1)
+                    self.episode_state = 'TRADE2'
+                else:
+                    self.retest_days_left -= 1
+                    if self.retest_days_left <= 0:
+                        self.episode_state = 'IDLE'
+
+        elif self.episode_state == 'TRADE2':
+            if self.position.size != 0:
+                atr_prev = self.atr[-1]
+                if self.trade_dir == 1:
+                    trail_level = self.data.high[0] - self.p.atr_mult * atr_prev
+                    current_sl = max(self.sl_price, trail_level)
+                    tp_hit = self.data.high[0] >= self.tp_price
+                    sl_hit = self.data.low[0] <= current_sl
+
+                    if tp_hit and sl_hit:
+                        # Simultaneous hit: conservatively assume trailing stop triggers first
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+                    elif sl_hit:
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+                    elif tp_hit:
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+                    else:
+                        self.sl_price = current_sl
+
+                elif self.trade_dir == -1:
+                    trail_level = self.data.low[0] + self.p.atr_mult * atr_prev
+                    current_sl = min(self.sl_price, trail_level)
+                    tp_hit = self.data.low[0] <= self.tp_price
+                    sl_hit = self.data.high[0] >= current_sl
+
+                    if tp_hit and sl_hit:
+                        # Simultaneous hit: conservatively assume trailing stop triggers first
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+                    elif sl_hit:
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+                    elif tp_hit:
+                        self.order = self.close()
+                        self.episode_state = 'IDLE'
+                    else:
+                        self.sl_price = current_sl
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "order_execution",
+      "choice": "Market orders at open are submitted via self.buy()/self.sell() in next() and filled at the next bar's Open.",
+      "reason": "Spec specifies market entry at the day's open on D1 timeframe."
+    },
+    {
+      "topic": "bar_exit_evaluation",
+      "choice": "TP, SL, and trailing stop hit conditions are evaluated against daily High and Low prices in next() starting from the entry bar, closing positions via self.close().",
+      "reason": "Spec states daily bar proxies and explicit conservative priorities when TP and SL/trail are hit simultaneously within a daily bar."
+    },
+    {
+      "topic": "retest_window_count",
+      "choice": "The 3 trading days retest window starts on the first trading bar after the First Trade exit completes.",
+      "reason": "Spec states 'during the next 3 trading days' following the stop-loss closure of the first trade."
+    }
+  ]
+}
+```

@@ -1,0 +1,286 @@
+{
+  "task_id": 6,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import datetime\nimport backtrader as bt\n\n\nclass StreakStrategy(bt.Strategy):\n    params = (\n        (\"mode\", \"swing\"),  # 'swing' or 'day'\n        (\"color_method\", \"prev_close\"),  # 'prev_close' or 'open_close'\n        (\"streak_len\", 2),  # Min consecutive days in streak\n        (\"risk_pct\", 0.01),  # 1% risk per trade\n        (\"stop_loss_pct\", 0.01),  # 1% stop loss distance\n    )\n\n    def __init__(self):\n        self.order = None\n        self.stop_order = None\n\n        self.current_date = None\n        self.day_open = 0.0\n        self.day_high = 0.0\n        self.day_low = 0.0\n        self.day_close = 0.0\n        self.completed_days = []\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed]:\n            if order == self.order:\n                self.order = None\n                exec_price = order.executed.price\n                pos_size = abs(self.position.size)\n                if self.position.size > 0:\n                    stop_price = exec_price * (1.0 - self.p.stop_loss_pct)\n                    self.stop_order = self.sell(\n                        exectype=bt.Order.Stop, price=stop_price, size=pos_size\n                    )\n                elif self.position.size < 0:\n                    stop_price = exec_price * (1.0 + self.p.stop_loss_pct)\n                    self.stop_order = self.buy(\n                        exectype=bt.Order.Stop, price=stop_price, size=pos_size\n                    )\n            elif order == self.stop_order:\n                self.stop_order = None\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            if order == self.order:\n                self.order = None\n            if order == self.stop_order:\n                self.stop_order = None\n\n    def next(self):\n        if len(self.data) < 2:\n            return\n\n        cur_date = self.data.datetime.date(0)\n\n        # Track and finalize daily candles\n        if self.current_date is None:\n            self.current_date = cur_date\n            self.day_open = self.data.open[0]\n            self.day_high = self.data.high[0]\n            self.day_low = self.data.low[0]\n            self.day_close = self.data.close[0]\n            return\n\n        if cur_date != self.current_date:\n            # Finalize previous day\n            prev_open = self.day_open\n            prev_close = self.day_close\n\n            # Open-Close method\n            if prev_close > prev_open:\n                color_oc = \"green\"\n            elif prev_close < prev_open:\n                color_oc = \"red\"\n            else:\n                color_oc = \"neutral\"\n\n            # Prev Close - Current Close method\n            if len(self.completed_days) > 0:\n                last_close = self.completed_days[-1][\"close\"]\n                if prev_close > last_close:\n                    color_cc = \"green\"\n                elif prev_close < last_close:\n                    color_cc = \"red\"\n                else:\n                    color_cc = \"neutral\"\n            else:\n                color_cc = color_oc\n\n            self.completed_days.append(\n                {\n                    \"date\": self.current_date,\n                    \"open\": prev_open,\n                    \"close\": prev_close,\n                    \"color_oc\": color_oc,\n                    \"color_cc\": color_cc,\n                }\n            )\n\n            # Reset for new session day\n            self.current_date = cur_date\n            self.day_open = self.data.open[0]\n            self.day_high = self.data.high[0]\n            self.day_low = self.data.low[0]\n            self.day_close = self.data.close[0]\n\n            # Swing trade take-profit exit check on new day start\n            if self.position and self.p.mode == \"swing\":\n                last_day = self.completed_days[-1]\n                key = (\n                    \"color_cc\"\n                    if self.p.color_method == \"prev_close\"\n                    else \"color_oc\"\n                )\n                last_color = last_day[key]\n\n                if self.position.size > 0 and last_color == \"red\":\n                    if self.stop_order:\n                        self.cancel(self.stop_order)\n                        self.stop_order = None\n                    self.order = self.close()\n                    return\n                elif self.position.size < 0 and last_color == \"green\":\n                    if self.stop_order:\n                        self.cancel(self.stop_order)\n                        self.stop_order = None\n                    self.order = self.close()\n                    return\n        else:\n            self.day_high = max(self.day_high, self.data.high[0])\n            self.day_low = min(self.day_low, self.data.low[0])\n            self.day_close = self.data.close[0]\n\n        # Day trade exit check (end of session)\n        if self.position and self.p.mode == \"day\":\n            current_time = self.data.datetime.time(0)\n            if current_time >= datetime.time(15, 55):\n                if self.stop_order:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.order = self.close()\n                return\n\n        # Do not open new trades if an order is pending or position exists\n        if self.order or self.position:\n            return\n\n        if len(self.completed_days) < 1:\n            return\n\n        key = (\n            \"color_cc\" if self.p.color_method == \"prev_close\" else \"color_oc\"\n        )\n        recent_color = self.completed_days[-1][key]\n        if recent_color not in (\"green\", \"red\"):\n            return\n\n        streak_count = 0\n        for d in reversed(self.completed_days):\n            if d[key] == recent_color:\n                streak_count += 1\n            else:\n                break\n\n        bullish_streak = (\n            recent_color == \"red\" and streak_count >= self.p.streak_len\n        )\n        bearish_streak = (\n            recent_color == \"green\" and streak_count >= self.p.streak_len\n        )\n\n        # Price action confirmation (breakout of previous 5m bar)\n        price_action_buy = self.data.close[0] > self.data.high[-1]\n        price_action_sell = self.data.close[0] < self.data.low[-1]\n\n        price = self.data.close[0]\n        risk_amount = self.broker.getvalue() * self.p.risk_pct\n        stop_dist = price * self.p.stop_loss_pct\n\n        if stop_dist <= 0:\n            return\n\n        calc_size = int(risk_amount / stop_dist)\n        max_cash_size = int(self.broker.getcash() / price)\n        size = min(calc_size, max_cash_size)\n\n        if size <= 0:\n            return\n\n        if bullish_streak and price_action_buy:\n            self.order = self.buy(size=size)\n        elif bearish_streak and price_action_sell:\n            self.order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "trading_mode_and_color_method",
+      "choice": "Default mode set to 'swing' using 'prev_close' color calculation, with 'day' mode and 'open_close' calculation configurable via strategy parameters.",
+      "reason": "The specification describes logic for both swing and day trading modes; using swing with previous-close color as the default provides a standard baseline while preserving full parameter support for day trading."
+    },
+    {
+      "topic": "price_action_confirmation",
+      "choice": "Price action confirmation requires current 5m Close to break above previous 5m High for Long, and break below previous 5m Low for Short.",
+      "reason": "The specification states that entry must be accompanied by price action confirmation (giving a breakout as an explicit example), which is implemented as a 1-bar high/low breakout."
+    },
+    {
+      "topic": "risk_management_and_stop_loss",
+      "choice": "Fixed stop-loss distance set at 1% of entry price; position size calculated to risk 1% of account equity per trade.",
+      "reason": "The specification requires predefined risk management with a mandatory stop-loss and standard fixed-percentage capital risk (1-2%)."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 22,
+  "tape": [
+    {
+      "dt": "2026-04-21T13:35:00",
+      "side": "SELL",
+      "size": -36.0,
+      "price": 270.9849853515625
+    },
+    {
+      "dt": "2026-04-22T17:45:00",
+      "side": "BUY",
+      "size": 36.0,
+      "price": 273.6948352050781
+    },
+    {
+      "dt": "2026-04-24T13:35:00",
+      "side": "SELL",
+      "size": -36.0,
+      "price": 270.4200134277344
+    },
+    {
+      "dt": "2026-04-28T13:30:00",
+      "side": "BUY",
+      "size": 36.0,
+      "price": 273.12421356201173
+    },
+    {
+      "dt": "2026-04-28T13:35:00",
+      "side": "BUY",
+      "size": 36.0,
+      "price": 269.1205139160156
+    },
+    {
+      "dt": "2026-04-30T13:35:00",
+      "side": "SELL",
+      "size": -36.0,
+      "price": 269.05999755859375
+    },
+    {
+      "dt": "2026-05-04T13:35:00",
+      "side": "SELL",
+      "size": -35.0,
+      "price": 277.1282958984375
+    },
+    {
+      "dt": "2026-05-05T13:40:00",
+      "side": "BUY",
+      "size": 35.0,
+      "price": 279.8995788574219
+    },
+    {
+      "dt": "2026-05-07T14:15:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 290.3500061035156
+    },
+    {
+      "dt": "2026-05-08T13:30:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 293.2535061645508
+    },
+    {
+      "dt": "2026-05-14T13:35:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 297.7099914550781
+    },
+    {
+      "dt": "2026-05-15T14:40:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 300.6870913696289
+    },
+    {
+      "dt": "2026-05-21T13:35:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 301.3699951171875
+    },
+    {
+      "dt": "2026-05-21T17:15:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 304.3836950683594
+    },
+    {
+      "dt": "2026-05-21T18:05:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 304.5400085449219
+    },
+    {
+      "dt": "2026-05-22T13:30:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 307.5854086303711
+    },
+    {
+      "dt": "2026-05-22T13:45:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 307.3299865722656
+    },
+    {
+      "dt": "2026-05-22T14:55:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 310.4032864379883
+    },
+    {
+      "dt": "2026-05-22T15:40:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 310.6700134277344
+    },
+    {
+      "dt": "2026-05-26T13:35:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 310.7850036621094
+    },
+    {
+      "dt": "2026-05-26T14:40:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 310.9914855957031
+    },
+    {
+      "dt": "2026-05-28T13:35:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 309.8399963378906
+    },
+    {
+      "dt": "2026-05-29T13:50:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 313.3500061035156
+    },
+    {
+      "dt": "2026-06-03T13:30:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 316.48350616455076
+    },
+    {
+      "dt": "2026-06-09T14:40:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 293.3599853515625
+    },
+    {
+      "dt": "2026-06-09T16:05:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 290.4263854980469
+    },
+    {
+      "dt": "2026-06-09T17:00:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 289.2099914550781
+    },
+    {
+      "dt": "2026-06-10T13:35:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 288.7099914550781
+    },
+    {
+      "dt": "2026-06-10T13:45:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 289.8999938964844
+    },
+    {
+      "dt": "2026-06-15T13:35:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 293.80499267578125
+    },
+    {
+      "dt": "2026-06-17T13:50:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 299.79998779296875
+    },
+    {
+      "dt": "2026-06-22T13:35:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 298.42999267578125
+    },
+    {
+      "dt": "2026-06-24T14:25:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 295.56500244140625
+    },
+    {
+      "dt": "2026-06-25T13:30:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 287.510009765625
+    },
+    {
+      "dt": "2026-06-25T15:30:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 277.6600036621094
+    },
+    {
+      "dt": "2026-06-25T16:20:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 274.88340362548826
+    },
+    {
+      "dt": "2026-06-25T17:00:00",
+      "side": "BUY",
+      "size": 31.0,
+      "price": 275.135009765625
+    },
+    {
+      "dt": "2026-06-26T13:35:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 276.94000244140625
+    },
+    {
+      "dt": "2026-06-26T14:30:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 278.2799987792969
+    },
+    {
+      "dt": "2026-06-26T16:15:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 275.4971987915039
+    },
+    {
+      "dt": "2026-06-26T16:35:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 277.42999267578125
+    },
+    {
+      "dt": "2026-07-08T13:35:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 309.0400085449219
+    },
+    {
+      "dt": "2026-07-10T13:35:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 315.42999267578125
+    }
+  ]
+}

@@ -1,0 +1,131 @@
+```python
+import math
+import backtrader as bt
+
+
+class GapMomentum(bt.Strategy):
+    params = (
+        ('atr_period', 14),
+        ('sma_vol_period', 20),
+        ('liquidity_thresh', 1000000),
+        ('volatility_thresh', 0.01),
+        ('gap_mult', 1.5),
+        ('volume_mult', 1.2),
+        ('risk_pct', 0.01),
+        ('sl_pct', 0.01),
+        ('tp_pct', 0.02),
+        ('time_exit_bars', 12),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_vol = bt.indicators.SMA(self.data.volume, period=self.p.sma_vol_period)
+        self.order = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if self.position:
+                self.entry_bar = len(self)
+            else:
+                self.entry_bar = None
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            bars_held = len(self) - self.entry_bar if self.entry_bar is not None else 0
+            entry_price = self.position.price
+
+            if self.position.size > 0:
+                tp_price = entry_price * (1.0 + self.p.tp_pct)
+                sl_price = entry_price * (1.0 - self.p.sl_pct)
+
+                if self.data.low[0] <= sl_price:
+                    self.order = self.close()
+                elif self.data.high[0] >= tp_price:
+                    self.order = self.close()
+                elif bars_held >= self.p.time_exit_bars:
+                    self.order = self.close()
+
+            elif self.position.size < 0:
+                tp_price = entry_price * (1.0 - self.p.tp_pct)
+                sl_price = entry_price * (1.0 + self.p.sl_pct)
+
+                if self.data.high[0] >= sl_price:
+                    self.order = self.close()
+                elif self.data.low[0] <= tp_price:
+                    self.order = self.close()
+                elif bars_held >= self.p.time_exit_bars:
+                    self.order = self.close()
+
+            return
+
+        # Check overnight session boundary
+        if self.data.datetime.date(0) == self.data.datetime.date(-1):
+            return
+
+        # Filter 1: Liquidity
+        if self.sma_vol[0] < self.p.liquidity_thresh:
+            return
+
+        # Filter 2: Volatility
+        if (self.atr[0] / self.data.close[-1]) < self.p.volatility_thresh:
+            return
+
+        # Momentum strength confirmation: volume check
+        if self.data.volume[0] <= self.p.volume_mult * self.sma_vol[0]:
+            return
+
+        # Long Gap and directional candle
+        long_gap = (self.data.open[0] - self.data.close[-1]) >= self.p.gap_mult * self.atr[0]
+        long_breakaway = self.data.open[0] > self.data.high[-1]
+        long_candle = self.data.close[0] > self.data.open[0]
+
+        # Short Gap and directional candle
+        short_gap = (self.data.close[-1] - self.data.open[0]) >= self.p.gap_mult * self.atr[0]
+        short_breakaway = self.data.open[0] < self.data.low[-1]
+        short_candle = self.data.close[0] < self.data.open[0]
+
+        # Position Sizing: 1% risk of capital / stop in points
+        capital = self.broker.getvalue()
+        stop_points = self.p.sl_pct * self.data.close[0]
+        if stop_points <= 0:
+            return
+        risk_amount = self.p.risk_pct * capital
+        size = int(risk_amount / stop_points)
+
+        if size <= 0:
+            return
+
+        if long_gap and long_breakaway and long_candle:
+            self.order = self.buy(size=size)
+        elif short_gap and short_breakaway and short_candle:
+            self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "overnight_gap_detection",
+      "choice": "Restricting gap evaluation to bars where self.data.datetime.date(0) != self.data.datetime.date(-1).",
+      "reason": "The specification specifies an 'overnight' gap; checking for date change ensures gap logic is evaluated at intraday session boundaries rather than between consecutive 5-minute bars."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Calculating stop in points as sl_pct * Close[0] at signal time.",
+      "reason": "The specification defines stop-loss as 1% from entry price and position size as 1% of capital / (stop in points). Using the signal bar's close provides an accurate point-value estimate prior to market open fill."
+    },
+    {
+      "topic": "same_bar_tp_sl_conflict",
+      "choice": "Prioritizing Stop Loss over Take Profit if both thresholds are breached within the same bar.",
+      "reason": "Checking Stop Loss first ensures conservative risk management when price range covers both TP and SL levels in a single bar."
+    }
+  ]
+}
+```

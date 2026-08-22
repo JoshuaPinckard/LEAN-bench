@@ -1,143 +1,101 @@
 ```python
-import backtrader as bt
-import math
-import collections
 import statistics
+import backtrader as bt
 
 
-class CostAwarePortfolioStrategy(bt.Strategy):
+class PortfolioCostOptimizationStrategy(bt.Strategy):
     params = (
-        ('lookback', 252),       # bars for r and sigma estimation (1 year)
-        ('lambda_risk', 1.0),    # risk-aversion coefficient lambda
-        ('theta', 0.1),          # market-impact coefficient Theta
-        ('n_grid', 1000),        # grid points for 1-D optimisation
+        ("lookback", 252),
+        ("risk_aversion", 1.0),  # lambda
+        ("impact_coef", 0.001),  # Theta
+        ("min_weight", 0.0),  # l_b
+        ("max_weight", 1.0),  # u_b
     )
 
     def __init__(self):
         self.order = None
-        self._returns = collections.deque(maxlen=self.p.lookback)
-        self._prev_close = None
 
     def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
         if order.status in [
-            order.Completed, order.Canceled,
-            order.Margin, order.Rejected,
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
         ]:
             self.order = None
 
-    def _objective(self, w, r, sigma2, w0):
-        """
-        Scalar form of (r - I(t))^T w - lambda w^T Sigma w - Theta |w|^(3/2)
-        I(t) = Theta * sqrt(|w - w0|), t = |w - w0|
-        """
-        t = abs(w - w0)
-        I_t = self.p.theta * math.sqrt(t) if t > 0.0 else 0.0
-        return (
-            (r - I_t) * w
-            - self.p.lambda_risk * sigma2 * w * w
-            - self.p.theta * math.pow(w, 1.5)
-        )
-
     def next(self):
-        if self._prev_close is not None:
-            self._returns.append(
-                (self.data.close[0] - self._prev_close) / self._prev_close
-            )
-        self._prev_close = self.data.close[0]
-
-        if len(self._returns) < self.p.lookback:
+        if len(self.data) <= self.p.lookback:
             return
+
         if self.order:
             return
 
-        rets = list(self._returns)
-        r = statistics.mean(rets) * 252          # annualised expected return
-        sigma2 = statistics.variance(rets) * 252 # annualised variance
+        returns = [
+            (self.data.close[-i] - self.data.close[-i - 1])
+            / self.data.close[-i - 1]
+            for i in range(self.p.lookback)
+        ]
 
-        portfolio_value = self.broker.get_value()
-        if portfolio_value <= 0.0:
+        r = statistics.mean(returns)
+        var = statistics.variance(returns) if len(returns) > 1 else 0.0
+
+        total_value = self.broker.getvalue()
+        price = self.data.close[0]
+
+        if total_value <= 0 or price <= 0:
             return
-        w0 = (self.position.size * self.data.close[0]) / portfolio_value
 
-        # Solve: maximise f(w) over long-only w in [0, 1] via grid search
-        best_w = 0.0
-        best_f = self._objective(0.0, r, sigma2, w0)
-        for i in range(1, self.p.n_grid + 1):
-            w_cand = i / self.p.n_grid
-            fv = self._objective(w_cand, r, sigma2, w0)
-            if fv > best_f:
-                best_f = fv
-                best_w = w_cand
+        current_size = self.position.size
+        w0 = (current_size * price) / total_value
+        w0 = max(self.p.min_weight, min(self.p.max_weight, w0))
 
-        self.order = self.order_target_percent(self.data, best_w)
+        best_w = w0
+        best_utility = -float("inf")
+        steps = 1000
+        step_size = (self.p.max_weight - self.p.min_weight) / steps
+
+        for i in range(steps + 1):
+            w = self.p.min_weight + i * step_size
+            utility = (
+                r * w
+                - self.p.risk_aversion * var * (w**2)
+                - self.p.impact_coef * (abs(w - w0) ** 1.5)
+            )
+            if utility > best_utility:
+                best_utility = utility
+                best_w = w
+
+        target_value = best_w * total_value
+        target_size = int(target_value / price)
+        size_diff = target_size - current_size
+
+        if size_diff > 0:
+            self.order = self.buy(size=size_diff)
+        elif size_diff < 0:
+            self.order = self.sell(size=abs(size_diff))
 ```
 
 ```json
-{"assumptions": [
-  {
-    "topic": "infeasible — single asset",
-    "choice": "All vector/matrix quantities (r, w, I(t), Sigma) reduced to scalars; the single AAPL feed is the entire portfolio.",
-    "reason": "Spec is written for a multi-asset portfolio; only one data feed is provided by the harness."
-  },
-  {
-    "topic": "I(t) explicit formula",
-    "choice": "I(t) = Theta * sqrt(|w - w0|) where t = |w - w0|.",
-    "reason": "Spec states I(t) is a vector of impact costs with t = |w - w0| but gives no closed form. This definition recovers the 3/2-power cost I(t)*t = Theta*|w-w0|^(3/2) described in the Impact Costs section, and is dimensionally consistent with I(t) appearing in the linear term (r - I(t))^T w."
-  },
-  {
-    "topic": "Theta|w|^(3/2) literal reading",
-    "choice": "Applied to target weight w (not trade size |w - w0|), as literally written in the objective.",
-    "reason": "The spec writes Theta|w|^(3/2) with w as the target weight vector. This penalises portfolio size rather than trade size; both this term and the I(t) term together form the cost model. Consistent with the spec's symbol definitions."
-  },
-  {
-    "topic": "Optimisation method",
-    "choice": "1-D grid search over w in [0, 1] with 1000 uniformly spaced points.",
-    "reason": "Allowed imports exclude scipy. A grid of 1000 points gives resolution 0.1% per grid step, sufficient for a weight-space search."
-  },
-  {
-    "topic": "Parameter values",
-    "choice": "lambda_risk = 1.0, theta = 0.1, lookback = 252 bars.",
-    "reason": "Spec names these parameters but specifies no numeric values. Chosen as round, neutral defaults in the standard ranges for Almgren-Chriss-style models."
-  },
-  {
-    "topic": "Expected return annualisation",
-    "choice": "r = mean(daily_returns) * 252 over the 252-bar rolling window.",
-    "reason": "Spec says 'expected returns over the reinvestment period T=1 year'; simple annualisation of the rolling mean daily return is the standard approach."
-  },
-  {
-    "topic": "Variance annualisation",
-    "choice": "sigma2 = sample_variance(daily_returns) * 252 over the same window.",
-    "reason": "Spec says 'covariance matrix based on historical asset return data over the same period'; sample variance of daily returns scaled by 252 gives the annualised variance."
-  },
-  {
-    "topic": "Full-investment constraint",
-    "choice": "Constraint omitted; search domain is w in [0, 1], allowing a cash allocation of (1 - w).",
-    "reason": "Spec's example notation l_b = u_b = w0 is ambiguous and, read literally, would freeze the portfolio (w = w0, no trading ever). For a single asset, enforcing sum(w) = 1 would fix w = 1 and make the optimisation trivial. Allowing cash allocation preserves the economic meaning of the cost-benefit trade-off."
-  },
-  {
-    "topic": "infeasible — factor covariance model",
-    "choice": "Simple historical variance used instead of Sigma = X^T F X + D.",
-    "reason": "Factor model requires factor loading matrix and factor covariance data not present in an OHLCV feed. Inapplicable with a single asset."
-  },
-  {
-    "topic": "infeasible — sector and per-asset max-weight constraints",
-    "choice": "Not implemented.",
-    "reason": "Spec lists these as illustrative examples, not mandatory rules. With a single asset there is no sector structure; the per-asset cap of 10% is presented as an example only."
-  },
-  {
-    "topic": "infeasible — liquidity filter",
-    "choice": "Not implemented.",
-    "reason": "Spec mentions excluding low-liquidity assets; with a single data feed there is nothing to filter."
-  },
-  {
-    "topic": "Rebalancing frequency",
-    "choice": "Daily (every bar after warm-up).",
-    "reason": "Spec says 'at each iteration (for example, daily or weekly)'; daily is the natural choice on 1-day bars."
-  },
-  {
-    "topic": "Position sizing method",
-    "choice": "order_target_percent(self.data, w*) used instead of plain self.buy()/self.sell().",
-    "reason": "The spec explicitly defines target weights w* and requires rebalancing to them; weight-based order sizing is integral to the strategy, not a sizing default."
-  }
-]}
+{
+  "assumptions": [
+    {
+      "topic": "single_asset_mapping",
+      "choice": "Map vector portfolio optimization model to single-asset weight allocation vs cash",
+      "reason": "Execution harness provides a single data feed (AAPL), so target weight w is a scalar bounded between min_weight (0.0) and max_weight (1.0)."
+    },
+    {
+      "topic": "parameter_defaults",
+      "choice": "lookback=252 (1 year of daily trading bars), risk_aversion=1.0, impact_coef=0.001, min_weight=0.0, max_weight=1.0",
+      "reason": "The specification specifies reinvestment period T=1 year and canonical structure for risk/impact parameters; defaults selected based on spec examples."
+    },
+    {
+      "topic": "optimization_method",
+      "choice": "Dense grid search with 1000 evaluation steps over [min_weight, max_weight]",
+      "reason": "Scipy is not in allowed imports list. A fine 1D grid search yields high accuracy without external library dependencies."
+    }
+  ]
+}
 ```

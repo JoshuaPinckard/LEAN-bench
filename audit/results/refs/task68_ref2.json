@@ -1,82 +1,5212 @@
 {
   "task_id": 68,
   "ref_idx": 2,
-  "model": "sonnet",
-  "code": "import backtrader as bt\nimport math\nimport collections\n\n\nclass AITradingStrategy(bt.Strategy):\n\n    params = (\n        ('atr_period', 14),\n        ('atr_multiplier', 1.5),\n        ('risk_per_trade', 0.01),\n        ('rr_ratio', 2.0),\n        ('max_daily_risk_pct', 0.02),\n        ('max_drawdown_pct', 0.05),\n        ('signal_history_len', 20),\n        ('fast_ema', 9),\n        ('slow_ema', 21),\n        ('mid_ema', 50),\n        ('rsi_period', 14),\n        ('macd_fast', 12),\n        ('macd_slow', 26),\n        ('macd_signal', 9),\n        ('bb_period', 20),\n        ('bb_dev', 2.0),\n        ('stoch_period', 14),\n        ('stoch_period_dfast', 3),\n        ('mom_period', 10),\n        ('wr_period', 14),\n        ('close_before_news', False),\n    )\n\n    def __init__(self):\n        c = self.data.close\n\n        self.ema_fast = bt.indicators.EMA(c, period=self.p.fast_ema)\n        self.ema_slow = bt.indicators.EMA(c, period=self.p.slow_ema)\n        self.ema_mid = bt.indicators.EMA(c, period=self.p.mid_ema)\n        self.rsi = bt.indicators.RSI(c, period=self.p.rsi_period)\n        self.macd_ind = bt.indicators.MACD(\n            c,\n            period1=self.p.macd_fast,\n            period2=self.p.macd_slow,\n            period3=self.p.macd_signal,\n        )\n        self.bb = bt.indicators.BollingerBands(\n            c, period=self.p.bb_period, devfactor=self.p.bb_dev\n        )\n        self.stoch = bt.indicators.Stochastic(\n            self.data,\n            period=self.p.stoch_period,\n            period_dfast=self.p.stoch_period_dfast,\n        )\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.mom = bt.indicators.Momentum(c, period=self.p.mom_period)\n        self.wpr = bt.indicators.WilliamsR(self.data, period=self.p.wr_period)\n\n        self.order = None\n        self.sl_price = None\n        self.tp_price = None\n\n        # Rolling history of generated signals for BUY/SELL/HOLD imbalance features\n        self.signal_history = collections.deque(maxlen=self.p.signal_history_len)\n\n        self.current_date = None\n        self.daily_start_equity = None\n        self.peak_equity = None\n        self.halted_daily = False\n        self.halted_dd = False\n\n        self.trade_log = []\n\n    # ------------------------------------------------------------------\n    # Risk-management helpers\n    # ------------------------------------------------------------------\n\n    def _reset_if_new_day(self):\n        bar_date = self.data.datetime.date(0)\n        if bar_date != self.current_date:\n            self.current_date = bar_date\n            equity = self.broker.getvalue()\n            self.daily_start_equity = equity\n            self.peak_equity = equity\n            self.halted_daily = False\n            self.halted_dd = False\n\n    def _update_halts(self):\n        equity = self.broker.getvalue()\n        if equity > self.peak_equity:\n            self.peak_equity = equity\n        if self.daily_start_equity and self.daily_start_equity > 0:\n            daily_loss = (self.daily_start_equity - equity) / self.daily_start_equity\n            if daily_loss >= self.p.max_daily_risk_pct:\n                self.halted_daily = True\n        if self.peak_equity and self.peak_equity > 0:\n            dd = (self.peak_equity - equity) / self.peak_equity\n            if dd >= self.p.max_drawdown_pct:\n                self.halted_dd = True\n\n    def _trading_allowed(self):\n        return not self.halted_daily and not self.halted_dd\n\n    # ------------------------------------------------------------------\n    # Signal generation (LSTM proxy \u2014 see assumptions)\n    # ------------------------------------------------------------------\n\n    def _get_signal(self):\n        n = len(self.signal_history)\n        buy_frac = sum(1 for s in self.signal_history if s == 'BUY') / n if n else 0.0\n        sell_frac = sum(1 for s in self.signal_history if s == 'SELL') / n if n else 0.0\n\n        c = self.data.close[0]\n        ema_bull = self.ema_fast[0] > self.ema_slow[0]\n        macd_bull = self.macd_ind.macd[0] > self.macd_ind.signal[0]\n        rsi_v = self.rsi[0]\n        stoch_k = self.stoch.percK[0]\n        mom_v = self.mom[0]\n        wpr_v = self.wpr[0]\n        bb_mid = self.bb.mid[0]\n        mid_bull = c > self.ema_mid[0]\n\n        if (ema_bull and macd_bull and mom_v > 0\n                and 40 < rsi_v < 70\n                and stoch_k < 80\n                and wpr_v > -80\n                and c > bb_mid\n                and mid_bull\n                and buy_frac < 0.6):\n            return 'BUY'\n\n        if (not ema_bull and not macd_bull and mom_v < 0\n                and 30 < rsi_v < 60\n                and stoch_k > 20\n                and wpr_v < -20\n                and c < bb_mid\n                and not mid_bull\n                and sell_frac < 0.6):\n            return 'SELL'\n\n        return 'HOLD'\n\n    # ------------------------------------------------------------------\n    # Position sizing\n    # ------------------------------------------------------------------\n\n    def _calc_size(self, sl_dist):\n        equity = self.broker.getvalue()\n        risk_amt = equity * self.p.risk_per_trade\n        return max(1, int(risk_amt / sl_dist))\n\n    # ------------------------------------------------------------------\n    # Trade log\n    # ------------------------------------------------------------------\n\n    def _log(self, decision, size=None, sl=None, tp=None, risk=None):\n        dt = self.data.datetime.datetime(0)\n        price = self.data.close[0]\n        self.trade_log.append({\n            'datetime': dt,\n            'decision': decision,\n            'price': price,\n            'size': size,\n            'sl': sl,\n            'tp': tp,\n            'risk': risk,\n        })\n        if risk is not None:\n            print(\n                f\"[{dt}] {decision} price={price:.2f} size={size} \"\n                f\"SL={sl:.2f} TP={tp:.2f} risk={risk:.2f}\"\n            )\n\n    # ------------------------------------------------------------------\n    # Order lifecycle\n    # ------------------------------------------------------------------\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n        if order.status == order.Completed:\n            self.order = None\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n            self.sl_price = None\n            self.tp_price = None\n\n    # ------------------------------------------------------------------\n    # Main bar logic\n    # ------------------------------------------------------------------\n\n    def next(self):\n        self._reset_if_new_day()\n        self._update_halts()\n\n        if self.order:\n            return\n\n        signal = self._get_signal()\n        self.signal_history.append(signal)\n\n        high = self.data.high[0]\n        low = self.data.low[0]\n        close = self.data.close[0]\n        sl_dist = self.atr[0] * self.p.atr_multiplier\n        if sl_dist <= 0:\n            return\n\n        if self.position:\n            is_long = self.position.size > 0\n\n            if is_long:\n                # SL breached (bar low touched or crossed SL level)\n                if self.sl_price is not None and low <= self.sl_price:\n                    self._log('CLOSE_SL')\n                    self.order = self.close()\n                    self.sl_price = self.tp_price = None\n                    return\n                # TP breached\n                if self.tp_price is not None and high >= self.tp_price:\n                    self._log('CLOSE_TP')\n                    self.order = self.close()\n                    self.sl_price = self.tp_price = None\n                    return\n                # Opposite signal \u2014 close immediately\n                if signal == 'SELL':\n                    self._log('CLOSE_OPPOSITE')\n                    self.order = self.close()\n                    self.sl_price = self.tp_price = None\n                    return\n                # Same-direction signal \u2014 trail stop upward\n                if signal == 'BUY' and self.sl_price is not None:\n                    new_sl = close - sl_dist\n                    if new_sl > self.sl_price:\n                        self.sl_price = new_sl\n\n            else:  # short position\n                # SL breached (bar high touched or crossed SL level)\n                if self.sl_price is not None and high >= self.sl_price:\n                    self._log('CLOSE_SL')\n                    self.order = self.close()\n                    self.sl_price = self.tp_price = None\n                    return\n                # TP breached\n                if self.tp_price is not None and low <= self.tp_price:\n                    self._log('CLOSE_TP')\n                    self.order = self.close()\n                    self.sl_price = self.tp_price = None\n                    return\n                # Opposite signal \u2014 close immediately\n                if signal == 'BUY':\n                    self._log('CLOSE_OPPOSITE')\n                    self.order = self.close()\n                    self.sl_price = self.tp_price = None\n                    return\n                # Same-direction signal \u2014 trail stop downward\n                if signal == 'SELL' and self.sl_price is not None:\n                    new_sl = close + sl_dist\n                    if new_sl < self.sl_price:\n                        self.sl_price = new_sl\n\n        else:\n            if not self._trading_allowed():\n                self._log('HOLD')\n                return\n\n            if signal == 'BUY':\n                sl = close - sl_dist\n                tp = close + sl_dist * self.p.rr_ratio\n                size = self._calc_size(sl_dist)\n                risk = sl_dist * size\n                self._log('BUY', size=size, sl=sl, tp=tp, risk=risk)\n                self.order = self.buy(size=size)\n                self.sl_price = sl\n                self.tp_price = tp\n\n            elif signal == 'SELL':\n                sl = close + sl_dist\n                tp = close - sl_dist * self.p.rr_ratio\n                size = self._calc_size(sl_dist)\n                risk = sl_dist * size\n                self._log('SELL', size=size, sl=sl, tp=tp, risk=risk)\n                self.order = self.sell(size=size)\n                self.sl_price = sl\n                self.tp_price = tp\n\n            else:\n                self._log('HOLD')",
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import collections\nimport math\nimport statistics\nimport backtrader as bt\n\n\nclass AITradingStrategy(bt.Strategy):\n    params = (\n        (\"risk_per_trade\", 0.01),  # 1% risk per trade\n        (\"rr_ratio\", 2.0),  # Risk/Reward ratio 1:2\n        (\"atr_period\", 14),\n        (\"atr_mult\", 2.0),\n        (\"max_daily_risk\", 0.02),  # 2% max daily risk\n        (\"max_drawdown\", 0.05),  # 5% max drawdown limit\n        (\"close_before_news\", False),  # Option for news event closing\n    )\n\n    def __init__(self):\n        self.order = None\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.sma20 = bt.indicators.SMA(self.data, period=20)\n        self.sma50 = bt.indicators.SMA(self.data, period=50)\n        self.rsi = bt.indicators.RSI(self.data, period=14)\n\n        self.signal_history = collections.deque(maxlen=100)\n        self.trade_log = []\n\n        # Risk management tracking\n        self.current_date = None\n        self.day_start_equity = 10000.0\n        self.daily_pnl = 0.0\n        self.daily_halted = False\n\n        self.peak_equity = 10000.0\n        self.drawdown_halted = False\n\n        # Open trade metadata\n        self.trade_dir = None  # 'LONG' or 'SHORT'\n        self.sl_price = None\n        self.tp_price = None\n        self.entry_price = None\n        self.trade_size = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def notify_trade(self, trade):\n        if trade.isclosed:\n            pnl = trade.pnlcomm\n            self.daily_pnl += pnl\n            if self.daily_pnl < -(self.day_start_equity * self.p.max_daily_risk):\n                self.daily_halted = True\n\n    def _get_62_features(self):\n        features = []\n        close = self.data.close[0]\n\n        # 1-5: Primary OHLCV\n        features.extend([\n            self.data.open[0],\n            self.data.high[0],\n            self.data.low[0],\n            close,\n            self.data.volume[0]\n        ])\n\n        # 6-10: Returns over multiple windows\n        for p in [1, 2, 3, 5, 10]:\n            ret = (close - self.data.close[-p]) / self.data.close[-p] if len(self.data) > p else 0.0\n            features.append(ret)\n\n        # 11-15: High-Low range relative to close\n        for p in range(5):\n            hl = (self.data.high[-p] - self.data.low[-p]) / self.data.close[-p] if len(self.data) > p else 0.0\n            features.append(hl)\n\n        # 16-25: Moving Average differences\n        for p in [5, 10, 15, 20, 30, 40, 50, 60, 100, 200]:\n            if len(self.data) >= p:\n                vals = self.data.close.get(size=p)\n                sma = sum(vals) / p\n                features.append((close - sma) / sma if sma != 0 else 0.0)\n            else:\n                features.append(0.0)\n\n        # 26-35: Exponential / Price offset proxies\n        for p in [5, 10, 15, 20, 30, 40, 50, 60, 100, 200]:\n            if len(self.data) >= p:\n                vals = self.data.close.get(size=p)\n                features.append(close - (sum(vals) / p))\n            else:\n                features.append(0.0)\n\n        # 36-40: Volume features\n        for p in [1, 2, 3, 5, 10]:\n            vol = self.data.volume[-p] if len(self.data) > p else 0.0\n            features.append(vol)\n\n        # 41-45: Price momentum\n        for p in [1, 3, 5, 10, 20]:\n            mom = close - self.data.close[-p] if len(self.data) > p else 0.0\n            features.append(mom)\n\n        # 46-50: Price standard deviation\n        for p in [5, 10, 15, 20, 30]:\n            if len(self.data) >= p:\n                vals = self.data.close.get(size=p)\n                mean_val = sum(vals) / p\n                var_val = sum((x - mean_val) ** 2 for x in vals) / p\n                features.append(math.sqrt(var_val))\n            else:\n                features.append(0.0)\n\n        # 51-55: High minus Close offset\n        for p in range(5):\n            features.append(self.data.high[-p] - close if len(self.data) > p else 0.0)\n\n        # 56-59: Close minus Low offset\n        for p in range(4):\n            features.append(close - self.data.low[-p] if len(self.data) > p else 0.0)\n\n        # 60-62: Signal imbalances (counts of past BUY, SELL, HOLD decisions)\n        buy_cnt = sum(1 for s in self.signal_history if s == 1)\n        sell_cnt = sum(1 for s in self.signal_history if s == -1)\n        hold_cnt = sum(1 for s in self.signal_history if s == 0)\n        features.extend([buy_cnt, sell_cnt, hold_cnt])\n\n        return features\n\n    def _predict_action(self, features):\n        if self.sma20[0] > self.sma50[0] and self.rsi[0] > 55:\n            return 1  # BUY\n        elif self.sma20[0] < self.sma50[0] and self.rsi[0] < 45:\n            return -1  # SELL\n        else:\n            return 0  # HOLD\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n\n        # 24-hour Auto-reset of risk parameters at day start\n        if self.current_date != dt:\n            self.current_date = dt\n            self.day_start_equity = self.broker.getvalue()\n            self.daily_pnl = 0.0\n            self.daily_halted = False\n            self.peak_equity = self.broker.getvalue()\n            self.drawdown_halted = False\n\n        # Maximum Drawdown check\n        current_equity = self.broker.getvalue()\n        if current_equity > self.peak_equity:\n            self.peak_equity = current_equity\n        drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0\n        if drawdown >= self.p.max_drawdown:\n            self.drawdown_halted = True\n\n        features = self.get_62_features = self._get_62_features()\n        signal = self._predict_action(features)\n        self.signal_history.append(signal)\n\n        action_name = \"BUY\" if signal == 1 else (\"SELL\" if signal == -1 else \"HOLD\")\n        self.trade_log.append({\n            \"datetime\": self.data.datetime.datetime(0),\n            \"decision\": action_name,\n            \"close\": self.data.close[0]\n        })\n\n        if self.order:\n            return\n\n        # Position Exits & Trailing Stops\n        if self.position:\n            if self.trade_dir == 'LONG':\n                # SL / TP Trigger Check\n                if self.data.low[0] <= self.sl_price or self.data.high[0] >= self.tp_price:\n                    self.close()\n                    self.trade_dir = None\n                    return\n\n                # Opposite Signal Exit\n                if signal == -1:\n                    self.close()\n                    self.trade_dir = None\n                    return\n\n                # Trailing Stop Update on Same Direction Signal\n                if signal == 1:\n                    atr_val = self.atr[0]\n                    new_sl = self.data.close[0] - (atr_val * self.p.atr_mult)\n                    if new_sl > self.sl_price:\n                        self.sl_price = new_sl\n\n            elif self.trade_dir == 'SHORT':\n                # SL / TP Trigger Check\n                if self.data.high[0] >= self.sl_price or self.data.low[0] <= self.tp_price:\n                    self.close()\n                    self.trade_dir = None\n                    return\n\n                # Opposite Signal Exit\n                if signal == 1:\n                    self.close()\n                    self.trade_dir = None\n                    return\n\n                # Trailing Stop Update on Same Direction Signal\n                if signal == -1:\n                    atr_val = self.atr[0]\n                    new_sl = self.data.close[0] + (atr_val * self.p.atr_mult)\n                    if new_sl < self.sl_price:\n                        self.sl_price = new_sl\n\n            return\n\n        # Entry logic\n        if self.daily_halted or self.drawdown_halted:\n            return\n\n        atr_val = self.atr[0]\n        if atr_val <= 0:\n            return\n\n        if signal == 1:  # BUY\n            sl_dist = atr_val * self.p.atr_mult\n            tp_dist = sl_dist * self.p.rr_ratio\n            entry_price = self.data.close[0]\n\n            self.sl_price = entry_price - sl_dist\n            self.tp_price = entry_price + tp_dist\n\n            risk_budget = current_equity * self.p.risk_per_trade\n            size = risk_budget / sl_dist\n            expected_risk = sl_dist * size\n\n            self.trade_dir = 'LONG'\n            self.entry_price = entry_price\n            self.trade_size = size\n\n            self.order = self.buy(size=size)\n\n        elif signal == -1:  # SELL\n            sl_dist = atr_val * self.p.atr_mult\n            tp_dist = sl_dist * self.p.rr_ratio\n            entry_price = self.data.close[0]\n\n            self.sl_price = entry_price + sl_dist\n            self.tp_price = entry_price - tp_dist\n\n            risk_budget = current_equity * self.p.risk_per_trade\n            size = risk_budget / sl_dist\n            expected_risk = sl_dist * size\n\n            self.trade_dir = 'SHORT'\n            self.entry_price = entry_price\n            self.trade_size = size\n\n            self.order = self.sell(size=size)",
   "assumptions": [
     {
-      "topic": "lstm_proxy",
-      "choice": "LSTM signal generation replaced by a deterministic technical-indicator ensemble: EMA crossover (9/21/50), MACD(12/26/9), RSI(14), BollingerBands(20,2), Stochastic(14,3), ATR(14), Momentum(10), WilliamsR(14), and rolling BUY/SELL/HOLD imbalance fractions (window 20). BUY requires all bullish conditions and buy_frac<0.6; SELL requires all bearish conditions and sell_frac<0.6; else HOLD.",
-      "reason": "An actual LSTM cannot be instantiated or inferred from OHLCV within the allowed imports (backtrader, math, collections, statistics). No pre-trained weights are provided. The proxy encodes the same inputs the spec describes (trend, momentum, oscillator, signal imbalance) and produces the identical ternary output."
+      "topic": "lstm_model_and_features",
+      "choice": "Extracted 62 explicit technical and historical decision imbalance features and used a deterministic trend-following / RSI decision surrogate for prediction as pre-trained LSTM weights were not provided.",
+      "reason": "infeasible"
     },
     {
-      "topic": "62_features",
-      "choice": "Proxy uses 10 indicator objects producing ~15 named values (plus imbalance fractions), declared as a representative subset. The 62 specific feature names are not enumerated in the spec.",
-      "reason": "infeasible \u2014 the spec lists '62 independent features' without specifying them. The proxy covers the major OHLCV-derivable feature families (trend, momentum, mean-reversion, volatility, signal imbalance) that a gold-trading LSTM feature set would typically contain."
+      "topic": "news_events",
+      "choice": "Disabled news-based position exit feature since economic news calendar data is not available in the single OHLCV data feed.",
+      "reason": "infeasible"
     },
     {
-      "topic": "close_before_news",
-      "choice": "Parameter close_before_news permanently False; no close-before-news logic executes.",
-      "reason": "infeasible \u2014 closing 30 minutes before high-impact economic releases requires an external economic-calendar feed not present in the OHLCV data. The parameter exists so the harness can document the gap."
-    },
-    {
-      "topic": "rr_ratio",
-      "choice": "Risk/Reward ratio set to 2.0 (TP distance = 2 \u00d7 SL distance).",
-      "reason": "Spec states 'e.g., 1:2 or 1:3'. The lower bound of the given range (1:2) is chosen as the conservative default."
-    },
-    {
-      "topic": "risk_per_trade",
-      "choice": "1% of current equity per trade.",
-      "reason": "Spec states 'e.g., 1-2%'. Lower bound chosen to minimise deviation from unspecified intent."
-    },
-    {
-      "topic": "max_daily_risk_pct",
-      "choice": "2% of day-opening equity.",
-      "reason": "Spec states 'e.g., 2% of the deposit' \u2014 the example value is adopted verbatim."
-    },
-    {
-      "topic": "max_drawdown_pct",
-      "choice": "5% from the daily peak equity.",
-      "reason": "Spec states 'e.g., 5% of the deposit' \u2014 the example value is adopted verbatim."
-    },
-    {
-      "topic": "volatility_sl",
-      "choice": "SL distance = ATR(14) \u00d7 1.5. The same distance is used when updating a trailing stop.",
-      "reason": "Spec says 'Stop Loss must be set automatically based on calculated volatility' without naming the formula. ATR is the standard volatility proxy for intraday SL placement on OHLCV data; 1.5\u00d7 is a common multiplier that keeps SL outside typical bar noise."
-    },
-    {
-      "topic": "sl_tp_detection",
-      "choice": "Long SL triggered when bar Low \u2264 sl_price; Long TP when bar High \u2265 tp_price. Short SL when High \u2265 sl_price; Short TP when Low \u2264 tp_price. Close order fills at next bar's open per backtrader default.",
-      "reason": "Using bar High/Low is more faithful to intrabar price movement than using only Close. Backtrader does not support tick-level fills; next-bar-open execution is the framework's standard."
-    },
-    {
-      "topic": "daily_reset_timing",
-      "choice": "'Every 24 hours' implemented as a calendar-date change. On each new date, daily_start_equity and peak_equity reset to current broker.getvalue(); both halt flags reset to False.",
-      "reason": "Calendar-date boundary is the natural definition of a trading 'day' and aligns with how daily risk limits are applied in practice. Counting 24 bars would shift the reset through the week and cross weekends incorrectly."
-    },
-    {
-      "topic": "daily_loss_measurement",
-      "choice": "Daily cumulative loss = (daily_start_equity \u2212 broker.getvalue()) / daily_start_equity, evaluated each bar. Includes unrealized P&L of any open position.",
-      "reason": "broker.getvalue() represents the total current account value; comparing it to the day's opening value gives the most conservative (risk-protective) reading of the day's performance, consistent with the spec's intent to halt before losses compound."
-    },
-    {
-      "topic": "drawdown_reset",
-      "choice": "Peak equity for drawdown measurement resets to current equity at the start of each new calendar day.",
-      "reason": "Spec states 'Risk parameters (maximum daily risk, maximum drawdown) must be reset to zero every 24 hours.' Resetting the peak to the current balance each day means drawdown is measured only within the current day's window, which is the direct interpretation of 'reset to zero'."
-    },
-    {
-      "topic": "halt_scope",
-      "choice": "When halted (daily risk or drawdown), no new position entries are made. Open-position management (SL/TP checks, trailing stops, opposite-signal closes) continues normally.",
-      "reason": "Spec says 'trading must be stopped' / 'suspended', which in standard risk-management practice means blocking new entries while letting existing risk-management mechanisms protect open trades."
-    },
-    {
-      "topic": "xauusd_vs_gcf",
-      "choice": "No price-scale or tick-value adjustment applied; the feed is treated as a unit-denominated instrument.",
-      "reason": "infeasible \u2014 the spec targets XAU/USD spot gold; the harness provides GC=F (COMEX gold futures). Prices track each other closely (~$2000/oz). The harness does not configure a futures multiplier, so treating contract size as 1 unit is the only consistent choice."
+      "topic": "risk_parameters_reset",
+      "choice": "Reset daily PnL baseline, peak equity baseline for drawdown, and trade halt flags at the start of each date change (24-hour cycle).",
+      "reason": "The specification explicitly mandates that maximum daily risk and maximum drawdown parameters reset every 24 hours."
     }
   ],
-  "success": false,
-  "error": "Backtest error: MACD.__init__() got an unexpected keyword argument 'period1'",
-  "total_trades": 0,
-  "tape": []
+  "success": true,
+  "error": null,
+  "total_trades": 432,
+  "tape": [
+    {
+      "dt": "2024-02-22T14:00:00",
+      "side": "SELL",
+      "size": -15.468596778022508,
+      "price": 2035.5999755859373
+    },
+    {
+      "dt": "2024-02-23T12:00:00",
+      "side": "BUY",
+      "size": 15.468596778022508,
+      "price": 2033.4000244140625
+    },
+    {
+      "dt": "2024-02-28T07:00:00",
+      "side": "SELL",
+      "size": -19.436774991400167,
+      "price": 2038.199951171875
+    },
+    {
+      "dt": "2024-02-28T13:00:00",
+      "side": "BUY",
+      "size": 19.436774991400167,
+      "price": 2038.5999755859375
+    },
+    {
+      "dt": "2024-03-12T13:00:00",
+      "side": "SELL",
+      "size": -9.058750124013672,
+      "price": 2175.5
+    },
+    {
+      "dt": "2024-03-13T14:00:00",
+      "side": "BUY",
+      "size": 9.058750124013672,
+      "price": 2171.60009765625
+    },
+    {
+      "dt": "2024-03-14T23:00:00",
+      "side": "SELL",
+      "size": -11.763035301104216,
+      "price": 2165.5
+    },
+    {
+      "dt": "2024-03-15T07:00:00",
+      "side": "BUY",
+      "size": 11.763035301104216,
+      "price": 2172.89990234375
+    },
+    {
+      "dt": "2024-03-15T13:00:00",
+      "side": "SELL",
+      "size": -11.597634902116356,
+      "price": 2165.60009765625
+    },
+    {
+      "dt": "2024-03-18T10:00:00",
+      "side": "BUY",
+      "size": 11.597634902116356,
+      "price": 2158.39990234375
+    },
+    {
+      "dt": "2024-03-20T10:00:00",
+      "side": "SELL",
+      "size": -15.513435679403361,
+      "price": 2157.39990234375
+    },
+    {
+      "dt": "2024-03-20T15:00:00",
+      "side": "BUY",
+      "size": 15.513435679403361,
+      "price": 2160.10009765625
+    },
+    {
+      "dt": "2024-03-22T09:00:00",
+      "side": "SELL",
+      "size": -8.113756854382045,
+      "price": 2169.39990234375
+    },
+    {
+      "dt": "2024-03-22T14:00:00",
+      "side": "BUY",
+      "size": 8.113756854382045,
+      "price": 2179.699951171875
+    },
+    {
+      "dt": "2024-03-22T16:00:00",
+      "side": "SELL",
+      "size": -7.555087535879614,
+      "price": 2167.699951171875
+    },
+    {
+      "dt": "2024-03-25T02:00:00",
+      "side": "BUY",
+      "size": 7.555087535879614,
+      "price": 2176.3000488281245
+    },
+    {
+      "dt": "2024-03-25T07:00:00",
+      "side": "SELL",
+      "size": -8.526889047599,
+      "price": 2166.39990234375
+    },
+    {
+      "dt": "2024-03-25T13:00:00",
+      "side": "BUY",
+      "size": 8.526889047599,
+      "price": 2175.699951171875
+    },
+    {
+      "dt": "2024-03-27T11:00:00",
+      "side": "BUY",
+      "size": 4.2086034696232995,
+      "price": 2214.5
+    },
+    {
+      "dt": "2024-03-27T12:00:00",
+      "side": "SELL",
+      "size": -4.2086034696232995,
+      "price": 2209.199951171875
+    },
+    {
+      "dt": "2024-03-27T13:00:00",
+      "side": "BUY",
+      "size": 3.4254132339531407,
+      "price": 2206.699951171875
+    },
+    {
+      "dt": "2024-03-31T23:00:00",
+      "side": "SELL",
+      "size": -3.4254132339531407,
+      "price": 2257.39990234375
+    },
+    {
+      "dt": "2024-04-01T00:00:00",
+      "side": "BUY",
+      "size": 2.4288929242815973,
+      "price": 2266.39990234375
+    },
+    {
+      "dt": "2024-04-01T15:00:00",
+      "side": "SELL",
+      "size": -2.4288929242815973,
+      "price": 2256.60009765625
+    },
+    {
+      "dt": "2024-04-05T04:00:00",
+      "side": "SELL",
+      "size": -6.185678985739633,
+      "price": 2295.300048828125
+    },
+    {
+      "dt": "2024-04-05T09:00:00",
+      "side": "BUY",
+      "size": 6.185678985739633,
+      "price": 2307.10009765625
+    },
+    {
+      "dt": "2024-04-08T03:00:00",
+      "side": "BUY",
+      "size": 3.815599475600252,
+      "price": 2366.89990234375
+    },
+    {
+      "dt": "2024-04-08T13:00:00",
+      "side": "SELL",
+      "size": -3.815599475600252,
+      "price": 2348.199951171875
+    },
+    {
+      "dt": "2024-04-10T20:00:00",
+      "side": "SELL",
+      "size": -4.521381224946154,
+      "price": 2347.800048828125
+    },
+    {
+      "dt": "2024-04-11T13:00:00",
+      "side": "BUY",
+      "size": 4.521381224946154,
+      "price": 2358.89990234375
+    },
+    {
+      "dt": "2024-04-12T16:00:00",
+      "side": "BUY",
+      "size": 3.6846205889730066,
+      "price": 2412.60009765625
+    },
+    {
+      "dt": "2024-04-12T17:00:00",
+      "side": "SELL",
+      "size": -3.6846205889730066,
+      "price": 2386.1999511718755
+    },
+    {
+      "dt": "2024-04-15T09:00:00",
+      "side": "SELL",
+      "size": -3.726973602890822,
+      "price": 2368.10009765625
+    },
+    {
+      "dt": "2024-04-15T19:00:00",
+      "side": "BUY",
+      "size": 3.726973602890822,
+      "price": 2392.60009765625
+    },
+    {
+      "dt": "2024-04-17T23:00:00",
+      "side": "SELL",
+      "size": -4.577144185756953,
+      "price": 2380.39990234375
+    },
+    {
+      "dt": "2024-04-18T12:00:00",
+      "side": "BUY",
+      "size": 4.577144185756953,
+      "price": 2395.89990234375
+    },
+    {
+      "dt": "2024-04-22T06:00:00",
+      "side": "SELL",
+      "size": -5.106171799714264,
+      "price": 2379.10009765625
+    },
+    {
+      "dt": "2024-04-22T17:00:00",
+      "side": "BUY",
+      "size": 5.106171799714264,
+      "price": 2343.800048828125
+    },
+    {
+      "dt": "2024-04-22T18:00:00",
+      "side": "SELL",
+      "size": -4.794887465089354,
+      "price": 2344.10009765625
+    },
+    {
+      "dt": "2024-04-23T10:00:00",
+      "side": "BUY",
+      "size": 4.794887465089354,
+      "price": 2309.10009765625
+    },
+    {
+      "dt": "2024-04-23T11:00:00",
+      "side": "SELL",
+      "size": -4.463206524598059,
+      "price": 2316.89990234375
+    },
+    {
+      "dt": "2024-04-23T14:00:00",
+      "side": "BUY",
+      "size": 4.463206524598059,
+      "price": 2342.89990234375
+    },
+    {
+      "dt": "2024-04-24T10:00:00",
+      "side": "SELL",
+      "size": -6.154257854965748,
+      "price": 2328.10009765625
+    },
+    {
+      "dt": "2024-04-24T15:00:00",
+      "side": "BUY",
+      "size": 6.154257854965748,
+      "price": 2343.300048828125
+    },
+    {
+      "dt": "2024-04-30T00:00:00",
+      "side": "SELL",
+      "size": -7.010932399374914,
+      "price": 2344.4999999999995
+    },
+    {
+      "dt": "2024-04-30T13:00:00",
+      "side": "BUY",
+      "size": 7.010932399374914,
+      "price": 2316.800048828125
+    },
+    {
+      "dt": "2024-04-30T14:00:00",
+      "side": "SELL",
+      "size": -6.981463586742089,
+      "price": 2318.60009765625
+    },
+    {
+      "dt": "2024-05-01T05:00:00",
+      "side": "BUY",
+      "size": 6.981463586742089,
+      "price": 2293.5
+    },
+    {
+      "dt": "2024-05-01T06:00:00",
+      "side": "SELL",
+      "size": -7.555575140589274,
+      "price": 2298.10009765625
+    },
+    {
+      "dt": "2024-05-01T13:00:00",
+      "side": "BUY",
+      "size": 7.555575140589274,
+      "price": 2309.10009765625
+    },
+    {
+      "dt": "2024-05-03T03:00:00",
+      "side": "SELL",
+      "size": -7.006612796430981,
+      "price": 2309.800048828125
+    },
+    {
+      "dt": "2024-05-03T13:00:00",
+      "side": "BUY",
+      "size": 7.006612796430981,
+      "price": 2313.300048828125
+    },
+    {
+      "dt": "2024-05-03T14:00:00",
+      "side": "SELL",
+      "size": -5.121321003625992,
+      "price": 2299.60009765625
+    },
+    {
+      "dt": "2024-05-06T02:00:00",
+      "side": "BUY",
+      "size": 5.121321003625992,
+      "price": 2317.39990234375
+    },
+    {
+      "dt": "2024-05-08T01:00:00",
+      "side": "SELL",
+      "size": -8.865017987260883,
+      "price": 2322.0
+    },
+    {
+      "dt": "2024-05-08T05:00:00",
+      "side": "BUY",
+      "size": 8.865017987260883,
+      "price": 2327.39990234375
+    },
+    {
+      "dt": "2024-05-08T08:00:00",
+      "side": "SELL",
+      "size": -7.947891742063856,
+      "price": 2313.39990234375
+    },
+    {
+      "dt": "2024-05-08T11:00:00",
+      "side": "BUY",
+      "size": 7.947891742063856,
+      "price": 2323.39990234375
+    },
+    {
+      "dt": "2024-05-09T01:00:00",
+      "side": "SELL",
+      "size": -8.904274943853364,
+      "price": 2316.199951171875
+    },
+    {
+      "dt": "2024-05-09T06:00:00",
+      "side": "BUY",
+      "size": 8.904274943853364,
+      "price": 2323.199951171875
+    },
+    {
+      "dt": "2024-05-09T08:00:00",
+      "side": "SELL",
+      "size": -8.96850887108651,
+      "price": 2315.699951171875
+    },
+    {
+      "dt": "2024-05-09T13:00:00",
+      "side": "BUY",
+      "size": 8.96850887108651,
+      "price": 2333.5
+    },
+    {
+      "dt": "2024-05-13T16:00:00",
+      "side": "SELL",
+      "size": -6.192100845141922,
+      "price": 2341.89990234375
+    },
+    {
+      "dt": "2024-05-14T10:00:00",
+      "side": "BUY",
+      "size": 6.192100845141922,
+      "price": 2351.60009765625
+    },
+    {
+      "dt": "2024-05-22T03:00:00",
+      "side": "SELL",
+      "size": -6.295750375108259,
+      "price": 2421.199951171875
+    },
+    {
+      "dt": "2024-05-22T15:00:00",
+      "side": "BUY",
+      "size": 6.295750375108259,
+      "price": 2391.300048828125
+    },
+    {
+      "dt": "2024-05-22T16:00:00",
+      "side": "SELL",
+      "size": -5.115653606762991,
+      "price": 2395.39990234375
+    },
+    {
+      "dt": "2024-05-23T06:00:00",
+      "side": "BUY",
+      "size": 5.115653606762991,
+      "price": 2362.199951171875
+    },
+    {
+      "dt": "2024-05-23T07:00:00",
+      "side": "SELL",
+      "size": -5.4227134535612835,
+      "price": 2366.39990234375
+    },
+    {
+      "dt": "2024-05-23T18:00:00",
+      "side": "BUY",
+      "size": 5.4227134535612835,
+      "price": 2333.699951171875
+    },
+    {
+      "dt": "2024-05-23T19:00:00",
+      "side": "SELL",
+      "size": -4.679407577205892,
+      "price": 2336.10009765625
+    },
+    {
+      "dt": "2024-05-24T14:00:00",
+      "side": "BUY",
+      "size": 4.679407577205892,
+      "price": 2338.39990234375
+    },
+    {
+      "dt": "2024-05-24T15:00:00",
+      "side": "SELL",
+      "size": -6.25897182291725,
+      "price": 2339.699951171875
+    },
+    {
+      "dt": "2024-05-27T03:00:00",
+      "side": "BUY",
+      "size": 6.25897182291725,
+      "price": 2347.699951171875
+    },
+    {
+      "dt": "2024-05-29T20:00:00",
+      "side": "SELL",
+      "size": -7.245578694527353,
+      "price": 2336.39990234375
+    },
+    {
+      "dt": "2024-05-30T08:00:00",
+      "side": "BUY",
+      "size": 7.245578694527353,
+      "price": 2355.8000488281245
+    },
+    {
+      "dt": "2024-05-31T01:00:00",
+      "side": "BUY",
+      "size": 1.9191983620757853,
+      "price": 2367.5
+    },
+    {
+      "dt": "2024-05-31T16:00:00",
+      "side": "SELL",
+      "size": -1.9191983620757853,
+      "price": 2351.10009765625
+    },
+    {
+      "dt": "2024-06-03T04:00:00",
+      "side": "SELL",
+      "size": -2.3360261230912647,
+      "price": 2341.800048828125
+    },
+    {
+      "dt": "2024-06-03T18:00:00",
+      "side": "BUY",
+      "size": 2.3360261230912647,
+      "price": 2369.199951171875
+    },
+    {
+      "dt": "2024-06-04T22:00:00",
+      "side": "SELL",
+      "size": -5.726541922753036,
+      "price": 2347.10009765625
+    },
+    {
+      "dt": "2024-06-05T06:00:00",
+      "side": "BUY",
+      "size": 5.726541922753036,
+      "price": 2357.199951171875
+    },
+    {
+      "dt": "2024-06-07T15:00:00",
+      "side": "SELL",
+      "size": -3.720854663310633,
+      "price": 2331.60009765625
+    },
+    {
+      "dt": "2024-06-10T13:00:00",
+      "side": "BUY",
+      "size": 3.720854663310633,
+      "price": 2323.60009765625
+    },
+    {
+      "dt": "2024-06-10T15:00:00",
+      "side": "SELL",
+      "size": -5.2815197231737825,
+      "price": 2320.0
+    },
+    {
+      "dt": "2024-06-11T13:00:00",
+      "side": "BUY",
+      "size": 5.2815197231737825,
+      "price": 2335.199951171875
+    },
+    {
+      "dt": "2024-06-13T14:00:00",
+      "side": "SELL",
+      "size": -4.9091781010760815,
+      "price": 2326.0
+    },
+    {
+      "dt": "2024-06-14T08:00:00",
+      "side": "BUY",
+      "size": 4.9091781010760815,
+      "price": 2330.5
+    },
+    {
+      "dt": "2024-06-18T08:00:00",
+      "side": "SELL",
+      "size": -8.681521005959302,
+      "price": 2329.89990234375
+    },
+    {
+      "dt": "2024-06-18T13:00:00",
+      "side": "BUY",
+      "size": 8.681521005959302,
+      "price": 2328.5
+    },
+    {
+      "dt": "2024-06-24T00:00:00",
+      "side": "SELL",
+      "size": -6.0356055993354385,
+      "price": 2331.199951171875
+    },
+    {
+      "dt": "2024-06-24T09:00:00",
+      "side": "BUY",
+      "size": 6.0356055993354385,
+      "price": 2343.39990234375
+    },
+    {
+      "dt": "2024-06-24T10:00:00",
+      "side": "SELL",
+      "size": -6.476298948581361,
+      "price": 2337.10009765625
+    },
+    {
+      "dt": "2024-06-25T10:00:00",
+      "side": "BUY",
+      "size": 6.476298948581361,
+      "price": 2345.5
+    },
+    {
+      "dt": "2024-06-25T13:00:00",
+      "side": "SELL",
+      "size": -7.510452316334573,
+      "price": 2336.89990234375
+    },
+    {
+      "dt": "2024-06-26T12:00:00",
+      "side": "BUY",
+      "size": 7.510452316334573,
+      "price": 2324.800048828125
+    },
+    {
+      "dt": "2024-06-26T13:00:00",
+      "side": "SELL",
+      "size": -6.466559252935392,
+      "price": 2321.699951171875
+    },
+    {
+      "dt": "2024-06-27T09:00:00",
+      "side": "BUY",
+      "size": 6.466559252935392,
+      "price": 2318.199951171875
+    },
+    {
+      "dt": "2024-07-09T00:00:00",
+      "side": "SELL",
+      "size": -6.932734665178662,
+      "price": 2369.0
+    },
+    {
+      "dt": "2024-07-09T15:00:00",
+      "side": "BUY",
+      "size": 6.932734665178662,
+      "price": 2361.60009765625
+    },
+    {
+      "dt": "2024-07-09T17:00:00",
+      "side": "SELL",
+      "size": -5.972557184778339,
+      "price": 2364.10009765625
+    },
+    {
+      "dt": "2024-07-10T07:00:00",
+      "side": "BUY",
+      "size": 5.972557184778339,
+      "price": 2378.39990234375
+    },
+    {
+      "dt": "2024-07-18T17:00:00",
+      "side": "SELL",
+      "size": -5.942389677603858,
+      "price": 2459.199951171875
+    },
+    {
+      "dt": "2024-07-19T01:00:00",
+      "side": "BUY",
+      "size": 5.942389677603858,
+      "price": 2437.0
+    },
+    {
+      "dt": "2024-07-19T02:00:00",
+      "side": "SELL",
+      "size": -5.100991642177148,
+      "price": 2428.39990234375
+    },
+    {
+      "dt": "2024-07-19T14:00:00",
+      "side": "BUY",
+      "size": 5.100991642177148,
+      "price": 2405.699951171875
+    },
+    {
+      "dt": "2024-07-19T15:00:00",
+      "side": "SELL",
+      "size": -5.228427435666828,
+      "price": 2399.89990234375
+    },
+    {
+      "dt": "2024-07-22T20:00:00",
+      "side": "BUY",
+      "size": 5.228427435666828,
+      "price": 2400.5
+    },
+    {
+      "dt": "2024-07-22T22:00:00",
+      "side": "SELL",
+      "size": -6.384154250433324,
+      "price": 2398.0
+    },
+    {
+      "dt": "2024-07-23T09:00:00",
+      "side": "BUY",
+      "size": 6.384154250433324,
+      "price": 2405.10009765625
+    },
+    {
+      "dt": "2024-07-25T04:00:00",
+      "side": "SELL",
+      "size": -4.8063673174918025,
+      "price": 2373.5
+    },
+    {
+      "dt": "2024-07-26T03:00:00",
+      "side": "BUY",
+      "size": 4.8063673174918025,
+      "price": 2372.699951171875
+    },
+    {
+      "dt": "2024-07-30T10:00:00",
+      "side": "BUY",
+      "size": 2.7944669441930956,
+      "price": 2433.800048828125
+    },
+    {
+      "dt": "2024-07-30T11:00:00",
+      "side": "SELL",
+      "size": -2.7944669441930956,
+      "price": 2436.60009765625
+    },
+    {
+      "dt": "2024-07-30T12:00:00",
+      "side": "BUY",
+      "size": 2.026929600051749,
+      "price": 2432.10009765625
+    },
+    {
+      "dt": "2024-07-30T13:00:00",
+      "side": "SELL",
+      "size": -2.026929600051749,
+      "price": 2383.800048828125
+    },
+    {
+      "dt": "2024-07-30T14:00:00",
+      "side": "BUY",
+      "size": 1.5966786560886137,
+      "price": 2390.800048828125
+    },
+    {
+      "dt": "2024-07-30T15:00:00",
+      "side": "SELL",
+      "size": -1.5966786560886137,
+      "price": 2388.60009765625
+    },
+    {
+      "dt": "2024-07-30T16:00:00",
+      "side": "BUY",
+      "size": 1.3488221039355266,
+      "price": 2430.199951171875
+    },
+    {
+      "dt": "2024-08-02T15:00:00",
+      "side": "SELL",
+      "size": -1.3488221039355266,
+      "price": 2474.300048828125
+    },
+    {
+      "dt": "2024-08-05T07:00:00",
+      "side": "SELL",
+      "size": -0.9294039500153467,
+      "price": 2470.0
+    },
+    {
+      "dt": "2024-08-08T15:00:00",
+      "side": "BUY",
+      "size": 0.9294039500153467,
+      "price": 2452.1000976562505
+    },
+    {
+      "dt": "2024-08-08T16:00:00",
+      "side": "BUY",
+      "size": 1.6862709929397288,
+      "price": 2458.0
+    },
+    {
+      "dt": "2024-08-09T02:00:00",
+      "side": "SELL",
+      "size": -1.6862709929397288,
+      "price": 2466.60009765625
+    },
+    {
+      "dt": "2024-08-09T03:00:00",
+      "side": "BUY",
+      "size": 2.2130012298636466,
+      "price": 2462.0
+    },
+    {
+      "dt": "2024-08-09T07:00:00",
+      "side": "SELL",
+      "size": -2.2130012298636466,
+      "price": 2459.89990234375
+    },
+    {
+      "dt": "2024-08-09T08:00:00",
+      "side": "BUY",
+      "size": 2.386281280329328,
+      "price": 2462.39990234375
+    },
+    {
+      "dt": "2024-08-09T09:00:00",
+      "side": "SELL",
+      "size": -2.386281280329328,
+      "price": 2463.60009765625
+    },
+    {
+      "dt": "2024-08-09T10:00:00",
+      "side": "BUY",
+      "size": 2.258317401561532,
+      "price": 2462.699951171875
+    },
+    {
+      "dt": "2024-08-09T13:00:00",
+      "side": "SELL",
+      "size": -2.258317401561532,
+      "price": 2469.0
+    },
+    {
+      "dt": "2024-08-09T14:00:00",
+      "side": "BUY",
+      "size": 1.8888214763153588,
+      "price": 2466.0
+    },
+    {
+      "dt": "2024-08-09T17:00:00",
+      "side": "SELL",
+      "size": -1.8888214763153588,
+      "price": 2473.89990234375
+    },
+    {
+      "dt": "2024-08-09T18:00:00",
+      "side": "BUY",
+      "size": 1.9628753234307017,
+      "price": 2470.10009765625
+    },
+    {
+      "dt": "2024-08-09T19:00:00",
+      "side": "SELL",
+      "size": -1.9628753234307017,
+      "price": 2469.300048828125
+    },
+    {
+      "dt": "2024-08-09T20:00:00",
+      "side": "BUY",
+      "size": 1.682961867780576,
+      "price": 2468.60009765625
+    },
+    {
+      "dt": "2024-08-12T07:00:00",
+      "side": "SELL",
+      "size": -1.682961867780576,
+      "price": 2475.89990234375
+    },
+    {
+      "dt": "2024-08-12T08:00:00",
+      "side": "BUY",
+      "size": 2.310552787698865,
+      "price": 2481.10009765625
+    },
+    {
+      "dt": "2024-08-12T09:00:00",
+      "side": "SELL",
+      "size": -2.310552787698865,
+      "price": 2481.0
+    },
+    {
+      "dt": "2024-08-12T10:00:00",
+      "side": "BUY",
+      "size": 2.1835341977730405,
+      "price": 2481.89990234375
+    },
+    {
+      "dt": "2024-08-12T13:00:00",
+      "side": "SELL",
+      "size": -2.1835341977730405,
+      "price": 2483.89990234375
+    },
+    {
+      "dt": "2024-08-12T14:00:00",
+      "side": "BUY",
+      "size": 1.8923725204849358,
+      "price": 2493.699951171875
+    },
+    {
+      "dt": "2024-08-12T15:00:00",
+      "side": "SELL",
+      "size": -1.8923725204849358,
+      "price": 2492.60009765625
+    },
+    {
+      "dt": "2024-08-12T16:00:00",
+      "side": "BUY",
+      "size": 1.7921041086301366,
+      "price": 2499.300048828125
+    },
+    {
+      "dt": "2024-08-13T02:00:00",
+      "side": "SELL",
+      "size": -1.7921041086301366,
+      "price": 2506.60009765625
+    },
+    {
+      "dt": "2024-08-13T03:00:00",
+      "side": "BUY",
+      "size": 1.80836939114086,
+      "price": 2501.5
+    },
+    {
+      "dt": "2024-08-13T06:00:00",
+      "side": "SELL",
+      "size": -1.80836939114086,
+      "price": 2503.10009765625
+    },
+    {
+      "dt": "2024-08-13T07:00:00",
+      "side": "BUY",
+      "size": 1.7103833549630685,
+      "price": 2503.300048828125
+    },
+    {
+      "dt": "2024-08-13T09:00:00",
+      "side": "SELL",
+      "size": -1.7103833549630685,
+      "price": 2499.89990234375
+    },
+    {
+      "dt": "2024-08-13T11:00:00",
+      "side": "BUY",
+      "size": 1.4810290571080726,
+      "price": 2501.39990234375
+    },
+    {
+      "dt": "2024-08-14T08:00:00",
+      "side": "SELL",
+      "size": -1.4810290571080726,
+      "price": 2509.800048828125
+    },
+    {
+      "dt": "2024-08-14T09:00:00",
+      "side": "BUY",
+      "size": 2.0047310926560216,
+      "price": 2513.5
+    },
+    {
+      "dt": "2024-08-14T13:00:00",
+      "side": "SELL",
+      "size": -2.0047310926560216,
+      "price": 2507.89990234375
+    },
+    {
+      "dt": "2024-08-14T16:00:00",
+      "side": "SELL",
+      "size": -1.5536641952119292,
+      "price": 2482.5
+    },
+    {
+      "dt": "2024-08-16T11:00:00",
+      "side": "BUY",
+      "size": 1.5536641952119292,
+      "price": 2502.39990234375
+    },
+    {
+      "dt": "2024-08-16T12:00:00",
+      "side": "BUY",
+      "size": 1.6742487641496773,
+      "price": 2510.0
+    },
+    {
+      "dt": "2024-08-16T15:00:00",
+      "side": "SELL",
+      "size": -1.6742487641496773,
+      "price": 2525.60009765625
+    },
+    {
+      "dt": "2024-08-16T16:00:00",
+      "side": "BUY",
+      "size": 1.443671893526515,
+      "price": 2530.5
+    },
+    {
+      "dt": "2024-08-19T12:00:00",
+      "side": "SELL",
+      "size": -1.443671893526515,
+      "price": 2532.89990234375
+    },
+    {
+      "dt": "2024-08-19T15:00:00",
+      "side": "BUY",
+      "size": 1.5267432503605154,
+      "price": 2539.5
+    },
+    {
+      "dt": "2024-08-20T07:00:00",
+      "side": "SELL",
+      "size": -1.5267432503605154,
+      "price": 2540.39990234375
+    },
+    {
+      "dt": "2024-08-20T08:00:00",
+      "side": "BUY",
+      "size": 2.070803011476564,
+      "price": 2553.39990234375
+    },
+    {
+      "dt": "2024-08-20T13:00:00",
+      "side": "SELL",
+      "size": -2.070803011476564,
+      "price": 2565.300048828125
+    },
+    {
+      "dt": "2024-08-20T14:00:00",
+      "side": "BUY",
+      "size": 2.016836847347304,
+      "price": 2568.39990234375
+    },
+    {
+      "dt": "2024-08-20T15:00:00",
+      "side": "SELL",
+      "size": -2.016836847347304,
+      "price": 2562.10009765625
+    },
+    {
+      "dt": "2024-08-21T02:00:00",
+      "side": "BUY",
+      "size": 2.051436756447937,
+      "price": 2554.800048828125
+    },
+    {
+      "dt": "2024-08-21T12:00:00",
+      "side": "SELL",
+      "size": -2.051436756447937,
+      "price": 2550.0
+    },
+    {
+      "dt": "2024-08-21T19:00:00",
+      "side": "BUY",
+      "size": 1.908134358706181,
+      "price": 2554.199951171875
+    },
+    {
+      "dt": "2024-08-22T02:00:00",
+      "side": "SELL",
+      "size": -1.908134358706181,
+      "price": 2544.0
+    },
+    {
+      "dt": "2024-08-22T03:00:00",
+      "side": "SELL",
+      "size": -2.7510506165713937,
+      "price": 2538.89990234375
+    },
+    {
+      "dt": "2024-08-22T15:00:00",
+      "side": "BUY",
+      "size": 2.7510506165713937,
+      "price": 2515.800048828125
+    },
+    {
+      "dt": "2024-08-22T16:00:00",
+      "side": "SELL",
+      "size": -1.8197806383539332,
+      "price": 2518.0
+    },
+    {
+      "dt": "2024-08-25T22:00:00",
+      "side": "BUY",
+      "size": 1.8197806383539332,
+      "price": 2545.10009765625
+    },
+    {
+      "dt": "2024-08-25T23:00:00",
+      "side": "BUY",
+      "size": 2.2401060161341286,
+      "price": 2548.39990234375
+    },
+    {
+      "dt": "2024-08-26T00:00:00",
+      "side": "SELL",
+      "size": -2.2401060161341286,
+      "price": 2551.199951171875
+    },
+    {
+      "dt": "2024-08-26T01:00:00",
+      "side": "BUY",
+      "size": 2.1596548150762707,
+      "price": 2549.0
+    },
+    {
+      "dt": "2024-08-26T02:00:00",
+      "side": "SELL",
+      "size": -2.1596548150762707,
+      "price": 2548.699951171875
+    },
+    {
+      "dt": "2024-08-26T03:00:00",
+      "side": "BUY",
+      "size": 2.090361554096397,
+      "price": 2547.300048828125
+    },
+    {
+      "dt": "2024-08-26T08:00:00",
+      "side": "SELL",
+      "size": -2.090361554096397,
+      "price": 2557.0
+    },
+    {
+      "dt": "2024-08-26T09:00:00",
+      "side": "BUY",
+      "size": 2.4579449864392275,
+      "price": 2560.10009765625
+    },
+    {
+      "dt": "2024-08-26T10:00:00",
+      "side": "SELL",
+      "size": -2.4579449864392275,
+      "price": 2561.0
+    },
+    {
+      "dt": "2024-08-26T11:00:00",
+      "side": "BUY",
+      "size": 2.351690342281629,
+      "price": 2560.699951171875
+    },
+    {
+      "dt": "2024-08-26T12:00:00",
+      "side": "SELL",
+      "size": -2.351690342281629,
+      "price": 2562.199951171875
+    },
+    {
+      "dt": "2024-08-26T13:00:00",
+      "side": "BUY",
+      "size": 1.932638801176122,
+      "price": 2559.5
+    },
+    {
+      "dt": "2024-08-26T14:00:00",
+      "side": "SELL",
+      "size": -1.932638801176122,
+      "price": 2551.60009765625
+    },
+    {
+      "dt": "2024-08-26T15:00:00",
+      "side": "BUY",
+      "size": 1.6325606702145783,
+      "price": 2552.4999999999995
+    },
+    {
+      "dt": "2024-08-27T08:00:00",
+      "side": "SELL",
+      "size": -1.6325606702145783,
+      "price": 2539.89990234375
+    },
+    {
+      "dt": "2024-08-28T12:00:00",
+      "side": "SELL",
+      "size": -3.9416026024562294,
+      "price": 2536.199951171875
+    },
+    {
+      "dt": "2024-08-29T07:00:00",
+      "side": "BUY",
+      "size": 3.9416026024562294,
+      "price": 2550.10009765625
+    },
+    {
+      "dt": "2024-08-29T13:00:00",
+      "side": "SELL",
+      "size": -5.590833306799495,
+      "price": 2542.5
+    },
+    {
+      "dt": "2024-08-29T15:00:00",
+      "side": "BUY",
+      "size": 5.590833306799495,
+      "price": 2555.60009765625
+    },
+    {
+      "dt": "2024-08-30T18:00:00",
+      "side": "SELL",
+      "size": -5.34947130240387,
+      "price": 2532.199951171875
+    },
+    {
+      "dt": "2024-09-03T09:00:00",
+      "side": "BUY",
+      "size": 5.34947130240387,
+      "price": 2536.10009765625
+    },
+    {
+      "dt": "2024-09-03T10:00:00",
+      "side": "SELL",
+      "size": -6.57577927625846,
+      "price": 2532.800048828125
+    },
+    {
+      "dt": "2024-09-03T14:00:00",
+      "side": "BUY",
+      "size": 6.57577927625846,
+      "price": 2511.699951171875
+    },
+    {
+      "dt": "2024-09-03T15:00:00",
+      "side": "SELL",
+      "size": -4.266471691224631,
+      "price": 2509.60009765625
+    },
+    {
+      "dt": "2024-09-04T03:00:00",
+      "side": "BUY",
+      "size": 4.266471691224631,
+      "price": 2526.699951171875
+    },
+    {
+      "dt": "2024-09-04T07:00:00",
+      "side": "SELL",
+      "size": -6.222947988885399,
+      "price": 2515.5
+    },
+    {
+      "dt": "2024-09-04T11:00:00",
+      "side": "BUY",
+      "size": 6.222947988885399,
+      "price": 2520.199951171875
+    },
+    {
+      "dt": "2024-09-09T01:00:00",
+      "side": "SELL",
+      "size": -5.2368114904534835,
+      "price": 2524.89990234375
+    },
+    {
+      "dt": "2024-09-09T13:00:00",
+      "side": "BUY",
+      "size": 5.2368114904534835,
+      "price": 2530.10009765625
+    },
+    {
+      "dt": "2024-09-17T11:00:00",
+      "side": "SELL",
+      "size": -7.003487327255946,
+      "price": 2600.199951171875
+    },
+    {
+      "dt": "2024-09-18T11:00:00",
+      "side": "BUY",
+      "size": 7.003487327255946,
+      "price": 2602.800048828125
+    },
+    {
+      "dt": "2024-09-18T16:00:00",
+      "side": "SELL",
+      "size": -6.289988717980733,
+      "price": 2596.60009765625
+    },
+    {
+      "dt": "2024-09-18T19:00:00",
+      "side": "BUY",
+      "size": 6.289988717980733,
+      "price": 2602.0
+    },
+    {
+      "dt": "2024-09-18T20:00:00",
+      "side": "SELL",
+      "size": -3.778385354355153,
+      "price": 2574.800048828125
+    },
+    {
+      "dt": "2024-09-19T06:00:00",
+      "side": "BUY",
+      "size": 3.778385354355153,
+      "price": 2599.10009765625
+    },
+    {
+      "dt": "2024-09-27T17:00:00",
+      "side": "SELL",
+      "size": -4.567288485750314,
+      "price": 2674.0
+    },
+    {
+      "dt": "2024-09-29T23:00:00",
+      "side": "BUY",
+      "size": 4.567288485750314,
+      "price": 2684.39990234375
+    },
+    {
+      "dt": "2024-09-30T02:00:00",
+      "side": "SELL",
+      "size": -4.436766486007853,
+      "price": 2674.10009765625
+    },
+    {
+      "dt": "2024-10-01T08:00:00",
+      "side": "BUY",
+      "size": 4.436766486007853,
+      "price": 2667.10009765625
+    },
+    {
+      "dt": "2024-10-03T08:00:00",
+      "side": "SELL",
+      "size": -5.951096008125943,
+      "price": 2665.39990234375
+    },
+    {
+      "dt": "2024-10-03T17:00:00",
+      "side": "BUY",
+      "size": 5.951096008125943,
+      "price": 2680.300048828125
+    },
+    {
+      "dt": "2024-10-07T02:00:00",
+      "side": "SELL",
+      "size": -4.397494792182227,
+      "price": 2665.699951171875
+    },
+    {
+      "dt": "2024-10-07T09:00:00",
+      "side": "BUY",
+      "size": 4.397494792182227,
+      "price": 2671.89990234375
+    },
+    {
+      "dt": "2024-10-07T13:00:00",
+      "side": "SELL",
+      "size": -4.491950231505545,
+      "price": 2659.699951171875
+    },
+    {
+      "dt": "2024-10-08T12:00:00",
+      "side": "BUY",
+      "size": 4.491950231505545,
+      "price": 2670.0
+    },
+    {
+      "dt": "2024-10-08T15:00:00",
+      "side": "SELL",
+      "size": -3.6622659374446815,
+      "price": 2640.10009765625
+    },
+    {
+      "dt": "2024-10-10T13:00:00",
+      "side": "BUY",
+      "size": 3.6622659374446815,
+      "price": 2642.199951171875
+    },
+    {
+      "dt": "2024-10-15T05:00:00",
+      "side": "SELL",
+      "size": -6.354628093639198,
+      "price": 2660.5
+    },
+    {
+      "dt": "2024-10-15T08:00:00",
+      "side": "BUY",
+      "size": 6.354628093639198,
+      "price": 2667.3999023437505
+    },
+    {
+      "dt": "2024-10-24T00:00:00",
+      "side": "SELL",
+      "size": -5.238456814402904,
+      "price": 2733.89990234375
+    },
+    {
+      "dt": "2024-10-24T07:00:00",
+      "side": "BUY",
+      "size": 5.238456814402904,
+      "price": 2747.699951171875
+    },
+    {
+      "dt": "2024-10-25T02:00:00",
+      "side": "SELL",
+      "size": -6.089939140724986,
+      "price": 2742.5
+    },
+    {
+      "dt": "2024-10-25T13:00:00",
+      "side": "BUY",
+      "size": 6.089939140724986,
+      "price": 2744.10009765625
+    },
+    {
+      "dt": "2024-10-31T16:00:00",
+      "side": "SELL",
+      "size": -4.0366090884698345,
+      "price": 2752.199951171875
+    },
+    {
+      "dt": "2024-11-01T07:00:00",
+      "side": "BUY",
+      "size": 4.0366090884698345,
+      "price": 2761.60009765625
+    },
+    {
+      "dt": "2024-11-01T08:00:00",
+      "side": "SELL",
+      "size": -5.5925176057001815,
+      "price": 2759.300048828125
+    },
+    {
+      "dt": "2024-11-01T14:00:00",
+      "side": "BUY",
+      "size": 5.5925176057001815,
+      "price": 2766.199951171875
+    },
+    {
+      "dt": "2024-11-04T00:00:00",
+      "side": "SELL",
+      "size": -4.513126166744675,
+      "price": 2747.60009765625
+    },
+    {
+      "dt": "2024-11-04T14:00:00",
+      "side": "BUY",
+      "size": 4.513126166744675,
+      "price": 2756.10009765625
+    },
+    {
+      "dt": "2024-11-04T16:00:00",
+      "side": "SELL",
+      "size": -4.456376896428668,
+      "price": 2747.89990234375
+    },
+    {
+      "dt": "2024-11-05T08:00:00",
+      "side": "BUY",
+      "size": 4.456376896428668,
+      "price": 2745.39990234375
+    },
+    {
+      "dt": "2024-11-06T10:00:00",
+      "side": "SELL",
+      "size": -2.7358410588392053,
+      "price": 2733.60009765625
+    },
+    {
+      "dt": "2024-11-06T14:00:00",
+      "side": "BUY",
+      "size": 2.7358410588392053,
+      "price": 2672.199951171875
+    },
+    {
+      "dt": "2024-11-06T15:00:00",
+      "side": "SELL",
+      "size": -2.2032035392879097,
+      "price": 2668.39990234375
+    },
+    {
+      "dt": "2024-11-07T13:00:00",
+      "side": "BUY",
+      "size": 2.2032035392879097,
+      "price": 2681.10009765625
+    },
+    {
+      "dt": "2024-11-11T07:00:00",
+      "side": "SELL",
+      "size": -4.574233419642424,
+      "price": 2679.800048828125
+    },
+    {
+      "dt": "2024-11-11T14:00:00",
+      "side": "BUY",
+      "size": 4.574233419642424,
+      "price": 2642.10009765625
+    },
+    {
+      "dt": "2024-11-11T15:00:00",
+      "side": "SELL",
+      "size": -3.571123178778193,
+      "price": 2628.89990234375
+    },
+    {
+      "dt": "2024-11-12T14:00:00",
+      "side": "BUY",
+      "size": 3.571123178778193,
+      "price": 2618.300048828125
+    },
+    {
+      "dt": "2024-11-12T15:00:00",
+      "side": "SELL",
+      "size": -3.9014729160171657,
+      "price": 2616.800048828125
+    },
+    {
+      "dt": "2024-11-13T14:00:00",
+      "side": "BUY",
+      "size": 3.9014729160171657,
+      "price": 2618.60009765625
+    },
+    {
+      "dt": "2024-11-13T15:00:00",
+      "side": "SELL",
+      "size": -4.541978891138567,
+      "price": 2607.699951171875
+    },
+    {
+      "dt": "2024-11-13T21:00:00",
+      "side": "BUY",
+      "size": 4.541978891138567,
+      "price": 2579.5
+    },
+    {
+      "dt": "2024-11-13T23:00:00",
+      "side": "SELL",
+      "size": -4.1620205250604805,
+      "price": 2578.10009765625
+    },
+    {
+      "dt": "2024-11-14T10:00:00",
+      "side": "BUY",
+      "size": 4.1620205250604805,
+      "price": 2548.199951171875
+    },
+    {
+      "dt": "2024-11-14T11:00:00",
+      "side": "SELL",
+      "size": -3.8388027796663198,
+      "price": 2551.89990234375
+    },
+    {
+      "dt": "2024-11-14T15:00:00",
+      "side": "BUY",
+      "size": 3.8388027796663198,
+      "price": 2564.60009765625
+    },
+    {
+      "dt": "2024-11-15T06:00:00",
+      "side": "SELL",
+      "size": -4.577395600994101,
+      "price": 2564.300048828125
+    },
+    {
+      "dt": "2024-11-15T14:00:00",
+      "side": "BUY",
+      "size": 4.577395600994101,
+      "price": 2569.60009765625
+    },
+    {
+      "dt": "2024-11-15T17:00:00",
+      "side": "SELL",
+      "size": -3.9180995148053506,
+      "price": 2566.60009765625
+    },
+    {
+      "dt": "2024-11-18T01:00:00",
+      "side": "BUY",
+      "size": 3.9180995148053506,
+      "price": 2581.0
+    },
+    {
+      "dt": "2024-11-25T16:00:00",
+      "side": "SELL",
+      "size": -2.4428770122859547,
+      "price": 2629.39990234375
+    },
+    {
+      "dt": "2024-11-26T14:00:00",
+      "side": "BUY",
+      "size": 2.4428770122859547,
+      "price": 2629.89990234375
+    },
+    {
+      "dt": "2024-11-26T15:00:00",
+      "side": "SELL",
+      "size": -2.93431958853364,
+      "price": 2623.0
+    },
+    {
+      "dt": "2024-11-27T06:00:00",
+      "side": "BUY",
+      "size": 2.93431958853364,
+      "price": 2642.199951171875
+    },
+    {
+      "dt": "2024-11-27T13:00:00",
+      "side": "BUY",
+      "size": 2.1780852599265974,
+      "price": 2676.0
+    },
+    {
+      "dt": "2024-11-27T14:00:00",
+      "side": "SELL",
+      "size": -2.1780852599265974,
+      "price": 2681.39990234375
+    },
+    {
+      "dt": "2024-11-27T15:00:00",
+      "side": "BUY",
+      "size": 1.8199722999330497,
+      "price": 2676.3999023437505
+    },
+    {
+      "dt": "2024-11-27T16:00:00",
+      "side": "SELL",
+      "size": -1.8199722999330497,
+      "price": 2667.800048828125
+    },
+    {
+      "dt": "2024-11-27T17:00:00",
+      "side": "BUY",
+      "size": 1.5792122523049879,
+      "price": 2638.699951171875
+    },
+    {
+      "dt": "2024-11-28T02:00:00",
+      "side": "SELL",
+      "size": -1.5792122523049879,
+      "price": 2652.60009765625
+    },
+    {
+      "dt": "2024-11-29T15:30:00",
+      "side": "BUY",
+      "size": 1.2375716114364688,
+      "price": 2677.60009765625
+    },
+    {
+      "dt": "2024-12-02T02:00:00",
+      "side": "SELL",
+      "size": -1.2375716114364688,
+      "price": 2658.39990234375
+    },
+    {
+      "dt": "2024-12-02T12:00:00",
+      "side": "BUY",
+      "size": 1.1166806323212433,
+      "price": 2664.699951171875
+    },
+    {
+      "dt": "2024-12-03T16:00:00",
+      "side": "SELL",
+      "size": -1.1166806323212433,
+      "price": 2663.10009765625
+    },
+    {
+      "dt": "2024-12-03T17:00:00",
+      "side": "BUY",
+      "size": 1.4936182072417423,
+      "price": 2670.89990234375
+    },
+    {
+      "dt": "2024-12-04T13:00:00",
+      "side": "SELL",
+      "size": -1.4936182072417423,
+      "price": 2659.0
+    },
+    {
+      "dt": "2024-12-04T14:00:00",
+      "side": "BUY",
+      "size": 1.857807089630994,
+      "price": 2671.199951171875
+    },
+    {
+      "dt": "2024-12-05T10:00:00",
+      "side": "SELL",
+      "size": -1.857807089630994,
+      "price": 2668.5
+    },
+    {
+      "dt": "2024-12-05T13:00:00",
+      "side": "BUY",
+      "size": 1.8153352890192083,
+      "price": 2676.60009765625
+    },
+    {
+      "dt": "2024-12-05T16:00:00",
+      "side": "SELL",
+      "size": -1.8153352890192083,
+      "price": 2663.699951171875
+    },
+    {
+      "dt": "2024-12-05T20:00:00",
+      "side": "SELL",
+      "size": -1.5044568492251342,
+      "price": 2652.89990234375
+    },
+    {
+      "dt": "2024-12-09T10:00:00",
+      "side": "BUY",
+      "size": 1.5044568492251342,
+      "price": 2677.300048828125
+    },
+    {
+      "dt": "2024-12-09T11:00:00",
+      "side": "BUY",
+      "size": 1.4159460673264501,
+      "price": 2679.39990234375
+    },
+    {
+      "dt": "2024-12-11T08:00:00",
+      "side": "SELL",
+      "size": -1.4159460673264501,
+      "price": 2726.10009765625
+    },
+    {
+      "dt": "2024-12-11T09:00:00",
+      "side": "BUY",
+      "size": 1.7803358212274503,
+      "price": 2728.0
+    },
+    {
+      "dt": "2024-12-12T10:00:00",
+      "side": "SELL",
+      "size": -1.7803358212274503,
+      "price": 2748.3999023437495
+    },
+    {
+      "dt": "2024-12-12T21:00:00",
+      "side": "SELL",
+      "size": -1.7919703902050068,
+      "price": 2704.199951171875
+    },
+    {
+      "dt": "2024-12-17T14:00:00",
+      "side": "BUY",
+      "size": 1.7919703902050068,
+      "price": 2649.9999999999995
+    },
+    {
+      "dt": "2024-12-17T15:00:00",
+      "side": "SELL",
+      "size": -2.207409701554792,
+      "price": 2649.699951171875
+    },
+    {
+      "dt": "2024-12-19T02:00:00",
+      "side": "BUY",
+      "size": 2.207409701554792,
+      "price": 2624.10009765625
+    },
+    {
+      "dt": "2024-12-19T03:00:00",
+      "side": "SELL",
+      "size": -3.1614173810897843,
+      "price": 2624.5
+    },
+    {
+      "dt": "2024-12-19T11:00:00",
+      "side": "BUY",
+      "size": 3.1614173810897843,
+      "price": 2633.300048828125
+    },
+    {
+      "dt": "2024-12-19T13:00:00",
+      "side": "SELL",
+      "size": -3.5958728656748256,
+      "price": 2620.60009765625
+    },
+    {
+      "dt": "2024-12-20T08:00:00",
+      "side": "BUY",
+      "size": 3.5958728656748256,
+      "price": 2620.10009765625
+    },
+    {
+      "dt": "2024-12-24T15:30:00",
+      "side": "SELL",
+      "size": -6.469169429902746,
+      "price": 2625.0
+    },
+    {
+      "dt": "2024-12-26T05:00:00",
+      "side": "BUY",
+      "size": 6.469169429902746,
+      "price": 2643.800048828125
+    },
+    {
+      "dt": "2024-12-30T05:00:00",
+      "side": "SELL",
+      "size": -6.060156091844311,
+      "price": 2634.89990234375
+    },
+    {
+      "dt": "2024-12-30T13:00:00",
+      "side": "BUY",
+      "size": 6.060156091844311,
+      "price": 2635.10009765625
+    },
+    {
+      "dt": "2024-12-30T14:00:00",
+      "side": "SELL",
+      "size": -4.6351028441302695,
+      "price": 2618.10009765625
+    },
+    {
+      "dt": "2024-12-31T09:00:00",
+      "side": "BUY",
+      "size": 4.6351028441302695,
+      "price": 2628.699951171875
+    },
+    {
+      "dt": "2025-01-06T04:00:00",
+      "side": "SELL",
+      "size": -5.507817873122015,
+      "price": 2652.199951171875
+    },
+    {
+      "dt": "2025-01-06T12:00:00",
+      "side": "BUY",
+      "size": 5.507817873122015,
+      "price": 2659.39990234375
+    },
+    {
+      "dt": "2025-01-06T14:00:00",
+      "side": "SELL",
+      "size": -3.6180262875302627,
+      "price": 2634.5
+    },
+    {
+      "dt": "2025-01-06T16:00:00",
+      "side": "BUY",
+      "size": 3.6180262875302627,
+      "price": 2644.300048828125
+    },
+    {
+      "dt": "2025-01-13T19:00:00",
+      "side": "SELL",
+      "size": -3.6323531350519978,
+      "price": 2678.699951171875
+    },
+    {
+      "dt": "2025-01-14T20:00:00",
+      "side": "BUY",
+      "size": 3.6323531350519978,
+      "price": 2687.800048828125
+    },
+    {
+      "dt": "2025-01-21T12:00:00",
+      "side": "SELL",
+      "size": -4.581368451125921,
+      "price": 2734.39990234375
+    },
+    {
+      "dt": "2025-01-21T15:00:00",
+      "side": "BUY",
+      "size": 4.581368451125921,
+      "price": 2753.800048828125
+    },
+    {
+      "dt": "2025-01-23T15:00:00",
+      "side": "SELL",
+      "size": -4.544281936821817,
+      "price": 2752.39990234375
+    },
+    {
+      "dt": "2025-01-23T17:00:00",
+      "side": "BUY",
+      "size": 4.544281936821817,
+      "price": 2760.699951171875
+    },
+    {
+      "dt": "2025-01-27T14:00:00",
+      "side": "SELL",
+      "size": -3.6550898179464797,
+      "price": 2761.1999511718745
+    },
+    {
+      "dt": "2025-01-28T14:00:00",
+      "side": "BUY",
+      "size": 3.6550898179464797,
+      "price": 2753.699951171875
+    },
+    {
+      "dt": "2025-01-30T15:00:00",
+      "side": "BUY",
+      "size": 1.9412055877952465,
+      "price": 2834.300048828125
+    },
+    {
+      "dt": "2025-01-30T18:00:00",
+      "side": "SELL",
+      "size": -1.9412055877952465,
+      "price": 2845.10009765625
+    },
+    {
+      "dt": "2025-01-30T19:00:00",
+      "side": "BUY",
+      "size": 1.4822969936141877,
+      "price": 2845.199951171875
+    },
+    {
+      "dt": "2025-01-31T18:00:00",
+      "side": "SELL",
+      "size": -1.4822969936141877,
+      "price": 2843.1000976562505
+    },
+    {
+      "dt": "2025-02-04T02:00:00",
+      "side": "BUY",
+      "size": 1.1023252125425944,
+      "price": 2857.0
+    },
+    {
+      "dt": "2025-02-06T09:00:00",
+      "side": "SELL",
+      "size": -1.1023252125425944,
+      "price": 2879.0
+    },
+    {
+      "dt": "2025-02-06T12:00:00",
+      "side": "BUY",
+      "size": 1.365645329768021,
+      "price": 2888.699951171875
+    },
+    {
+      "dt": "2025-02-06T15:00:00",
+      "side": "SELL",
+      "size": -1.365645329768021,
+      "price": 2861.800048828125
+    },
+    {
+      "dt": "2025-02-07T15:00:00",
+      "side": "BUY",
+      "size": 1.2654789972064764,
+      "price": 2900.300048828125
+    },
+    {
+      "dt": "2025-02-11T10:00:00",
+      "side": "SELL",
+      "size": -1.2654789972064764,
+      "price": 2929.0
+    },
+    {
+      "dt": "2025-02-12T04:00:00",
+      "side": "SELL",
+      "size": -1.449119557608271,
+      "price": 2914.6999511718755
+    },
+    {
+      "dt": "2025-02-13T04:00:00",
+      "side": "BUY",
+      "size": 1.449119557608271,
+      "price": 2943.89990234375
+    },
+    {
+      "dt": "2025-02-13T07:00:00",
+      "side": "BUY",
+      "size": 1.4862533658870392,
+      "price": 2942.8999023437505
+    },
+    {
+      "dt": "2025-02-14T14:00:00",
+      "side": "SELL",
+      "size": -1.4862533658870392,
+      "price": 2940.300048828125
+    },
+    {
+      "dt": "2025-02-14T21:00:00",
+      "side": "SELL",
+      "size": -1.4102688924379463,
+      "price": 2896.39990234375
+    },
+    {
+      "dt": "2025-02-18T13:00:00",
+      "side": "BUY",
+      "size": 1.4102688924379463,
+      "price": 2931.800048828125
+    },
+    {
+      "dt": "2025-02-19T02:00:00",
+      "side": "BUY",
+      "size": 1.913227776159235,
+      "price": 2957.5
+    },
+    {
+      "dt": "2025-02-19T17:00:00",
+      "side": "SELL",
+      "size": -1.913227776159235,
+      "price": 2944.300048828125
+    },
+    {
+      "dt": "2025-02-20T01:00:00",
+      "side": "BUY",
+      "size": 1.7079616937926478,
+      "price": 2957.1999511718755
+    },
+    {
+      "dt": "2025-02-20T15:00:00",
+      "side": "SELL",
+      "size": -1.7079616937926478,
+      "price": 2950.699951171875
+    },
+    {
+      "dt": "2025-02-21T07:00:00",
+      "side": "SELL",
+      "size": -2.1032184467643,
+      "price": 2944.10009765625
+    },
+    {
+      "dt": "2025-02-24T13:00:00",
+      "side": "BUY",
+      "size": 2.1032184467643,
+      "price": 2961.89990234375
+    },
+    {
+      "dt": "2025-02-24T14:00:00",
+      "side": "BUY",
+      "size": 1.7931826962376676,
+      "price": 2971.10009765625
+    },
+    {
+      "dt": "2025-02-24T16:00:00",
+      "side": "SELL",
+      "size": -1.7931826962376676,
+      "price": 2952.6000976562505
+    },
+    {
+      "dt": "2025-02-24T19:00:00",
+      "side": "BUY",
+      "size": 1.6886433144565869,
+      "price": 2962.800048828125
+    },
+    {
+      "dt": "2025-02-25T05:00:00",
+      "side": "SELL",
+      "size": -1.6886433144565869,
+      "price": 2952.60009765625
+    },
+    {
+      "dt": "2025-02-25T17:00:00",
+      "side": "SELL",
+      "size": -1.3812752250272686,
+      "price": 2908.39990234375
+    },
+    {
+      "dt": "2025-02-28T17:00:00",
+      "side": "BUY",
+      "size": 1.3812752250272686,
+      "price": 2859.39990234375
+    },
+    {
+      "dt": "2025-02-28T18:00:00",
+      "side": "SELL",
+      "size": -2.819576089409521,
+      "price": 2855.5
+    },
+    {
+      "dt": "2025-03-03T00:00:00",
+      "side": "BUY",
+      "size": 2.819576089409521,
+      "price": 2882.5
+    },
+    {
+      "dt": "2025-03-06T12:00:00",
+      "side": "SELL",
+      "size": -2.979948900624366,
+      "price": 2913.800048828125
+    },
+    {
+      "dt": "2025-03-06T16:00:00",
+      "side": "BUY",
+      "size": 2.979948900624366,
+      "price": 2923.10009765625
+    },
+    {
+      "dt": "2025-03-07T01:00:00",
+      "side": "SELL",
+      "size": -3.1749174694292472,
+      "price": 2912.89990234375
+    },
+    {
+      "dt": "2025-03-07T09:00:00",
+      "side": "BUY",
+      "size": 3.1749174694292472,
+      "price": 2930.199951171875
+    },
+    {
+      "dt": "2025-03-07T18:00:00",
+      "side": "SELL",
+      "size": -2.6647385987626024,
+      "price": 2916.300048828125
+    },
+    {
+      "dt": "2025-03-10T10:00:00",
+      "side": "BUY",
+      "size": 2.6647385987626024,
+      "price": 2918.10009765625
+    },
+    {
+      "dt": "2025-03-10T11:00:00",
+      "side": "SELL",
+      "size": -2.945574612497955,
+      "price": 2909.89990234375
+    },
+    {
+      "dt": "2025-03-11T07:00:00",
+      "side": "BUY",
+      "size": 2.945574612497955,
+      "price": 2906.89990234375
+    },
+    {
+      "dt": "2025-03-21T04:00:00",
+      "side": "SELL",
+      "size": -4.383773731366532,
+      "price": 3037.5
+    },
+    {
+      "dt": "2025-03-21T14:00:00",
+      "side": "BUY",
+      "size": 4.383773731366532,
+      "price": 3010.699951171875
+    },
+    {
+      "dt": "2025-03-21T15:00:00",
+      "side": "SELL",
+      "size": -3.043496389222582,
+      "price": 3020.89990234375
+    },
+    {
+      "dt": "2025-03-24T10:00:00",
+      "side": "BUY",
+      "size": 3.043496389222582,
+      "price": 3028.60009765625
+    },
+    {
+      "dt": "2025-03-24T15:00:00",
+      "side": "SELL",
+      "size": -3.4028476351694943,
+      "price": 3016.699951171875
+    },
+    {
+      "dt": "2025-03-25T10:00:00",
+      "side": "BUY",
+      "size": 3.4028476351694943,
+      "price": 3027.300048828125
+    },
+    {
+      "dt": "2025-03-28T12:00:00",
+      "side": "BUY",
+      "size": 1.6507438555986687,
+      "price": 3111.699951171875
+    },
+    {
+      "dt": "2025-03-28T13:00:00",
+      "side": "SELL",
+      "size": -1.6507438555986687,
+      "price": 3112.699951171875
+    },
+    {
+      "dt": "2025-03-28T14:00:00",
+      "side": "BUY",
+      "size": 1.3523082488050877,
+      "price": 3118.800048828125
+    },
+    {
+      "dt": "2025-03-28T15:00:00",
+      "side": "SELL",
+      "size": -1.3523082488050877,
+      "price": 3103.800048828125
+    },
+    {
+      "dt": "2025-03-28T16:00:00",
+      "side": "BUY",
+      "size": 1.1193204376492119,
+      "price": 3089.300048828125
+    },
+    {
+      "dt": "2025-04-01T17:00:00",
+      "side": "SELL",
+      "size": -1.1193204376492119,
+      "price": 3138.800048828125
+    },
+    {
+      "dt": "2025-04-02T02:00:00",
+      "side": "BUY",
+      "size": 0.9208409740834312,
+      "price": 3161.1000976562495
+    },
+    {
+      "dt": "2025-04-02T07:00:00",
+      "side": "SELL",
+      "size": -0.9208409740834312,
+      "price": 3146.10009765625
+    },
+    {
+      "dt": "2025-04-02T22:00:00",
+      "side": "BUY",
+      "size": 0.8252769103145527,
+      "price": 3196.60009765625
+    },
+    {
+      "dt": "2025-04-03T06:00:00",
+      "side": "SELL",
+      "size": -0.8252769103145527,
+      "price": 3154.300048828125
+    },
+    {
+      "dt": "2025-04-03T14:00:00",
+      "side": "SELL",
+      "size": -0.7151122777539652,
+      "price": 3087.5000000000005
+    },
+    {
+      "dt": "2025-04-07T02:00:00",
+      "side": "BUY",
+      "size": 0.7151122777539652,
+      "price": 3059.1999511718745
+    },
+    {
+      "dt": "2025-04-07T03:00:00",
+      "side": "SELL",
+      "size": -0.5579394485284586,
+      "price": 3044.89990234375
+    },
+    {
+      "dt": "2025-04-09T07:00:00",
+      "side": "BUY",
+      "size": 0.5579394485284586,
+      "price": 3057.10009765625
+    },
+    {
+      "dt": "2025-04-09T10:00:00",
+      "side": "BUY",
+      "size": 1.1448312815419674,
+      "price": 3062.0
+    },
+    {
+      "dt": "2025-04-09T18:00:00",
+      "side": "SELL",
+      "size": -1.1448312815419674,
+      "price": 3076.10009765625
+    },
+    {
+      "dt": "2025-04-09T19:00:00",
+      "side": "BUY",
+      "size": 0.9768508837963702,
+      "price": 3083.60009765625
+    },
+    {
+      "dt": "2025-04-10T16:00:00",
+      "side": "SELL",
+      "size": -0.9768508837963702,
+      "price": 3175.10009765625
+    },
+    {
+      "dt": "2025-04-10T17:00:00",
+      "side": "BUY",
+      "size": 0.9695757205817644,
+      "price": 3175.5
+    },
+    {
+      "dt": "2025-04-14T11:00:00",
+      "side": "SELL",
+      "size": -0.9695757205817644,
+      "price": 3230.300048828125
+    },
+    {
+      "dt": "2025-04-22T04:00:00",
+      "side": "BUY",
+      "size": 1.5590768139936286,
+      "price": 3497.39990234375
+    },
+    {
+      "dt": "2025-04-22T09:00:00",
+      "side": "SELL",
+      "size": -1.5590768139936286,
+      "price": 3455.6000976562495
+    },
+    {
+      "dt": "2025-04-22T10:00:00",
+      "side": "BUY",
+      "size": 1.447534368534177,
+      "price": 3466.800048828125
+    },
+    {
+      "dt": "2025-04-22T14:00:00",
+      "side": "SELL",
+      "size": -1.447534368534177,
+      "price": 3431.0
+    },
+    {
+      "dt": "2025-04-23T03:00:00",
+      "side": "SELL",
+      "size": -0.9695516465093579,
+      "price": 3363.800048828125
+    },
+    {
+      "dt": "2025-04-24T01:00:00",
+      "side": "BUY",
+      "size": 0.9695516465093579,
+      "price": 3340.800048828125
+    },
+    {
+      "dt": "2025-04-24T14:00:00",
+      "side": "SELL",
+      "size": -1.3774592773245646,
+      "price": 3326.5
+    },
+    {
+      "dt": "2025-04-24T20:00:00",
+      "side": "BUY",
+      "size": 1.3774592773245646,
+      "price": 3353.8000488281245
+    },
+    {
+      "dt": "2025-04-24T23:00:00",
+      "side": "BUY",
+      "size": 1.5471882125525447,
+      "price": 3378.5
+    },
+    {
+      "dt": "2025-04-25T04:00:00",
+      "side": "SELL",
+      "size": -1.5471882125525447,
+      "price": 3334.39990234375
+    },
+    {
+      "dt": "2025-04-25T16:00:00",
+      "side": "SELL",
+      "size": -1.4730557178991244,
+      "price": 3293.699951171875
+    },
+    {
+      "dt": "2025-04-27T22:00:00",
+      "side": "BUY",
+      "size": 1.4730557178991244,
+      "price": 3336.5
+    },
+    {
+      "dt": "2025-04-28T02:00:00",
+      "side": "SELL",
+      "size": -1.3626070443040308,
+      "price": 3290.8999023437495
+    },
+    {
+      "dt": "2025-04-28T15:00:00",
+      "side": "BUY",
+      "size": 1.3626070443040308,
+      "price": 3339.5
+    },
+    {
+      "dt": "2025-04-30T07:00:00",
+      "side": "SELL",
+      "size": -2.2485479877475125,
+      "price": 3315.39990234375
+    },
+    {
+      "dt": "2025-04-30T13:00:00",
+      "side": "BUY",
+      "size": 2.2485479877475125,
+      "price": 3308.10009765625
+    },
+    {
+      "dt": "2025-04-30T22:00:00",
+      "side": "SELL",
+      "size": -1.7953400271211533,
+      "price": 3299.0
+    },
+    {
+      "dt": "2025-05-01T02:00:00",
+      "side": "BUY",
+      "size": 1.7953400271211533,
+      "price": 3246.5
+    },
+    {
+      "dt": "2025-05-01T03:00:00",
+      "side": "SELL",
+      "size": -1.5770703699856343,
+      "price": 3248.199951171875
+    },
+    {
+      "dt": "2025-05-01T22:00:00",
+      "side": "BUY",
+      "size": 1.5770703699856343,
+      "price": 3247.60009765625
+    },
+    {
+      "dt": "2025-05-02T01:00:00",
+      "side": "SELL",
+      "size": -1.7576532469483463,
+      "price": 3239.39990234375
+    },
+    {
+      "dt": "2025-05-02T07:00:00",
+      "side": "BUY",
+      "size": 1.7576532469483463,
+      "price": 3261.5
+    },
+    {
+      "dt": "2025-05-02T16:00:00",
+      "side": "SELL",
+      "size": -1.666281743900935,
+      "price": 3240.0
+    },
+    {
+      "dt": "2025-05-05T02:00:00",
+      "side": "BUY",
+      "size": 1.666281743900935,
+      "price": 3272.10009765625
+    },
+    {
+      "dt": "2025-05-07T00:00:00",
+      "side": "BUY",
+      "size": 1.3771266217145994,
+      "price": 3409.300048828125
+    },
+    {
+      "dt": "2025-05-07T01:00:00",
+      "side": "SELL",
+      "size": -1.3771266217145994,
+      "price": 3387.300048828125
+    },
+    {
+      "dt": "2025-05-08T06:00:00",
+      "side": "SELL",
+      "size": -1.475305963975516,
+      "price": 3361.0
+    },
+    {
+      "dt": "2025-05-08T14:00:00",
+      "side": "BUY",
+      "size": 1.475305963975516,
+      "price": 3361.60009765625
+    },
+    {
+      "dt": "2025-05-08T16:00:00",
+      "side": "SELL",
+      "size": -1.3980576624853922,
+      "price": 3335.8999023437505
+    },
+    {
+      "dt": "2025-05-09T05:00:00",
+      "side": "BUY",
+      "size": 1.3980576624853922,
+      "price": 3330.10009765625
+    },
+    {
+      "dt": "2025-05-11T23:00:00",
+      "side": "SELL",
+      "size": -1.3968349839667182,
+      "price": 3276.699951171875
+    },
+    {
+      "dt": "2025-05-12T14:00:00",
+      "side": "BUY",
+      "size": 1.3968349839667182,
+      "price": 3244.3000488281255
+    },
+    {
+      "dt": "2025-05-12T15:00:00",
+      "side": "SELL",
+      "size": -1.3662002271231508,
+      "price": 3242.10009765625
+    },
+    {
+      "dt": "2025-05-13T06:00:00",
+      "side": "BUY",
+      "size": 1.3662002271231508,
+      "price": 3260.89990234375
+    },
+    {
+      "dt": "2025-05-13T13:00:00",
+      "side": "SELL",
+      "size": -1.8765710700213403,
+      "price": 3246.199951171875
+    },
+    {
+      "dt": "2025-05-13T16:00:00",
+      "side": "BUY",
+      "size": 1.8765710700213403,
+      "price": 3258.0
+    },
+    {
+      "dt": "2025-05-14T13:00:00",
+      "side": "SELL",
+      "size": -1.8111379652534394,
+      "price": 3188.60009765625
+    },
+    {
+      "dt": "2025-05-15T06:00:00",
+      "side": "BUY",
+      "size": 1.8111379652534394,
+      "price": 3132.300048828125
+    },
+    {
+      "dt": "2025-05-15T07:00:00",
+      "side": "SELL",
+      "size": -1.6898242548894002,
+      "price": 3153.199951171875
+    },
+    {
+      "dt": "2025-05-15T11:00:00",
+      "side": "BUY",
+      "size": 1.6898242548894002,
+      "price": 3181.39990234375
+    },
+    {
+      "dt": "2025-05-18T23:00:00",
+      "side": "BUY",
+      "size": 1.4736090503663053,
+      "price": 3242.39990234375
+    },
+    {
+      "dt": "2025-05-19T04:00:00",
+      "side": "SELL",
+      "size": -1.4736090503663053,
+      "price": 3214.699951171875
+    },
+    {
+      "dt": "2025-05-19T06:00:00",
+      "side": "BUY",
+      "size": 1.4561116039565003,
+      "price": 3226.60009765625
+    },
+    {
+      "dt": "2025-05-20T01:00:00",
+      "side": "SELL",
+      "size": -1.4561116039565003,
+      "price": 3225.0
+    },
+    {
+      "dt": "2025-05-27T06:00:00",
+      "side": "SELL",
+      "size": -2.6956107276401227,
+      "price": 3322.60009765625
+    },
+    {
+      "dt": "2025-05-27T12:00:00",
+      "side": "BUY",
+      "size": 2.6956107276401227,
+      "price": 3286.699951171875
+    },
+    {
+      "dt": "2025-05-27T13:00:00",
+      "side": "SELL",
+      "size": -2.2200315165546356,
+      "price": 3292.300048828125
+    },
+    {
+      "dt": "2025-05-28T01:00:00",
+      "side": "BUY",
+      "size": 2.2200315165546356,
+      "price": 3306.89990234375
+    },
+    {
+      "dt": "2025-05-28T02:00:00",
+      "side": "SELL",
+      "size": -2.4328420674622744,
+      "price": 3299.89990234375
+    },
+    {
+      "dt": "2025-05-28T08:00:00",
+      "side": "BUY",
+      "size": 2.4328420674622744,
+      "price": 3317.800048828125
+    },
+    {
+      "dt": "2025-05-29T01:00:00",
+      "side": "SELL",
+      "size": -1.785501308853026,
+      "price": 3261.199951171875
+    },
+    {
+      "dt": "2025-05-29T08:00:00",
+      "side": "BUY",
+      "size": 1.785501308853026,
+      "price": 3310.800048828125
+    },
+    {
+      "dt": "2025-05-30T01:00:00",
+      "side": "BUY",
+      "size": 0.8374878938229414,
+      "price": 3335.8000488281245
+    },
+    {
+      "dt": "2025-05-30T14:00:00",
+      "side": "SELL",
+      "size": -0.8374878938229414,
+      "price": 3300.6000976562495
+    },
+    {
+      "dt": "2025-06-01T23:00:00",
+      "side": "BUY",
+      "size": 0.6875786172859006,
+      "price": 3336.39990234375
+    },
+    {
+      "dt": "2025-06-03T14:00:00",
+      "side": "SELL",
+      "size": -0.6875786172859006,
+      "price": 3369.800048828125
+    },
+    {
+      "dt": "2025-06-04T00:00:00",
+      "side": "BUY",
+      "size": 0.8492887260346307,
+      "price": 3384.39990234375
+    },
+    {
+      "dt": "2025-06-04T12:00:00",
+      "side": "SELL",
+      "size": -0.8492887260346307,
+      "price": 3370.5
+    },
+    {
+      "dt": "2025-06-04T22:00:00",
+      "side": "BUY",
+      "size": 1.0999081616261228,
+      "price": 3398.0
+    },
+    {
+      "dt": "2025-06-05T13:00:00",
+      "side": "SELL",
+      "size": -1.0999081616261228,
+      "price": 3407.300048828125
+    },
+    {
+      "dt": "2025-06-06T05:00:00",
+      "side": "BUY",
+      "size": 1.2800734226979067,
+      "price": 3396.0
+    },
+    {
+      "dt": "2025-06-06T08:00:00",
+      "side": "SELL",
+      "size": -1.2800734226979067,
+      "price": 3382.60009765625
+    },
+    {
+      "dt": "2025-06-06T10:00:00",
+      "side": "SELL",
+      "size": -1.2903168415431103,
+      "price": 3380.0
+    },
+    {
+      "dt": "2025-06-08T22:00:00",
+      "side": "BUY",
+      "size": 1.2903168415431103,
+      "price": 3333.3999023437505
+    },
+    {
+      "dt": "2025-06-08T23:00:00",
+      "side": "SELL",
+      "size": -1.0072586095108034,
+      "price": 3334.5
+    },
+    {
+      "dt": "2025-06-10T12:00:00",
+      "side": "BUY",
+      "size": 1.0072586095108034,
+      "price": 3354.60009765625
+    },
+    {
+      "dt": "2025-06-10T13:00:00",
+      "side": "BUY",
+      "size": 1.1525078551385342,
+      "price": 3358.199951171875
+    },
+    {
+      "dt": "2025-06-10T19:00:00",
+      "side": "SELL",
+      "size": -1.1525078551385342,
+      "price": 3342.60009765625
+    },
+    {
+      "dt": "2025-06-11T01:00:00",
+      "side": "BUY",
+      "size": 1.2458836532370645,
+      "price": 3353.300048828125
+    },
+    {
+      "dt": "2025-06-11T12:00:00",
+      "side": "SELL",
+      "size": -1.2458836532370645,
+      "price": 3353.800048828125
+    },
+    {
+      "dt": "2025-06-11T19:00:00",
+      "side": "BUY",
+      "size": 1.0851660373305967,
+      "price": 3364.5
+    },
+    {
+      "dt": "2025-06-12T09:00:00",
+      "side": "SELL",
+      "size": -1.0851660373305967,
+      "price": 3376.199951171875
+    },
+    {
+      "dt": "2025-06-12T10:00:00",
+      "side": "BUY",
+      "size": 1.0417148573482757,
+      "price": 3385.60009765625
+    },
+    {
+      "dt": "2025-06-13T08:00:00",
+      "side": "SELL",
+      "size": -1.0417148573482757,
+      "price": 3435.199951171875
+    },
+    {
+      "dt": "2025-06-13T09:00:00",
+      "side": "BUY",
+      "size": 1.1269209874127026,
+      "price": 3444.800048828125
+    },
+    {
+      "dt": "2025-06-16T08:00:00",
+      "side": "SELL",
+      "size": -1.1269209874127026,
+      "price": 3432.10009765625
+    },
+    {
+      "dt": "2025-06-16T19:00:00",
+      "side": "SELL",
+      "size": -1.7858214587527483,
+      "price": 3404.89990234375
+    },
+    {
+      "dt": "2025-06-18T05:00:00",
+      "side": "BUY",
+      "size": 1.7858214587527483,
+      "price": 3413.89990234375
+    },
+    {
+      "dt": "2025-06-18T10:00:00",
+      "side": "SELL",
+      "size": -2.3679481018938393,
+      "price": 3396.39990234375
+    },
+    {
+      "dt": "2025-06-19T11:00:00",
+      "side": "BUY",
+      "size": 2.3679481018938393,
+      "price": 3392.0
+    },
+    {
+      "dt": "2025-06-19T13:00:00",
+      "side": "SELL",
+      "size": -2.2513365916677612,
+      "price": 3384.800048828125
+    },
+    {
+      "dt": "2025-06-20T14:00:00",
+      "side": "BUY",
+      "size": 2.2513365916677612,
+      "price": 3386.5
+    },
+    {
+      "dt": "2025-06-23T02:00:00",
+      "side": "SELL",
+      "size": -2.1464642680255075,
+      "price": 3370.699951171875
+    },
+    {
+      "dt": "2025-06-23T12:00:00",
+      "side": "BUY",
+      "size": 2.1464642680255075,
+      "price": 3396.300048828125
+    },
+    {
+      "dt": "2025-06-24T09:00:00",
+      "side": "SELL",
+      "size": -1.7949120200778528,
+      "price": 3341.39990234375
+    },
+    {
+      "dt": "2025-06-25T01:00:00",
+      "side": "BUY",
+      "size": 1.7949120200778528,
+      "price": 3340.5
+    },
+    {
+      "dt": "2025-06-25T10:00:00",
+      "side": "SELL",
+      "size": -2.749162647665529,
+      "price": 3339.0
+    },
+    {
+      "dt": "2025-06-25T17:00:00",
+      "side": "BUY",
+      "size": 2.749162647665529,
+      "price": 3348.800048828125
+    },
+    {
+      "dt": "2025-06-27T03:00:00",
+      "side": "SELL",
+      "size": -2.633793482532146,
+      "price": 3321.1999511718745
+    },
+    {
+      "dt": "2025-06-27T13:00:00",
+      "side": "BUY",
+      "size": 2.633793482532146,
+      "price": 3281.0000000000005
+    },
+    {
+      "dt": "2025-06-27T14:00:00",
+      "side": "SELL",
+      "size": -2.107614000019676,
+      "price": 3286.10009765625
+    },
+    {
+      "dt": "2025-06-30T06:00:00",
+      "side": "BUY",
+      "size": 2.107614000019676,
+      "price": 3299.699951171875
+    },
+    {
+      "dt": "2025-06-30T12:00:00",
+      "side": "SELL",
+      "size": -2.2673504723488156,
+      "price": 3289.300048828125
+    },
+    {
+      "dt": "2025-06-30T17:00:00",
+      "side": "BUY",
+      "size": 2.2673504723488156,
+      "price": 3309.10009765625
+    },
+    {
+      "dt": "2025-07-04T13:00:00",
+      "side": "SELL",
+      "size": -2.929588867927989,
+      "price": 3343.699951171875
+    },
+    {
+      "dt": "2025-07-07T08:00:00",
+      "side": "BUY",
+      "size": 2.929588867927989,
+      "price": 3311.10009765625
+    },
+    {
+      "dt": "2025-07-07T09:00:00",
+      "side": "SELL",
+      "size": -2.575279054713418,
+      "price": 3319.300048828125
+    },
+    {
+      "dt": "2025-07-07T15:00:00",
+      "side": "BUY",
+      "size": 2.575279054713418,
+      "price": 3327.699951171875
+    },
+    {
+      "dt": "2025-07-08T20:00:00",
+      "side": "SELL",
+      "size": -2.6251412971240087,
+      "price": 3312.3000488281255
+    },
+    {
+      "dt": "2025-07-09T14:00:00",
+      "side": "BUY",
+      "size": 2.6251412971240087,
+      "price": 3308.699951171875
+    },
+    {
+      "dt": "2025-07-15T13:00:00",
+      "side": "SELL",
+      "size": -3.061984824351393,
+      "price": 3357.60009765625
+    },
+    {
+      "dt": "2025-07-15T17:00:00",
+      "side": "BUY",
+      "size": 3.061984824351393,
+      "price": 3336.39990234375
+    },
+    {
+      "dt": "2025-07-15T18:00:00",
+      "side": "SELL",
+      "size": -2.4546849171325076,
+      "price": 3334.89990234375
+    },
+    {
+      "dt": "2025-07-16T07:00:00",
+      "side": "BUY",
+      "size": 2.4546849171325076,
+      "price": 3345.9999999999995
+    },
+    {
+      "dt": "2025-07-16T14:00:00",
+      "side": "SELL",
+      "size": -2.9589563079390477,
+      "price": 3333.60009765625
+    },
+    {
+      "dt": "2025-07-16T15:00:00",
+      "side": "BUY",
+      "size": 2.9589563079390477,
+      "price": 3345.3000488281245
+    },
+    {
+      "dt": "2025-07-17T07:00:00",
+      "side": "SELL",
+      "size": -2.562839915340855,
+      "price": 3341.1999511718755
+    },
+    {
+      "dt": "2025-07-17T16:00:00",
+      "side": "BUY",
+      "size": 2.562839915340855,
+      "price": 3342.39990234375
+    },
+    {
+      "dt": "2025-07-24T01:00:00",
+      "side": "SELL",
+      "size": -2.772385192313652,
+      "price": 3399.1999511718745
+    },
+    {
+      "dt": "2025-07-24T12:00:00",
+      "side": "BUY",
+      "size": 2.772385192313652,
+      "price": 3366.300048828125
+    },
+    {
+      "dt": "2025-07-24T13:00:00",
+      "side": "SELL",
+      "size": -2.680267447527746,
+      "price": 3357.3999023437495
+    },
+    {
+      "dt": "2025-07-24T14:00:00",
+      "side": "BUY",
+      "size": 2.680267447527746,
+      "price": 3370.6000976562505
+    },
+    {
+      "dt": "2025-07-24T15:00:00",
+      "side": "SELL",
+      "size": -2.3680151230750752,
+      "price": 3377.5
+    },
+    {
+      "dt": "2025-07-25T13:00:00",
+      "side": "BUY",
+      "size": 2.3680151230750752,
+      "price": 3341.800048828125
+    },
+    {
+      "dt": "2025-07-25T14:00:00",
+      "side": "SELL",
+      "size": -2.9726317662964816,
+      "price": 3345.10009765625
+    },
+    {
+      "dt": "2025-07-28T07:00:00",
+      "side": "BUY",
+      "size": 2.9726317662964816,
+      "price": 3340.10009765625
+    },
+    {
+      "dt": "2025-07-28T08:00:00",
+      "side": "SELL",
+      "size": -3.0522646340562978,
+      "price": 3334.60009765625
+    },
+    {
+      "dt": "2025-07-28T14:00:00",
+      "side": "BUY",
+      "size": 3.0522646340562978,
+      "price": 3300.699951171875
+    },
+    {
+      "dt": "2025-07-28T15:00:00",
+      "side": "SELL",
+      "size": -2.4888097593923018,
+      "price": 3306.3000488281255
+    },
+    {
+      "dt": "2025-07-29T09:00:00",
+      "side": "BUY",
+      "size": 2.4888097593923018,
+      "price": 3323.89990234375
+    },
+    {
+      "dt": "2025-07-29T12:00:00",
+      "side": "SELL",
+      "size": -3.055360868541871,
+      "price": 3313.5
+    },
+    {
+      "dt": "2025-07-29T16:00:00",
+      "side": "BUY",
+      "size": 3.055360868541871,
+      "price": 3318.5
+    },
+    {
+      "dt": "2025-07-30T10:00:00",
+      "side": "BUY",
+      "size": 1.290593606529961,
+      "price": 3386.699951171875
+    },
+    {
+      "dt": "2025-07-30T11:00:00",
+      "side": "SELL",
+      "size": -1.290593606529961,
+      "price": 3382.8999023437505
+    },
+    {
+      "dt": "2025-07-30T12:00:00",
+      "side": "BUY",
+      "size": 0.9450949910317806,
+      "price": 3385.5
+    },
+    {
+      "dt": "2025-07-30T13:00:00",
+      "side": "SELL",
+      "size": -0.9450949910317806,
+      "price": 3309.1000976562505
+    },
+    {
+      "dt": "2025-07-31T08:00:00",
+      "side": "BUY",
+      "size": 0.41972227698317194,
+      "price": 3356.199951171875
+    },
+    {
+      "dt": "2025-08-01T08:00:00",
+      "side": "SELL",
+      "size": -0.41972227698317194,
+      "price": 3337.60009765625
+    },
+    {
+      "dt": "2025-08-01T15:00:00",
+      "side": "BUY",
+      "size": 0.3749306267612852,
+      "price": 3399.300048828125
+    },
+    {
+      "dt": "2025-08-05T11:00:00",
+      "side": "SELL",
+      "size": -0.3749306267612852,
+      "price": 3406.60009765625
+    },
+    {
+      "dt": "2025-08-05T14:00:00",
+      "side": "BUY",
+      "size": 0.5734498727449179,
+      "price": 3428.5
+    },
+    {
+      "dt": "2025-08-07T09:00:00",
+      "side": "SELL",
+      "size": -0.5734498727449179,
+      "price": 3452.199951171875
+    },
+    {
+      "dt": "2025-08-10T22:00:00",
+      "side": "BUY",
+      "size": 1.2233723510053536,
+      "price": 3458.10009765625
+    },
+    {
+      "dt": "2025-08-11T01:00:00",
+      "side": "SELL",
+      "size": -1.2233723510053536,
+      "price": 3443.8999023437505
+    },
+    {
+      "dt": "2025-08-11T06:00:00",
+      "side": "SELL",
+      "size": -1.4499873264657943,
+      "price": 3439.1999511718745
+    },
+    {
+      "dt": "2025-08-12T16:00:00",
+      "side": "BUY",
+      "size": 1.4499873264657943,
+      "price": 3400.39990234375
+    },
+    {
+      "dt": "2025-08-13T01:00:00",
+      "side": "SELL",
+      "size": -2.4078409894341317,
+      "price": 3393.89990234375
+    },
+    {
+      "dt": "2025-08-13T09:00:00",
+      "side": "BUY",
+      "size": 2.4078409894341317,
+      "price": 3409.5
+    },
+    {
+      "dt": "2025-08-14T17:00:00",
+      "side": "SELL",
+      "size": -2.2885886606902925,
+      "price": 3380.300048828125
+    },
+    {
+      "dt": "2025-08-18T01:00:00",
+      "side": "BUY",
+      "size": 2.2885886606902925,
+      "price": 3385.199951171875
+    },
+    {
+      "dt": "2025-08-19T01:00:00",
+      "side": "SELL",
+      "size": -3.8853319155057595,
+      "price": 3379.39990234375
+    },
+    {
+      "dt": "2025-08-19T11:00:00",
+      "side": "BUY",
+      "size": 3.8853319155057595,
+      "price": 3387.89990234375
+    },
+    {
+      "dt": "2025-08-19T14:00:00",
+      "side": "SELL",
+      "size": -3.540655031815704,
+      "price": 3377.699951171875
+    },
+    {
+      "dt": "2025-08-20T07:00:00",
+      "side": "BUY",
+      "size": 3.540655031815704,
+      "price": 3365.60009765625
+    },
+    {
+      "dt": "2025-08-22T07:00:00",
+      "side": "SELL",
+      "size": -4.1606565742351895,
+      "price": 3371.699951171875
+    },
+    {
+      "dt": "2025-08-22T14:00:00",
+      "side": "BUY",
+      "size": 4.1606565742351895,
+      "price": 3376.10009765625
+    },
+    {
+      "dt": "2025-09-04T23:00:00",
+      "side": "SELL",
+      "size": -2.046977661553406,
+      "price": 3596.699951171875
+    },
+    {
+      "dt": "2025-09-05T04:00:00",
+      "side": "BUY",
+      "size": 2.046977661553406,
+      "price": 3617.60009765625
+    },
+    {
+      "dt": "2025-09-11T06:00:00",
+      "side": "SELL",
+      "size": -2.46880927592243,
+      "price": 3662.89990234375
+    },
+    {
+      "dt": "2025-09-11T13:00:00",
+      "side": "BUY",
+      "size": 2.46880927592243,
+      "price": 3666.8000488281245
+    },
+    {
+      "dt": "2025-09-17T19:00:00",
+      "side": "SELL",
+      "size": -1.7288874467729836,
+      "price": 3685.800048828125
+    },
+    {
+      "dt": "2025-09-18T09:00:00",
+      "side": "BUY",
+      "size": 1.7288874467729836,
+      "price": 3700.0
+    },
+    {
+      "dt": "2025-09-18T14:00:00",
+      "side": "SELL",
+      "size": -1.5633881589500762,
+      "price": 3675.300048828125
+    },
+    {
+      "dt": "2025-09-19T05:00:00",
+      "side": "BUY",
+      "size": 1.5633881589500762,
+      "price": 3691.5
+    },
+    {
+      "dt": "2025-09-24T19:00:00",
+      "side": "SELL",
+      "size": -1.8495516826404408,
+      "price": 3757.10009765625
+    },
+    {
+      "dt": "2025-09-25T01:00:00",
+      "side": "BUY",
+      "size": 1.8495516826404408,
+      "price": 3779.699951171875
+    },
+    {
+      "dt": "2025-09-25T02:00:00",
+      "side": "SELL",
+      "size": -1.8482834658636544,
+      "price": 3766.60009765625
+    },
+    {
+      "dt": "2025-09-25T09:00:00",
+      "side": "BUY",
+      "size": 1.8482834658636544,
+      "price": 3786.699951171875
+    },
+    {
+      "dt": "2025-09-26T02:00:00",
+      "side": "SELL",
+      "size": -1.6497906939691331,
+      "price": 3768.39990234375
+    },
+    {
+      "dt": "2025-09-26T14:00:00",
+      "side": "BUY",
+      "size": 1.6497906939691331,
+      "price": 3792.1999511718745
+    },
+    {
+      "dt": "2025-10-02T17:00:00",
+      "side": "SELL",
+      "size": -1.2830429408555903,
+      "price": 3868.60009765625
+    },
+    {
+      "dt": "2025-10-03T11:00:00",
+      "side": "BUY",
+      "size": 1.2830429408555903,
+      "price": 3888.89990234375
+    },
+    {
+      "dt": "2025-10-09T19:00:00",
+      "side": "SELL",
+      "size": -0.931605588252654,
+      "price": 3971.39990234375
+    },
+    {
+      "dt": "2025-10-10T10:00:00",
+      "side": "BUY",
+      "size": 0.931605588252654,
+      "price": 4009.800048828125
+    },
+    {
+      "dt": "2025-10-13T04:00:00",
+      "side": "BUY",
+      "size": 0.8261262595494574,
+      "price": 4069.800048828125
+    },
+    {
+      "dt": "2025-10-14T02:00:00",
+      "side": "SELL",
+      "size": -0.8261262595494574,
+      "price": 4154.10009765625
+    },
+    {
+      "dt": "2025-10-14T08:00:00",
+      "side": "BUY",
+      "size": 0.9494390837503628,
+      "price": 4141.60009765625
+    },
+    {
+      "dt": "2025-10-14T14:00:00",
+      "side": "SELL",
+      "size": -0.9494390837503628,
+      "price": 4140.5
+    },
+    {
+      "dt": "2025-10-14T16:00:00",
+      "side": "BUY",
+      "size": 0.9325686149476446,
+      "price": 4154.5
+    },
+    {
+      "dt": "2025-10-15T10:00:00",
+      "side": "SELL",
+      "size": -0.9325686149476446,
+      "price": 4208.7001953125
+    },
+    {
+      "dt": "2025-10-16T23:00:00",
+      "side": "BUY",
+      "size": 0.9090000745581382,
+      "price": 4360.2001953125
+    },
+    {
+      "dt": "2025-10-17T02:00:00",
+      "side": "SELL",
+      "size": -0.9090000745581382,
+      "price": 4326.10009765625
+    },
+    {
+      "dt": "2025-10-17T03:00:00",
+      "side": "BUY",
+      "size": 0.7145857524873487,
+      "price": 4355.60009765625
+    },
+    {
+      "dt": "2025-10-17T08:00:00",
+      "side": "SELL",
+      "size": -0.7145857524873487,
+      "price": 4354.5
+    },
+    {
+      "dt": "2025-10-17T09:00:00",
+      "side": "BUY",
+      "size": 0.6692789784480127,
+      "price": 4360.2001953125
+    },
+    {
+      "dt": "2025-10-17T12:00:00",
+      "side": "SELL",
+      "size": -0.6692789784480127,
+      "price": 4298.7001953125
+    },
+    {
+      "dt": "2025-10-20T06:00:00",
+      "side": "SELL",
+      "size": -0.597997114444568,
+      "price": 4252.2998046875
+    },
+    {
+      "dt": "2025-10-20T13:00:00",
+      "side": "BUY",
+      "size": 0.597997114444568,
+      "price": 4340.89990234375
+    },
+    {
+      "dt": "2025-10-20T23:00:00",
+      "side": "BUY",
+      "size": 0.7123543034703144,
+      "price": 4385.5
+    },
+    {
+      "dt": "2025-10-21T06:00:00",
+      "side": "SELL",
+      "size": -0.7123543034703144,
+      "price": 4338.60009765625
+    },
+    {
+      "dt": "2025-10-21T18:00:00",
+      "side": "SELL",
+      "size": -0.5221450986415666,
+      "price": 4124.0
+    },
+    {
+      "dt": "2025-10-22T07:00:00",
+      "side": "BUY",
+      "size": 0.5221450986415666,
+      "price": 4169.2998046875
+    },
+    {
+      "dt": "2025-10-22T08:00:00",
+      "side": "SELL",
+      "size": -0.5427727163250305,
+      "price": 4146.2001953125
+    },
+    {
+      "dt": "2025-10-22T20:00:00",
+      "side": "BUY",
+      "size": 0.5427727163250305,
+      "price": 4120.39990234375
+    },
+    {
+      "dt": "2025-10-23T02:00:00",
+      "side": "SELL",
+      "size": -0.5525198241373873,
+      "price": 4088.89990234375
+    },
+    {
+      "dt": "2025-10-23T14:00:00",
+      "side": "BUY",
+      "size": 0.5525198241373873,
+      "price": 4161.10009765625
+    },
+    {
+      "dt": "2025-10-23T15:00:00",
+      "side": "BUY",
+      "size": 0.6978075711004085,
+      "price": 4164.5
+    },
+    {
+      "dt": "2025-10-24T07:00:00",
+      "side": "SELL",
+      "size": -0.6978075711004085,
+      "price": 4107.39990234375
+    },
+    {
+      "dt": "2025-10-24T15:00:00",
+      "side": "BUY",
+      "size": 0.7334986166716406,
+      "price": 4133.10009765625
+    },
+    {
+      "dt": "2025-10-26T23:00:00",
+      "side": "SELL",
+      "size": -0.7334986166716406,
+      "price": 4097.2998046875
+    },
+    {
+      "dt": "2025-10-27T00:00:00",
+      "side": "SELL",
+      "size": -0.6960369637678526,
+      "price": 4078.699951171875
+    },
+    {
+      "dt": "2025-10-28T07:00:00",
+      "side": "BUY",
+      "size": 0.6960369637678526,
+      "price": 3958.199951171875
+    },
+    {
+      "dt": "2025-10-28T08:00:00",
+      "side": "SELL",
+      "size": -0.7857883521064193,
+      "price": 3947.60009765625
+    },
+    {
+      "dt": "2025-10-28T15:00:00",
+      "side": "BUY",
+      "size": 0.7857883521064193,
+      "price": 3964.5
+    },
+    {
+      "dt": "2025-10-28T23:00:00",
+      "side": "SELL",
+      "size": -0.7996436221333424,
+      "price": 3949.1000976562505
+    },
+    {
+      "dt": "2025-10-29T07:00:00",
+      "side": "BUY",
+      "size": 0.7996436221333424,
+      "price": 3992.0
+    },
+    {
+      "dt": "2025-10-29T14:00:00",
+      "side": "BUY",
+      "size": 0.8929736214547002,
+      "price": 4026.800048828125
+    },
+    {
+      "dt": "2025-10-29T19:00:00",
+      "side": "SELL",
+      "size": -0.8929736214547002,
+      "price": 3983.0
+    },
+    {
+      "dt": "2025-10-30T10:00:00",
+      "side": "BUY",
+      "size": 0.6939540355255341,
+      "price": 4010.699951171875
+    },
+    {
+      "dt": "2025-10-31T04:00:00",
+      "side": "SELL",
+      "size": -0.6939540355255341,
+      "price": 4009.5
+    },
+    {
+      "dt": "2025-10-31T08:00:00",
+      "side": "BUY",
+      "size": 0.8542488377726967,
+      "price": 4032.39990234375
+    },
+    {
+      "dt": "2025-10-31T17:00:00",
+      "side": "SELL",
+      "size": -0.8542488377726967,
+      "price": 3992.199951171875
+    },
+    {
+      "dt": "2025-11-04T00:00:00",
+      "side": "SELL",
+      "size": -1.024900920551729,
+      "price": 4008.39990234375
+    },
+    {
+      "dt": "2025-11-04T15:00:00",
+      "side": "BUY",
+      "size": 1.024900920551729,
+      "price": 3966.39990234375
+    },
+    {
+      "dt": "2025-11-04T16:00:00",
+      "side": "SELL",
+      "size": -0.9536400843974001,
+      "price": 3966.5
+    },
+    {
+      "dt": "2025-11-05T05:00:00",
+      "side": "BUY",
+      "size": 0.9536400843974001,
+      "price": 3978.800048828125
+    },
+    {
+      "dt": "2025-11-14T11:00:00",
+      "side": "SELL",
+      "size": -0.9819926844055286,
+      "price": 4171.0
+    },
+    {
+      "dt": "2025-11-14T14:00:00",
+      "side": "BUY",
+      "size": 0.9819926844055286,
+      "price": 4056.39990234375
+    },
+    {
+      "dt": "2025-11-14T15:00:00",
+      "side": "SELL",
+      "size": -0.6911403098725188,
+      "price": 4083.39990234375
+    },
+    {
+      "dt": "2025-11-18T11:00:00",
+      "side": "BUY",
+      "size": 0.6911403098725188,
+      "price": 4043.5
+    },
+    {
+      "dt": "2025-11-18T13:00:00",
+      "side": "SELL",
+      "size": -0.9497674809729475,
+      "price": 4031.89990234375
+    },
+    {
+      "dt": "2025-11-18T15:00:00",
+      "side": "BUY",
+      "size": 0.9497674809729475,
+      "price": 4064.89990234375
+    },
+    {
+      "dt": "2025-11-20T12:00:00",
+      "side": "SELL",
+      "size": -0.9193395941539203,
+      "price": 4059.60009765625
+    },
+    {
+      "dt": "2025-11-20T15:00:00",
+      "side": "BUY",
+      "size": 0.9193395941539203,
+      "price": 4092.300048828125
+    },
+    {
+      "dt": "2025-11-20T17:00:00",
+      "side": "SELL",
+      "size": -0.7760282208711656,
+      "price": 4047.5
+    },
+    {
+      "dt": "2025-11-21T13:00:00",
+      "side": "BUY",
+      "size": 0.7760282208711656,
+      "price": 4064.5
+    },
+    {
+      "dt": "2025-11-24T02:00:00",
+      "side": "SELL",
+      "size": -0.8485736308151824,
+      "price": 4040.89990234375
+    },
+    {
+      "dt": "2025-11-24T13:00:00",
+      "side": "BUY",
+      "size": 0.8485736308151824,
+      "price": 4078.0
+    },
+    {
+      "dt": "2025-11-25T10:00:00",
+      "side": "BUY",
+      "size": 0.8559613622680465,
+      "price": 4161.7998046875
+    },
+    {
+      "dt": "2025-11-25T13:00:00",
+      "side": "SELL",
+      "size": -0.8559613622680465,
+      "price": 4127.10009765625
+    },
+    {
+      "dt": "2025-11-25T14:00:00",
+      "side": "BUY",
+      "size": 0.605344353643725,
+      "price": 4181.7001953125
+    },
+    {
+      "dt": "2025-11-25T15:00:00",
+      "side": "SELL",
+      "size": -0.605344353643725,
+      "price": 4121.7998046875
+    },
+    {
+      "dt": "2025-11-26T01:00:00",
+      "side": "BUY",
+      "size": 0.4194644278483834,
+      "price": 4177.60009765625
+    },
+    {
+      "dt": "2025-12-02T02:00:00",
+      "side": "SELL",
+      "size": -0.4194644278483834,
+      "price": 4250.7998046875
+    },
+    {
+      "dt": "2025-12-02T16:00:00",
+      "side": "SELL",
+      "size": -0.43538198170687714,
+      "price": 4200.89990234375
+    },
+    {
+      "dt": "2025-12-05T07:00:00",
+      "side": "BUY",
+      "size": 0.43538198170687714,
+      "price": 4254.7998046875
+    },
+    {
+      "dt": "2025-12-08T14:00:00",
+      "side": "SELL",
+      "size": -0.6749810573266588,
+      "price": 4230.89990234375
+    },
+    {
+      "dt": "2025-12-10T02:00:00",
+      "side": "BUY",
+      "size": 0.6749810573266588,
+      "price": 4242.7001953125
+    },
+    {
+      "dt": "2025-12-10T03:00:00",
+      "side": "BUY",
+      "size": 0.7555463491324058,
+      "price": 4246.0
+    },
+    {
+      "dt": "2025-12-10T14:00:00",
+      "side": "SELL",
+      "size": -0.7555463491324058,
+      "price": 4229.0
+    },
+    {
+      "dt": "2025-12-10T20:00:00",
+      "side": "BUY",
+      "size": 0.6978599994021286,
+      "price": 4245.60009765625
+    },
+    {
+      "dt": "2025-12-11T08:00:00",
+      "side": "SELL",
+      "size": -0.6978599994021286,
+      "price": 4243.7001953125
+    },
+    {
+      "dt": "2025-12-11T15:00:00",
+      "side": "BUY",
+      "size": 0.7532149341218628,
+      "price": 4257.89990234375
+    },
+    {
+      "dt": "2025-12-12T10:00:00",
+      "side": "SELL",
+      "size": -0.7532149341218628,
+      "price": 4350.60009765625
+    },
+    {
+      "dt": "2025-12-12T11:00:00",
+      "side": "BUY",
+      "size": 0.7524549694063112,
+      "price": 4364.89990234375
+    },
+    {
+      "dt": "2025-12-12T16:00:00",
+      "side": "SELL",
+      "size": -0.7524549694063112,
+      "price": 4320.2998046875
+    },
+    {
+      "dt": "2025-12-15T00:00:00",
+      "side": "BUY",
+      "size": 0.590312089098458,
+      "price": 4334.0
+    },
+    {
+      "dt": "2025-12-15T16:00:00",
+      "side": "SELL",
+      "size": -0.590312089098458,
+      "price": 4350.0
+    },
+    {
+      "dt": "2025-12-16T07:00:00",
+      "side": "SELL",
+      "size": -0.7703526953839107,
+      "price": 4315.60009765625
+    },
+    {
+      "dt": "2025-12-16T15:00:00",
+      "side": "BUY",
+      "size": 0.7703526953839107,
+      "price": 4355.89990234375
+    },
+    {
+      "dt": "2025-12-17T17:00:00",
+      "side": "BUY",
+      "size": 0.7835274005608989,
+      "price": 4365.10009765625
+    },
+    {
+      "dt": "2025-12-18T15:00:00",
+      "side": "SELL",
+      "size": -0.7835274005608989,
+      "price": 4360.0
+    },
+    {
+      "dt": "2025-12-29T13:00:00",
+      "side": "SELL",
+      "size": -0.7442434934897014,
+      "price": 4484.2998046875
+    },
+    {
+      "dt": "2025-12-29T15:00:00",
+      "side": "BUY",
+      "size": 0.7442434934897014,
+      "price": 4378.60009765625
+    },
+    {
+      "dt": "2025-12-29T16:00:00",
+      "side": "SELL",
+      "size": -0.5660725426244299,
+      "price": 4343.0
+    },
+    {
+      "dt": "2025-12-30T11:00:00",
+      "side": "BUY",
+      "size": 0.5660725426244299,
+      "price": 4400.7998046875
+    },
+    {
+      "dt": "2025-12-30T15:00:00",
+      "side": "SELL",
+      "size": -0.763269925205182,
+      "price": 4381.2998046875
+    },
+    {
+      "dt": "2025-12-31T06:00:00",
+      "side": "BUY",
+      "size": 0.763269925205182,
+      "price": 4297.0
+    },
+    {
+      "dt": "2025-12-31T07:00:00",
+      "side": "SELL",
+      "size": -0.6446575791258773,
+      "price": 4339.2998046875
+    },
+    {
+      "dt": "2026-01-02T06:00:00",
+      "side": "BUY",
+      "size": 0.6446575791258773,
+      "price": 4393.5
+    },
+    {
+      "dt": "2026-01-05T01:00:00",
+      "side": "BUY",
+      "size": 0.7978258323625396,
+      "price": 4404.60009765625
+    },
+    {
+      "dt": "2026-01-05T14:00:00",
+      "side": "SELL",
+      "size": -0.7978258323625396,
+      "price": 4429.0
+    },
+    {
+      "dt": "2026-01-08T02:00:00",
+      "side": "SELL",
+      "size": -1.1084895534160115,
+      "price": 4457.10009765625
+    },
+    {
+      "dt": "2026-01-08T16:00:00",
+      "side": "BUY",
+      "size": 1.1084895534160115,
+      "price": 4463.60009765625
+    },
+    {
+      "dt": "2026-01-15T14:00:00",
+      "side": "SELL",
+      "size": -1.0370782275897075,
+      "price": 4591.60009765625
+    },
+    {
+      "dt": "2026-01-15T17:00:00",
+      "side": "BUY",
+      "size": 1.0370782275897075,
+      "price": 4610.39990234375
+    },
+    {
+      "dt": "2026-01-16T01:00:00",
+      "side": "SELL",
+      "size": -1.1015162386979196,
+      "price": 4603.7998046875
+    },
+    {
+      "dt": "2026-01-16T16:00:00",
+      "side": "BUY",
+      "size": 1.1015162386979196,
+      "price": 4574.60009765625
+    },
+    {
+      "dt": "2026-01-16T18:00:00",
+      "side": "SELL",
+      "size": -0.8378060916926107,
+      "price": 4586.0
+    },
+    {
+      "dt": "2026-01-20T05:00:00",
+      "side": "BUY",
+      "size": 0.8378060916926107,
+      "price": 4700.89990234375
+    },
+    {
+      "dt": "2026-01-20T07:00:00",
+      "side": "BUY",
+      "size": 0.699731131514172,
+      "price": 4718.39990234375
+    },
+    {
+      "dt": "2026-01-21T02:00:00",
+      "side": "SELL",
+      "size": -0.699731131514172,
+      "price": 4838.60009765625
+    },
+    {
+      "dt": "2026-01-21T16:00:00",
+      "side": "BUY",
+      "size": 0.6817582574124942,
+      "price": 4850.0
+    },
+    {
+      "dt": "2026-01-21T20:00:00",
+      "side": "SELL",
+      "size": -0.6817582574124942,
+      "price": 4783.0
+    },
+    {
+      "dt": "2026-01-22T08:00:00",
+      "side": "BUY",
+      "size": 0.6167011973713699,
+      "price": 4833.39990234375
+    },
+    {
+      "dt": "2026-01-23T00:00:00",
+      "side": "SELL",
+      "size": -0.6167011973713699,
+      "price": 4961.2001953125
+    },
+    {
+      "dt": "2026-01-23T01:00:00",
+      "side": "BUY",
+      "size": 0.7065896409433482,
+      "price": 4968.0
+    },
+    {
+      "dt": "2026-01-23T09:00:00",
+      "side": "SELL",
+      "size": -0.7065896409433482,
+      "price": 4914.7998046875
+    },
+    {
+      "dt": "2026-01-26T02:00:00",
+      "side": "BUY",
+      "size": 0.6446906186185347,
+      "price": 5068.89990234375
+    },
+    {
+      "dt": "2026-01-26T20:00:00",
+      "side": "SELL",
+      "size": -0.6446906186185347,
+      "price": 5023.60009765625
+    },
+    {
+      "dt": "2026-01-27T04:00:00",
+      "side": "BUY",
+      "size": 0.4875348729026185,
+      "price": 5071.7001953125
+    },
+    {
+      "dt": "2026-01-28T02:00:00",
+      "side": "SELL",
+      "size": -0.4875348729026185,
+      "price": 5199.0
+    },
+    {
+      "dt": "2026-01-28T03:00:00",
+      "side": "BUY",
+      "size": 0.5576337697686274,
+      "price": 5226.2998046875
+    },
+    {
+      "dt": "2026-01-28T19:00:00",
+      "side": "SELL",
+      "size": -0.5576337697686274,
+      "price": 5315.0
+    },
+    {
+      "dt": "2026-01-28T20:00:00",
+      "side": "BUY",
+      "size": 0.48322699545536285,
+      "price": 5358.60009765625
+    },
+    {
+      "dt": "2026-01-29T00:00:00",
+      "side": "SELL",
+      "size": -0.48322699545536285,
+      "price": 5539.89990234375
+    },
+    {
+      "dt": "2026-01-29T01:00:00",
+      "side": "BUY",
+      "size": 0.3550616689484588,
+      "price": 5548.89990234375
+    },
+    {
+      "dt": "2026-01-29T16:00:00",
+      "side": "SELL",
+      "size": -0.3550616689484588,
+      "price": 5210.7001953125
+    },
+    {
+      "dt": "2026-01-30T06:00:00",
+      "side": "SELL",
+      "size": -0.19613416114536886,
+      "price": 5210.7001953125
+    },
+    {
+      "dt": "2026-01-30T18:00:00",
+      "side": "BUY",
+      "size": 0.19613416114536886,
+      "price": 4874.39990234375
+    },
+    {
+      "dt": "2026-01-30T19:00:00",
+      "side": "SELL",
+      "size": -0.15783947620094338,
+      "price": 4898.2998046875
+    },
+    {
+      "dt": "2026-02-02T07:00:00",
+      "side": "BUY",
+      "size": 0.15783947620094338,
+      "price": 4525.7998046875
+    },
+    {
+      "dt": "2026-02-02T08:00:00",
+      "side": "SELL",
+      "size": -0.14045145022800032,
+      "price": 4609.5
+    },
+    {
+      "dt": "2026-02-03T02:00:00",
+      "side": "BUY",
+      "size": 0.14045145022800032,
+      "price": 4863.2001953125
+    },
+    {
+      "dt": "2026-02-03T14:00:00",
+      "side": "BUY",
+      "size": 0.25874248197866734,
+      "price": 4958.7001953125
+    },
+    {
+      "dt": "2026-02-04T15:00:00",
+      "side": "SELL",
+      "size": -0.25874248197866734,
+      "price": 5007.2998046875
+    },
+    {
+      "dt": "2026-02-05T00:00:00",
+      "side": "BUY",
+      "size": 0.33814097998711273,
+      "price": 5033.2001953125
+    },
+    {
+      "dt": "2026-02-05T03:00:00",
+      "side": "SELL",
+      "size": -0.33814097998711273,
+      "price": 4830.39990234375
+    },
+    {
+      "dt": "2026-02-05T10:00:00",
+      "side": "SELL",
+      "size": -0.2939141600097091,
+      "price": 4875.89990234375
+    },
+    {
+      "dt": "2026-02-06T03:00:00",
+      "side": "BUY",
+      "size": 0.2939141600097091,
+      "price": 4832.5
+    },
+    {
+      "dt": "2026-02-06T21:00:00",
+      "side": "BUY",
+      "size": 0.40629939245336066,
+      "price": 4977.2001953125
+    },
+    {
+      "dt": "2026-02-10T00:00:00",
+      "side": "SELL",
+      "size": -0.40629939245336066,
+      "price": 5056.39990234375
+    },
+    {
+      "dt": "2026-02-10T10:00:00",
+      "side": "BUY",
+      "size": 0.5782105261803349,
+      "price": 5068.60009765625
+    },
+    {
+      "dt": "2026-02-11T13:00:00",
+      "side": "SELL",
+      "size": -0.5782105261803349,
+      "price": 5107.5
+    },
+    {
+      "dt": "2026-02-11T17:00:00",
+      "side": "BUY",
+      "size": 0.5156581995943329,
+      "price": 5098.7001953125
+    },
+    {
+      "dt": "2026-02-12T17:00:00",
+      "side": "SELL",
+      "size": -0.5156581995943329,
+      "price": 4974.5
+    },
+    {
+      "dt": "2026-02-12T18:00:00",
+      "side": "SELL",
+      "size": -0.4573315525433253,
+      "price": 4961.7001953125
+    },
+    {
+      "dt": "2026-02-13T05:00:00",
+      "side": "BUY",
+      "size": 0.4573315525433253,
+      "price": 4996.10009765625
+    },
+    {
+      "dt": "2026-02-13T06:00:00",
+      "side": "SELL",
+      "size": -0.48982473937393955,
+      "price": 4964.60009765625
+    },
+    {
+      "dt": "2026-02-13T15:00:00",
+      "side": "BUY",
+      "size": 0.48982473937393955,
+      "price": 5017.39990234375
+    },
+    {
+      "dt": "2026-02-17T05:00:00",
+      "side": "SELL",
+      "size": -0.5726972988525292,
+      "price": 4970.7998046875
+    },
+    {
+      "dt": "2026-02-17T15:00:00",
+      "side": "BUY",
+      "size": 0.5726972988525292,
+      "price": 4880.7998046875
+    },
+    {
+      "dt": "2026-02-17T16:00:00",
+      "side": "SELL",
+      "size": -0.4907428326567374,
+      "price": 4897.10009765625
+    },
+    {
+      "dt": "2026-02-18T04:00:00",
+      "side": "BUY",
+      "size": 0.4907428326567374,
+      "price": 4939.10009765625
+    },
+    {
+      "dt": "2026-02-23T00:00:00",
+      "side": "BUY",
+      "size": 0.5454135224447059,
+      "price": 5187.0
+    },
+    {
+      "dt": "2026-02-24T02:00:00",
+      "side": "SELL",
+      "size": -0.5454135224447059,
+      "price": 5197.0
+    },
+    {
+      "dt": "2026-02-24T23:00:00",
+      "side": "SELL",
+      "size": -0.6746283314227913,
+      "price": 5160.0
+    },
+    {
+      "dt": "2026-02-25T06:00:00",
+      "side": "BUY",
+      "size": 0.6746283314227913,
+      "price": 5220.10009765625
+    },
+    {
+      "dt": "2026-03-02T00:00:00",
+      "side": "BUY",
+      "size": 0.5197147840403025,
+      "price": 5401.2998046875
+    },
+    {
+      "dt": "2026-03-02T02:00:00",
+      "side": "SELL",
+      "size": -0.5197147840403025,
+      "price": 5338.5
+    },
+    {
+      "dt": "2026-03-02T03:00:00",
+      "side": "BUY",
+      "size": 0.48603228700124806,
+      "price": 5358.7998046875
+    },
+    {
+      "dt": "2026-03-02T15:00:00",
+      "side": "SELL",
+      "size": -0.48603228700124806,
+      "price": 5346.10009765625
+    },
+    {
+      "dt": "2026-03-03T01:00:00",
+      "side": "BUY",
+      "size": 0.5349231216681585,
+      "price": 5364.89990234375
+    },
+    {
+      "dt": "2026-03-03T06:00:00",
+      "side": "SELL",
+      "size": -0.5349231216681585,
+      "price": 5333.7001953125
+    },
+    {
+      "dt": "2026-03-03T14:00:00",
+      "side": "SELL",
+      "size": -0.30314897219132647,
+      "price": 5166.89990234375
+    },
+    {
+      "dt": "2026-03-04T02:00:00",
+      "side": "BUY",
+      "size": 0.30314897219132647,
+      "price": 5183.89990234375
+    },
+    {
+      "dt": "2026-03-04T15:00:00",
+      "side": "SELL",
+      "size": -0.415832184424947,
+      "price": 5155.2001953125
+    },
+    {
+      "dt": "2026-03-06T02:00:00",
+      "side": "BUY",
+      "size": 0.415832184424947,
+      "price": 5142.0
+    },
+    {
+      "dt": "2026-03-06T10:00:00",
+      "side": "SELL",
+      "size": -0.6116575484732739,
+      "price": 5094.5
+    },
+    {
+      "dt": "2026-03-06T15:00:00",
+      "side": "BUY",
+      "size": 0.6116575484732739,
+      "price": 5139.2998046875
+    },
+    {
+      "dt": "2026-03-09T00:00:00",
+      "side": "SELL",
+      "size": -0.46004477608322863,
+      "price": 5083.10009765625
+    },
+    {
+      "dt": "2026-03-09T06:00:00",
+      "side": "BUY",
+      "size": 0.46004477608322863,
+      "price": 5131.39990234375
+    },
+    {
+      "dt": "2026-03-09T14:00:00",
+      "side": "SELL",
+      "size": -0.4765762839601493,
+      "price": 5081.10009765625
+    },
+    {
+      "dt": "2026-03-09T20:00:00",
+      "side": "BUY",
+      "size": 0.4765762839601493,
+      "price": 5150.89990234375
+    },
+    {
+      "dt": "2026-03-10T02:00:00",
+      "side": "BUY",
+      "size": 0.5103853782463338,
+      "price": 5192.7998046875
+    },
+    {
+      "dt": "2026-03-10T19:00:00",
+      "side": "SELL",
+      "size": -0.5103853782463338,
+      "price": 5200.2998046875
+    },
+    {
+      "dt": "2026-03-10T20:00:00",
+      "side": "BUY",
+      "size": 0.5765321357661728,
+      "price": 5206.7001953125
+    },
+    {
+      "dt": "2026-03-11T13:00:00",
+      "side": "SELL",
+      "size": -0.5765321357661728,
+      "price": 5174.7001953125
+    },
+    {
+      "dt": "2026-03-12T00:00:00",
+      "side": "SELL",
+      "size": -0.6899836045960812,
+      "price": 5139.39990234375
+    },
+    {
+      "dt": "2026-03-12T08:00:00",
+      "side": "BUY",
+      "size": 0.6899836045960812,
+      "price": 5188.2001953125
+    },
+    {
+      "dt": "2026-03-12T14:00:00",
+      "side": "SELL",
+      "size": -0.7226449767507311,
+      "price": 5157.0
+    },
+    {
+      "dt": "2026-03-12T22:00:00",
+      "side": "BUY",
+      "size": 0.7226449767507311,
+      "price": 5084.0
+    },
+    {
+      "dt": "2026-03-12T23:00:00",
+      "side": "SELL",
+      "size": -0.6701647905996035,
+      "price": 5099.60009765625
+    },
+    {
+      "dt": "2026-03-16T00:00:00",
+      "side": "BUY",
+      "size": 0.6701647905996035,
+      "price": 5001.10009765625
+    },
+    {
+      "dt": "2026-03-16T01:00:00",
+      "side": "SELL",
+      "size": -0.5105236445995815,
+      "price": 5031.5
+    },
+    {
+      "dt": "2026-03-16T14:00:00",
+      "side": "BUY",
+      "size": 0.5105236445995815,
+      "price": 5035.7998046875
+    },
+    {
+      "dt": "2026-03-16T15:00:00",
+      "side": "SELL",
+      "size": -0.5459493596288346,
+      "price": 5000.39990234375
+    },
+    {
+      "dt": "2026-03-18T13:00:00",
+      "side": "BUY",
+      "size": 0.5459493596288346,
+      "price": 4884.0
+    },
+    {
+      "dt": "2026-03-18T14:00:00",
+      "side": "SELL",
+      "size": -0.6407427220541747,
+      "price": 4881.89990234375
+    },
+    {
+      "dt": "2026-03-19T07:00:00",
+      "side": "BUY",
+      "size": 0.6407427220541747,
+      "price": 4765.2998046875
+    },
+    {
+      "dt": "2026-03-19T08:00:00",
+      "side": "SELL",
+      "size": -0.5313539609720681,
+      "price": 4729.2998046875
+    },
+    {
+      "dt": "2026-03-19T13:00:00",
+      "side": "BUY",
+      "size": 0.5313539609720681,
+      "price": 4576.10009765625
+    },
+    {
+      "dt": "2026-03-19T14:00:00",
+      "side": "SELL",
+      "size": -0.3630634583427752,
+      "price": 4624.89990234375
+    },
+    {
+      "dt": "2026-03-20T02:00:00",
+      "side": "BUY",
+      "size": 0.3630634583427752,
+      "price": 4680.0
+    },
+    {
+      "dt": "2026-03-20T07:00:00",
+      "side": "SELL",
+      "size": -0.4254767292422978,
+      "price": 4669.89990234375
+    },
+    {
+      "dt": "2026-03-20T19:00:00",
+      "side": "BUY",
+      "size": 0.4254767292422978,
+      "price": 4501.2998046875
+    },
+    {
+      "dt": "2026-03-20T20:00:00",
+      "side": "SELL",
+      "size": -0.3676836716746521,
+      "price": 4503.5
+    },
+    {
+      "dt": "2026-03-23T06:00:00",
+      "side": "BUY",
+      "size": 0.3676836716746521,
+      "price": 4313.7998046875
+    },
+    {
+      "dt": "2026-03-23T07:00:00",
+      "side": "SELL",
+      "size": -0.26753314359332014,
+      "price": 4224.7998046875
+    },
+    {
+      "dt": "2026-03-23T12:00:00",
+      "side": "BUY",
+      "size": 0.26753314359332014,
+      "price": 4380.10009765625
+    },
+    {
+      "dt": "2026-03-23T16:00:00",
+      "side": "SELL",
+      "size": -0.20415414330756787,
+      "price": 4364.10009765625
+    },
+    {
+      "dt": "2026-03-24T22:00:00",
+      "side": "BUY",
+      "size": 0.20415414330756787,
+      "price": 4473.5
+    },
+    {
+      "dt": "2026-03-24T23:00:00",
+      "side": "BUY",
+      "size": 0.33805307336089035,
+      "price": 4487.5
+    },
+    {
+      "dt": "2026-03-25T20:00:00",
+      "side": "SELL",
+      "size": -0.33805307336089035,
+      "price": 4528.2998046875
+    },
+    {
+      "dt": "2026-03-26T13:00:00",
+      "side": "SELL",
+      "size": -0.4967259290596226,
+      "price": 4426.5
+    },
+    {
+      "dt": "2026-03-27T04:00:00",
+      "side": "BUY",
+      "size": 0.4967259290596226,
+      "price": 4431.7998046875
+    },
+    {
+      "dt": "2026-03-27T20:00:00",
+      "side": "BUY",
+      "size": 0.49249255098259176,
+      "price": 4543.5
+    },
+    {
+      "dt": "2026-03-30T01:00:00",
+      "side": "SELL",
+      "size": -0.49249255098259176,
+      "price": 4460.60009765625
+    },
+    {
+      "dt": "2026-03-30T04:00:00",
+      "side": "BUY",
+      "size": 0.4576149681709223,
+      "price": 4526.5
+    },
+    {
+      "dt": "2026-03-30T19:00:00",
+      "side": "SELL",
+      "size": -0.4576149681709223,
+      "price": 4528.5
+    },
+    {
+      "dt": "2026-03-31T01:00:00",
+      "side": "BUY",
+      "size": 0.5307153153271083,
+      "price": 4576.5
+    },
+    {
+      "dt": "2026-03-31T11:00:00",
+      "side": "SELL",
+      "size": -0.5307153153271083,
+      "price": 4577.5
+    },
+    {
+      "dt": "2026-03-31T12:00:00",
+      "side": "BUY",
+      "size": 0.5353513000288547,
+      "price": 4613.2998046875
+    },
+    {
+      "dt": "2026-04-01T01:00:00",
+      "side": "SELL",
+      "size": -0.5353513000288547,
+      "price": 4738.60009765625
+    },
+    {
+      "dt": "2026-04-01T02:00:00",
+      "side": "BUY",
+      "size": 0.5547845204297722,
+      "price": 4719.89990234375
+    },
+    {
+      "dt": "2026-04-02T02:00:00",
+      "side": "SELL",
+      "size": -0.5547845204297722,
+      "price": 4723.10009765625
+    },
+    {
+      "dt": "2026-04-06T00:00:00",
+      "side": "SELL",
+      "size": -0.4583604323860698,
+      "price": 4637.2001953125
+    },
+    {
+      "dt": "2026-04-06T09:00:00",
+      "side": "BUY",
+      "size": 0.4583604323860698,
+      "price": 4722.7998046875
+    },
+    {
+      "dt": "2026-04-06T22:00:00",
+      "side": "SELL",
+      "size": -0.6859027313016505,
+      "price": 4678.60009765625
+    },
+    {
+      "dt": "2026-04-07T09:00:00",
+      "side": "BUY",
+      "size": 0.6859027313016505,
+      "price": 4709.7998046875
+    },
+    {
+      "dt": "2026-04-07T15:00:00",
+      "side": "SELL",
+      "size": -0.5785053301786748,
+      "price": 4658.2998046875
+    },
+    {
+      "dt": "2026-04-07T20:00:00",
+      "side": "BUY",
+      "size": 0.5785053301786748,
+      "price": 4727.2998046875
+    },
+    {
+      "dt": "2026-04-08T01:00:00",
+      "side": "BUY",
+      "size": 0.4544940699642904,
+      "price": 4846.7001953125
+    },
+    {
+      "dt": "2026-04-08T15:00:00",
+      "side": "SELL",
+      "size": -0.4544940699642904,
+      "price": 4761.60009765625
+    },
+    {
+      "dt": "2026-04-13T02:00:00",
+      "side": "SELL",
+      "size": -0.6135112374560185,
+      "price": 4743.7001953125
+    },
+    {
+      "dt": "2026-04-13T18:00:00",
+      "side": "BUY",
+      "size": 0.6135112374560185,
+      "price": 4753.5
+    },
+    {
+      "dt": "2026-04-16T14:00:00",
+      "side": "SELL",
+      "size": -0.9938251102774571,
+      "price": 4815.7998046875
+    },
+    {
+      "dt": "2026-04-17T13:00:00",
+      "side": "BUY",
+      "size": 0.9938251102774571,
+      "price": 4869.0
+    },
+    {
+      "dt": "2026-04-21T04:00:00",
+      "side": "SELL",
+      "size": -0.7691876670157995,
+      "price": 4816.10009765625
+    },
+    {
+      "dt": "2026-04-21T17:00:00",
+      "side": "BUY",
+      "size": 0.7691876670157995,
+      "price": 4729.2998046875
+    },
+    {
+      "dt": "2026-04-21T18:00:00",
+      "side": "SELL",
+      "size": -0.6429990223902424,
+      "price": 4730.89990234375
+    },
+    {
+      "dt": "2026-04-22T00:00:00",
+      "side": "BUY",
+      "size": 0.6429990223902424,
+      "price": 4756.2998046875
+    },
+    {
+      "dt": "2026-04-22T01:00:00",
+      "side": "SELL",
+      "size": -0.6318041844438251,
+      "price": 4757.39990234375
+    },
+    {
+      "dt": "2026-04-23T13:00:00",
+      "side": "BUY",
+      "size": 0.6318041844438251,
+      "price": 4758.10009765625
+    },
+    {
+      "dt": "2026-04-23T18:00:00",
+      "side": "SELL",
+      "size": -0.7021448694886826,
+      "price": 4726.10009765625
+    },
+    {
+      "dt": "2026-04-24T12:00:00",
+      "side": "BUY",
+      "size": 0.7021448694886826,
+      "price": 4723.2001953125
+    },
+    {
+      "dt": "2026-04-26T23:00:00",
+      "side": "SELL",
+      "size": -0.848412968490598,
+      "price": 4699.10009765625
+    },
+    {
+      "dt": "2026-04-27T03:00:00",
+      "side": "BUY",
+      "size": 0.848412968490598,
+      "price": 4733.2001953125
+    },
+    {
+      "dt": "2026-04-27T16:00:00",
+      "side": "SELL",
+      "size": -1.0391118437170814,
+      "price": 4684.60009765625
+    },
+    {
+      "dt": "2026-04-28T10:00:00",
+      "side": "BUY",
+      "size": 1.0391118437170814,
+      "price": 4618.39990234375
+    },
+    {
+      "dt": "2026-04-28T11:00:00",
+      "side": "SELL",
+      "size": -1.012464209858193,
+      "price": 4616.60009765625
+    },
+    {
+      "dt": "2026-04-28T18:00:00",
+      "side": "BUY",
+      "size": 1.012464209858193,
+      "price": 4609.39990234375
+    },
+    {
+      "dt": "2026-04-28T19:00:00",
+      "side": "SELL",
+      "size": -0.8451299628708531,
+      "price": 4608.5
+    },
+    {
+      "dt": "2026-04-29T14:00:00",
+      "side": "BUY",
+      "size": 0.8451299628708531,
+      "price": 4534.7001953125
+    },
+    {
+      "dt": "2026-04-29T15:00:00",
+      "side": "SELL",
+      "size": -0.8148317948971138,
+      "price": 4551.89990234375
+    },
+    {
+      "dt": "2026-04-30T02:00:00",
+      "side": "BUY",
+      "size": 0.8148317948971138,
+      "price": 4591.10009765625
+    },
+    {
+      "dt": "2026-04-30T04:00:00",
+      "side": "SELL",
+      "size": -0.8789044610639221,
+      "price": 4567.39990234375
+    },
+    {
+      "dt": "2026-04-30T07:00:00",
+      "side": "BUY",
+      "size": 0.8789044610639221,
+      "price": 4601.7998046875
+    },
+    {
+      "dt": "2026-05-04T11:00:00",
+      "side": "SELL",
+      "size": -0.8130681354186663,
+      "price": 4573.5
+    },
+    {
+      "dt": "2026-05-05T09:00:00",
+      "side": "BUY",
+      "size": 0.8130681354186663,
+      "price": 4568.60009765625
+    },
+    {
+      "dt": "2026-05-07T16:00:00",
+      "side": "BUY",
+      "size": 0.6861640830282713,
+      "price": 4739.2998046875
+    },
+    {
+      "dt": "2026-05-07T23:00:00",
+      "side": "SELL",
+      "size": -0.6861640830282713,
+      "price": 4694.39990234375
+    },
+    {
+      "dt": "2026-05-08T02:00:00",
+      "side": "BUY",
+      "size": 0.66477005777036,
+      "price": 4731.10009765625
+    },
+    {
+      "dt": "2026-05-10T23:00:00",
+      "side": "SELL",
+      "size": -0.66477005777036,
+      "price": 4700.0
+    },
+    {
+      "dt": "2026-05-11T01:00:00",
+      "side": "SELL",
+      "size": -0.7941584595132423,
+      "price": 4692.0
+    },
+    {
+      "dt": "2026-05-11T13:00:00",
+      "side": "BUY",
+      "size": 0.7941584595132423,
+      "price": 4708.89990234375
+    },
+    {
+      "dt": "2026-05-13T11:00:00",
+      "side": "SELL",
+      "size": -0.9980489878481174,
+      "price": 4701.7998046875
+    },
+    {
+      "dt": "2026-05-14T05:00:00",
+      "side": "BUY",
+      "size": 0.9980489878481174,
+      "price": 4709.5
+    },
+    {
+      "dt": "2026-05-14T14:00:00",
+      "side": "SELL",
+      "size": -0.8132499840088665,
+      "price": 4685.0
+    },
+    {
+      "dt": "2026-05-15T06:00:00",
+      "side": "BUY",
+      "size": 0.8132499840088665,
+      "price": 4562.39990234375
+    },
+    {
+      "dt": "2026-05-15T07:00:00",
+      "side": "SELL",
+      "size": -0.7650259341683362,
+      "price": 4573.89990234375
+    },
+    {
+      "dt": "2026-05-18T01:00:00",
+      "side": "BUY",
+      "size": 0.7650259341683362,
+      "price": 4518.10009765625
+    },
+    {
+      "dt": "2026-05-18T02:00:00",
+      "side": "SELL",
+      "size": -0.6185922261288352,
+      "price": 4527.89990234375
+    },
+    {
+      "dt": "2026-05-18T14:00:00",
+      "side": "BUY",
+      "size": 0.6185922261288352,
+      "price": 4579.89990234375
+    },
+    {
+      "dt": "2026-05-18T19:00:00",
+      "side": "SELL",
+      "size": -0.7256082643802743,
+      "price": 4539.89990234375
+    },
+    {
+      "dt": "2026-05-19T00:00:00",
+      "side": "BUY",
+      "size": 0.7256082643802743,
+      "price": 4585.39990234375
+    },
+    {
+      "dt": "2026-05-19T05:00:00",
+      "side": "SELL",
+      "size": -0.8331200547015608,
+      "price": 4545.60009765625
+    },
+    {
+      "dt": "2026-05-20T02:00:00",
+      "side": "BUY",
+      "size": 0.8331200547015608,
+      "price": 4484.0
+    },
+    {
+      "dt": "2026-05-20T03:00:00",
+      "side": "SELL",
+      "size": -0.7354229652265926,
+      "price": 4467.39990234375
+    },
+    {
+      "dt": "2026-05-20T13:00:00",
+      "side": "BUY",
+      "size": 0.7354229652265926,
+      "price": 4499.0
+    },
+    {
+      "dt": "2026-05-20T14:00:00",
+      "side": "SELL",
+      "size": -0.8796826102391228,
+      "price": 4485.5
+    },
+    {
+      "dt": "2026-05-20T15:00:00",
+      "side": "BUY",
+      "size": 0.8796826102391228,
+      "price": 4534.7998046875
+    },
+    {
+      "dt": "2026-05-22T15:00:00",
+      "side": "SELL",
+      "size": -0.8559369284712378,
+      "price": 4501.60009765625
+    },
+    {
+      "dt": "2026-05-26T05:00:00",
+      "side": "BUY",
+      "size": 0.8559369284712378,
+      "price": 4525.7998046875
+    },
+    {
+      "dt": "2026-05-26T12:00:00",
+      "side": "SELL",
+      "size": -0.8730960000849317,
+      "price": 4507.10009765625
+    },
+    {
+      "dt": "2026-05-27T00:00:00",
+      "side": "BUY",
+      "size": 0.8730960000849317,
+      "price": 4517.39990234375
+    },
+    {
+      "dt": "2026-05-27T04:00:00",
+      "side": "SELL",
+      "size": -0.988144328098173,
+      "price": 4496.0
+    },
+    {
+      "dt": "2026-05-27T08:00:00",
+      "side": "BUY",
+      "size": 0.988144328098173,
+      "price": 4513.10009765625
+    },
+    {
+      "dt": "2026-05-27T11:00:00",
+      "side": "SELL",
+      "size": -0.7782103178085238,
+      "price": 4476.2998046875
+    },
+    {
+      "dt": "2026-05-27T23:00:00",
+      "side": "BUY",
+      "size": 0.7782103178085238,
+      "price": 4487.7001953125
+    },
+    {
+      "dt": "2026-05-28T00:00:00",
+      "side": "SELL",
+      "size": -0.8309136935572148,
+      "price": 4477.39990234375
+    },
+    {
+      "dt": "2026-05-28T04:00:00",
+      "side": "BUY",
+      "size": 0.8309136935572148,
+      "price": 4404.2001953125
+    },
+    {
+      "dt": "2026-05-28T05:00:00",
+      "side": "SELL",
+      "size": -0.7542238667453852,
+      "price": 4402.7001953125
+    },
+    {
+      "dt": "2026-05-28T13:00:00",
+      "side": "BUY",
+      "size": 0.7542238667453852,
+      "price": 4462.2998046875
+    },
+    {
+      "dt": "2026-06-01T16:00:00",
+      "side": "SELL",
+      "size": -0.7734028783435334,
+      "price": 4504.7001953125
+    },
+    {
+      "dt": "2026-06-02T05:00:00",
+      "side": "BUY",
+      "size": 0.7734028783435334,
+      "price": 4547.7001953125
+    },
+    {
+      "dt": "2026-06-02T17:00:00",
+      "side": "SELL",
+      "size": -0.964776317599825,
+      "price": 4521.2001953125
+    },
+    {
+      "dt": "2026-06-03T14:00:00",
+      "side": "BUY",
+      "size": 0.964776317599825,
+      "price": 4473.89990234375
+    },
+    {
+      "dt": "2026-06-03T15:00:00",
+      "side": "SELL",
+      "size": -0.8583700466356757,
+      "price": 4485.7001953125
+    },
+    {
+      "dt": "2026-06-04T02:00:00",
+      "side": "BUY",
+      "size": 0.8583700466356757,
+      "price": 4492.10009765625
+    },
+    {
+      "dt": "2026-06-05T13:00:00",
+      "side": "SELL",
+      "size": -0.8182067702057484,
+      "price": 4432.0
+    },
+    {
+      "dt": "2026-06-05T17:00:00",
+      "side": "BUY",
+      "size": 0.8182067702057484,
+      "price": 4369.2998046875
+    },
+    {
+      "dt": "2026-06-05T18:00:00",
+      "side": "SELL",
+      "size": -0.6940873101620836,
+      "price": 4366.7998046875
+    },
+    {
+      "dt": "2026-06-08T13:00:00",
+      "side": "BUY",
+      "size": 0.6940873101620836,
+      "price": 4358.10009765625
+    },
+    {
+      "dt": "2026-06-08T14:00:00",
+      "side": "SELL",
+      "size": -0.6545777864335036,
+      "price": 4351.2998046875
+    },
+    {
+      "dt": "2026-06-09T14:00:00",
+      "side": "BUY",
+      "size": 0.6545777864335036,
+      "price": 4352.89990234375
+    },
+    {
+      "dt": "2026-06-09T15:00:00",
+      "side": "SELL",
+      "size": -0.7757111309790466,
+      "price": 4324.7998046875
+    },
+    {
+      "dt": "2026-06-10T00:00:00",
+      "side": "BUY",
+      "size": 0.7757111309790466,
+      "price": 4245.2001953125
+    },
+    {
+      "dt": "2026-06-10T01:00:00",
+      "side": "SELL",
+      "size": -0.6903128161309974,
+      "price": 4242.2001953125
+    },
+    {
+      "dt": "2026-06-10T07:00:00",
+      "side": "BUY",
+      "size": 0.6903128161309974,
+      "price": 4226.7001953125
+    },
+    {
+      "dt": "2026-06-10T08:00:00",
+      "side": "SELL",
+      "size": -0.6840733861899617,
+      "price": 4209.39990234375
+    },
+    {
+      "dt": "2026-06-10T20:00:00",
+      "side": "BUY",
+      "size": 0.6840733861899617,
+      "price": 4106.0
+    },
+    {
+      "dt": "2026-06-10T22:00:00",
+      "side": "SELL",
+      "size": -0.5946472631433412,
+      "price": 4094.3999023437505
+    },
+    {
+      "dt": "2026-06-11T02:00:00",
+      "side": "BUY",
+      "size": 0.5946472631433412,
+      "price": 4122.7998046875
+    },
+    {
+      "dt": "2026-06-11T03:00:00",
+      "side": "SELL",
+      "size": -0.499317802038406,
+      "price": 4089.39990234375
+    },
+    {
+      "dt": "2026-06-11T18:00:00",
+      "side": "BUY",
+      "size": 0.499317802038406,
+      "price": 4173.2001953125
+    },
+    {
+      "dt": "2026-06-12T04:00:00",
+      "side": "BUY",
+      "size": 0.5152914981598817,
+      "price": 4219.0
+    },
+    {
+      "dt": "2026-06-15T03:00:00",
+      "side": "SELL",
+      "size": -0.5152914981598817,
+      "price": 4350.5
+    },
+    {
+      "dt": "2026-06-15T04:00:00",
+      "side": "BUY",
+      "size": 0.6436070064520154,
+      "price": 4346.39990234375
+    },
+    {
+      "dt": "2026-06-15T22:00:00",
+      "side": "SELL",
+      "size": -0.6436070064520154,
+      "price": 4331.2998046875
+    },
+    {
+      "dt": "2026-06-17T20:00:00",
+      "side": "SELL",
+      "size": -0.6095858719595126,
+      "price": 4254.2001953125
+    },
+    {
+      "dt": "2026-06-18T01:00:00",
+      "side": "BUY",
+      "size": 0.6095858719595126,
+      "price": 4328.7998046875
+    },
+    {
+      "dt": "2026-06-18T08:00:00",
+      "side": "SELL",
+      "size": -0.6810248789842261,
+      "price": 4308.60009765625
+    },
+    {
+      "dt": "2026-06-19T00:00:00",
+      "side": "BUY",
+      "size": 0.6810248789842261,
+      "price": 4206.89990234375
+    },
+    {
+      "dt": "2026-06-19T01:00:00",
+      "side": "SELL",
+      "size": -0.8094333025954997,
+      "price": 4209.2998046875
+    },
+    {
+      "dt": "2026-06-22T01:00:00",
+      "side": "BUY",
+      "size": 0.8094333025954997,
+      "price": 4217.7001953125
+    },
+    {
+      "dt": "2026-06-22T02:00:00",
+      "side": "SELL",
+      "size": -0.6089513567460997,
+      "price": 4208.2001953125
+    },
+    {
+      "dt": "2026-06-24T00:00:00",
+      "side": "BUY",
+      "size": 0.6089513567460997,
+      "price": 4117.0
+    },
+    {
+      "dt": "2026-06-24T01:00:00",
+      "side": "SELL",
+      "size": -0.7557575148236374,
+      "price": 4114.89990234375
+    },
+    {
+      "dt": "2026-06-24T13:00:00",
+      "side": "BUY",
+      "size": 0.7557575148236374,
+      "price": 4004.1000976562505
+    },
+    {
+      "dt": "2026-06-24T14:00:00",
+      "side": "SELL",
+      "size": -0.6111719219298775,
+      "price": 4054.89990234375
+    },
+    {
+      "dt": "2026-06-25T14:00:00",
+      "side": "BUY",
+      "size": 0.6111719219298775,
+      "price": 4017.89990234375
+    },
+    {
+      "dt": "2026-06-26T03:00:00",
+      "side": "SELL",
+      "size": -0.7636795835983321,
+      "price": 4005.89990234375
+    },
+    {
+      "dt": "2026-06-26T08:00:00",
+      "side": "BUY",
+      "size": 0.7636795835983321,
+      "price": 4046.10009765625
+    },
+    {
+      "dt": "2026-06-26T09:00:00",
+      "side": "BUY",
+      "size": 0.8265943285804588,
+      "price": 4045.800048828125
+    },
+    {
+      "dt": "2026-06-29T01:00:00",
+      "side": "SELL",
+      "size": -0.8265943285804588,
+      "price": 4083.699951171875
+    },
+    {
+      "dt": "2026-06-29T20:00:00",
+      "side": "SELL",
+      "size": -0.9434990559527371,
+      "price": 4030.60009765625
+    },
+    {
+      "dt": "2026-06-30T02:00:00",
+      "side": "BUY",
+      "size": 0.9434990559527371,
+      "price": 3982.3999023437495
+    },
+    {
+      "dt": "2026-06-30T03:00:00",
+      "side": "SELL",
+      "size": -0.8679374760789597,
+      "price": 3976.10009765625
+    },
+    {
+      "dt": "2026-06-30T07:00:00",
+      "side": "BUY",
+      "size": 0.8679374760789597,
+      "price": 4043.699951171875
+    },
+    {
+      "dt": "2026-06-30T22:00:00",
+      "side": "SELL",
+      "size": -0.9196205979617352,
+      "price": 4025.0
+    },
+    {
+      "dt": "2026-07-01T12:00:00",
+      "side": "BUY",
+      "size": 0.9196205979617352,
+      "price": 4044.5
+    },
+    {
+      "dt": "2026-07-01T19:00:00",
+      "side": "BUY",
+      "size": 0.7885316442295661,
+      "price": 4075.5
+    },
+    {
+      "dt": "2026-07-03T01:00:00",
+      "side": "SELL",
+      "size": -0.7885316442295661,
+      "price": 4159.7998046875
+    },
+    {
+      "dt": "2026-07-03T02:00:00",
+      "side": "BUY",
+      "size": 0.7681890336583258,
+      "price": 4194.5
+    },
+    {
+      "dt": "2026-07-06T06:00:00",
+      "side": "SELL",
+      "size": -0.7681890336583258,
+      "price": 4159.5
+    },
+    {
+      "dt": "2026-07-06T08:00:00",
+      "side": "BUY",
+      "size": 0.7527878044929359,
+      "price": 4176.39990234375
+    },
+    {
+      "dt": "2026-07-07T06:00:00",
+      "side": "SELL",
+      "size": -0.7527878044929359,
+      "price": 4135.0
+    },
+    {
+      "dt": "2026-07-07T09:00:00",
+      "side": "SELL",
+      "size": -0.8380289318454084,
+      "price": 4136.89990234375
+    },
+    {
+      "dt": "2026-07-07T13:00:00",
+      "side": "BUY",
+      "size": 0.8380289318454084,
+      "price": 4184.10009765625
+    },
+    {
+      "dt": "2026-07-08T01:00:00",
+      "side": "SELL",
+      "size": -0.8625277088795203,
+      "price": 4122.7998046875
+    },
+    {
+      "dt": "2026-07-08T13:00:00",
+      "side": "BUY",
+      "size": 0.8625277088795203,
+      "price": 4082.5
+    },
+    {
+      "dt": "2026-07-08T14:00:00",
+      "side": "SELL",
+      "size": -0.766081218116324,
+      "price": 4081.10009765625
+    },
+    {
+      "dt": "2026-07-08T19:00:00",
+      "side": "BUY",
+      "size": 0.766081218116324,
+      "price": 4095.0000000000005
+    },
+    {
+      "dt": "2026-07-09T01:00:00",
+      "side": "SELL",
+      "size": -0.8353623490566453,
+      "price": 4083.199951171875
+    },
+    {
+      "dt": "2026-07-09T07:00:00",
+      "side": "BUY",
+      "size": 0.8353623490566453,
+      "price": 4117.2998046875
+    }
+  ]
 }

@@ -1,0 +1,176 @@
+```python
+import math
+import backtrader as bt
+
+
+class MarketMakingStrategy(bt.Strategy):
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data, period=20, devfactor=2.0)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.sma_vol = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.buy_quote = None
+        self.sell_quote = None
+        self.tp_order = None
+        self.tp_bar = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.buy_quote:
+                self.buy_quote = None
+                if self.sell_quote:
+                    self.cancel(self.sell_quote)
+                    self.sell_quote = None
+                entry_price = order.executed.price
+                tp_price = entry_price + 0.30 * self.atr[0]
+                self.tp_order = self.sell(
+                    exectype=bt.Order.Limit,
+                    price=tp_price,
+                    size=abs(order.executed.size)
+                )
+                self.tp_bar = len(self)
+
+            elif order == self.sell_quote:
+                self.sell_quote = None
+                if self.buy_quote:
+                    self.cancel(self.buy_quote)
+                    self.buy_quote = None
+                entry_price = order.executed.price
+                tp_price = entry_price - 0.30 * self.atr[0]
+                self.tp_order = self.buy(
+                    exectype=bt.Order.Limit,
+                    price=tp_price,
+                    size=abs(order.executed.size)
+                )
+                self.tp_bar = len(self)
+
+            elif order == self.tp_order:
+                self.tp_order = None
+                self.tp_bar = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.buy_quote:
+                self.buy_quote = None
+            elif order == self.sell_quote:
+                self.sell_quote = None
+            elif order == self.tp_order:
+                self.tp_order = None
+                self.tp_bar = None
+
+    def next(self):
+        # 1. Position management and exits if position is currently held
+        if self.position:
+            pos_size = self.position.size
+            close_price = self.data.close[0]
+
+            # Stop protection: price moves against position beyond corresponding Bollinger Band
+            stopped_out = False
+            if pos_size > 0 and close_price < self.bb.bot[0]:
+                stopped_out = True
+            elif pos_size < 0 and close_price > self.bb.top[0]:
+                stopped_out = True
+
+            if stopped_out:
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                self.close()
+                return
+
+            # Time-out check: if opposing take-profit order is not filled within 1 bar,
+            # cancel it and close position at market on next bar.
+            if self.tp_order and self.tp_bar is not None:
+                if len(self) - self.tp_bar >= 1:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                    self.close()
+            return
+
+        # 2. Quoting logic when no position is open
+        # Time constraints: ignore first 30 mins (09:30-10:00) and last 30 mins (15:30-16:00)
+        t = self.data.datetime.time(0)
+        in_time_window = (10 <= t.hour < 15) or (t.hour == 15 and t.minute < 30)
+
+        # Activation conditions (narrow and liquid market)
+        bb_mid = self.bb.mid[0]
+        bb_top = self.bb.top[0]
+        bb_bot = self.bb.bot[0]
+
+        bb_width_ok = ((bb_top - bb_bot) / bb_mid) <= 0.003 if bb_mid != 0 else False
+        rel_vol_ok = (self.atr[0] / self.data.close[0]) <= 0.004 if self.data.close[0] != 0 else False
+        volume_ok = self.data.volume[0] >= self.sma_vol[0]
+
+        activation = in_time_window and bb_width_ok and rel_vol_ok and volume_ok
+
+        if not activation:
+            if self.buy_quote:
+                self.cancel(self.buy_quote)
+                self.buy_quote = None
+            if self.sell_quote:
+                self.cancel(self.sell_quote)
+                self.sell_quote = None
+            return
+
+        capital = self.broker.getvalue()
+        current_price = self.data.close[0]
+        if current_price <= 0:
+            return
+
+        size = math.floor((0.01 * capital) / current_price)
+        if size <= 0:
+            return
+
+        # Risk Management: Do not place new orders if total value of open orders and positions > 5% of capital
+        open_orders_val = 0.0
+        if self.buy_quote:
+            open_orders_val += self.buy_quote.size * self.buy_quote.price
+        if self.sell_quote:
+            open_orders_val += abs(self.sell_quote.size) * self.sell_quote.price
+        if self.tp_order:
+            open_orders_val += abs(self.tp_order.size) * self.tp_order.price
+
+        pos_val = abs(self.position.size) * current_price
+        total_risk = open_orders_val + pos_val
+
+        if total_risk > 0.05 * capital:
+            return
+
+        # Cancel previous entry quotes to update quotes around current mean price
+        if self.buy_quote:
+            self.cancel(self.buy_quote)
+            self.buy_quote = None
+        if self.sell_quote:
+            self.cancel(self.sell_quote)
+            self.sell_quote = None
+
+        buy_price = bb_mid - 0.15 * self.atr[0]
+        sell_price = bb_mid + 0.15 * self.atr[0]
+
+        self.buy_quote = self.buy(exectype=bt.Order.Limit, price=buy_price, size=size)
+        self.sell_quote = self.sell(exectype=bt.Order.Limit, price=sell_price, size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_quote_management",
+      "choice": "Cancel pending entry quote limit orders prior to placing updated quotes or when activation conditions are no longer met.",
+      "reason": "Passive market-making quotes track the current mean price (BB_mid) on each bar; obsolete quotes from previous bars are canceled so quotes continuously reflect current market indicators."
+    },
+    {
+      "topic": "stop_protection_price",
+      "choice": "Evaluate stop protection using the bar close price relative to the lower Bollinger Band (for long) or upper Bollinger Band (for short).",
+      "reason": "The specification states 'if price moves against the position beyond the corresponding Bollinger Band', which is evaluated on bar close in strategy next()."
+    },
+    {
+      "topic": "trading_hours",
+      "choice": "Filter trading between 10:00:00 and 15:29:59 (excluding 09:30-10:00 and 15:30-16:00 of standard US trading session).",
+      "reason": "The spec requires ignoring the first and last 30 minutes of minute bar sessions."
+    }
+  ]
+}
+```

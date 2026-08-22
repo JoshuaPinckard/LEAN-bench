@@ -1,0 +1,184 @@
+```python
+import statistics
+import backtrader as bt
+
+
+class ARGradientDescentStrategy(bt.Strategy):
+    params = (
+        ("sma_period", 50),
+        ("rsi_period", 14),
+        ("macd_fast", 12),
+        ("macd_slow", 26),
+        ("macd_signal", 9),
+        ("vol_period", 20),
+        ("ar_order", 5),
+        ("ar_lr", 0.01),
+        ("tp_pct", 0.02),
+        ("sl_pct", 0.01),
+        ("max_pos_pct", 0.01),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.std20 = bt.indicators.StdDev(
+            self.data.close, period=self.p.vol_period
+        )
+
+        self.order = None
+        self.entry_price = None
+        self.vol_history = []
+
+        # AR model weights: [intercept, w1, w2, ..., wp]
+        self.ar_weights = [0.0] * (self.p.ar_order + 1)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if not self.position:
+                self.entry_price = None
+            else:
+                self.entry_price = order.executed.price
+
+        self.order = None
+
+    def next(self):
+        # Update historical volatility record
+        self.vol_history.append(self.std20[0])
+
+        # Train AR model using online stochastic gradient descent on percentage returns
+        p = self.p.ar_order
+        lr = self.p.ar_lr
+
+        current_return = (
+            self.data.close[0] - self.data.close[-1]
+        ) / self.data.close[-1]
+
+        X_t = [1.0] + [
+            (self.data.close[-i] - self.data.close[-i - 1])
+            / self.data.close[-i - 1]
+            for i in range(1, p + 1)
+        ]
+
+        pred_t = sum(w * x for w, x in zip(self.ar_weights, X_t))
+        error_t = pred_t - current_return
+        for k in range(len(self.ar_weights)):
+            self.ar_weights[k] -= lr * error_t * X_t[k]
+
+        # Forecast return for next bar
+        X_next = [1.0] + [
+            (self.data.close[-i] - self.data.close[-i - 1])
+            / self.data.close[-i - 1]
+            for i in range(0, p)
+        ]
+        pred_next = sum(w * x for w, x in zip(self.ar_weights, X_next))
+
+        predicts_increase = pred_next > 0
+        predicts_decrease = pred_next < 0
+
+        # Check MACD crossover
+        macd_cross_up = (self.macd.macd[0] > self.macd.signal[0]) and (
+            self.macd.macd[-1] <= self.macd.signal[-1]
+        )
+        macd_cross_down = (self.macd.macd[0] < self.macd.signal[0]) and (
+            self.macd.macd[-1] >= self.macd.signal[-1]
+        )
+
+        # Check volatility condition
+        hist_avg_vol = sum(self.vol_history) / len(self.vol_history)
+        high_volatility = self.std20[0] > 1.5 * hist_avg_vol
+
+        # Position Exits
+        if self.position:
+            if self.position.size > 0:
+                tp_cond = self.data.close[0] >= self.entry_price * (
+                    1.0 + self.p.tp_pct
+                )
+                sl_cond = self.data.close[0] <= self.entry_price * (
+                    1.0 - self.p.sl_pct
+                )
+                rsi_cond = self.rsi[0] > 70
+                macd_cond = macd_cross_down
+
+                if tp_cond or sl_cond or rsi_cond or macd_cond:
+                    self.close()
+
+            elif self.position.size < 0:
+                tp_cond = self.data.close[0] <= self.entry_price * (
+                    1.0 - self.p.tp_pct
+                )
+                sl_cond = self.data.close[0] >= self.entry_price * (
+                    1.0 + self.p.sl_pct
+                )
+                rsi_cond = self.rsi[0] < 30
+                macd_cond = macd_cross_up
+
+                if tp_cond or sl_cond or rsi_cond or macd_cond:
+                    self.close()
+
+            return
+
+        # Position Entries
+        if self.order:
+            return
+
+        if high_volatility:
+            return
+
+        long_cond = (
+            predicts_increase
+            and (self.data.close[0] > self.sma[0])
+            and (40 <= self.rsi[0] <= 60)
+            and macd_cross_up
+        )
+
+        short_cond = (
+            predicts_decrease
+            and (self.data.close[0] < self.sma[0])
+            and (40 <= self.rsi[0] <= 60)
+            and macd_cross_down
+        )
+
+        capital = self.broker.getvalue()
+        size = (capital * self.p.max_pos_pct) / self.data.close[0]
+
+        if long_cond:
+            self.order = self.buy(size=size)
+        elif short_cond:
+            self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "macd_crossover",
+      "choice": "Interpreted 'MACD histogram crosses its signal line' as the standard MACD line crossing the Signal line (which corresponds to MT4/MT5 convention where the main MACD line is plotted as a histogram).",
+      "reason": "MACD signal line crossover is the standard technical analysis signal and matches common trading terminology."
+    },
+    {
+      "topic": "ar_model",
+      "choice": "Implemented an AR(5) model trained online using Stochastic Gradient Descent (SGD) on price percentage returns.",
+      "reason": "The specification required an autoregressive learning model trained with gradient descent without specifying order or hyperparameters; returns ensure numerical stability during gradient updates."
+    },
+    {
+      "topic": "volatility_filter",
+      "choice": "Calculated historical average volatility as the expanding mean of 20-period standard deviation values observed up to the current bar.",
+      "reason": "The specification states historical average volatility without explicitly defining a static lookback period."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Sized orders by allocating exactly 1% of total portfolio equity (capital) divided by the current close price.",
+      "reason": "The specification mandates that position size must be no more than 1% of total trading capital."
+    }
+  ]
+}
+```

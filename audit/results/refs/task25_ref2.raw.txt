@@ -1,0 +1,181 @@
+```python
+import datetime
+import backtrader as bt
+
+
+class SessionTimeStrategy(bt.Strategy):
+    params = (
+        ('atr_period', 5),
+        ('atr_threshold', 0.05),
+        ('sl_pct', 0.005),
+        ('tp_pct', 0.01),
+        ('capital_risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.order = None
+        self.entry_price = None
+        self.entry_window = None
+        self.sl_price = None
+        self.tp_price = None
+
+        self.asia_high = None
+        self.asia_low = None
+        self.in_asia = False
+        self.pending_window = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.position:
+                self.entry_price = order.executed.price
+                self.entry_window = self.pending_window
+                if self.position.size > 0:
+                    self.sl_price = self.entry_price * (1.0 - self.p.sl_pct)
+                    self.tp_price = self.entry_price * (1.0 + self.p.tp_pct)
+                else:
+                    self.sl_price = self.entry_price * (1.0 + self.p.sl_pct)
+                    self.tp_price = self.entry_price * (1.0 - self.p.tp_pct)
+            else:
+                self.entry_price = None
+                self.entry_window = None
+                self.sl_price = None
+                self.tp_price = None
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        t = self.data.datetime.time(0)
+
+        # Track Asian session extremes (20:00 - 04:00 EDT)
+        is_asia_time = (t >= datetime.time(20, 0)) or (t < datetime.time(4, 0))
+        if is_asia_time:
+            if not self.in_asia or self.asia_high is None:
+                self.asia_high = self.data.high[0]
+                self.asia_low = self.data.low[0]
+                self.in_asia = True
+            else:
+                self.asia_high = max(self.asia_high, self.data.high[0])
+                self.asia_low = min(self.asia_low, self.data.low[0])
+        else:
+            self.in_asia = False
+
+        # Manage existing open position
+        if self.position:
+            # 1. Stop-Loss and Take-Profit Exits
+            if self.position.size > 0:
+                if self.data.low[0] <= self.sl_price or self.data.high[0] >= self.tp_price:
+                    self.order = self.close()
+                    return
+            elif self.position.size < 0:
+                if self.data.high[0] >= self.sl_price or self.data.low[0] <= self.tp_price:
+                    self.order = self.close()
+                    return
+
+            # 2. Time-Based Exit: 30 minutes before NY session open (09:00 - 09:30 EDT)
+            if datetime.time(9, 0) <= t < datetime.time(9, 30):
+                self.order = self.close()
+                return
+
+            # 3. Time-Based Exit: End of the defined entry window
+            if self.entry_window == 'NY_OPEN' and t >= datetime.time(11, 30):
+                self.order = self.close()
+                return
+            elif self.entry_window == 'NY_POWER' and t >= datetime.time(16, 0):
+                self.order = self.close()
+                return
+            elif self.entry_window == 'LONDON' and t >= datetime.time(12, 0):
+                self.order = self.close()
+                return
+
+            return
+
+        # Entry Filters
+        # Filter 1: Trading Ban 30m before NY open
+        if datetime.time(9, 0) <= t < datetime.time(9, 30):
+            return
+
+        # Filter 2: Session Filter (Do not trade during Asian session)
+        if is_asia_time:
+            return
+
+        # Filter 3: Volatility Filter
+        if self.atr[0] < self.p.atr_threshold:
+            return
+
+        # Evaluate Entry Windows
+        in_ny_open = datetime.time(9, 30) <= t < datetime.time(11, 30)
+        in_ny_power = datetime.time(15, 0) <= t < datetime.time(16, 0)
+        in_london = datetime.time(4, 0) <= t < datetime.time(12, 0)
+
+        buy_signal = False
+        sell_signal = False
+        selected_window = None
+
+        if in_ny_open:
+            if self.data.close[0] > self.data.open[0]:
+                buy_signal = True
+                selected_window = 'NY_OPEN'
+            elif self.data.close[0] < self.data.open[0]:
+                sell_signal = True
+                selected_window = 'NY_OPEN'
+        elif in_ny_power:
+            if self.data.close[0] > self.data.open[0]:
+                buy_signal = True
+                selected_window = 'NY_POWER'
+            elif self.data.close[0] < self.data.open[0]:
+                sell_signal = True
+                selected_window = 'NY_POWER'
+        elif in_london:
+            if self.asia_high is not None and self.asia_low is not None:
+                if self.data.low[0] < self.asia_low and self.data.close[0] > self.data.open[0]:
+                    buy_signal = True
+                    selected_window = 'LONDON'
+                elif self.data.high[0] > self.asia_high and self.data.close[0] < self.data.open[0]:
+                    sell_signal = True
+                    selected_window = 'LONDON'
+
+        if buy_signal or sell_signal:
+            capital = self.broker.getvalue()
+            size = int((capital * self.p.capital_risk_pct) / self.data.close[0])
+            size = max(1, size)
+
+            self.pending_window = selected_window
+            if buy_signal:
+                self.order = self.buy(size=size)
+            elif sell_signal:
+                self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "session_times",
+      "choice": "Asian session: 20:00-04:00 EDT, London session: 04:00-12:00 EDT, NY session: 09:30-16:00 EDT",
+      "reason": "Standard financial market trading hours mapped to New York EDT local time matching the feed timezone."
+    },
+    {
+      "topic": "entry_signals",
+      "choice": "NY windows enter on bar direction (bullish for long, bearish for short); London window enters on Asian extreme sweep followed by bar reversal",
+      "reason": "The specification states decisions rely strictly on time of day and price action, specifying Asian high/low sweeps and reversals for London."
+    },
+    {
+      "topic": "volatility_threshold",
+      "choice": "ATR(5) minimum threshold set to 0.05",
+      "reason": "Specification mandates filtering trades when ATR(5) is below a threshold without stating a specific numeric value."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position capital allocation set to 1% of total account value per trade",
+      "reason": "Specification explicitly mentions fixing position size to 1% of total trading capital per trade."
+    }
+  ]
+}
+```

@@ -1,0 +1,160 @@
+```python
+import backtrader as bt
+import datetime
+import statistics
+
+
+class MomentumScalpStrategy(bt.Strategy):
+    params = (
+        ('sma_period', 20),
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('atr_period', 1),
+        ('max_spread_pct', 0.001),
+        ('near_mean_pct', 0.005),
+        ('max_bb_width', 0.015),
+        ('position_size', 100),
+        ('max_daily_trades', 5),
+        ('activation_pct', 0.002),
+        ('trail_offset_pct', 0.0005),
+        ('slippage_penalty_pct', 0.0005),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.order = None
+        self.current_date = None
+        self.trades_today = 0
+
+        # Position tracking
+        self.entry_price = 0.0
+        self.max_since_entry = 0.0
+        self.stop_activated = False
+
+        # Backtest metrics tracking
+        self.total_pnl = 0.0
+        self.trade_count = 0
+        self.entry_proxy_spreads = []
+        self.total_slippage_penalty = 0.0
+        self.net_profit_after_slippage = 0.0
+        self.avg_proxy_spread = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.max_since_entry = self.data.high[0]
+                self.stop_activated = False
+                self.trades_today += 1
+                self.trade_count += 1
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.total_pnl += trade.pnlcomm
+
+    def next(self):
+        # Reset daily trade counter on date change
+        current_date = self.data.datetime.date(0)
+        if self.current_date != current_date:
+            self.current_date = current_date
+            self.trades_today = 0
+
+        # Guard pending order
+        if self.order:
+            return
+
+        # Calculate current bar proxy spread
+        hl = self.data.high[0] - self.data.low[0]
+        proxy_spread = max(hl, self.atr[0])
+
+        if self.position:
+            # Trailing stop management
+            self.max_since_entry = max(self.max_since_entry, self.data.high[0])
+
+            if not self.stop_activated:
+                if self.max_since_entry >= self.entry_price * (1.0 + self.p.activation_pct):
+                    self.stop_activated = True
+
+            if self.stop_activated:
+                trailing_stop = self.max_since_entry * (1.0 - self.p.trail_offset_pct)
+                if self.data.low[0] <= trailing_stop:
+                    # Check exit proxy spread for slippage penalty
+                    if proxy_spread > self.p.max_spread_pct * self.data.close[0]:
+                        penalty = (
+                            self.p.slippage_penalty_pct
+                            * self.data.close[0]
+                            * abs(self.position.size)
+                        )
+                        self.total_slippage_penalty += penalty
+                    self.order = self.close()
+        else:
+            # Time filter: 09:45 to 11:00 ET
+            current_time = self.data.datetime.time(0)
+            if not (datetime.time(9, 45) <= current_time <= datetime.time(11, 0)):
+                return
+
+            # Daily trade limit check
+            if self.trades_today >= self.p.max_daily_trades:
+                return
+
+            # Entry Signal 1: Price crosses upward through SMA(20)
+            if self.crossover[0] <= 0:
+                return
+
+            # Entry Signal 2: Proxy spread <= 0.1% of Close
+            if proxy_spread > self.p.max_spread_pct * self.data.close[0]:
+                return
+
+            # Entry Signal 3: Proximity to mean |Close - SMA(20)| / Close <= 0.5%
+            mean_dist = abs(self.data.close[0] - self.sma[0]) / self.data.close[0]
+            if mean_dist > self.p.near_mean_pct:
+                return
+
+            # Entry Signal 4: BB Width = (BB.top - BB.bot) / BB.mid <= 1.5%
+            bb_mid = self.bb.mid[0]
+            if bb_mid != 0:
+                bb_width = (self.bb.top[0] - self.bb.bot[0]) / bb_mid
+                if bb_width > self.p.max_bb_width:
+                    return
+
+            # Execute entry order
+            self.entry_proxy_spreads.append(proxy_spread)
+            self.order = self.buy(size=self.p.position_size)
+
+    def stop(self):
+        self.avg_proxy_spread = (
+            statistics.mean(self.entry_proxy_spreads) if self.entry_proxy_spreads else 0.0
+        )
+        self.net_profit_after_slippage = self.total_pnl - self.total_slippage_penalty
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "exit_trigger_condition",
+      "choice": "Trailing stop triggers when bar Low is less than or equal to trailing_stop level; market exit order sent via self.close()",
+      "reason": "Standard backtesting execution for trailing stops evaluated on OHLCV data"
+    },
+    {
+      "topic": "bollinger_bands_parameters",
+      "choice": "Period 20 and standard deviation multiplier 2.0",
+      "reason": "Standard defaults matching SMA(20) reference timeframe in spec"
+    },
+    {
+      "topic": "slippage_penalty_accounting",
+      "choice": "Accumulate penalty as a separate dollar amount in self.total_slippage_penalty and calculate net_profit_after_slippage in stop()",
+      "reason": "Spec asks for metrics: total profit/loss, number of trades, average proxy spread, and net profit after accounting for slippage penalties"
+    }
+  ]
+}
+```

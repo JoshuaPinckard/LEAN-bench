@@ -1,0 +1,132 @@
+```python
+import math
+import statistics
+import backtrader as bt
+
+
+class AvellanedaStoikov(bt.Strategy):
+    """
+    Reference implementation of the Avellaneda-Stoikov market-making strategy
+    adapted for 1-minute OHLCV data execution in Backtrader.
+    """
+    params = (
+        ('gamma', 0.1),            # Risk aversion parameter (spec: 0.1)
+        ('mode', 'Inventory'),     # 'Inventory' or 'Symmetric'
+        ('kappa', 1.5),            # Order book liquidity / intensity parameter
+        ('max_inventory', 10),     # Maximum inventory limit for risk management
+        ('order_size', 1),         # Order size per quote
+        ('vol_period', 20),        # Rolling window for volatility estimation
+        ('stop_mult', 2.0),        # Multiplier for mid-price risk exit level
+    )
+
+    def __init__(self):
+        self.mid_price = (self.data.high + self.data.low) / 2.0
+        self.stddev = bt.indicators.StdDev(self.data.close, period=self.p.vol_period)
+
+        self.buy_order = None
+        self.sell_order = None
+
+        self.pnl_list = []
+        self.inventory_list = []
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order == self.buy_order:
+                self.buy_order = None
+            if order == self.sell_order:
+                self.sell_order = None
+
+    def _cancel_pending(self):
+        if self.buy_order and self.buy_order.status in [bt.Order.Submitted, bt.Order.Accepted]:
+            self.cancel(self.buy_order)
+            self.buy_order = None
+        if self.sell_order and self.sell_order.status in [bt.Order.Submitted, bt.Order.Accepted]:
+            self.cancel(self.sell_order)
+            self.sell_order = None
+
+    def next(self):
+        q = self.position.size
+        self.inventory_list.append(q)
+        self.pnl_list.append(self.broker.getvalue())
+
+        if len(self.data) < self.p.vol_period:
+            return
+
+        sigma = self.stddev[0]
+        if sigma <= 0 or math.isnan(sigma):
+            sigma = 0.01
+
+        mid = self.mid_price[0]
+
+        # 5. Position Exit / Risk Management: Mid-price crossing risk boundary
+        if q != 0:
+            entry_price = self.position.price
+            risk_dist = self.p.stop_mult * (self.p.gamma * (sigma ** 2) + sigma)
+            if q > 0 and mid < (entry_price - risk_dist):
+                self._cancel_pending()
+                self.close()
+                return
+            elif q < 0 and mid > (entry_price + risk_dist):
+                self._cancel_pending()
+                self.close()
+                return
+
+        # Cancel pending limit orders to calculate and place new quotes on updated state
+        self._cancel_pending()
+
+        # 1 & 2. Optimal Quote Price & Inventory Management Calculation
+        if self.p.mode == 'Inventory':
+            reservation_price = mid - q * self.p.gamma * (sigma ** 2)
+        else:  # Symmetric mode
+            reservation_price = mid
+
+        half_spread = 0.5 * self.p.gamma * (sigma ** 2) + (1.0 / self.p.gamma) * math.log(1.0 + self.p.gamma / self.p.kappa)
+
+        bid_price = reservation_price - half_spread
+        ask_price = reservation_price + half_spread
+
+        # Ensure valid pricing bounds relative to mid price
+        if bid_price >= mid:
+            bid_price = mid - 0.01
+        if ask_price <= mid:
+            ask_price = mid + 0.01
+
+        # 3 & 6. Order Placement with Maximum Inventory Guards
+        if q < self.p.max_inventory:
+            self.buy_order = self.buy(exectype=bt.Order.Limit, price=bid_price, size=self.p.order_size)
+
+        if q > -self.p.max_inventory:
+            self.sell_order = self.sell(exectype=bt.Order.Limit, price=ask_price, size=self.p.order_size)
+
+    def stop(self):
+        # Calculate evaluation metrics at backtest completion
+        if self.pnl_list:
+            starting_cash = getattr(self.broker, 'startingcash', 10000.0)
+            profits = [v - starting_cash for v in self.pnl_list]
+            self.total_avg_profit = statistics.mean(profits)
+            self.std_profit = statistics.stdev(profits) if len(profits) > 1 else 0.0
+            self.avg_final_inventory = statistics.mean(self.inventory_list)
+            self.std_final_inventory = statistics.stdev(self.inventory_list) if len(self.inventory_list) > 1 else 0.0
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Adapted order book tick model to 1-minute OHLCV bar feed using (High+Low)/2 as mid-price and StdDev(Close, 20) as volatility.",
+      "reason": "Execution environment provides 1m bar OHLCV data without order book depth or tick-level quote streams."
+    },
+    {
+      "topic": "reservation_price_formula",
+      "choice": "Used standard closed-form Avellaneda-Stoikov formulation r = S - q * gamma * sigma^2 for Inventory mode and r = S for Symmetric mode.",
+      "reason": "Direct implementation of Avellaneda-Stoikov optimal quote formulas for discrete inventory control."
+    },
+    {
+      "topic": "risk_exit",
+      "choice": "Triggered market close when mid-price deviates from entry price by stop_mult * (gamma * sigma^2 + sigma).",
+      "reason": "Implements required risk exit condition when mid-price crosses inventory/risk dependent thresholds."
+    }
+  ]
+}
+```

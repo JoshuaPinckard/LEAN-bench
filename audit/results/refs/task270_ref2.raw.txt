@@ -1,0 +1,152 @@
+```python
+import datetime
+import math
+import backtrader as bt
+
+
+class IntradayShortHedge(bt.Strategy):
+    params = (("risk_dollars", 200.0),)
+
+    def __init__(self):
+        # Indicators as specified
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.ema9 = bt.indicators.EMA(self.data.close, period=9)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.crossover = bt.indicators.CrossOver(self.ema9, self.sma20)
+
+        # Order tracking attributes
+        self.order = None
+        self.sl_order = None
+        self.tp_order = None
+
+        # Session tracking attributes
+        self.current_date = None
+        self.session_open = None
+        self.prev_close = None
+        self.opening_gap = 0.0
+        self.atr_at_entry = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                sl_price = entry_price + 1.5 * self.atr_at_entry
+                tp_price = entry_price - 2.0 * self.atr_at_entry
+
+                self.tp_order = self.buy(
+                    exectype=bt.Order.Limit, price=tp_price, size=size
+                )
+                self.sl_order = self.buy(
+                    exectype=bt.Order.Stop,
+                    price=sl_price,
+                    size=size,
+                    oco=self.tp_order,
+                )
+            elif order in [self.sl_order, self.tp_order]:
+                self.sl_order = None
+                self.tp_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.sl_order:
+                self.sl_order = None
+            if order == self.tp_order:
+                self.tp_order = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        current_time = self.data.datetime.time(0)
+
+        # New session detection
+        if self.current_date != current_date:
+            self.current_date = current_date
+            self.session_open = self.data.open[0]
+            if len(self.data) > 1:
+                self.prev_close = self.data.close[-1]
+
+            if self.prev_close is not None and self.prev_close > 0:
+                self.opening_gap = (
+                    abs(self.session_open - self.prev_close) / self.prev_close
+                )
+            else:
+                self.opening_gap = 0.0
+
+        # Forced closing of all positions 15 minutes before close (15:45 ET)
+        if current_time >= datetime.time(15, 45):
+            if self.position:
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                if not self.order:
+                    self.order = self.close()
+            return
+
+        # Entry allowed only between 09:30 and 11:30 ET
+        if datetime.time(9, 30) <= current_time <= datetime.time(11, 30):
+            if not self.position and not self.order:
+                # Filter out extreme opening gap (> 1.5%)
+                if self.opening_gap > 0.015:
+                    return
+
+                # Condition 1: current price fallen from session open by >= 0.5%
+                price_drop = (
+                    self.data.close[0] / self.session_open - 1.0
+                ) <= -0.005
+
+                # Condition 2: downtrend (close < SMA(50) and RSI(14) < 45)
+                downtrend = (self.data.close[0] < self.sma50[0]) and (
+                    self.rsi[0] < 45.0
+                )
+
+                # Condition 3 & Volatility filter: ATR(14)/close >= 0.005
+                volatility_ok = (self.atr[0] / self.data.close[0]) >= 0.005
+
+                # Trigger: bearish crossover of EMA(9) below SMA(20)
+                bearish_cross = self.crossover[0] < 0
+
+                if (
+                    price_drop
+                    and downtrend
+                    and volatility_ok
+                    and bearish_cross
+                ):
+                    atr_val = self.atr[0]
+                    risk_per_share = 1.5 * atr_val
+                    if risk_per_share > 0:
+                        size = math.floor(self.p.risk_dollars / risk_per_share)
+                        if size >= 1:
+                            self.atr_at_entry = atr_val
+                            self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "risk_dollars",
+      "choice": "200.0",
+      "reason": "Specification specifies a fixed risk per trade between $100 and $500; chosen $200 as default parameter."
+    },
+    {
+      "topic": "stop_take_profit_orders",
+      "choice": "OCO Stop and Limit buy orders submitted upon short entry order completion",
+      "reason": "Ensures precise exit execution when stop-loss or take-profit price levels are hit intraday, with automatically canceled child orders via OCO."
+    }
+  ]
+}
+```

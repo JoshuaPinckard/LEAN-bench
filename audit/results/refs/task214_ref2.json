@@ -1,0 +1,550 @@
+{
+  "task_id": 214,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\n\n\nclass HybridCoreOverlayStrategy(bt.Strategy):\n    params = dict(\n        sma_fast=50,\n        sma_slow=200,\n        atr_period=14,\n        core_pct=0.50,\n        overlay_pct=0.05,\n        max_overlays=5,\n        time_stop_bars=10,\n    )\n\n    def __init__(self):\n        self.sma50 = bt.ind.SMA(self.data.close, period=self.p.sma_fast)\n        self.sma200 = bt.ind.SMA(self.data.close, period=self.p.sma_slow)\n        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)\n\n        self.L = self.sma50 - 1.0 * self.atr\n        self.crossover = bt.ind.CrossOver(self.data.close, self.L)\n\n        self.order = None\n        self.pending_type = None\n        self.pending_trade_info = None\n\n        self.core_shares = 0\n        self.overlay_trades = []\n        self.last_rebalance_month = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed]:\n            if self.pending_type == \"core\":\n                exec_size = (\n                    order.executed.size\n                    if order.isbuy()\n                    else -order.executed.size\n                )\n                self.core_shares += exec_size\n            elif self.pending_type == \"overlay_buy\":\n                self.overlay_trades.append(\n                    {\n                        \"size\": order.executed.size,\n                        \"entry_price\": order.executed.price,\n                        \"entry_atr\": self.pending_trade_info.get(\n                            \"atr\", self.atr[0]\n                        ),\n                        \"bar_idx\": len(self),\n                    }\n                )\n            elif self.pending_type == \"overlay_sell\":\n                pass\n\n        self.order = None\n        self.pending_type = None\n        self.pending_trade_info = None\n\n    def next(self):\n        if self.order:\n            return\n\n        current_month = self.data.datetime.date(0).month\n\n        # 1. Monthly core rebalancing to 50% capital\n        if self.last_rebalance_month != current_month:\n            self.last_rebalance_month = current_month\n            target_core_val = self.broker.getvalue() * self.p.core_pct\n            target_core_shares = int(target_core_val / self.data.close[0])\n            diff = target_core_shares - self.core_shares\n            if diff != 0:\n                self.pending_type = \"core\"\n                if diff > 0:\n                    self.order = self.buy(size=diff)\n                else:\n                    self.order = self.sell(size=abs(diff))\n                return\n\n        close = self.data.close[0]\n        sma50 = self.sma50[0]\n        sma200 = self.sma200[0]\n        atr = self.atr[0]\n\n        # 2. Emergency mode: close all active overlay positions if SMA_50 < SMA_200 and Close < 0.9 * SMA_200\n        if sma50 < sma200 and close < 0.9 * sma200:\n            if self.overlay_trades:\n                total_overlay_size = sum(t[\"size\"] for t in self.overlay_trades)\n                self.overlay_trades.clear()\n                if total_overlay_size > 0:\n                    self.pending_type = \"overlay_sell\"\n                    self.order = self.sell(size=total_overlay_size)\n                    return\n\n        # 3. Covered-call proxy exit: Close >= U = SMA_50 + 1*ATR_14\n        if close >= (sma50 + 1.0 * atr):\n            if self.overlay_trades:\n                total_overlay_size = sum(t[\"size\"] for t in self.overlay_trades)\n                self.overlay_trades.clear()\n                if total_overlay_size > 0:\n                    self.pending_type = \"overlay_sell\"\n                    self.order = self.sell(size=total_overlay_size)\n                    return\n\n        # 4. Individual overlay exits (Take-Profit, Stop-Loss, Time-Stop)\n        trades_to_keep = []\n        exit_size = 0\n        for t in self.overlay_trades:\n            tp1 = t[\"entry_price\"] + 0.5 * t[\"entry_atr\"]\n            tp2 = sma50 + 0.5 * atr\n            sl = min(\n                t[\"entry_price\"] - 1.5 * t[\"entry_atr\"], t[\"entry_price\"] * 0.90\n            )\n            age = len(self) - t[\"bar_idx\"]\n\n            if close >= tp1 or close >= tp2 or close <= sl or age >= self.p.time_stop_bars:\n                exit_size += t[\"size\"]\n            else:\n                trades_to_keep.append(t)\n\n        if exit_size > 0:\n            self.overlay_trades = trades_to_keep\n            self.pending_type = \"overlay_sell\"\n            self.order = self.sell(size=exit_size)\n            return\n\n        # 5. Overlay entry logic\n        if (\n            sma50 >= sma200\n            and self.crossover[0] > 0\n            and close >= 0.9 * sma50\n            and close <= sma50\n            and len(self.overlay_trades) < self.p.max_overlays\n        ):\n            overlay_val = self.broker.getvalue() * self.p.overlay_pct\n            size = int(overlay_val / close)\n            if size > 0:\n                self.pending_type = \"overlay_buy\"\n                self.pending_trade_info = {\"atr\": atr}\n                self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "core_rebalance_frequency",
+      "choice": "Rebalance core position to target 50% capital on the first trading bar of each calendar month.",
+      "reason": "The specification states to rebalance the 50% core periodically without defining exact frequency; monthly rebalancing is standard."
+    },
+    {
+      "topic": "covered_call_overlay_exit_percentage",
+      "choice": "Close 100% of active overlay positions when Close >= SMA_50 + 1*ATR_14.",
+      "reason": "The specification allows closing 50-100% of overlay positions at discretion; choosing 100% provides deterministic execution trace comparison."
+    },
+    {
+      "topic": "overlay_entry_reference_values",
+      "choice": "Record entry price as actual executed price and entry ATR at execution time upon order completion.",
+      "reason": "Backtrader processes market orders on the bar after signal generation."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 2,
+  "tape": [
+    {
+      "dt": "2020-10-16T04:00:00",
+      "side": "BUY",
+      "size": 42.0,
+      "price": 117.63837770482154
+    },
+    {
+      "dt": "2020-10-30T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 107.72526275511105
+    },
+    {
+      "dt": "2020-11-03T05:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 106.36730788899447
+    },
+    {
+      "dt": "2020-11-05T05:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 114.40838980980128
+    },
+    {
+      "dt": "2020-12-02T05:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 118.56038101970898
+    },
+    {
+      "dt": "2021-01-05T05:00:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 125.23562928189571
+    },
+    {
+      "dt": "2021-02-02T05:00:00",
+      "side": "SELL",
+      "size": -11.0,
+      "price": 131.8816374338767
+    },
+    {
+      "dt": "2021-03-02T05:00:00",
+      "side": "SELL",
+      "size": -21.0,
+      "price": 124.9556470135569
+    },
+    {
+      "dt": "2021-04-05T04:00:00",
+      "side": "SELL",
+      "size": -40.0,
+      "price": 120.53777850848311
+    },
+    {
+      "dt": "2021-04-06T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 123.09701892635115
+    },
+    {
+      "dt": "2021-04-09T04:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 126.30826602843275
+    },
+    {
+      "dt": "2021-05-04T04:00:00",
+      "side": "SELL",
+      "size": -84.0,
+      "price": 127.6608679130952
+    },
+    {
+      "dt": "2021-05-14T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 123.06242504546209
+    },
+    {
+      "dt": "2021-06-01T04:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 121.92196296159237
+    },
+    {
+      "dt": "2021-06-02T04:00:00",
+      "side": "SELL",
+      "size": -162.0,
+      "price": 121.14215297391479
+    },
+    {
+      "dt": "2021-06-07T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 122.98444744531308
+    },
+    {
+      "dt": "2021-06-14T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 124.59279446771667
+    },
+    {
+      "dt": "2021-06-15T04:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 126.6592421533219
+    },
+    {
+      "dt": "2021-07-02T04:00:00",
+      "side": "SELL",
+      "size": -342.0,
+      "price": 134.41828334809892
+    },
+    {
+      "dt": "2021-08-03T04:00:00",
+      "side": "SELL",
+      "size": -703.0,
+      "price": 142.12856645538005
+    },
+    {
+      "dt": "2021-09-02T04:00:00",
+      "side": "SELL",
+      "size": -1436.0,
+      "price": 150.20980882981786
+    },
+    {
+      "dt": "2021-09-23T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 143.1615238009879
+    },
+    {
+      "dt": "2021-10-04T04:00:00",
+      "side": "SELL",
+      "size": -2773.0,
+      "price": 138.38785651091933
+    },
+    {
+      "dt": "2021-10-08T04:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 140.60385709315267
+    },
+    {
+      "dt": "2021-10-18T04:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 140.03766984054468
+    },
+    {
+      "dt": "2021-10-19T04:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 143.51295730034732
+    },
+    {
+      "dt": "2021-11-02T04:00:00",
+      "side": "SELL",
+      "size": -5675.0,
+      "price": 145.12373606469237
+    },
+    {
+      "dt": "2021-12-02T05:00:00",
+      "side": "SELL",
+      "size": -11898.0,
+      "price": 155.1901268526862
+    },
+    {
+      "dt": "2022-01-04T05:00:00",
+      "side": "SELL",
+      "size": -25036.0,
+      "price": 178.54589665749737
+    },
+    {
+      "dt": "2022-02-02T05:00:00",
+      "side": "SELL",
+      "size": -49098.0,
+      "price": 170.8420635898593
+    },
+    {
+      "dt": "2022-03-02T05:00:00",
+      "side": "SELL",
+      "size": -94929.0,
+      "price": 160.9185355637426
+    },
+    {
+      "dt": "2022-03-03T05:00:00",
+      "side": "BUY",
+      "size": 70.0,
+      "price": 164.91236813214016
+    },
+    {
+      "dt": "2022-03-15T04:00:00",
+      "side": "SELL",
+      "size": -70.0,
+      "price": 147.7134197726543
+    },
+    {
+      "dt": "2022-03-21T04:00:00",
+      "side": "BUY",
+      "size": 222.0,
+      "price": 160.05708320205216
+    },
+    {
+      "dt": "2022-03-23T04:00:00",
+      "side": "SELL",
+      "size": -222.0,
+      "price": 164.44251031244588
+    },
+    {
+      "dt": "2022-04-04T04:00:00",
+      "side": "SELL",
+      "size": -195856.0,
+      "price": 170.8835430731966
+    },
+    {
+      "dt": "2022-04-26T04:00:00",
+      "side": "BUY",
+      "size": 981.0,
+      "price": 158.8236916294158
+    },
+    {
+      "dt": "2022-04-29T04:00:00",
+      "side": "BUY",
+      "size": 887.0,
+      "price": 158.42238298865084
+    },
+    {
+      "dt": "2022-05-03T04:00:00",
+      "side": "SELL",
+      "size": -371976.0,
+      "price": 154.8102670522691
+    },
+    {
+      "dt": "2022-05-05T04:00:00",
+      "side": "SELL",
+      "size": -1868.0,
+      "price": 160.38991736716943
+    },
+    {
+      "dt": "2022-06-02T04:00:00",
+      "side": "SELL",
+      "size": -719853.0,
+      "price": 144.9208398093746
+    },
+    {
+      "dt": "2022-07-05T04:00:00",
+      "side": "SELL",
+      "size": -1387448.0,
+      "price": 135.05880629688934
+    },
+    {
+      "dt": "2022-08-02T04:00:00",
+      "side": "SELL",
+      "size": -2993834.0,
+      "price": 156.94938527079637
+    },
+    {
+      "dt": "2022-09-02T04:00:00",
+      "side": "SELL",
+      "size": -5943484.0,
+      "price": 156.82379496598037
+    },
+    {
+      "dt": "2022-10-04T04:00:00",
+      "side": "SELL",
+      "size": -11219269.0,
+      "price": 142.37345088895668
+    },
+    {
+      "dt": "2022-11-02T04:00:00",
+      "side": "SELL",
+      "size": -23006338.0,
+      "price": 146.22162239502856
+    },
+    {
+      "dt": "2022-12-02T05:00:00",
+      "side": "SELL",
+      "size": -45831186.0,
+      "price": 143.52406921601985
+    },
+    {
+      "dt": "2023-01-04T05:00:00",
+      "side": "SELL",
+      "size": -83548038.0,
+      "price": 124.77234386397704
+    },
+    {
+      "dt": "2023-02-02T05:00:00",
+      "side": "SELL",
+      "size": -180052130.0,
+      "price": 146.4149779827907
+    },
+    {
+      "dt": "2023-03-02T05:00:00",
+      "side": "SELL",
+      "size": -358170997.0,
+      "price": 142.18720807379
+    },
+    {
+      "dt": "2023-04-04T04:00:00",
+      "side": "SELL",
+      "size": -761952447.0,
+      "price": 164.06975594835677
+    },
+    {
+      "dt": "2023-05-02T04:00:00",
+      "side": "SELL",
+      "size": -1537217307.0,
+      "price": 167.50673256610264
+    },
+    {
+      "dt": "2023-06-02T04:00:00",
+      "side": "SELL",
+      "size": -3159143659.0,
+      "price": 178.52716847079088
+    },
+    {
+      "dt": "2023-07-05T04:00:00",
+      "side": "SELL",
+      "size": -6500998487.0,
+      "price": 188.92145597370774
+    },
+    {
+      "dt": "2023-08-02T04:00:00",
+      "side": "SELL",
+      "size": -13116709412.0,
+      "price": 192.34350758944402
+    },
+    {
+      "dt": "2023-08-30T04:00:00",
+      "side": "BUY",
+      "size": 28819214.0,
+      "price": 182.6293784130112
+    },
+    {
+      "dt": "2023-08-31T04:00:00",
+      "side": "SELL",
+      "size": -28819214.0,
+      "price": 185.49320316115478
+    },
+    {
+      "dt": "2023-09-05T04:00:00",
+      "side": "SELL",
+      "size": -25872840086.0,
+      "price": 185.92768366781115
+    },
+    {
+      "dt": "2023-10-03T04:00:00",
+      "side": "SELL",
+      "size": -49519487475.0,
+      "price": 170.10785870603348
+    },
+    {
+      "dt": "2023-10-09T04:00:00",
+      "side": "BUY",
+      "size": 79993905.0,
+      "price": 174.60098214625398
+    },
+    {
+      "dt": "2023-10-10T04:00:00",
+      "side": "SELL",
+      "size": -79993905.0,
+      "price": 175.8748846750232
+    },
+    {
+      "dt": "2023-11-02T04:00:00",
+      "side": "SELL",
+      "size": -99342023014.0,
+      "price": 173.32709544733643
+    },
+    {
+      "dt": "2023-12-04T05:00:00",
+      "side": "SELL",
+      "size": -207670076730.0,
+      "price": 187.85361573572166
+    },
+    {
+      "dt": "2024-01-03T05:00:00",
+      "side": "SELL",
+      "size": -410209964686.0,
+      "price": 182.15811164141854
+    },
+    {
+      "dt": "2024-02-02T05:00:00",
+      "side": "SELL",
+      "size": -824839274143.0,
+      "price": 177.84687547061628
+    },
+    {
+      "dt": "2024-03-04T05:00:00",
+      "side": "SELL",
+      "size": -1634550745221.0,
+      "price": 174.40064432483445
+    },
+    {
+      "dt": "2024-04-02T04:00:00",
+      "side": "SELL",
+      "size": -3193504954914.0,
+      "price": 167.40087579338118
+    },
+    {
+      "dt": "2024-05-02T04:00:00",
+      "side": "SELL",
+      "size": -6383249452895.0,
+      "price": 170.79682058773386
+    },
+    {
+      "dt": "2024-06-04T04:00:00",
+      "side": "SELL",
+      "size": -13554709695987.0,
+      "price": 192.9684109970025
+    },
+    {
+      "dt": "2024-07-02T04:00:00",
+      "side": "SELL",
+      "size": -28407165898291.0,
+      "price": 214.293668724795
+    },
+    {
+      "dt": "2024-08-02T04:00:00",
+      "side": "SELL",
+      "size": -57054775038032.0,
+      "price": 217.2679231335739
+    },
+    {
+      "dt": "2024-09-04T04:00:00",
+      "side": "SELL",
+      "size": -115160394306468.0,
+      "price": 220.01072730838987
+    },
+    {
+      "dt": "2024-10-02T04:00:00",
+      "side": "SELL",
+      "size": -232335979580834.0,
+      "price": 224.20925878310885
+    },
+    {
+      "dt": "2024-11-04T05:00:00",
+      "side": "SELL",
+      "size": -461634707183324.0,
+      "price": 219.34572401852256
+    },
+    {
+      "dt": "2024-12-03T05:00:00",
+      "side": "SELL",
+      "size": -957700010247713.0,
+      "price": 238.28756099978403
+    },
+    {
+      "dt": "2025-01-03T05:00:00",
+      "side": "SELL",
+      "size": -1931208108493592.0,
+      "price": 241.81503295898438
+    },
+    {
+      "dt": "2025-02-04T05:00:00",
+      "side": "SELL",
+      "size": -3736830974287733.0,
+      "price": 225.8073134168997
+    },
+    {
+      "dt": "2025-03-04T05:00:00",
+      "side": "SELL",
+      "size": -7647367620864104.0,
+      "price": 236.46059966619737
+    },
+    {
+      "dt": "2025-04-02T04:00:00",
+      "side": "SELL",
+      "size": -1.4805849628507744e+16,
+      "price": 220.15675729790527
+    },
+    {
+      "dt": "2025-05-02T04:00:00",
+      "side": "SELL",
+      "size": -2.8972284552844036e+16,
+      "price": 205.0067917796952
+    },
+    {
+      "dt": "2025-06-03T04:00:00",
+      "side": "SELL",
+      "size": -5.676228411916041e+16,
+      "price": 200.55435521702816
+    },
+    {
+      "dt": "2025-07-02T04:00:00",
+      "side": "SELL",
+      "size": -1.1536905374758187e+17,
+      "price": 208.08447525999884
+    },
+    {
+      "dt": "2025-08-04T04:00:00",
+      "side": "SELL",
+      "size": -2.2737111205108746e+17,
+      "price": 203.70186769022786
+    },
+    {
+      "dt": "2025-09-03T04:00:00",
+      "side": "SELL",
+      "size": -4.8174983467073504e+17,
+      "price": 236.54080133953738
+    },
+    {
+      "dt": "2025-10-02T04:00:00",
+      "side": "SELL",
+      "size": -1.0016680094318136e+18,
+      "price": 255.85613542550084
+    },
+    {
+      "dt": "2025-11-04T05:00:00",
+      "side": "SELL",
+      "size": -2.0476839799660367e+18,
+      "price": 267.5730004152706
+    },
+    {
+      "dt": "2025-12-02T05:00:00",
+      "side": "SELL",
+      "size": -4.194426743788049e+18,
+      "price": 282.47518456741903
+    }
+  ]
+}

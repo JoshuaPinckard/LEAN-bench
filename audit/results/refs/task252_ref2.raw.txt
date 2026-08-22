@@ -1,0 +1,178 @@
+```python
+import backtrader as bt
+
+
+class TechnicalBreakoutStrategy(bt.Strategy):
+    params = (
+        ('sma200_period', 200),
+        ('ema8_period', 8),
+        ('ema20_period', 20),
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('atr_period', 14),
+        ('vol_sma_period', 20),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('risk_pct', 0.01),
+        ('sl_atr_mult', 1.5),
+        ('tp_atr_mult', 3.0),
+    )
+
+    def __init__(self):
+        # Moving Averages
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma200_period)
+        self.ema8 = bt.indicators.EMA(self.data.close, period=self.p.ema8_period)
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema20_period)
+
+        # Bollinger Bands & Squeeze detection
+        self.boll = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.bb_width = self.boll.lines.top - self.boll.lines.bot
+        self.bb_width_sma = bt.indicators.SMA(self.bb_width, period=self.p.bb_period)
+
+        # ATR & ATR SMA
+        self.atr14 = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr14_sma = bt.indicators.SMA(self.atr14, period=self.p.atr_period)
+
+        # Volume SMA
+        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        # MACD
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.macd_cross = bt.indicators.CrossDown(self.macd.macd, self.macd.signal)
+
+        # Order tracking variables
+        self.buy_order = None
+        self.tp_order = None
+        self.sl_order = None
+        self.close_order = None
+
+        self.atr_at_entry = None
+        self.entry_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if order == self.buy_order:
+                self.buy_order = None
+                self.entry_price = order.executed.price
+                if self.atr_at_entry is not None:
+                    stop_price = self.entry_price - self.p.sl_atr_mult * self.atr_at_entry
+                    tp_price = self.entry_price + self.p.tp_atr_mult * self.atr_at_entry
+                    self.tp_order = self.sell(
+                        size=order.executed.size, exectype=bt.Order.Limit, price=tp_price
+                    )
+                    self.sl_order = self.sell(
+                        size=order.executed.size,
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                        oco=self.tp_order,
+                    )
+            elif order == self.tp_order:
+                self.tp_order = None
+            elif order == self.sl_order:
+                self.sl_order = None
+            elif order == self.close_order:
+                self.close_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.buy_order:
+                self.buy_order = None
+            if order == self.tp_order:
+                self.tp_order = None
+            if order == self.sl_order:
+                self.sl_order = None
+            if order == self.close_order:
+                self.close_order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.buy_order = None
+            self.tp_order = None
+            self.sl_order = None
+            self.close_order = None
+            self.atr_at_entry = None
+            self.entry_price = None
+
+    def next(self):
+        # Manage open position exits
+        if self.position:
+            # Trailing/alternative weakness-based exit: close < EMA(20) OR bearish MACD cross
+            weakness_exit = (self.data.close[0] < self.ema20[0]) or (self.macd_cross[0] > 0)
+            if weakness_exit:
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+                if not self.close_order:
+                    self.close_order = self.close()
+            return
+
+        # Do not enter if a buy order is currently pending
+        if self.buy_order is not None:
+            return
+
+        # 1) Breakout from consolidation
+        breakout = self.data.close[0] > self.boll.lines.top[0]
+        squeeze_yesterday = self.bb_width[-1] < self.bb_width_sma[-1]
+        cond1 = breakout and squeeze_yesterday
+
+        # 2) Trend filter
+        cond2 = (
+            (self.data.close[0] > self.sma200[0])
+            and (self.ema8[0] > self.ema20[0])
+            and (self.data.close[0] > self.ema8[0])
+        )
+
+        # 3) Confirmation of move strength
+        cond3 = (self.atr14[0] > self.atr14_sma[0]) and (
+            self.data.volume[0] > 1.2 * self.vol_sma20[0]
+        )
+
+        if cond1 and cond2 and cond3:
+            atr_val = self.atr14[0]
+            if atr_val <= 0:
+                return
+            risk_per_share = self.p.sl_atr_mult * atr_val
+            capital = self.broker.getvalue()
+            risk_amount = capital * self.p.risk_pct
+            size = int(risk_amount / risk_per_share)
+
+            # Cap size by available cash
+            max_size = int(self.broker.get_cash() / self.data.close[0])
+            size = min(size, max_size)
+
+            if size > 0:
+                self.atr_at_entry = atr_val
+                self.buy_order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "risk_capital_percentage",
+      "choice": "Selected 1% (0.01) of portfolio total value (capital) per trade for position sizing within the 1-2% range stated in the spec.",
+      "reason": "The specification states position sizing risk of 1-2% per trade without specifying an exact value in that range."
+    },
+    {
+      "topic": "tp_sl_execution",
+      "choice": "Submitted a limit order for TP at entry_price + 3 * ATR(14) and a stop order for SL at entry_price - 1.5 * ATR(14) upon trade execution in notify_order.",
+      "reason": "The spec states target level and initial stop based on entry price at the time of entry; executing TP/SL orders when the buy order fills ensures precise execution price anchoring."
+    },
+    {
+      "topic": "bb_width_definition",
+      "choice": "Defined Bollinger Band width as the absolute difference (upper band - lower band).",
+      "reason": "The specification explicitly defines BB band width yesterday as '(BB_top - BB_bot)'."
+    }
+  ]
+}
+```

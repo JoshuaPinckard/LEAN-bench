@@ -1,0 +1,181 @@
+```python
+import backtrader as bt
+
+
+class SwingRSIStrategy(bt.Strategy):
+    def __init__(self):
+        self.ema12 = bt.indicators.EMA(self.data.close, period=12)
+        self.ema26 = bt.indicators.EMA(self.data.close, period=26)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.tr = bt.indicators.TrueRange(self.data)
+
+        self.order = None
+        self.entry_price = 0.0
+        self.be_active = False
+        self.peak_equity = 0.0
+
+        self.long_pullback_active = False
+        self.long_trigger_active = False
+        self.long_trigger_high = 0.0
+
+        self.short_pullback_active = False
+        self.short_trigger_active = False
+        self.short_trigger_low = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed:
+            if self.position.size != 0:
+                self.entry_price = order.executed.price
+                self.be_active = False
+            else:
+                self.entry_price = 0.0
+                self.be_active = False
+        self.order = None
+
+    def next(self):
+        current_equity = self.broker.getvalue()
+        if self.peak_equity == 0.0:
+            self.peak_equity = current_equity
+        else:
+            self.peak_equity = max(self.peak_equity, current_equity)
+
+        rsi_val = self.rsi[0]
+
+        # --- Long Setup Tracking ---
+        if rsi_val < 30:
+            self.long_pullback_active = False
+            self.long_trigger_active = False
+        elif rsi_val < 40:
+            self.long_pullback_active = True
+        elif rsi_val > 35:
+            if self.long_pullback_active:
+                self.long_trigger_high = self.data.high[0]
+                self.long_trigger_active = True
+                self.long_pullback_active = False
+        if rsi_val > 70:
+            self.long_pullback_active = False
+            self.long_trigger_active = False
+
+        # --- Short Setup Tracking ---
+        if rsi_val > 70:
+            self.short_pullback_active = False
+            self.short_trigger_active = False
+        elif rsi_val > 60:
+            self.short_pullback_active = True
+        elif rsi_val < 65:
+            if self.short_pullback_active:
+                self.short_trigger_low = self.data.low[0]
+                self.short_trigger_active = True
+                self.short_pullback_active = False
+        if rsi_val < 30:
+            self.short_pullback_active = False
+            self.short_trigger_active = False
+
+        if self.order:
+            return
+
+        # --- Position Management (Exits) ---
+        if self.position.size > 0:
+            entry_p = self.entry_price if self.entry_price > 0 else self.position.price
+            if self.data.high[0] >= entry_p * 1.01:
+                self.be_active = True
+
+            stop_p = entry_p if self.be_active else entry_p * (1.0 - 0.015)
+            if self.data.low[0] <= stop_p:
+                self.order = self.close()
+                return
+
+            if self.rsi[0] > 70:
+                self.order = self.close()
+                return
+            return
+
+        elif self.position.size < 0:
+            entry_p = self.entry_price if self.entry_price > 0 else self.position.price
+            if self.data.low[0] <= entry_p * 0.99:
+                self.be_active = True
+
+            stop_p = entry_p if self.be_active else entry_p * (1.0 + 0.015)
+            if self.data.high[0] >= stop_p:
+                self.order = self.close()
+                return
+
+            if self.rsi[0] < 30:
+                self.order = self.close()
+                return
+            return
+
+        # --- Entry Filters ---
+        drawdown = (self.peak_equity - current_equity) / self.peak_equity
+        if drawdown > 0.05:
+            return
+
+        daily_range = self.data.high[0] - self.data.low[0]
+        if daily_range < 0.005 * self.data.open[0]:
+            return
+
+        prev_close = self.data.close[-1]
+        gap = abs(self.data.open[0] - prev_close) / prev_close
+        if self.tr[0] > 2.0 * self.atr[0] or gap > 0.01:
+            return
+
+        # --- Long Entry ---
+        if (
+            self.long_trigger_active
+            and self.ema12[0] > self.ema26[0]
+            and self.data.close[0] > self.long_trigger_high
+        ):
+            risk_amt = current_equity * 0.01
+            stop_dist = self.data.close[0] * 0.015
+            if stop_dist > 0:
+                size = int(risk_amt / stop_dist)
+                if size > 0:
+                    self.order = self.buy(size=size)
+                    self.long_trigger_active = False
+                    return
+
+        # --- Short Entry ---
+        if (
+            self.short_trigger_active
+            and self.ema12[0] < self.ema26[0]
+            and self.data.close[0] < self.short_trigger_low
+        ):
+            risk_amt = current_equity * 0.01
+            stop_dist = self.data.close[0] * 0.015
+            if stop_dist > 0:
+                size = int(risk_amt / stop_dist)
+                if size > 0:
+                    self.order = self.sell(size=size)
+                    self.short_trigger_active = False
+                    return
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "entry_price_execution",
+      "choice": "Used actual order execution price (order.executed.price) from notify_order for stop loss, breakeven, and risk calculations",
+      "reason": "The specification states stops and breakeven relative to entry price; using actual execution price reflects exact position entry."
+    },
+    {
+      "topic": "breakeven_activation",
+      "choice": "Breakeven stop is activated when intrabar price reaches +1% profit relative to entry price",
+      "reason": "Evaluates intrabar high (for long) or low (for short) against 1% profit threshold to ensure timely stop adjustment."
+    },
+    {
+      "topic": "trigger_invalidation",
+      "choice": "Long trigger is invalidated if RSI drops below 30 or exceeds 70; Short trigger is invalidated if RSI rises above 70 or drops below 30",
+      "reason": "Ensures that old triggers do not persist across invalid market conditions."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position size is computed as int((equity * 0.01) / (close[0] * 0.015))",
+      "reason": "Risk amount is 1% of total portfolio value and stop distance is 1.5% of current close price."
+    }
+  ]
+}
+```

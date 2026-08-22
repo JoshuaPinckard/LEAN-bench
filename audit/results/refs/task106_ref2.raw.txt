@@ -1,0 +1,182 @@
+```python
+import backtrader as bt
+
+
+class LevelRetestEntryStrategy(bt.Strategy):
+    params = (
+        ('lookback', 20),
+        ('rsi_period', 14),
+        ('atr_period', 14),
+        ('tp_atr_mult', 2.0),
+        ('htf_trend_period', 80),  # 4x 20-period on 1h feed to simulate 4h timeframe
+        ('risk_pct', 0.01),        # 1% capital risk per trade
+    )
+
+    def __init__(self):
+        self.order = None
+
+        # Key levels: local low/high over previous 20 bars
+        self.support = bt.indicators.Lowest(self.data.low(-1), period=self.p.lookback)
+        self.resistance = bt.indicators.Highest(self.data.high(-1), period=self.p.lookback)
+
+        # Indicators
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_htf = bt.indicators.SMA(self.data.close, period=self.p.htf_trend_period)
+
+        # Trade tracking attributes
+        self.pending_support = None
+        self.pending_resistance = None
+        self.pending_atr = None
+
+        self.entry_price = None
+        self.tp_price = None
+        self.sl_level = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.position:
+                if self.position.size > 0:
+                    self.entry_price = order.executed.price
+                    self.sl_level = self.pending_support
+                    self.tp_price = self.entry_price + (self.p.tp_atr_mult * self.pending_atr)
+                elif self.position.size < 0:
+                    self.entry_price = order.executed.price
+                    self.sl_level = self.pending_resistance
+                    self.tp_price = self.entry_price - (self.p.tp_atr_mult * self.pending_atr)
+
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def is_bullish_pattern(self):
+        c0, o0, h0, l0 = self.data.close[0], self.data.open[0], self.data.high[0], self.data.low[0]
+        c1, o1 = self.data.close[-1], self.data.open[-1]
+
+        # Bullish Engulfing
+        is_bullish_engulfing = (c1 < o1) and (c0 > o0) and (o0 <= c1) and (c0 >= o1)
+
+        # Hammer (small body near high, long lower shadow)
+        body = abs(c0 - o0)
+        total_range = h0 - l0
+        lower_shadow = min(o0, c0) - l0
+        upper_shadow = h0 - max(o0, c0)
+
+        is_hammer = (total_range > 0) and (c0 > o0) and (lower_shadow >= 2 * body) and (upper_shadow <= body)
+
+        return is_bullish_engulfing or is_hammer
+
+    def is_bearish_pattern(self):
+        c0, o0, h0, l0 = self.data.close[0], self.data.open[0], self.data.high[0], self.data.low[0]
+        c1, o1 = self.data.close[-1], self.data.open[-1]
+
+        # Bearish Engulfing
+        is_bearish_engulfing = (c1 > o1) and (c0 < o0) and (o0 >= c1) and (c0 <= o1)
+
+        # Hanging Man (small body near high, long lower shadow)
+        body = abs(c0 - o0)
+        total_range = h0 - l0
+        lower_shadow = min(o0, c0) - l0
+        upper_shadow = h0 - max(o0, c0)
+
+        is_hanging_man = (total_range > 0) and (c0 < o0) and (lower_shadow >= 2 * body) and (upper_shadow <= body)
+
+        return is_bearish_engulfing or is_hanging_man
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0:
+                # Take profit: High reached TP target; Stop loss: Close below support level
+                if self.data.high[0] >= self.tp_price or self.data.close[0] < self.sl_level:
+                    self.order = self.close()
+            elif self.position.size < 0:
+                # Take profit: Low reached TP target; Stop loss: Close above resistance level
+                if self.data.low[0] <= self.tp_price or self.data.close[0] > self.sl_level:
+                    self.order = self.close()
+            return
+
+        sup_val = self.support[0]
+        res_val = self.resistance[0]
+
+        # Long entry conditions
+        long_cond = (
+            (self.data.low[0] <= sup_val) and
+            (self.data.close[0] > sup_val) and
+            self.is_bullish_pattern() and
+            (self.rsi[0] > 50) and
+            (self.data.close[0] > self.sma_htf[0])
+        )
+
+        if long_cond:
+            risk_dist = self.data.close[0] - sup_val
+            if risk_dist > 0:
+                capital = self.broker.getvalue()
+                risk_amt = capital * self.p.risk_pct
+                size = int(risk_amt / risk_dist)
+                max_size = int(capital / self.data.close[0])
+                size = min(size, max_size)
+                if size > 0:
+                    self.pending_support = sup_val
+                    self.pending_atr = self.atr[0]
+                    self.order = self.buy(size=size)
+            return
+
+        # Short entry conditions
+        short_cond = (
+            (self.data.high[0] >= res_val) and
+            (self.data.close[0] < res_val) and
+            self.is_bearish_pattern() and
+            (self.rsi[0] < 50) and
+            (self.data.close[0] < self.sma_htf[0])
+        )
+
+        if short_cond:
+            risk_dist = res_val - self.data.close[0]
+            if risk_dist > 0:
+                capital = self.broker.getvalue()
+                risk_amt = capital * self.p.risk_pct
+                size = int(risk_amt / risk_dist)
+                max_size = int(capital / self.data.close[0])
+                size = min(size, max_size)
+                if size > 0:
+                    self.pending_resistance = res_val
+                    self.pending_atr = self.atr[0]
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "support_resistance_levels",
+      "choice": "Defined as the lowest low / highest high over the previous 20 bars excluding the current bar (self.data.low(-1) / self.data.high(-1)).",
+      "reason": "Including the current bar would cause low[0] to set a new lowest low and match the level by construction during breakdown bars, preventing proper detection of historical support retests."
+    },
+    {
+      "topic": "trend_filter_timeframe",
+      "choice": "Used an 80-period SMA on the 1-hour data feed to represent a 20-period SMA on the 4-hour higher timeframe.",
+      "reason": "The harness provides a single 1-hour data feed without pre-resampled multi-timeframe feeds. Scaling the indicator period by 4x approximates the 4-hour timeframe trend."
+    },
+    {
+      "topic": "candlestick_patterns",
+      "choice": "Implemented Bullish Engulfing and Hammer for buys, and Bearish Engulfing and Hanging Man for sells using standard body/wick ratio rules.",
+      "reason": "The spec gives these as specific canonical examples of bullish/bearish reversal candlestick patterns."
+    },
+    {
+      "topic": "stop_loss_execution",
+      "choice": "Evaluated stop-loss condition on bar close (close[0] < support / close[0] > resistance) in next().",
+      "reason": "The spec explicitly specifies closing the position if price 'returns and closes a bar below/above the support/resistance level'."
+    },
+    {
+      "topic": "risk_management_sizing",
+      "choice": "Calculated position size based on 1% risk of total portfolio value divided by the distance to the support/resistance level at signal time, capped by total capital.",
+      "reason": "The spec requires position sizing such that potential loss on stop-loss does not exceed 1-2% of total capital on a single trade."
+    }
+  ]
+}
+```

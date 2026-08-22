@@ -1,0 +1,308 @@
+```python
+import backtrader as bt
+
+
+class HybridYieldCoreStrategy(bt.Strategy):
+    """
+    Reference implementation of Hybrid Yield-and-Core Strategy on a Single Asset.
+    Splits capital into two virtual modules:
+      - Module 1 (70% max capital): Short-term yield module on pullbacks in high volatility.
+      - Module 2 (30% max capital): Long-term trend core with scaling, yield-selling, and trailing exits.
+    Global constraint: Total position value across both modules <= 90% of total equity.
+    """
+
+    def __init__(self):
+        # Trend Indicators
+        self.sma200 = bt.ind.SMA(self.data.close, period=200)
+        self.ema50 = bt.ind.EMA(self.data.close, period=50)
+        self.macd = bt.ind.MACD(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+
+        # Volatility & Deviation Indicators
+        self.bb = bt.ind.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.bb_width = self.bb.top - self.bb.bot
+        self.bb_width_sma = bt.ind.SMA(self.bb_width, period=50)
+        self.atr = bt.ind.ATR(self.data, period=14)
+
+        # Momentum Indicator
+        self.rsi = bt.ind.RSI(self.data.close, period=14)
+
+        # 20-day High for Module 2 scaling
+        self.high20 = bt.ind.Highest(self.data.high, period=20)
+
+        # Module 1 State Tracking
+        self.m1_size = 0
+        self.m1_entry_price = 0.0
+        self.m1_atr_entry = 0.0
+        self.m1_entry_bar = 0
+        self.order_m1 = None
+
+        # Module 2 State Tracking
+        self.m2_size = 0
+        self.m2_highest_price = 0.0
+        self.m2_sold_qty = 0
+        self.m2_bearish_bars = 0
+        self.order_m2 = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        module = order.info.get("module", None)
+
+        if order.status in [order.Completed]:
+            if module == 1:
+                if order.isbuy():
+                    self.m1_size += order.executed.size
+                    self.m1_entry_price = order.executed.price
+                    self.m1_atr_entry = order.info.get("atr", self.atr[0])
+                    self.m1_entry_bar = len(self)
+                elif order.issell():
+                    self.m1_size = 0
+                    self.m1_entry_price = 0.0
+                    self.m1_atr_entry = 0.0
+                    self.m1_entry_bar = 0
+                self.order_m1 = None
+
+            elif module == 2:
+                if order.isbuy():
+                    self.m2_size += order.executed.size
+                    if (
+                        self.m2_highest_price == 0.0
+                        or order.info.get("action") == "entry"
+                    ):
+                        self.m2_highest_price = order.executed.price
+                    else:
+                        self.m2_highest_price = max(
+                            self.m2_highest_price, order.executed.price
+                        )
+                    if order.info.get("action") == "buyback":
+                        self.m2_sold_qty = max(
+                            0, self.m2_sold_qty - order.executed.size
+                        )
+                elif order.issell():
+                    self.m2_size -= abs(order.executed.size)
+                    if order.info.get("action") == "partial_sell":
+                        self.m2_sold_qty += abs(order.executed.size)
+                    elif order.info.get("action") == "exit":
+                        self.m2_size = 0
+                        self.m2_highest_price = 0.0
+                        self.m2_sold_qty = 0
+                self.order_m2 = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if module == 1:
+                self.order_m1 = None
+            elif module == 2:
+                self.order_m2 = None
+
+    def next(self):
+        total_value = self.broker.getvalue()
+        cash = self.broker.getcash()
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+
+        # Track consecutive bearish bars for Module 2 liquidation condition
+        is_bearish = (self.ema50[0] < self.sma200[0]) and (
+            self.macd.macd[0] < 0
+        )
+        if is_bearish:
+            self.m2_bearish_bars += 1
+        else:
+            self.m2_bearish_bars = 0
+
+        # ==========================================
+        # MODULE 1: Yield Pullback in High Volatility
+        # ==========================================
+        if self.m1_size > 0:
+            if self.order_m1 is None:
+                # Exit conditions for Module 1
+                stop_hit = low <= (
+                    self.m1_entry_price - 1.0 * self.m1_atr_entry
+                )
+                tp_hit = (
+                    high >= (self.m1_entry_price + 0.7 * self.m1_atr_entry)
+                ) or (close >= self.bb.mid[0])
+                time_hit = (len(self) - self.m1_entry_bar) >= 10
+
+                if stop_hit or tp_hit or time_hit:
+                    o = self.sell(size=self.m1_size)
+                    o.info["module"] = 1
+                    o.info["action"] = "exit"
+                    self.order_m1 = o
+        else:
+            if self.order_m1 is None:
+                # Entry conditions for Module 1
+                m1_trend = close > self.sma200[0]
+                m1_vol = self.bb_width[0] > self.bb_width_sma[0]
+                m1_pullback = (close <= self.bb.bot[0]) and (self.rsi[0] < 40)
+
+                if m1_trend and m1_vol and m1_pullback:
+                    risk_capital = 0.01 * total_value
+                    atr_val = self.atr[0]
+                    if atr_val > 0 and close > 0:
+                        shares_risk = risk_capital / atr_val
+                        shares_m1_cap = (0.70 * total_value) / close
+
+                        current_pos_val = (self.m1_size + self.m2_size) * close
+                        allowed_strat_val = max(
+                            0.0, 0.90 * total_value - current_pos_val
+                        )
+                        shares_strat_cap = allowed_strat_val / close
+                        shares_cash = cash / close
+
+                        size = int(
+                            min(
+                                shares_risk,
+                                shares_m1_cap,
+                                shares_strat_cap,
+                                shares_cash,
+                            )
+                        )
+                        if size > 0:
+                            o = self.buy(size=size)
+                            o.info["module"] = 1
+                            o.info["action"] = "entry"
+                            o.info["atr"] = atr_val
+                            self.order_m1 = o
+
+        # ==========================================
+        # MODULE 2: Trend Core with Periodic Yield
+        # ==========================================
+        if self.order_m2 is None:
+            if self.m2_size > 0:
+                # Update highest price since entry for trailing stop
+                self.m2_highest_price = max(self.m2_highest_price, high)
+                core_stop = self.m2_highest_price - 3.0 * self.atr[0]
+
+                trailing_stop_hit = low <= core_stop
+                bearish_liq_hit = self.m2_bearish_bars >= 5
+
+                if trailing_stop_hit or bearish_liq_hit:
+                    o = self.sell(size=self.m2_size)
+                    o.info["module"] = 2
+                    o.info["action"] = "exit"
+                    self.order_m2 = o
+                else:
+                    # Partial Profit-Taking (Analog of Covered Calls)
+                    if high >= self.bb.top[0] and self.rsi[0] > 65:
+                        sell_qty = int(self.m2_size * 0.15)
+                        if sell_qty > 0:
+                            o = self.sell(size=sell_qty)
+                            o.info["module"] = 2
+                            o.info["action"] = "partial_sell"
+                            self.order_m2 = o
+                    # Buy back previously trimmed core
+                    elif self.m2_sold_qty > 0 and (
+                        close <= self.bb.mid[0] or self.rsi[0] < 45
+                    ):
+                        current_m2_val = self.m2_size * close
+                        allowed_m2_val = max(
+                            0.0, 0.30 * total_value - current_m2_val
+                        )
+                        current_pos_val = (self.m1_size + self.m2_size) * close
+                        allowed_strat_val = max(
+                            0.0, 0.90 * total_value - current_pos_val
+                        )
+
+                        max_buy_val = min(
+                            allowed_m2_val, allowed_strat_val, cash
+                        )
+                        max_buy_shares = (
+                            int(max_buy_val / close) if close > 0 else 0
+                        )
+                        buy_size = min(self.m2_sold_qty, max_buy_shares)
+                        if buy_size > 0:
+                            o = self.buy(size=buy_size)
+                            o.info["module"] = 2
+                            o.info["action"] = "buyback"
+                            self.order_m2 = o
+                    # Add to core on 10% pullback from 20-day high
+                    elif (
+                        close <= 0.90 * self.high20[0]
+                        and close <= self.bb.bot[0]
+                        and (35 <= self.rsi[0] <= 45)
+                    ):
+                        current_m2_val = self.m2_size * close
+                        allowed_m2_val = max(
+                            0.0, 0.30 * total_value - current_m2_val
+                        )
+                        current_pos_val = (self.m1_size + self.m2_size) * close
+                        allowed_strat_val = max(
+                            0.0, 0.90 * total_value - current_pos_val
+                        )
+
+                        max_add_val = min(
+                            allowed_m2_val, allowed_strat_val, cash
+                        )
+                        add_size = (
+                            int(max_add_val / close) if close > 0 else 0
+                        )
+                        if add_size > 0:
+                            o = self.buy(size=add_size)
+                            o.info["module"] = 2
+                            o.info["action"] = "add"
+                            self.order_m2 = o
+            else:
+                # Base Entry for Core Module 2
+                m2_bullish_filter = (self.ema50[0] > self.sma200[0]) and (
+                    self.macd.macd[0] > 0
+                )
+                ema_cross = (self.ema50[0] > self.sma200[0]) and (
+                    self.ema50[-1] <= self.sma200[-1]
+                )
+                pullback_mid = close <= self.bb.mid[0]
+
+                if m2_bullish_filter and (ema_cross or pullback_mid):
+                    allowed_m2_val = 0.30 * total_value
+                    current_pos_val = (self.m1_size + self.m2_size) * close
+                    allowed_strat_val = max(
+                        0.0, 0.90 * total_value - current_pos_val
+                    )
+
+                    max_entry_val = min(
+                        allowed_m2_val, allowed_strat_val, cash
+                    )
+                    size = int(max_entry_val / close) if close > 0 else 0
+                    if size > 0:
+                        o = self.buy(size=size)
+                        o.info["module"] = 2
+                        o.info["action"] = "entry"
+                        self.order_m2 = o
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "MACD Indicator Line Reference",
+      "choice": "Evaluated 'MACD > 0' and 'MACD < 0' using the main MACD line value (self.macd.macd[0]).",
+      "reason": "The specification states MACD conditions relative to zero without referencing signal or histogram, making the primary MACD line the literal standard choice."
+    },
+    {
+      "topic": "Partial Profit-Taking Fraction",
+      "choice": "Selected 15% of the current core position size for partial profit-taking.",
+      "reason": "The specification calls for selling '10-20% of the core'; 15% represents the exact midpoint of this specified range."
+    },
+    {
+      "topic": "Fixed Entry ATR for Module 1 Stops and Targets",
+      "choice": "Stored ATR(14) at the bar of Module 1 entry to calculate fixed stop-loss (entry - 1xATR) and take-profit (entry + 0.7xATR) levels.",
+      "reason": "Implements the literal reading of 'entry - 1xATR(14)' and '+0.7xATR' as price levels anchored to entry time."
+    },
+    {
+      "topic": "Intrabar Price Checking for Exit Conditions",
+      "choice": "Evaluated low[0] for stop-loss and trailing stop triggers, and high[0] / close[0] for take-profit and partial sell triggers.",
+      "reason": "Ensures intrabar high and low price extremes accurately trigger stop-losses and profit targets on daily bars."
+    },
+    {
+      "topic": "Buy Back Quantity Tracking",
+      "choice": "Tracked cumulative shares sold during partial profit-taking and buys back up to that quantity when conditions trigger, capped by available capital and the Module 2 30% limit.",
+      "reason": "Directly satisfies the specification requirement to buy back trimmed core position size upon a return to the middle Bollinger band or RSI < 45."
+    }
+  ]
+}
+```

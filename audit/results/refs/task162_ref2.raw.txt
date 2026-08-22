@@ -1,0 +1,160 @@
+```python
+import math
+import backtrader as bt
+
+
+class ScalpingPullbacksStrategy(bt.Strategy):
+    params = (
+        ("sma_trend_period", 50),
+        ("rsi_period", 14),
+        ("atr_period", 14),
+        ("boll_period", 20),
+        ("boll_dev", 2.0),
+        ("volume_sma_period", 20),
+        ("atr_sma_period", 50),
+        ("risk_pct", 0.02),
+        ("sl_atr_mult", 1.5),
+        ("tp_atr_mult", 1.5),
+        ("fast_exit_atr_mult", 1.0),
+        ("rsi_pullback_lookback", 5),
+        ("bb_touch_max_bars", 5),
+        ("fast_exit_max_bars", 3),
+        ("rsi_protective_threshold", 40),
+    )
+
+    def __init__(self):
+        self.sma50 = bt.ind.SMA(
+            self.data.close, period=self.p.sma_trend_period
+        )
+        self.rsi = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)
+        self.boll = bt.ind.BollingerBands(
+            self.data.close, period=self.p.boll_period, devfactor=self.p.boll_dev
+        )
+        self.sma_vol = bt.ind.SMA(
+            self.data.volume, period=self.p.volume_sma_period
+        )
+        self.sma_atr = bt.ind.SMA(self.atr, period=self.p.atr_sma_period)
+
+        self.order = None
+        self.buy_price = None
+        self.entry_atr = None
+        self.bars_held = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.buy_price = order.executed.price
+                self.entry_atr = self.atr[0]
+                self.bars_held = 0
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self.bars_held += 1
+
+            sl_price = self.buy_price - self.p.sl_atr_mult * self.entry_atr
+            tp_price = self.buy_price + self.p.tp_atr_mult * self.entry_atr
+            fast_tp_price = (
+                self.buy_price + self.p.fast_exit_atr_mult * self.entry_atr
+            )
+
+            # 1) Stop-loss
+            if self.data.low[0] <= sl_price:
+                self.order = self.close()
+                return
+
+            # 2) Take-profit (fixed target)
+            if self.data.high[0] >= tp_price:
+                self.order = self.close()
+                return
+
+            # 2b) Take-profit (upper Bollinger band touch within first 5 bars)
+            if (
+                self.bars_held <= self.p.bb_touch_max_bars
+                and self.data.high[0] >= self.boll.top[0]
+            ):
+                self.order = self.close()
+                return
+
+            # 3) Fast exit (price gain >= 1 * ATR in first 3 bars)
+            if (
+                self.bars_held <= self.p.fast_exit_max_bars
+                and self.data.high[0] >= fast_tp_price
+            ):
+                self.order = self.close()
+                return
+
+            # 4) Protective exit (RSI < 40)
+            if self.rsi[0] < self.p.rsi_protective_threshold:
+                self.order = self.close()
+                return
+
+        else:
+            # Entry logic
+            trend_ok = self.data.close[0] > self.sma50[0]
+
+            trigger_ok = self.rsi[0] > 50 and self.rsi[-1] <= 50
+
+            pullback_ok = any(
+                self.rsi[i] < 50 and self.rsi[i - 1] > 50
+                for i in range(-self.p.rsi_pullback_lookback, 0)
+            )
+
+            volume_ok = self.data.volume[0] > self.sma_vol[0]
+
+            volatility_ok = (self.atr[0] <= self.sma_atr[0] * 1.3) and (
+                abs(self.data.open[0] - self.data.close[-1]) <= self.atr[0]
+            )
+
+            if (
+                trend_ok
+                and trigger_ok
+                and pullback_ok
+                and volume_ok
+                and volatility_ok
+            ):
+                if self.atr[0] > 0:
+                    equity = self.broker.getvalue()
+                    risk_amount = self.p.risk_pct * equity
+                    risk_per_share = self.p.sl_atr_mult * self.atr[0]
+                    size = math.floor(risk_amount / risk_per_share)
+
+                    if size > 0:
+                        self.order = self.buy(size=int(size))
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "rsi_pullback_and_trigger",
+      "choice": "Pullback is evaluated as RSI crossing below 50 within bars [-5, -1], and trigger is RSI crossing back above 50 on bar 0 (rsi[0] > 50 and rsi[-1] <= 50).",
+      "reason": "Captures the exact specification of an upward reversal following a recent drop below 50 within the last 5 bars."
+    },
+    {
+      "topic": "gap_filter_calculation",
+      "choice": "Gap between current open and previous close is calculated as abs(open[0] - close[-1]).",
+      "reason": "Measures absolute price gap size relative to ATR(14) as specified in the volatility filter."
+    },
+    {
+      "topic": "exit_evaluation_prices",
+      "choice": "Intraday price thresholds (stop-loss, take-profit, BB upper band touch, fast exit gain) are evaluated against bar High/Low, while RSI protective exit is evaluated on Close.",
+      "reason": "High/Low represent intraday price touches for price-level exits, while RSI is a close-based indicator."
+    },
+    {
+      "topic": "entry_reference_price_and_atr",
+      "choice": "The executed buy order price and the ATR value at fill time are stored as the baseline entry price and entry ATR for stop-loss and take-profit calculations.",
+      "reason": "Aligns with 'upon entry set at entry - 1.5 * ATR(14)' using actual fill price and entry-bar volatility."
+    }
+  ]
+}
+```

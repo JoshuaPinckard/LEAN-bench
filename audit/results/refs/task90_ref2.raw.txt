@@ -1,0 +1,179 @@
+```python
+import math
+import statistics
+import backtrader as bt
+
+
+class PortfolioOptimizationStrategy(bt.Strategy):
+    params = (
+        ("lookback", 60),
+        ("risk_coeff", 2.5),
+        ("transaction_cost", 0.001),
+        ("turnover_limit", 0.20),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.last_month = None
+        self.portfolio_values = []
+        self.daily_returns = []
+        self.reports = []
+        self.total_tx_costs = 0.0
+        self.final_report = {}
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order.status == order.Completed:
+                self.total_tx_costs += order.executed.comm
+            self.order = None
+
+    def next(self):
+        cur_val = self.broker.getvalue()
+        if self.portfolio_values:
+            prev_val = self.portfolio_values[-1]
+            if prev_val > 0:
+                ret = (cur_val - prev_val) / prev_val
+                self.daily_returns.append(ret)
+        self.portfolio_values.append(cur_val)
+
+        if self.order:
+            return
+
+        if len(self) < self.p.lookback + 1:
+            return
+
+        current_date = self.data.datetime.date(0)
+        current_month = current_date.month
+
+        if self.last_month is None:
+            self.last_month = current_month
+            return
+
+        if current_month == self.last_month:
+            return
+
+        self.last_month = current_month
+
+        closes = [self.data.close[-i] for i in range(self.p.lookback, -1, -1)]
+        asset_returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]
+
+        mu = statistics.mean(asset_returns)
+        var = statistics.variance(asset_returns) if len(asset_returns) > 1 else 1e-6
+        if var <= 0:
+            var = 1e-6
+
+        pos_size = self.position.size
+        pos_val = pos_size * self.data.close[0]
+        w_curr = pos_val / cur_val if cur_val > 0 else 0.0
+
+        gamma = self.p.risk_coeff
+        c = self.p.transaction_cost
+        turnover = self.p.turnover_limit
+
+        w_min = max(0.0, w_curr - turnover)
+        w_max = min(1.0, w_curr + turnover)
+
+        def utility(w):
+            return w * mu - 0.5 * gamma * var * (w ** 2) - c * abs(w - w_curr)
+
+        candidates = {w_curr, w_min, w_max}
+
+        if gamma * var > 0:
+            w_plus = (mu - c) / (gamma * var)
+            if w_curr <= w_plus <= w_max:
+                candidates.add(w_plus)
+            w_minus = (mu + c) / (gamma * var)
+            if w_min <= w_minus <= w_curr:
+                candidates.add(w_minus)
+
+        best_w = w_curr
+        best_u = utility(w_curr)
+
+        for w in candidates:
+            w_clamped = max(w_min, min(w_max, w))
+            u = utility(w_clamped)
+            if u > best_u:
+                best_u = u
+                best_w = w_clamped
+
+        if abs(best_w - w_curr) > 1e-4:
+            self.order = self.order_target_percent(target=best_w)
+
+        if len(self.daily_returns) > 1:
+            mean_ret = statistics.mean(self.daily_returns)
+            std_ret = statistics.stdev(self.daily_returns)
+            ann_ret = mean_ret * 252
+            ann_vol = std_ret * math.sqrt(252)
+            sharpe = (ann_ret / ann_vol) if ann_vol > 0 else 0.0
+        else:
+            ann_ret = 0.0
+            ann_vol = 0.0
+            sharpe = 0.0
+
+        period_tx_cost = c * abs(best_w - w_curr) * cur_val
+        risk_contrib = 1.0 if best_w > 0 else 0.0
+
+        report_entry = {
+            "date": current_date.isoformat(),
+            "current_weight": round(w_curr, 4),
+            "target_weight": round(best_w, 4),
+            "period_tx_cost": round(period_tx_cost, 2),
+            "cum_return": round((cur_val - self.portfolio_values[0]) / self.portfolio_values[0], 4),
+            "ann_return": round(ann_ret, 4),
+            "ann_volatility": round(ann_vol, 4),
+            "sharpe_ratio": round(sharpe, 4),
+            "risk_contribution_pct": round(risk_contrib, 4),
+        }
+        self.reports.append(report_entry)
+
+    def stop(self):
+        cur_val = self.broker.getvalue()
+        init_val = self.portfolio_values[0] if self.portfolio_values else 10000.0
+        tot_ret = (cur_val - init_val) / init_val
+        if len(self.daily_returns) > 1:
+            std_ret = statistics.stdev(self.daily_returns)
+            mean_ret = statistics.mean(self.daily_returns)
+            ann_ret = mean_ret * 252
+            ann_vol = std_ret * math.sqrt(252)
+            sharpe = (ann_ret / ann_vol) if ann_vol > 0 else 0.0
+        else:
+            ann_ret = 0.0
+            ann_vol = 0.0
+            sharpe = 0.0
+
+        self.final_report = {
+            "total_return": round(tot_ret, 4),
+            "ann_return": round(ann_ret, 4),
+            "ann_volatility": round(ann_vol, 4),
+            "sharpe_ratio": round(sharpe, 4),
+            "total_tx_costs": round(self.total_tx_costs, 2),
+            "rebalance_count": len(self.reports),
+        }
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "single_asset_portfolio",
+      "choice": "Optimized weight allocation between single risky asset (AAPL) and cash with sum of weights equal to 1.0.",
+      "reason": "Execution environment contains a single data feed (AAPL)."
+    },
+    {
+      "topic": "alpha_forecasting_model",
+      "choice": "Rolling historical mean daily return over a 60-day window.",
+      "reason": "Spec requires expected return forecast; rolling historical mean return is standard."
+    },
+    {
+      "topic": "covariance_matrix",
+      "choice": "Rolling sample variance of daily returns over a 60-day window.",
+      "reason": "For a single risky asset, the covariance matrix reduces to the variance of returns."
+    },
+    {
+      "topic": "rebalancing_frequency",
+      "choice": "Monthly rebalancing on the first trading day of each month after warm-up.",
+      "reason": "Spec specifies fixed periodic rebalancing (e.g., monthly)."
+    }
+  ]
+}
+```

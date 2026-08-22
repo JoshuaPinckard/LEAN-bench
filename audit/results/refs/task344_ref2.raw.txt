@@ -1,0 +1,150 @@
+```python
+import backtrader as bt
+
+
+class DonchianSentimentStrategy(bt.Strategy):
+    params = (
+        ('donchian_period', 20),
+        ('atr_period', 14),
+        ('sentiment_sma_period', 20),
+        ('atr_mult', 2.0),
+        ('sentiment_mult', 2.0),
+        ('base_size', 1),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+
+        # Donchian Channels (computed on prior bars to allow crossover detection)
+        self.donchian_upper = bt.indicators.Highest(
+            self.data.high(-1), period=self.p.donchian_period
+        )
+        self.donchian_lower = bt.indicators.Lowest(
+            self.data.low(-1), period=self.p.donchian_period
+        )
+
+        # Average True Range
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        # Sentiment Data Feed handling
+        if len(self.datas) > 1:
+            self.sentiment = self.datas[1].close
+        elif hasattr(self.data, 'sentiment'):
+            self.sentiment = self.data.sentiment
+        else:
+            self.sentiment = self.data.close
+
+        # Sentiment 20-period SMA
+        self.sentiment_sma = bt.indicators.SMA(
+            self.sentiment, period=self.p.sentiment_sma_period
+        )
+
+        # Crossovers
+        self.crossover_upper = bt.indicators.CrossOver(
+            self.data.close, self.donchian_upper
+        )
+        self.crossover_lower = bt.indicators.CrossOver(
+            self.data.close, self.donchian_lower
+        )
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.order:
+                self.order = None
+                if self.position.size > 0 and self.stop_order is None:
+                    stop_price = (
+                        order.executed.price - self.p.atr_mult * self.atr[0]
+                    )
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                        size=abs(self.position.size),
+                    )
+                elif self.position.size < 0 and self.stop_order is None:
+                    stop_price = (
+                        order.executed.price + self.p.atr_mult * self.atr[0]
+                    )
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                        size=abs(self.position.size),
+                    )
+            elif order == self.stop_order:
+                self.stop_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        sentiment_val = float(self.sentiment[0])
+        sma_val = float(self.sentiment_sma[0])
+        denom = max(abs(sma_val), 1e-6)
+        size_mult = 1.0 + self.p.sentiment_mult * abs(
+            (sentiment_val - sma_val) / denom
+        )
+        calc_size = max(1, int(round(self.p.base_size * size_mult)))
+
+        long_signal = (
+            self.crossover_upper[0] > 0 and sentiment_val > sma_val
+        )
+        short_signal = (
+            self.crossover_lower[0] < 0 and sentiment_val < sma_val
+        )
+
+        if self.position.size > 0:
+            if short_signal:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.close()
+                self.order = self.sell(size=calc_size)
+        elif self.position.size < 0:
+            if long_signal:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.close()
+                self.order = self.buy(size=calc_size)
+        else:
+            if long_signal:
+                self.order = self.buy(size=calc_size)
+            elif short_signal:
+                self.order = self.sell(size=calc_size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "sentiment_data_source",
+      "choice": "Access sentiment data from self.datas[1].close if multiple data feeds are passed, else from self.data.sentiment if present as a line, else fall back to self.data.close.",
+      "reason": "The specification mentions a separate 15-minute sentiment data series, while the execution environment notes a single data feed self.data with standard OHLCV columns."
+    },
+    {
+      "topic": "donchian_channel_calculation",
+      "choice": "Calculate upper/lower Donchian bands using highest high and lowest low over the preceding 20 bars (self.data.high(-1) and self.data.low(-1)).",
+      "reason": "Including the current bar in the high/low range calculation makes close[0] strictly less than or equal to upper[0], which would mathematically prevent a close crossover above upper[0]."
+    },
+    {
+      "topic": "base_size",
+      "choice": "Set base_size = 1 and round calculated position_size to integer with a minimum of 1 share.",
+      "reason": "The specification details the position_size scaling formula using base_size but does not state a numerical value for base_size."
+    },
+    {
+      "topic": "stop_loss_execution",
+      "choice": "Set stop-loss order in notify_order upon entry completion using order.executed.price and current ATR.",
+      "reason": "The specification dictates setting stop-loss relative to exact entry_price, which is finalized when the entry order is executed."
+    }
+  ]
+}
+```

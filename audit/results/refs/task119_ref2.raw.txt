@@ -1,0 +1,169 @@
+```python
+import math
+import statistics
+import backtrader as bt
+
+
+class SupplyDemandGoldStrategy(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('risk_pct', 0.01),
+        ('min_zone_height_pct', 0.005),
+        ('sl_buffer_pct', 0.005),
+        ('consolidation_bars', 4),
+        ('sharp_move_pct', 0.005),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.order = None
+        self.demand_zones = []
+        self.supply_zones = []
+        self.daily_closes = []
+        self.last_date = None
+        self.sl_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        if self.last_date is None:
+            self.last_date = current_date
+        elif current_date != self.last_date:
+            self.daily_closes.append(self.data.close[-1])
+            self.last_date = current_date
+
+        daily_trend = 0
+        if len(self.daily_closes) >= 5:
+            sma_len = min(len(self.daily_closes), 20)
+            daily_sma = statistics.mean(self.daily_closes[-sma_len:])
+            current_close = self.data.close[0]
+            if current_close > daily_sma:
+                daily_trend = 1
+            elif current_close < daily_sma:
+                daily_trend = -1
+
+        if len(self) > self.p.consolidation_bars + 1:
+            highs = [self.data.high[-i] for i in range(1, self.p.consolidation_bars + 1)]
+            lows = [self.data.low[-i] for i in range(1, self.p.consolidation_bars + 1)]
+            c_high = max(highs)
+            c_low = min(lows)
+            c_height = c_high - c_low
+            current_close = self.data.close[0]
+
+            if current_close > 0 and (c_height / current_close) >= self.p.min_zone_height_pct:
+                if (current_close - c_high) / c_high >= self.p.sharp_move_pct:
+                    dz = {
+                        'lower': c_low,
+                        'upper': c_high,
+                        'central': (c_low + c_high) / 2.0
+                    }
+                    if not any(abs(z['lower'] - c_low) < 1e-4 and abs(z['upper'] - c_high) < 1e-4 for z in self.demand_zones):
+                        self.demand_zones.append(dz)
+
+                if (c_low - current_close) / c_low >= self.p.sharp_move_pct:
+                    sz = {
+                        'lower': c_low,
+                        'upper': c_high,
+                        'central': (c_low + c_high) / 2.0
+                    }
+                    if not any(abs(z['lower'] - c_low) < 1e-4 and abs(z['upper'] - c_high) < 1e-4 for z in self.supply_zones):
+                        self.supply_zones.append(sz)
+
+        self.demand_zones = [dz for dz in self.demand_zones if self.data.close[0] >= dz['lower']]
+        self.supply_zones = [sz for sz in self.supply_zones if self.data.close[0] <= sz['upper']]
+
+        if self.position:
+            if self.position.size > 0:
+                if self.sl_price and self.data.low[0] <= self.sl_price:
+                    self.close()
+                elif self.tp_price and self.data.high[0] >= self.tp_price:
+                    self.close()
+            elif self.position.size < 0:
+                if self.sl_price and self.data.high[0] >= self.sl_price:
+                    self.close()
+                elif self.tp_price and self.data.low[0] <= self.tp_price:
+                    self.close()
+            return
+
+        if self.order:
+            return
+
+        if daily_trend == 1:
+            for dz in self.demand_zones:
+                if self.data.low[0] <= dz['upper'] and self.data.high[0] >= dz['lower']:
+                    if self.data.low[0] <= dz['central'] and self.data.close[0] > dz['central']:
+                        if self.rsi[0] < 50:
+                            entry_price = self.data.close[0]
+                            sl_price = dz['lower'] * (1.0 - self.p.sl_buffer_pct)
+                            risk = entry_price - sl_price
+                            if risk > 0:
+                                capital = self.broker.getvalue()
+                                size = (capital * self.p.risk_pct) / risk
+                                size = max(1, math.floor(size))
+
+                                higher_supply = [sz for sz in self.supply_zones if sz['lower'] > entry_price]
+                                if higher_supply:
+                                    tp_price = min(sz['lower'] for sz in higher_supply)
+                                else:
+                                    tp_price = entry_price + 2.0 * risk
+
+                                self.sl_price = sl_price
+                                self.tp_price = tp_price
+                                self.order = self.buy(size=size)
+                                break
+
+        elif daily_trend == -1:
+            for sz in self.supply_zones:
+                if self.data.high[0] >= sz['lower'] and self.data.low[0] <= sz['upper']:
+                    if self.data.high[0] >= sz['central'] and self.data.close[0] < sz['central']:
+                        if self.rsi[0] > 50:
+                            entry_price = self.data.close[0]
+                            sl_price = sz['upper'] * (1.0 + self.p.sl_buffer_pct)
+                            risk = sl_price - entry_price
+                            if risk > 0:
+                                capital = self.broker.getvalue()
+                                size = (capital * self.p.risk_pct) / risk
+                                size = max(1, math.floor(size))
+
+                                lower_demand = [dz for dz in self.demand_zones if dz['upper'] < entry_price]
+                                if lower_demand:
+                                    tp_price = max(dz['upper'] for dz in lower_demand)
+                                else:
+                                    tp_price = entry_price - 2.0 * risk
+
+                                self.sl_price = sl_price
+                                self.tp_price = tp_price
+                                self.order = self.sell(size=size)
+                                break
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "timeframe_and_zones",
+      "choice": "Operationalize zone creation on the 1H price feed using a 4-bar consolidation range followed by a sharp expansion move (>= 0.5%), enforcing the minimum 0.5% zone height constraint.",
+      "reason": "The specification mentions combining 1D, 4H, and 1H timeframes. Since the execution harness provides a single 1H data feed, zone formation is computed dynamically on 1H bars with strict height and expansion filters."
+    },
+    {
+      "topic": "trend_filter",
+      "choice": "Track daily closes upon date changes and evaluate the 1D trend using a 20-day Simple Moving Average of daily closes (Uptrend if Close > SMA(20), Downtrend if Close < SMA(20)).",
+      "reason": "The specification requires checking the daily (1D) trend direction but does not specify a specific trend indicator."
+    },
+    {
+      "topic": "risk_management",
+      "choice": "Risk exactly 1% of equity per trade, calculating position size as (Account Value * 0.01) / |Entry Price - Stop Loss|.",
+      "reason": "The specification requires limiting risk per trade to 1-2% of total trading capital."
+    },
+    {
+      "topic": "optional_rsi_filter",
+      "choice": "Include the RSI(14) entry confirmation condition (RSI < 50 for buys, RSI > 50 for sells).",
+      "reason": "The optional condition is explicitly listed in the entry conditions section of the specification."
+    }
+  ]
+}
+```

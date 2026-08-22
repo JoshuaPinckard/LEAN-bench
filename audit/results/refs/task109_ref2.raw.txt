@@ -1,0 +1,177 @@
+```python
+import backtrader as bt
+
+
+class DiscretizedStateStrategy(bt.Strategy):
+    params = (
+        ('sma_period', 20),
+        ('rsi_period', 14),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('bb_period', 20),
+        ('bb_devfactor', 2.0),
+        ('capital_pct', 0.10),
+        ('stop_loss_pct', 0.02),
+        ('take_profit_pct', 0.04),
+    )
+
+    def __init__(self):
+        self.sma = bt.ind.SMA(self.data.close, period=self.p.sma_period)
+        self.rsi = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.ind.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal
+        )
+        self.bb = bt.ind.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor
+        )
+
+        self.entry_order = None
+        self.sl_order = None
+        self.tp_order = None
+
+    def _get_state(self):
+        close = self.data.close[0]
+        sma_val = self.sma[0]
+        rsi_val = self.rsi[0]
+        macd_line = self.macd.macd[0]
+        macd_sig = self.macd.signal[0]
+        bb_top = self.bb.top[0]
+        bb_bot = self.bb.bot[0]
+
+        sma_state = 1 if close > sma_val else 0
+
+        if rsi_val < 30:
+            rsi_state = 0
+        elif rsi_val > 70:
+            rsi_state = 2
+        else:
+            rsi_state = 1
+
+        macd_state = 1 if macd_line > macd_sig else 0
+
+        if close < bb_bot:
+            bb_state = 0
+        elif close > bb_top:
+            bb_state = 2
+        else:
+            bb_state = 1
+
+        return (sma_state, rsi_state, macd_state, bb_state)
+
+    def _get_signal(self, state):
+        sma_s, rsi_s, macd_s, bb_s = state
+
+        if self.position.size > 0:
+            if sma_s == 0 or macd_s == 0 or rsi_s == 2:
+                return 'EXIT_LONG'
+        elif self.position.size < 0:
+            if sma_s == 1 or macd_s == 1 or rsi_s == 0:
+                return 'EXIT_SHORT'
+        else:
+            if sma_s == 1 and macd_s == 1 and rsi_s != 2 and bb_s != 2:
+                return 'BUY'
+            if sma_s == 0 and macd_s == 0 and rsi_s != 0 and bb_s != 0:
+                return 'SELL'
+
+        return 'NOTHING'
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.entry_order:
+                self.entry_order = None
+                exec_price = order.executed.price
+                exec_size = abs(order.executed.size)
+
+                if self.position.size > 0:
+                    sl_price = exec_price * (1.0 - self.p.stop_loss_pct)
+                    tp_price = exec_price * (1.0 + self.p.take_profit_pct)
+                    self.sl_order = self.sell(size=exec_size, exectype=bt.Order.Stop, price=sl_price)
+                    self.tp_order = self.sell(size=exec_size, exectype=bt.Order.Limit, price=tp_price)
+                elif self.position.size < 0:
+                    sl_price = exec_price * (1.0 + self.p.stop_loss_pct)
+                    tp_price = exec_price * (1.0 - self.p.take_profit_pct)
+                    self.sl_order = self.buy(size=exec_size, exectype=bt.Order.Stop, price=sl_price)
+                    self.tp_order = self.buy(size=exec_size, exectype=bt.Order.Limit, price=tp_price)
+
+            elif order in [self.sl_order, self.tp_order]:
+                if order == self.sl_order and self.tp_order:
+                    self.cancel(self.tp_order)
+                elif order == self.tp_order and self.sl_order:
+                    self.cancel(self.sl_order)
+                self.sl_order = None
+                self.tp_order = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.entry_order:
+                self.entry_order = None
+            if order == self.sl_order:
+                self.sl_order = None
+            if order == self.tp_order:
+                self.tp_order = None
+
+    def next(self):
+        if self.entry_order:
+            return
+
+        state = self._get_state()
+        signal = self._get_signal(state)
+
+        if self.position.size > 0:
+            if signal == 'EXIT_LONG':
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                self.entry_order = self.close()
+        elif self.position.size < 0:
+            if signal == 'EXIT_SHORT':
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                    self.tp_order = None
+                self.entry_order = self.close()
+        else:
+            if signal in ['BUY', 'SELL']:
+                capital = self.broker.getvalue() * self.p.capital_pct
+                size = int(capital / self.data.close[0])
+                if size > 0:
+                    if signal == 'BUY':
+                        self.entry_order = self.buy(size=size)
+                    elif signal == 'SELL':
+                        self.entry_order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "state_discretization",
+      "choice": "Discretized indicators into standard bins: SMA (1 if Close > SMA, 0 otherwise), RSI (0 if <30, 2 if >70, 1 otherwise), MACD (1 if macd > signal, 0 otherwise), Bollinger Bands (0 if < lower band, 2 if > upper band, 1 otherwise).",
+      "reason": "The spec requires discretizing four indicators into discrete states but leaves explicit quantization thresholds unstated."
+    },
+    {
+      "topic": "state_action_mapping",
+      "choice": "BUY signal maps to bullish state confluence (SMA=1, MACD=1, RSI!=2, BB!=2); SELL signal maps to bearish state confluence (SMA=0, MACD=0, RSI!=0, BB!=0); Exit signals trigger when trend/momentum states break.",
+      "reason": "The specification states that entry/exit decisions are derived from identified states without specifying the pre-computed policy table."
+    },
+    {
+      "topic": "stop_loss_and_take_profit_execution",
+      "choice": "Placed Stop and Limit orders upon position entry completion based on actual executed fill price (2% SL, 4% TP).",
+      "reason": "The specification requires 2% stop-loss and 4% take-profit relative to the entry price."
+    }
+  ]
+}
+```

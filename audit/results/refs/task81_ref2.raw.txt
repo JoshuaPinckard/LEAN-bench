@@ -1,0 +1,152 @@
+```python
+import collections
+import math
+import statistics
+import backtrader as bt
+
+
+class ContinuousEventPredictiveStrategy(bt.Strategy):
+    params = (
+        ("mode", "continuous"),  # 'continuous' or 'event_driven'
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.order = None
+
+        # Rolling history buffers for online linear regression
+        self.reg_history = collections.deque(maxlen=100)
+        self.x_history = collections.deque(maxlen=10)
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+        open_ = self.data.open[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+
+        hl_range = max(high - low, 1e-6)
+
+        # Feature 1: Order Imbalance proxy via Close-Open relative to High-Low range
+        oi = (close - open_) / hl_range
+        oi = max(-1.0, min(1.0, oi))
+
+        # Feature 2: Trade Imbalance proxy via Close change relative to High-Low range
+        if len(self.data) > 1:
+            ti = (close - self.data.close[-1]) / hl_range
+            ti = max(-1.0, min(1.0, ti))
+        else:
+            ti = 0.0
+
+        # Composite feature x_curr
+        x_curr = 0.5 * oi + 0.5 * ti
+
+        # Update regression training data (predicting 5-bar future return)
+        if len(self.data) >= 6 and len(self.x_history) >= 5:
+            x_past = self.x_history[-5]
+            y_past = (close - self.data.close[-5]) / self.data.close[-5]
+            self.reg_history.append((x_past, y_past))
+
+        self.x_history.append(x_curr)
+
+        # Compute forecast using simple linear regression (OLS)
+        if len(self.reg_history) >= 20:
+            x_vals = [p[0] for p in self.reg_history]
+            y_vals = [p[1] for p in self.reg_history]
+
+            x_mean = statistics.mean(x_vals)
+            y_mean = statistics.mean(y_vals)
+
+            num = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, y_vals))
+            den = sum((x - x_mean) ** 2 for x in x_vals)
+
+            beta = num / den if den > 1e-12 else 0.0
+            alpha = y_mean - beta * x_mean
+
+            y_pred = alpha + beta * x_curr
+            y_std = statistics.stdev(y_vals) if len(y_vals) > 1 else 1e-4
+            if y_std < 1e-6:
+                y_std = 1e-6
+
+            # Scale prediction to [-1, 1] range
+            forecast = y_pred / (2.0 * y_std)
+            forecast = max(-1.0, min(1.0, forecast))
+        else:
+            forecast = max(-1.0, min(1.0, x_curr))
+
+        # Exit condition: close position when forecast changes sign
+        if self.position:
+            if self.position.size > 0 and forecast < 0:
+                self.order = self.close()
+                return
+            elif self.position.size < 0 and forecast > 0:
+                self.order = self.close()
+                return
+
+        # Entry logic (only if currently out of market)
+        if not self.position:
+            # Volatility filter: ATR(14) >= 0.1% of asset price
+            if self.atr[0] < 0.001 * close:
+                return
+
+            # Trading window filter: 10:00 to 16:00
+            t = self.data.datetime.time(0)
+            time_mins = t.hour * 60 + t.minute
+            if not (10 * 60 <= time_mins <= 16 * 60):
+                return
+
+            # Position sizing: 100% of available cash (adjusted for commission)
+            cash = self.broker.getcash()
+            size = (cash * 0.999) / close
+
+            if self.p.mode == "continuous":
+                if forecast > 0.2:
+                    self.order = self.buy(size=size)
+                elif forecast < -0.2:
+                    self.order = self.sell(size=size)
+            elif self.p.mode == "event_driven":
+                # Event criterion: absolute value of Order Imbalance > 0.6
+                if abs(oi) > 0.6:
+                    if forecast > 0.5:
+                        self.order = self.buy(size=size)
+                    elif forecast < -0.5:
+                        self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Proxy Order Imbalance and Trade Imbalance using OHLCV bar features.",
+      "reason": "The input data feed consists of 1m OHLCV bars without orderbook depth or tick trade flow data. Order Imbalance is proxied as (Close - Open) / (High - Low + 1e-6) and Trade Imbalance as (Close - Close[-1]) / (High - Low + 1e-6)."
+    },
+    {
+      "topic": "predictive_model",
+      "choice": "Rolling online OLS regression forecasting 5-bar future returns from composite imbalance features.",
+      "reason": "The spec requires a simple predictive model forecasting future returns (e.g., over 5 bars) outputting values in [-1, 1]. OLS regression is fit on rolling 5-bar return history without lookahead bias and scaled by return volatility."
+    },
+    {
+      "topic": "model_comparison_mode",
+      "choice": "Strategy parameter 'mode' defaults to 'continuous' and supports 'event_driven'.",
+      "reason": "The specification details two operational modes (Continuous vs Event-Driven). A parameter allows selecting either mode within the single strategy class."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Allocate 99.9% of available cash divided by current close price.",
+      "reason": "Spec mandates 100% of available capital per trade; a 0.1% safety margin covers broker commissions to prevent order rejection."
+    }
+  ]
+}
+```

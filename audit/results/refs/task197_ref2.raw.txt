@@ -1,0 +1,223 @@
+```python
+import math
+import backtrader as bt
+
+
+class XAUUSDRetestStrategy(bt.Strategy):
+    params = (
+        ("sma_period", 50),
+        ("atr_period", 14),
+        ("sma_slope_bars", 5),
+        ("retest_window", 10),
+        ("breakout_atr_mult", 0.25),
+        ("retest_atr_mult", 0.25),
+        ("entry_atr_mult", 0.5),
+        ("sl_atr_mult", 0.5),
+        ("risk_pct", 0.01),
+        ("vol_atr_pct", 0.025),
+        ("vol_range_pct", 0.035),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.pivot_highs = []
+        self.pivot_lows = []
+
+        self.active_S = None
+        self.breakout_bar_idx = None
+
+        self.entry_order = None
+        self.entry_bar = None
+        self.sl_order = None
+        self.tp_orders = []
+        self.sl_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.entry_order:
+                self.entry_order = None
+                entry_price = order.executed.price
+                size = order.executed.size
+
+                R = entry_price - self.sl_price
+                tp1 = entry_price + 2.0 * R
+                tp2 = entry_price + 4.0 * R
+                tp3 = entry_price + 6.0 * R
+                tp4 = entry_price + 8.0 * R
+
+                q1 = int(size * 0.25)
+                q2 = int(size * 0.25)
+                q3 = int(size * 0.25)
+                q4 = size - q1 - q2 - q3
+
+                self.sl_order = self.sell(
+                    size=size, price=self.sl_price, exectype=bt.Order.Stop
+                )
+
+                self.tp_orders = []
+                if q1 > 0:
+                    self.tp_orders.append(
+                        self.sell(size=q1, price=tp1, exectype=bt.Order.Limit)
+                    )
+                if q2 > 0:
+                    self.tp_orders.append(
+                        self.sell(size=q2, price=tp2, exectype=bt.Order.Limit)
+                    )
+                if q3 > 0:
+                    self.tp_orders.append(
+                        self.sell(size=q3, price=tp3, exectype=bt.Order.Limit)
+                    )
+                if q4 > 0:
+                    self.tp_orders.append(
+                        self.sell(size=q4, price=tp4, exectype=bt.Order.Limit)
+                    )
+
+            elif order == self.sl_order:
+                self.sl_order = None
+                for tp in self.tp_orders:
+                    self.cancel(tp)
+                self.tp_orders = []
+
+            elif order in self.tp_orders:
+                self.tp_orders.remove(order)
+                if self.sl_order:
+                    self.cancel(self.sl_order)
+                    self.sl_order = None
+                if self.position.size > 0:
+                    self.sl_order = self.sell(
+                        size=self.position.size,
+                        price=self.sl_price,
+                        exectype=bt.Order.Stop,
+                    )
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.entry_order:
+                self.entry_order = None
+            elif order == self.sl_order:
+                self.sl_order = None
+            elif order in self.tp_orders:
+                self.tp_orders.remove(order)
+
+    def next(self):
+        if self.entry_order and len(self) > self.entry_bar:
+            self.cancel(self.entry_order)
+            self.entry_order = None
+
+        if len(self) >= 3:
+            if (
+                self.data.high[-1] > self.data.high[-2]
+                and self.data.high[-1] > self.data.high[0]
+            ):
+                self.pivot_highs.append(self.data.high[-1])
+            if (
+                self.data.low[-1] < self.data.low[-2]
+                and self.data.low[-1] < self.data.low[0]
+            ):
+                self.pivot_lows.append(self.data.low[-1])
+
+        if self.pivot_highs:
+            latest_ph = self.pivot_highs[-1]
+            if (
+                self.data.close[0]
+                > latest_ph + self.p.breakout_atr_mult * self.atr[0]
+            ):
+                self.active_S = latest_ph
+                self.breakout_bar_idx = len(self)
+
+        if (
+            self.active_S is not None
+            and not self.position
+            and not self.entry_order
+        ):
+            days_since = len(self) - self.breakout_bar_idx
+            if days_since > self.p.retest_window:
+                self.active_S = None
+            elif 1 <= days_since <= self.p.retest_window:
+                S = self.active_S
+                atr_0 = self.atr[0]
+
+                retest_touch = (
+                    abs(self.data.low[0] - S) <= self.p.retest_atr_mult * atr_0
+                )
+
+                if retest_touch:
+                    c0 = self.data.close[0]
+                    o0 = self.data.open[0]
+                    l0 = self.data.low[0]
+                    h0 = self.data.high[0]
+
+                    is_hammer = (c0 > o0) and ((o0 - l0) >= 1.5 * (c0 - o0))
+                    is_engulfing = (c0 > self.data.high[-1]) and (
+                        o0 <= self.data.close[-1]
+                    )
+                    is_long_wick = (l0 <= S) and (c0 > o0)
+
+                    pa_signal = is_hammer or is_engulfing or is_long_wick
+
+                    if pa_signal:
+                        uptrend = (c0 > self.sma[0]) and (
+                            self.sma[0] > self.sma[-self.p.sma_slope_bars]
+                        )
+                        ascending = (len(self.pivot_lows) >= 2) and (
+                            self.pivot_lows[-1] > self.pivot_lows[-2]
+                        )
+                        vol_ok = (atr_0 / c0 <= self.p.vol_atr_pct) and (
+                            (h0 - l0) / c0 <= self.p.vol_range_pct
+                        )
+
+                        if uptrend and ascending and vol_ok:
+                            sl_price = S - self.p.sl_atr_mult * atr_0
+                            max_entry = S + self.p.entry_atr_mult * atr_0
+                            risk_per_share = max_entry - sl_price
+
+                            equity = self.broker.getvalue()
+                            risk_amount = self.p.risk_pct * equity
+
+                            qty = math.floor(risk_amount / risk_per_share)
+                            if qty >= 1:
+                                self.entry_order = self.buy(
+                                    size=qty,
+                                    price=max_entry,
+                                    exectype=bt.Order.Limit,
+                                )
+                                self.entry_bar = len(self)
+                                self.sl_price = sl_price
+                                self.active_S = None
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "pivot_definition",
+      "choice": "Pivot high (low) with 3-bar window is confirmed at bar t if High[t-1] > High[t-2] and High[t-1] > High[t] (or Low[t-1] < Low[t-2] and Low[t-1] < Low[t]).",
+      "reason": "A 3-bar window centered at bar t-1 requires bar t to complete before confirming the pivot point."
+    },
+    {
+      "topic": "retest_tolerance",
+      "choice": "Retest touch condition is implemented as abs(Low - S) <= 0.25 * ATR(14).",
+      "reason": "Touches level S with tolerance <= 0.25*ATR(14) means the day's Low comes within 0.25*ATR distance of S."
+    },
+    {
+      "topic": "entry_execution_and_cancellation",
+      "choice": "Entry order is submitted as a Limit Buy at S + 0.5 * ATR(14). Unfilled orders are cancelled at the end of the entry day.",
+      "reason": "Enforces execution at the next day's Open only if Open <= S + 0.5*ATR(14), skipping the entry if price opens above the threshold."
+    },
+    {
+      "topic": "position_sizing_risk",
+      "choice": "Maximum risk per share for quantity calculation is defined as (S + 0.5*ATR) - SL = 1.0 * ATR(14).",
+      "reason": "Ensures that (Entry - SL) * quantity <= 1% of current equity for any valid execution price <= S + 0.5*ATR."
+    },
+    {
+      "topic": "partial_tp_sizing",
+      "choice": "Total position size Q is split into q1 = q2 = q3 = int(Q * 0.25) and q4 = Q - q1 - q2 - q3.",
+      "reason": "Accurately distributes the total volume into 4 partial exit orders while handling integer rounding."
+    }
+  ]
+}
+```

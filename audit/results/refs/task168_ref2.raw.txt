@@ -1,0 +1,120 @@
+```python
+import backtrader as bt
+
+
+class LeapCallProxyStrategy(bt.Strategy):
+    def __init__(self):
+        self.sma50 = bt.ind.SMA(self.data.close, period=50)
+        self.sma200 = bt.ind.SMA(self.data.close, period=200)
+        self.atr = bt.ind.ATR(self.data, period=14)
+        self.sma14 = bt.ind.SMA(self.data.close, period=14)
+        self.bb = bt.ind.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.sma_vol = bt.ind.SMA(self.data.volume, period=20)
+        self.stoch = bt.ind.Stochastic(self.data)
+
+        self.order = None
+        self.initial_bought = False
+        self.bars_in_trade = 0
+        self.bars_since_exit = 0
+        self.last_exit_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.bars_in_trade = 0
+            elif order.issell():
+                self.last_exit_price = order.executed.price
+                self.bars_since_exit = 0
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        # Initial entry: spec assumes initial long position is already open
+        if not self.position and not self.initial_bought:
+            target_val = 0.25 * self.broker.getvalue()
+            size = int(target_val / self.data.close[0])
+            if size > 0:
+                self.initial_bought = True
+                self.order = self.buy(size=size)
+            return
+
+        if self.position:
+            self.bars_in_trade += 1
+            entry_price = self.position.price
+
+            # (1) Take-profit: Close >= Entry * 1.10
+            cond1 = self.data.close[0] >= entry_price * 1.10
+
+            # (2) Holding time limit: BarsInTrade >= 380
+            cond2 = self.bars_in_trade >= 380
+
+            # (3) Relative volatility spike: ((BB.top - BB.bot)/BB.mid) - (ATR(14)/SMA(14)) > 0.10
+            bb_top = self.bb.top[0]
+            bb_bot = self.bb.bot[0]
+            bb_mid = self.bb.mid[0]
+            bb_width = (bb_top - bb_bot) / bb_mid if bb_mid != 0 else 0
+            atr_pct = (
+                self.atr[0] / self.sma14[0] if self.sma14[0] != 0 else 0
+            )
+            cond3 = (bb_width - atr_pct) > 0.10
+
+            # (4) Before an event proxy: price inc > 5% and Volume > 1.5 * SMA(20) and Stochastic > 80
+            price_inc = (self.data.close[0] - entry_price) / entry_price
+            vol_spike = self.data.volume[0] > 1.5 * self.sma_vol[0]
+            stoch_high = self.stoch.percK[0] > 80
+            cond4 = (price_inc > 0.05) and vol_spike and stoch_high
+
+            if cond1 or cond2 or cond3 or cond4:
+                self.order = self.close()
+
+        else:
+            # Roll (re-entry) logic
+            if self.last_exit_price is not None:
+                self.bars_since_exit += 1
+                if self.bars_since_exit >= 10:
+                    price_diff = (
+                        abs(self.data.close[0] - self.last_exit_price)
+                        / self.last_exit_price
+                    )
+                    trend_ok = self.sma50[0] > self.sma200[0]
+                    if price_diff <= 0.03 and trend_ok:
+                        target_val = 0.25 * self.broker.getvalue()
+                        size = int(target_val / self.data.close[0])
+                        if size > 0:
+                            self.order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "Initial entry handling",
+      "choice": "Open a long position on the first bar after indicator warm-up",
+      "reason": "Specification states that the initial long position is assumed open and entry is not modeled, but Backtrader requires an explicit buy order to establish position tracking."
+    },
+    {
+      "topic": "Position sizing calculation",
+      "choice": "Size = floor(0.25 * broker portfolio value / close price)",
+      "reason": "Specification requires long value not to exceed 25% of the portfolio."
+    },
+    {
+      "topic": "Stochastic line selection",
+      "choice": "Use percK line of standard Stochastic(14, 3, 3) indicator",
+      "reason": "Specification refers to Stochastic > 80 without specifying parameter set or line; %K line of default parameters is canonical."
+    },
+    {
+      "topic": "Bars in trade counter",
+      "choice": "Increment counter on each bar spent in position, starting at 1 on first bar following buy order execution",
+      "reason": "Accurately tracks duration of open trade against the 380 bar holding time limit."
+    }
+  ]
+}
+```

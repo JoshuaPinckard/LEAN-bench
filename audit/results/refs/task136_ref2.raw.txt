@@ -1,77 +1,81 @@
 ```python
+import math
 import backtrader as bt
 
 
-class QCBStrategy(bt.Strategy):
-
-    ENTRY_LEVEL = 179.33
-    TP1_LEVEL = 184.89
-    TP2_LEVEL = 192.95
-    RISK_PCT = 0.02
+class NVDABreakoutStrategy(bt.Strategy):
+    params = (
+        ('ema_period', 8),
+        ('breakout_level', 179.33),
+        ('tp1_level', 184.89),
+        ('tp2_level', 192.95),
+        ('risk_pct', 0.02),
+    )
 
     def __init__(self):
-        self.ema8 = bt.indicators.EMA(self.data.close, period=8)
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
         self.order = None
+        self.stop_price = 0.0
         self.tp1_done = False
-        self.trailing_stop_level = None
-        self.entry_size = 0
 
     def notify_order(self, order):
         if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
-            if order is self.order:
-                self.order = None
-                if order.status == order.Completed and order.isbuy():
-                    self.entry_size = order.executed.size
+            self.order = None
 
     def next(self):
         if self.order:
             return
 
         if not self.position:
-            self.tp1_done = False
-            self.trailing_stop_level = None
-
-            if self.data.close[0] > self.ENTRY_LEVEL:
+            if self.data.close[0] > self.p.breakout_level:
                 entry_price = self.data.close[0]
-                initial_stop = self.ema8[0]
-                risk_per_share = entry_price - initial_stop
+                init_stop = self.ema[0]
+                risk_per_share = entry_price - init_stop
 
-                if risk_per_share <= 0:
-                    return
+                if risk_per_share > 0:
+                    capital = self.broker.getvalue()
+                    max_risk = capital * self.p.risk_pct
+                    size = int(max_risk / risk_per_share)
 
-                portfolio_value = self.broker.getvalue()
-                risk_amount = portfolio_value * self.RISK_PCT
-                size = int(risk_amount / risk_per_share)
+                    cash = self.broker.getcash()
+                    max_cash_size = int(cash / entry_price)
+                    size = min(size, max_cash_size)
 
-                if size <= 0:
-                    return
-
-                self.trailing_stop_level = initial_stop
-                self.order = self.buy(size=size)
-
+                    if size > 0:
+                        self.order = self.buy(size=size)
+                        self.stop_price = init_stop
+                        self.tp1_done = False
         else:
-            # Advance trailing stop to current EMA level but never retreat
-            self.trailing_stop_level = max(self.trailing_stop_level, self.ema8[0])
-            close = self.data.close[0]
+            self.stop_price = max(self.stop_price, self.ema[0])
 
-            # Final take-profit: close the remaining position
-            if self.tp1_done and close >= self.TP2_LEVEL:
+            if self.data.low[0] <= self.stop_price:
                 self.order = self.close()
-                return
-
-            # Take-profit 1: close 50% of original entry size
-            if not self.tp1_done and close >= self.TP1_LEVEL:
-                tp1_size = self.entry_size // 2
-                if tp1_size > 0:
-                    self.order = self.sell(size=tp1_size)
+            elif self.data.high[0] >= self.p.tp2_level:
+                self.order = self.close()
+            elif not self.tp1_done and self.data.high[0] >= self.p.tp1_level:
+                half_size = max(1, self.position.size // 2)
+                self.order = self.sell(size=half_size)
                 self.tp1_done = True
-                return
-
-            # Trailing stop: close entire remaining position
-            if close <= self.trailing_stop_level:
-                self.order = self.close()
 ```
 
 ```json
-{"assumptions": [{"topic": "trailing stop interpretation", "choice": "Stop level is placed AT the EMA(8) value and updated each bar as max(prev_stop_level, ema8[0]), so it ratchets upward with price but never retreats.", "reason": "Literal reading of 'lagging by a distance equal to the value of the 8-period EMA' would set stop = close - EMA; since EMA ≈ $180–$900 across the feed, that yields a stop near zero or negative—meaningless for risk management. The only sensible reading consistent with the clarifying sentence ('will not fall below its previous value') is that the EMA line itself is the trailing stop level, locked upward with max()."}, {"topic": "50% partial close size", "choice": "TP1 sell size = entry_size // 2 (integer floor division). If entry_size == 1, tp1_done is set to True without a sell, and the single share is held for TP2 or the trailing stop.", "reason": "Fractional shares are not supported in backtrader. Floor division is the standard rounding choice; the residual share(s) remain for the second exit."}, {"topic": "initial trailing stop timing", "choice": "Trailing stop is initialised to EMA(8) at the close of the signal bar (bar N). The buy order fills at bar N+1 open; the stop is already set before bar N+1's next() runs and is then updated with the bar N+1 EMA via max().", "reason": "Market orders in backtrader fill at the following bar's open. Capturing the EMA at signal time is the closest available approximation; the max() update on bar N+1 corrects any one-bar lag."}, {"topic": "risk calculation base", "choice": "broker.getvalue() (total portfolio equity including any open-position mark-to-market) at the close of the signal bar is used as 'total trading capital'.", "reason": "The spec says '2% of total trading capital'; broker.getvalue() is the canonical backtrader measure of total account equity."}, {"topic": "TP price condition operator", "choice": "Take-profit triggers when close >= TP level (greater-than-or-equal).", "reason": "The spec says 'upon reaching the price'. On daily bars an exact float equality hit is practically impossible; >= is the standard interpretation of 'reaching or exceeding a price level'."}, {"topic": "trailing stop comparison price", "choice": "Closing price is compared against the trailing stop level each bar.", "reason": "All conditions in the spec are evaluated at daily bar close. Intrabar stop simulation would require tick or minute data not present in the feed."}, {"topic": "re-entry after exit", "choice": "Re-entry is permitted on any subsequent bar where close > 179.33 after the position is fully closed.", "reason": "The spec states an entry condition without restricting it to a single trade lifetime. The canonical default (no re-entry while a position is open) is satisfied; once flat the strategy follows its stated entry rule anew."}]}
+{
+  "assumptions": [
+    {
+      "topic": "trailing_stop_interpretation",
+      "choice": "Set initial trailing stop at EMA(8) value at signal time, and ratchet upward to max(previous_stop, EMA(8)) on each subsequent bar.",
+      "reason": "Spec states trailing stop lags by a distance equal to the 8-period EMA and moves upward without falling below previous values; placing ratcheted stop at EMA(8) satisfies all stated properties."
+    },
+    {
+      "topic": "exit_execution",
+      "choice": "Evaluate exit conditions in next() using current bar High/Low prices and submit market orders upon condition detection.",
+      "reason": "Dynamic EMA trailing stop updates continuously, making per-bar intrabar extreme checks with market order submissions the standard Backtrader implementation choice."
+    },
+    {
+      "topic": "partial_take_profit_rounding",
+      "choice": "Close max(1, position.size // 2) shares when TP1 threshold is reached.",
+      "reason": "Position size must be an integer number of shares; integer division with a minimum of 1 share handles odd-lot or single-share positions cleanly."
+    }
+  ]
+}
 ```

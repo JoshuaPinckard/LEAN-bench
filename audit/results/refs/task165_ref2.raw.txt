@@ -1,0 +1,181 @@
+```python
+import backtrader as bt
+
+
+class Fibo114XBBATRProxy(bt.Strategy):
+    params = (
+        ("sma_period", 200),
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("ema_period", 9),
+        ("atr_period", 14),
+        ("fibo_factor", 0.114),
+        ("stop_atr_factor", 0.5),
+        ("trail_atr_factor", 1.5),
+        ("risk_pct", 0.01),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.ema)
+
+        self.order = None
+        self.long_armed = False
+        self.short_armed = False
+        self.entry_stop = None
+        self.highest_price = None
+        self.lowest_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        bb_width = self.bb.lines.top[0] - self.bb.lines.bot[0]
+
+        # Check for spike arming conditions
+        # Long spike: close < lower BB band and (lower band - close) >= 0.114 * bb_width in uptrend
+        if self.data.close[0] > self.sma[0]:
+            if (
+                self.data.close[0] < self.bb.lines.bot[0]
+                and (self.bb.lines.bot[0] - self.data.close[0])
+                >= self.p.fibo_factor * bb_width
+            ):
+                self.long_armed = True
+                self.short_armed = False
+
+        # Short spike: close > upper BB band and (close - upper band) >= 0.114 * bb_width in downtrend
+        if self.data.close[0] < self.sma[0]:
+            if (
+                self.data.close[0] > self.bb.lines.top[0]
+                and (self.data.close[0] - self.bb.lines.top[0])
+                >= self.p.fibo_factor * bb_width
+            ):
+                self.short_armed = True
+                self.long_armed = False
+
+        # Signal confirmations
+        long_signal = (
+            self.long_armed
+            and self.crossover[0] > 0
+            and self.data.close[0] > self.sma[0]
+        )
+        short_signal = (
+            self.short_armed
+            and self.crossover[0] < 0
+            and self.data.close[0] < self.sma[0]
+        )
+
+        if self.order:
+            return
+
+        # Position management
+        if self.position.size > 0:
+            # Update high for trailing stop
+            self.highest_price = max(self.highest_price, self.data.high[0])
+            trail_stop = self.highest_price - self.p.trail_atr_factor * self.atr[0]
+            effective_stop = (
+                max(self.entry_stop, trail_stop)
+                if self.entry_stop is not None
+                else trail_stop
+            )
+
+            # Exit logic for Long
+            if short_signal:
+                self.order = self.close()
+                self.short_armed = False
+            elif self.data.high[0] >= self.bb.lines.mid[0]:
+                self.order = self.close()
+            elif self.data.low[0] <= effective_stop:
+                self.order = self.close()
+
+        elif self.position.size < 0:
+            # Update low for trailing stop
+            self.lowest_price = min(self.lowest_price, self.data.low[0])
+            trail_stop = self.lowest_price + self.p.trail_atr_factor * self.atr[0]
+            effective_stop = (
+                min(self.entry_stop, trail_stop)
+                if self.entry_stop is not None
+                else trail_stop
+            )
+
+            # Exit logic for Short
+            if long_signal:
+                self.order = self.close()
+                self.long_armed = False
+            elif self.data.low[0] <= self.bb.lines.mid[0]:
+                self.order = self.close()
+            elif self.data.high[0] >= effective_stop:
+                self.order = self.close()
+
+        else:
+            # Entry logic
+            if long_signal:
+                breakout_level = self.bb.lines.bot[0] - self.p.fibo_factor * bb_width
+                stop_loss_price = (
+                    breakout_level - self.p.stop_atr_factor * self.atr[0]
+                )
+                dist = self.data.close[0] - stop_loss_price
+                if dist > 0:
+                    risk_in_money = self.broker.getvalue() * self.p.risk_pct
+                    size = int(risk_in_money / dist)
+                    if size >= 1:
+                        self.entry_stop = stop_loss_price
+                        self.highest_price = self.data.high[0]
+                        self.order = self.buy(size=size)
+                        self.long_armed = False
+
+            elif short_signal:
+                breakout_level = self.bb.lines.top[0] + self.p.fibo_factor * bb_width
+                stop_loss_price = (
+                    breakout_level + self.p.stop_atr_factor * self.atr[0]
+                )
+                dist = stop_loss_price - self.data.close[0]
+                if dist > 0:
+                    risk_in_money = self.broker.getvalue() * self.p.risk_pct
+                    size = int(risk_in_money / dist)
+                    if size >= 1:
+                        self.entry_stop = stop_loss_price
+                        self.lowest_price = self.data.low[0]
+                        self.order = self.sell(size=size)
+                        self.short_armed = False
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "risk_pct",
+      "choice": "0.01 (1% of total portfolio equity)",
+      "reason": "The specification states a fixed risk of 1-2% of equity per trade; 1% (0.01) was chosen as the concrete parameter value."
+    },
+    {
+      "topic": "spike_arming",
+      "choice": "State tracking via flags (long_armed, short_armed)",
+      "reason": "An extreme breakout spike arms the reversal setup state, which remains active until confirmed by an EMA(9) crossover or overridden by an opposing extreme spike."
+    },
+    {
+      "topic": "exit_price_eval",
+      "choice": "Intraday high/low evaluation for exits",
+      "reason": "Take-profit reaching the BB midline evaluates using bar High for Long positions and bar Low for Short positions; stop-loss and trailing stops evaluate using bar Low for Long and bar High for Short."
+    },
+    {
+      "topic": "opposite_signal_exit",
+      "choice": "Exit open position via self.close() when an opposite entry signal occurs",
+      "reason": "The specification states to close positions upon an opposite signal without explicitly requiring immediate position reversal in the same bar."
+    }
+  ]
+}
+```

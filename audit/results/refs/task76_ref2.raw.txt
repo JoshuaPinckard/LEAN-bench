@@ -1,0 +1,266 @@
+```python
+import math
+import collections
+import statistics
+import backtrader as bt
+
+
+def solve_entropy_pooling(priors, returns, target_return, max_iter=100, tol=1e-8):
+    """
+    Solves for posterior probabilities q minimizing KL divergence D(q || p)
+    subject to sum(q) = 1 and sum(q * returns) = target_return.
+    Returns (q, converged).
+    """
+    n = len(returns)
+    min_r = min(returns)
+    max_r = max(returns)
+
+    if target_return <= min_r or target_return >= max_r:
+        return None, False
+
+    gamma_low = -100.0
+    gamma_high = 100.0
+
+    def get_q_and_mean(gamma):
+        weights = [-gamma * r for r in returns]
+        max_w = max(weights)
+        unnorm = [p * math.exp(w - max_w) for p, w in zip(priors, weights)]
+        total = sum(unnorm)
+        if total <= 0:
+            return None, 0.0
+        q = [u / total for u in unnorm]
+        mean = sum(q_i * r_i for q_i, r_i in zip(q, returns))
+        return q, mean
+
+    q_opt = None
+    converged = False
+
+    for _ in range(max_iter):
+        gamma_mid = 0.5 * (gamma_low + gamma_high)
+        q_mid, mean_mid = get_q_and_mean(gamma_mid)
+        if q_mid is None:
+            break
+
+        diff = mean_mid - target_return
+        if abs(diff) < tol:
+            q_opt = q_mid
+            converged = True
+            break
+
+        if diff > 0:
+            gamma_low = gamma_mid
+        else:
+            gamma_high = gamma_mid
+
+        q_opt = q_mid
+
+    if q_opt is not None:
+        actual_mean = sum(q_i * r_i for q_i, r_i in zip(q_opt, returns))
+        if abs(actual_mean - target_return) < 1e-3:
+            converged = True
+        else:
+            converged = False
+
+    return q_opt, converged
+
+
+def weighted_percentile(values, weights, pct):
+    """
+    Computes percentile of values given scenario weights.
+    pct is between 0.0 and 1.0.
+    """
+    pairs = sorted(zip(values, weights), key=lambda x: x[0])
+    cum = 0.0
+    for val, w in pairs:
+        cum += w
+        if cum >= pct:
+            return val
+    return pairs[-1][0]
+
+
+def is_abnormal_distribution(q, ens_min=5.0, max_prob_threshold=0.40):
+    """
+    Filters strange posterior distributions (abnormal spikes / bimodal degeneracy).
+    """
+    if q is None:
+        return True
+    if max(q) > max_prob_threshold:
+        return True
+    entropy = -sum(q_i * math.log(q_i) for q_i in q if q_i > 0)
+    ens = math.exp(entropy)
+    if ens < ens_min:
+        return True
+    return False
+
+
+class EntropyPoolingStrategy(bt.Strategy):
+    params = (
+        ('lookback', 60),
+        ('target_return_long', 0.05),
+        ('target_return_short', -0.05),
+        ('shift_threshold', 0.05),
+        ('revert_threshold', 0.02),
+        ('volume_period', 20),
+        ('ens_min', 5.0),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_period)
+        self.sl_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            if not self.position:
+                self.sl_price = None
+                self.tp_price = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if len(self) < self.p.lookback + 1:
+            return
+
+        # Build historical scenario returns over lookback
+        returns = []
+        for i in range(self.p.lookback, 0, -1):
+            p_prev = self.data.close[-i - 1]
+            p_curr = self.data.close[-i]
+            if p_prev > 0:
+                returns.append((p_curr - p_prev) / p_prev)
+            else:
+                returns.append(0.0)
+
+        n_scenarios = len(returns)
+        if n_scenarios == 0:
+            return
+
+        priors = [1.0 / n_scenarios] * n_scenarios
+        current_price = self.data.close[0]
+        scenario_prices = [current_price * (1.0 + r) for r in returns]
+
+        prior_median = weighted_percentile(scenario_prices, priors, 0.50)
+
+        high_volume = self.data.volume[0] > self.vol_sma[0]
+
+        # Long Stress Scenario Optimization
+        q_long, conv_long = solve_entropy_pooling(
+            priors, returns, self.p.target_return_long
+        )
+        valid_long = conv_long and not is_abnormal_distribution(q_long, ens_min=self.p.ens_min)
+
+        median_long = weighted_percentile(scenario_prices, q_long, 0.50) if valid_long else prior_median
+        shift_long = (median_long - prior_median) / prior_median if prior_median > 0 else 0.0
+
+        if valid_long:
+            mean_ret_long = sum(q_i * r_i for q_i, r_i in zip(q_long, returns))
+            var_long = sum(q_i * ((r_i - mean_ret_long) ** 2) for q_i, r_i in zip(q_long, returns))
+            vol_long = math.sqrt(max(var_long, 1e-8))
+        else:
+            vol_long = 0.02
+
+        # Short Stress Scenario Optimization
+        q_short, conv_short = solve_entropy_pooling(
+            priors, returns, self.p.target_return_short
+        )
+        valid_short = conv_short and not is_abnormal_distribution(q_short, ens_min=self.p.ens_min)
+
+        median_short = weighted_percentile(scenario_prices, q_short, 0.50) if valid_short else prior_median
+        shift_short = (prior_median - median_short) / prior_median if prior_median > 0 else 0.0
+
+        if valid_short:
+            mean_ret_short = sum(q_i * r_i for q_i, r_i in zip(q_short, returns))
+            var_short = sum(q_i * ((r_i - mean_ret_short) ** 2) for q_i, r_i in zip(q_short, returns))
+            vol_short = math.sqrt(max(var_short, 1e-8))
+        else:
+            vol_short = 0.02
+
+        # Manage Open Position Exits
+        if self.position:
+            if self.position.size > 0:
+                # Stop-Loss / Take-Profit for Long
+                if self.sl_price and current_price <= self.sl_price:
+                    self.order = self.close()
+                    return
+                if self.tp_price and current_price >= self.tp_price:
+                    self.order = self.close()
+                    return
+                # Reversion exit or opposite signal
+                if abs(shift_long) < self.p.revert_threshold or (high_volume and valid_short and shift_short >= self.p.shift_threshold):
+                    self.order = self.close()
+                    return
+
+            elif self.position.size < 0:
+                # Stop-Loss / Take-Profit for Short
+                if self.sl_price and current_price >= self.sl_price:
+                    self.order = self.close()
+                    return
+                if self.tp_price and current_price <= self.tp_price:
+                    self.order = self.close()
+                    return
+                # Reversion exit or opposite signal
+                if abs(shift_short) < self.p.revert_threshold or (high_volume and valid_long and shift_long >= self.p.shift_threshold):
+                    self.order = self.close()
+                    return
+
+        # Entry Signals
+        if not self.position and high_volume:
+            cash = self.broker.getcash()
+            max_shares = int(cash / current_price) if current_price > 0 else 0
+
+            if valid_long and shift_long >= self.p.shift_threshold:
+                raw_size = 1.0 / max(vol_long, 1e-5)
+                size = max(1, min(int(raw_size), max_shares))
+                if size > 0 and max_shares > 0:
+                    self.sl_price = weighted_percentile(scenario_prices, q_long, 0.05)
+                    self.tp_price = weighted_percentile(scenario_prices, q_long, 0.95)
+                    self.order = self.buy(size=size)
+
+            elif valid_short and shift_short >= self.p.shift_threshold:
+                raw_size = 1.0 / max(vol_short, 1e-5)
+                size = max(1, min(int(raw_size), max_shares))
+                if size > 0 and max_shares > 0:
+                    self.sl_price = weighted_percentile(scenario_prices, q_short, 0.95)
+                    self.tp_price = weighted_percentile(scenario_prices, q_short, 0.05)
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "lookback_window",
+      "choice": "60 trading days lookback window for historical scenario generation.",
+      "reason": "Provides a robust set of historical return scenarios while maintaining numerical stability for entropy pooling optimization."
+    },
+    {
+      "topic": "target_stress_returns",
+      "choice": "Long scenario target return set to +5% (+0.05) and Short scenario target return set to -5% (-0.05).",
+      "reason": "Specifies concrete target expected returns for the stress scenarios to generate non-trivial posterior probability shifts."
+    },
+    {
+      "topic": "distribution_shift_thresholds",
+      "choice": "Signal shift threshold Y% = 5% (0.05); Reversion threshold Z% = 2% (0.02).",
+      "reason": "Directly matches the specification's example values for significant shift confirmation and reversion exit."
+    },
+    {
+      "topic": "volume_filter",
+      "choice": "High volume condition evaluated as daily Volume > 20-day Simple Moving Average of Volume.",
+      "reason": "Implements the liquidity filter requirement using a standard 20-day volume moving average."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position size = min(int(1.0 / posterior_volatility), max_affordable_cash_shares).",
+      "reason": "Adheres to the spec formula size = 1 / (posterior volatility) while bounding units to available broker cash."
+    },
+    {
+      "topic": "quality_and_strange_behavior_filter",
+      "choice": "Distributions flagged abnormal if optimization fails, max probability > 0.40, or Effective Number of Scenarios (ENS) < 5.0.",
+      "reason": "Meets the requirement to skip trading signals when the optimizer fails to converge or when posterior distributions exhibit extreme spikes/bimodality."
+    }
+  ]
+}
+```

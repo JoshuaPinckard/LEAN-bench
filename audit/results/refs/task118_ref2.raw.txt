@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+
+
+class EnhancedDCAStrategy(bt.Strategy):
+    params = (
+        ("rsi_period", 14),
+        ("rsi_oversold", 30.0),
+        ("rsi_overbought", 70.0),
+        ("sma_period", 50),
+        ("bb_period", 20),
+        ("bb_devfactor", 2.0),
+        ("macd_fast", 12),
+        ("macd_slow", 26),
+        ("macd_signal", 9),
+        ("atr_period", 14),
+        ("adx_period", 14),
+        ("adx_threshold", 25.0),
+        ("risk_pct", 0.05),
+        ("max_pos_pct", 0.20),
+        ("stop_loss_atr_mult", 2.0),
+        ("weighted_threshold", 2.5),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(
+            self.data.close, period=self.params.rsi_period
+        )
+        self.sma = bt.indicators.SMA(
+            self.data.close, period=self.params.sma_period
+        )
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.params.bb_period,
+            devfactor=self.params.bb_devfactor,
+        )
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.params.macd_fast,
+            period_me2=self.params.macd_slow,
+            period_signal=self.params.macd_signal,
+        )
+        self.macd_cross = bt.indicators.CrossOver(
+            self.macd.macd, self.macd.signal
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.params.atr_period)
+        self.adx = bt.indicators.ADX(self.data, period=self.params.adx_period)
+
+        self.order = None
+        self.entry_price = None
+        self.stop_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.stop_price = self.entry_price - (
+                    self.params.stop_loss_atr_mult * self.atr[0]
+                )
+            elif order.issell():
+                self.entry_price = None
+                self.stop_price = None
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            # Indicator signals
+            sig_rsi = 1 if self.rsi[0] < self.params.rsi_oversold else 0
+            sig_sma = 1 if self.data.close[0] > self.sma[0] else 0
+            sig_bb = 1 if self.data.close[0] < self.bb.lines.bot[0] else 0
+            sig_macd = 1 if self.macd_cross[0] > 0 else 0
+
+            # Dynamic weighting based on market regime (ADX > threshold -> trending)
+            is_trending = self.adx[0] > self.params.adx_threshold
+            if is_trending:
+                w_sma, w_macd, w_rsi, w_bb = 1.5, 1.5, 0.5, 0.5
+            else:
+                w_rsi, w_bb, w_sma, w_macd = 1.5, 1.5, 0.5, 0.5
+
+            weighted_score = (
+                w_rsi * sig_rsi
+                + w_sma * sig_sma
+                + w_bb * sig_bb
+                + w_macd * sig_macd
+            )
+
+            if weighted_score >= self.params.weighted_threshold:
+                portfolio_value = self.broker.getvalue()
+                available_cash = self.broker.getcash()
+
+                if self.atr[0] > 0:
+                    raw_size = (
+                        portfolio_value * self.params.risk_pct
+                    ) / self.atr[0]
+                else:
+                    raw_size = 0
+
+                max_size_cap = (
+                    portfolio_value * self.params.max_pos_pct
+                ) / self.data.close[0]
+                cash_size_cap = available_cash / self.data.close[0]
+
+                size = int(min(raw_size, max_size_cap, cash_size_cap))
+
+                if size > 0:
+                    self.order = self.buy(size=size)
+
+        else:
+            exit_rsi = self.rsi[0] > self.params.rsi_overbought
+            exit_macd = self.macd_cross[0] < 0
+            exit_stop = (
+                self.stop_price is not None
+                and self.data.close[0] < self.stop_price
+            )
+
+            if exit_rsi or exit_macd or exit_stop:
+                self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "market_regime_detection",
+      "choice": "ADX(14) with a threshold of 25 to separate trending (ADX > 25) from ranging (ADX <= 25) regimes.",
+      "reason": "ADX is the standard technical indicator for quantifying trend strength and market regime when the specification does not explicitly prescribe a mathematical regime formula."
+    },
+    {
+      "topic": "dynamic_indicator_weighting",
+      "choice": "In trending regime: SMA weight=1.5, MACD weight=1.5, RSI weight=0.5, BB weight=0.5. In ranging regime: RSI weight=1.5, BB weight=1.5, SMA weight=0.5, MACD weight=0.5. Entry requires aggregated weighted score >= 2.5 out of 4.0.",
+      "reason": "This implements the specification requirement for dynamically adjusting indicator weights based on market regime while ensuring consensus (equivalent to at least 3 standard signals or primary indicator alignment)."
+    },
+    {
+      "topic": "position_sizing_and_capital_limits",
+      "choice": "Base position sizing calculates shares as (5% of total portfolio equity) / ATR(14), capped at 20% total portfolio allocation and available cash.",
+      "reason": "The specification explicitly suggests 5% risk per trade scaled inversely by ATR and a maximum 20% aggregate portfolio exposure limit."
+    },
+    {
+      "topic": "stop_loss_trigger",
+      "choice": "Stop-loss is calculated as entry_price - 2 * ATR(14) at position entry and evaluated against the daily close price.",
+      "reason": "Captures the exact stop-loss formula stated in the specification and evaluates it in standard daily bar strategy execution."
+    }
+  ]
+}
+```

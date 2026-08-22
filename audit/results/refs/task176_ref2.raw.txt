@@ -1,0 +1,229 @@
+```python
+import backtrader as bt
+
+
+class SyntheticWheel(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("atr_period", 14),
+        ("ema_fast", 50),
+        ("ema_slow", 200),
+        ("rsi_period", 14),
+        ("entry_interval", 20),
+        ("max_tranches", 3),
+        ("tranche_pct", 0.03),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.params.bb_period,
+            devfactor=self.params.bb_dev,
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.params.atr_period)
+        self.ema50 = bt.indicators.EMA(
+            self.data.close, period=self.params.ema_fast
+        )
+        self.ema200 = bt.indicators.EMA(
+            self.data.close, period=self.params.ema_slow
+        )
+        self.rsi = bt.indicators.RSI(
+            self.data.close, period=self.params.rsi_period
+        )
+
+        self.order_buy = None
+        self.order_sell = None
+
+        self.tranches = 0
+        self.bars_since_last_entry = self.params.entry_interval
+        self.buy_order_bars = 0
+        self.sell_order_bars = 0
+
+        self.cycle_records = []
+        self.current_cycle = {}
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.tranches += 1
+                self.order_buy = None
+                self.buy_order_bars = 0
+
+                if "buy_date" not in self.current_cycle:
+                    self.current_cycle["buy_date"] = self.data.datetime.date(0)
+                    self.current_cycle["buy_price"] = order.executed.price
+
+                if self.order_sell:
+                    self.cancel(self.order_sell)
+                    self.order_sell = None
+
+                self._place_covered_call_order()
+
+            elif order.issell():
+                self.order_sell = None
+                self.sell_order_bars = 0
+
+                if self.position.size == 0:
+                    self.current_cycle["sell_date"] = self.data.datetime.date(
+                        0
+                    )
+                    self.current_cycle["sell_price"] = order.executed.price
+                    self.current_cycle["realized_profit"] = order.executed.pnl
+                    self.current_cycle["tranches"] = self.tranches
+                    self.current_cycle["avg_price"] = (
+                        self.current_cycle.get(
+                            "avg_price", order.executed.price
+                        )
+                    )
+                    self.cycle_records.append(self.current_cycle)
+                    self.current_cycle = {}
+
+                    self.tranches = 0
+                    self.bars_since_last_entry = 0
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order_buy:
+                self.order_buy = None
+                self.buy_order_bars = 0
+            elif order == self.order_sell:
+                self.order_sell = None
+                self.sell_order_bars = 0
+
+    def _place_covered_call_order(self):
+        if self.position.size > 0:
+            avg_price = self.position.price
+            sell_lim = max(self.bb.lines.top[0], avg_price * 1.07)
+            self.order_sell = self.sell(
+                exectype=bt.Order.Limit,
+                price=sell_lim,
+                size=self.position.size,
+            )
+            self.sell_order_bars = 0
+
+    def next(self):
+        if self.position.size > 0:
+            avg_price = self.position.price
+            self.current_cycle["avg_price"] = avg_price
+
+            # Protective exit (catastrophic)
+            if (
+                self.data.close[0] < self.ema200[0] * 0.9
+                or self.data.close[0] <= avg_price - 4.0 * self.atr[0]
+            ):
+                if self.order_buy:
+                    self.cancel(self.order_buy)
+                    self.order_buy = None
+                if self.order_sell:
+                    self.cancel(self.order_sell)
+                    self.order_sell = None
+                self.close()
+                return
+
+            # Monthly roll simulation for limit sell (20 bars)
+            if self.order_sell:
+                self.sell_order_bars += 1
+                if self.sell_order_bars >= 20:
+                    self.cancel(self.order_sell)
+                    self.order_sell = None
+                    self._place_covered_call_order()
+
+            # Expiration for pending averaging limit buy (20 bars)
+            if self.order_buy:
+                self.buy_order_bars += 1
+                if self.buy_order_bars >= 20:
+                    self.cancel(self.order_buy)
+                    self.order_buy = None
+                    self.buy_order_bars = 0
+
+            # Averaging (adding tranches) on a drop
+            if (
+                self.tranches < self.params.max_tranches
+                and self.order_buy is None
+            ):
+                if (
+                    self.data.close[0] <= avg_price - 1.5 * self.atr[0]
+                    and self.rsi[0] < 35
+                ):
+                    buy_lim = min(
+                        self.bb.lines.bot[0], self.data.close[0] * 0.93
+                    )
+                    portfolio_val = self.broker.getvalue()
+                    size = int(
+                        (portfolio_val * self.params.tranche_pct) / buy_lim
+                    )
+                    if size > 0:
+                        self.order_buy = self.buy(
+                            exectype=bt.Order.Limit, price=buy_lim, size=size
+                        )
+                        self.buy_order_bars = 0
+
+        else:
+            # Flat position
+            if self.order_buy:
+                self.buy_order_bars += 1
+                if self.buy_order_bars >= 20:
+                    self.cancel(self.order_buy)
+                    self.order_buy = None
+                    self.buy_order_bars = 0
+
+            if self.order_buy is None and self.order_sell is None:
+                self.bars_since_last_entry += 1
+                if self.bars_since_last_entry >= self.params.entry_interval:
+                    self.bars_since_last_entry = 0
+
+                    price_ok = 1.0 <= self.data.close[0] <= 15.0
+                    bb_width = (
+                        self.bb.lines.top[0] - self.bb.lines.bot[0]
+                    ) / self.bb.lines.mid[0]
+                    vol_ok = (bb_width > 0.06) or (
+                        (self.atr[0] / self.data.close[0]) > 0.03
+                    )
+                    trend_ok = self.ema50[0] >= self.ema200[0]
+
+                    if price_ok and vol_ok and trend_ok:
+                        buy_lim = min(
+                            self.bb.lines.bot[0], self.data.close[0] * 0.93
+                        )
+                        portfolio_val = self.broker.getvalue()
+                        size = int(
+                            (portfolio_val * self.params.tranche_pct) / buy_lim
+                        )
+                        if size > 0:
+                            self.order_buy = self.buy(
+                                exectype=bt.Order.Limit,
+                                price=buy_lim,
+                                size=size,
+                            )
+                            self.buy_order_bars = 0
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "20-bar Entry Cadence Reset",
+      "choice": "Reset entry evaluation timer back to 0 whenever an evaluation attempt occurs on the 20th bar, regardless of whether filters pass or fail.",
+      "reason": "The specification states 'once every 20 bars place a limit buy'. Maintaining a strict 20-bar evaluation cadence reflects this exact interval logic."
+    },
+    {
+      "topic": "Limit Buy Expiration",
+      "choice": "Unfilled limit buy orders are cancelled after 20 bars.",
+      "reason": "The specification states 'after each sell/buy cycle, reset new limit levels every 20 bars'. Cancelling unfilled limit buy orders after 20 bars allows recalculating BuyLim based on fresh indicator values."
+    },
+    {
+      "topic": "Averaging Limit Buy Sizing and Pricing",
+      "choice": "Averaging tranches place limit buys at BuyLim = min(lowerBB, Close * 0.93) using size = int((portfolio_value * 0.03) / BuyLim).",
+      "reason": "The specification states 'add the next tranche using the same sizing rule until the limit of 3 tranches and 9% of the portfolio is reached', extending the entry sizing rule to additional tranches."
+    },
+    {
+      "topic": "Cycle History Tracking",
+      "choice": "Records for each buy/sell cycle (entry/exit dates, prices, realized profit, tranche count, average price) are accumulated in self.cycle_records.",
+      "reason": "The specification explicitly requires keeping records of all cycles."
+    }
+  ]
+}
+```

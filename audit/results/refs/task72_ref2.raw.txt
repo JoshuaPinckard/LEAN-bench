@@ -1,0 +1,225 @@
+```python
+import backtrader as bt
+
+
+class SwingBreakAndRetest(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("vol_period", 20),
+        ("sma_market_period", 200),
+        ("atr_period", 14),
+        ("risk_pct", 0.01),
+        ("max_hold_bars", 70),  # 10 trading days * 7 trading hours/day
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_dev,
+        )
+        self.vol_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.vol_period
+        )
+        self.sma_market = bt.indicators.SMA(
+            self.data.close, period=self.p.sma_market_period
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.breakout_vol = None
+        self.stop_loss = None
+        self.has_retested = False
+        self.bars_held = 0
+        self.initial_entry_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if not self.position:
+                self.breakout_vol = None
+                self.stop_loss = None
+                self.has_retested = False
+                self.bars_held = 0
+                self.initial_entry_price = None
+            else:
+                if self.initial_entry_price is None:
+                    self.initial_entry_price = order.executed.price
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self.bars_held += 1
+
+            # 1. Maximum Holding Period Check
+            if self.bars_held >= self.p.max_hold_bars:
+                self.order = self.close()
+                return
+
+            # 2. Position Exits & Retest Logic
+            if self.position.size > 0:  # Long Position
+                # Take Profit: price reaches middle Bollinger Band (SMA 20)
+                if (
+                    self.data.low[0] <= self.bb.mid[0]
+                    or self.data.close[0] <= self.bb.mid[0]
+                ):
+                    self.order = self.close()
+                    return
+
+                # Stop Loss
+                if self.stop_loss and self.data.low[0] <= self.stop_loss:
+                    self.order = self.close()
+                    return
+
+                # Trailing Stop: once in profit, move SL to break-even + 1 ATR
+                if (
+                    self.initial_entry_price
+                    and self.data.close[0] > self.initial_entry_price
+                ):
+                    new_sl = self.initial_entry_price + self.atr[0]
+                    if self.stop_loss is None or new_sl > self.stop_loss:
+                        self.stop_loss = new_sl
+
+                # Retest Entry (Long)
+                if not self.has_retested:
+                    touched_band = (
+                        self.data.low[0] <= self.bb.top[0]
+                        or self.data.close[0] <= self.bb.top[0]
+                    )
+                    lower_vol = (
+                        self.breakout_vol is not None
+                        and self.data.volume[0] < self.breakout_vol
+                    )
+                    if touched_band and lower_vol:
+                        risk_per_share = abs(
+                            self.data.close[0] - self.stop_loss
+                        )
+                        if risk_per_share > 0:
+                            capital = self.broker.getvalue()
+                            size = int(
+                                (capital * self.p.risk_pct) / risk_per_share
+                            )
+                            if size > 0:
+                                self.order = self.buy(size=size)
+                                self.has_retested = True
+
+            elif self.position.size < 0:  # Short Position
+                # Take Profit: price reaches middle Bollinger Band (SMA 20)
+                if (
+                    self.data.high[0] >= self.bb.mid[0]
+                    or self.data.close[0] >= self.bb.mid[0]
+                ):
+                    self.order = self.close()
+                    return
+
+                # Stop Loss
+                if self.stop_loss and self.data.high[0] >= self.stop_loss:
+                    self.order = self.close()
+                    return
+
+                # Trailing Stop: once in profit, move SL to break-even - 1 ATR
+                if (
+                    self.initial_entry_price
+                    and self.data.close[0] < self.initial_entry_price
+                ):
+                    new_sl = self.initial_entry_price - self.atr[0]
+                    if self.stop_loss is None or new_sl < self.stop_loss:
+                        self.stop_loss = new_sl
+
+                # Retest Entry (Short)
+                if not self.has_retested:
+                    touched_band = (
+                        self.data.high[0] >= self.bb.bot[0]
+                        or self.data.close[0] >= self.bb.bot[0]
+                    )
+                    lower_vol = (
+                        self.breakout_vol is not None
+                        and self.data.volume[0] < self.breakout_vol
+                    )
+                    if touched_band and lower_vol:
+                        risk_per_share = abs(
+                            self.stop_loss - self.data.close[0]
+                        )
+                        if risk_per_share > 0:
+                            capital = self.broker.getvalue()
+                            size = int(
+                                (capital * self.p.risk_pct) / risk_per_share
+                            )
+                            if size > 0:
+                                self.order = self.sell(size=size)
+                                self.has_retested = True
+
+        else:
+            # Position Flat: Initial Breakout Entry Search
+            vol_ok = self.data.volume[0] >= 1.20 * self.vol_sma[0]
+
+            # Long Breakout
+            if (
+                self.data.close[0] > self.bb.top[0]
+                and vol_ok
+                and self.data.close[0] > self.sma_market[0]
+            ):
+                sl = self.data.low[0]
+                risk_per_share = self.data.close[0] - sl
+                if risk_per_share > 0:
+                    capital = self.broker.getvalue()
+                    size = int((capital * self.p.risk_pct) / risk_per_share)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+                        self.breakout_vol = self.data.volume[0]
+                        self.stop_loss = sl
+                        self.has_retested = False
+                        self.bars_held = 0
+
+            # Short Breakout
+            elif (
+                self.data.close[0] < self.bb.bot[0]
+                and vol_ok
+                and self.data.close[0] < self.sma_market[0]
+            ):
+                sl = self.data.high[0]
+                risk_per_share = sl - self.data.close[0]
+                if risk_per_share > 0:
+                    capital = self.broker.getvalue()
+                    size = int((capital * self.p.risk_pct) / risk_per_share)
+                    if size > 0:
+                        self.order = self.sell(size=size)
+                        self.breakout_vol = self.data.volume[0]
+                        self.stop_loss = sl
+                        self.has_retested = False
+                        self.bars_held = 0
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Apply 200 SMA market filter directly on the provided 1h data feed",
+      "reason": "The specification mentions a 200-period SMA on a higher timeframe (e.g. daily chart), but only a single 1h data feed is available in the test environment."
+    },
+    {
+      "topic": "max_holding_period",
+      "choice": "Define 10 trading days as 70 1h bars",
+      "reason": "Assuming standard US stock market trading hours of 7 hours/bars per day on 1-hour data."
+    },
+    {
+      "topic": "retest_position_sizing",
+      "choice": "Calculate retest position size using 1% risk of total capital relative to current close and breakout stop loss",
+      "reason": "The specification dictates a 1% risk position sizing rule based on capital and distance to stop loss."
+    },
+    {
+      "topic": "entry_price_estimate",
+      "choice": "Use current signal bar close price as estimated entry price for calculating position size",
+      "reason": "Market orders execute at next bar open, making exact entry price unknown at calculation time."
+    }
+  ]
+}
+```

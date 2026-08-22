@@ -1,0 +1,161 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionBB(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('rsi_period', 14),
+        ('stoch_period', 14),
+        ('ema_fast', 5),
+        ('ema_slow', 10),
+        ('vol_fast', 20),
+        ('vol_slow', 50),
+        ('atr_period', 14),
+        ('risk_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.boll = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.stoch = bt.indicators.Stochastic(self.data, period=self.p.stoch_period)
+        self.ema5 = bt.indicators.EMA(self.data.close, period=self.p.ema_fast)
+        self.ema10 = bt.indicators.EMA(self.data.close, period=self.p.ema_slow)
+        self.ema_crossover = bt.indicators.CrossOver(self.ema5, self.ema10)
+        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_fast)
+        self.vol_sma50 = bt.indicators.SMA(self.data.volume, period=self.p.vol_slow)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.entry_order = None
+        self.stop_order = None
+        self.pending_stop_dist = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order == self.entry_order:
+                self.entry_order = None
+                fill_price = order.executed.price
+                size = abs(order.executed.size)
+                if order.isbuy():
+                    stop_price = fill_price - self.pending_stop_dist
+                    self.stop_order = self.sell(size=size, price=stop_price, exectype=bt.Order.Stop)
+                else:
+                    stop_price = fill_price + self.pending_stop_dist
+                    self.stop_order = self.buy(size=size, price=stop_price, exectype=bt.Order.Stop)
+            elif order == self.stop_order:
+                self.stop_order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.entry_order:
+                self.entry_order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if self.entry_order:
+            return
+
+        if self.position:
+            if self.position.size > 0:
+                target_hit = self.data.high[0] >= self.boll.lines.mid[0]
+                deteriorated = (self.ema_crossover[0] < 0) or (self.rsi[0] >= 50)
+                if target_hit or deteriorated:
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.close()
+            elif self.position.size < 0:
+                target_hit = self.data.low[0] <= self.boll.lines.mid[0]
+                deteriorated = (self.ema_crossover[0] > 0) or (self.rsi[0] <= 50)
+                if target_hit or deteriorated:
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                        self.stop_order = None
+                    self.close()
+            return
+
+        mid = self.boll.lines.mid[0]
+        top = self.boll.lines.top[0]
+        bot = self.boll.lines.bot[0]
+
+        if mid == 0:
+            return
+
+        bb_width = (top - bot) / mid
+        if not (0.03 <= bb_width <= 0.20):
+            return
+
+        if self.vol_sma20[0] <= self.vol_sma50[0]:
+            return
+
+        bar_range = self.data.high[0] - self.data.low[0]
+        if bar_range > 3.0 * self.atr[0]:
+            return
+
+        close = self.data.close[0]
+        rsi_val = self.rsi[0]
+        stoch_k = self.stoch.lines.percK[0]
+
+        long_signal = (close < bot) and (rsi_val < 35) and (stoch_k < 20)
+        short_signal = (close > top) and (rsi_val > 65) and (stoch_k > 80)
+
+        if not (long_signal or short_signal):
+            return
+
+        stddev = (top - mid) / 2.0
+        z_score = abs(close - mid) / stddev if stddev > 0 else 0.0
+        multiplier = max(0.5, min(1.5, z_score - 1.0))
+
+        dist_atr = 1.5 * self.atr[0]
+
+        if long_signal:
+            bb3_lower = mid - 3.0 * stddev
+            dist_bb3 = close - bb3_lower
+            stop_dist = max(dist_bb3, dist_atr)
+            if stop_dist <= 0:
+                return
+            risk_amt = self.broker.getvalue() * self.p.risk_pct
+            size = int((risk_amt / stop_dist) * multiplier)
+            if size > 0:
+                self.pending_stop_dist = stop_dist
+                self.entry_order = self.buy(size=size)
+
+        elif short_signal:
+            bb3_upper = mid + 3.0 * stddev
+            dist_bb3 = bb3_upper - close
+            stop_dist = max(dist_bb3, dist_atr)
+            if stop_dist <= 0:
+                return
+            risk_amt = self.broker.getvalue() * self.p.risk_pct
+            size = int((risk_amt / stop_dist) * multiplier)
+            if size > 0:
+                self.pending_stop_dist = stop_dist
+                self.entry_order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "Deterioration Exit Condition",
+      "choice": "Close position immediately if EMA(5) crosses EMA(10) against position or RSI reaches/crosses 50 prior to touching SMA(20)",
+      "reason": "The spec states alternative exit on deterioration — if EMA(5) crosses EMA(10) against position or RSI returns to ~50 and price has not reached SMA(20). Checking these on open positions prior to SMA(20) target reach exacts this behavior."
+    },
+    {
+      "topic": "Stop Loss Execution and Calculation",
+      "choice": "Calculate stop distance at signal time relative to close, then submit a native stop order upon entry fill at fill_price +/- stop_distance",
+      "reason": "Placing a protective stop order upon entry order completion enforces strict risk management using actual fill price while retaining signal bar calculated stop distance."
+    },
+    {
+      "topic": "Deviation Strength Multiplier Mapping",
+      "choice": "Compute z-score = abs(close - SMA20) / stddev, and linearly map [1.5, 2.5] to multiplier [0.5, 1.5] clipped to range [0.5, 1.5]",
+      "reason": "The specification states multiplier = clip(deviation beyond 1.5σ to 2.5σ, 0.5–1.5), which directly corresponds to z-score - 1.0 clamped between 0.5 and 1.5."
+    }
+  ]
+}
+```

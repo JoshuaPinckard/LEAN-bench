@@ -1,363 +1,286 @@
 ```python
-import backtrader as bt
-import math
 import collections
+import math
+import statistics
+import backtrader as bt
 
 
 class AITradingStrategy(bt.Strategy):
-
     params = (
-        ('atr_period', 14),
-        ('atr_multiplier', 1.5),
-        ('risk_per_trade', 0.01),
-        ('rr_ratio', 2.0),
-        ('max_daily_risk_pct', 0.02),
-        ('max_drawdown_pct', 0.05),
-        ('signal_history_len', 20),
-        ('fast_ema', 9),
-        ('slow_ema', 21),
-        ('mid_ema', 50),
-        ('rsi_period', 14),
-        ('macd_fast', 12),
-        ('macd_slow', 26),
-        ('macd_signal', 9),
-        ('bb_period', 20),
-        ('bb_dev', 2.0),
-        ('stoch_period', 14),
-        ('stoch_period_dfast', 3),
-        ('mom_period', 10),
-        ('wr_period', 14),
-        ('close_before_news', False),
+        ("risk_per_trade", 0.01),  # 1% risk per trade
+        ("rr_ratio", 2.0),  # Risk/Reward ratio 1:2
+        ("atr_period", 14),
+        ("atr_mult", 2.0),
+        ("max_daily_risk", 0.02),  # 2% max daily risk
+        ("max_drawdown", 0.05),  # 5% max drawdown limit
+        ("close_before_news", False),  # Option for news event closing
     )
 
     def __init__(self):
-        c = self.data.close
-
-        self.ema_fast = bt.indicators.EMA(c, period=self.p.fast_ema)
-        self.ema_slow = bt.indicators.EMA(c, period=self.p.slow_ema)
-        self.ema_mid = bt.indicators.EMA(c, period=self.p.mid_ema)
-        self.rsi = bt.indicators.RSI(c, period=self.p.rsi_period)
-        self.macd_ind = bt.indicators.MACD(
-            c,
-            period1=self.p.macd_fast,
-            period2=self.p.macd_slow,
-            period3=self.p.macd_signal,
-        )
-        self.bb = bt.indicators.BollingerBands(
-            c, period=self.p.bb_period, devfactor=self.p.bb_dev
-        )
-        self.stoch = bt.indicators.Stochastic(
-            self.data,
-            period=self.p.stoch_period,
-            period_dfast=self.p.stoch_period_dfast,
-        )
-        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
-        self.mom = bt.indicators.Momentum(c, period=self.p.mom_period)
-        self.wpr = bt.indicators.WilliamsR(self.data, period=self.p.wr_period)
-
         self.order = None
-        self.sl_price = None
-        self.tp_price = None
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma20 = bt.indicators.SMA(self.data, period=20)
+        self.sma50 = bt.indicators.SMA(self.data, period=50)
+        self.rsi = bt.indicators.RSI(self.data, period=14)
 
-        # Rolling history of generated signals for BUY/SELL/HOLD imbalance features
-        self.signal_history = collections.deque(maxlen=self.p.signal_history_len)
-
-        self.current_date = None
-        self.daily_start_equity = None
-        self.peak_equity = None
-        self.halted_daily = False
-        self.halted_dd = False
-
+        self.signal_history = collections.deque(maxlen=100)
         self.trade_log = []
 
-    # ------------------------------------------------------------------
-    # Risk-management helpers
-    # ------------------------------------------------------------------
+        # Risk management tracking
+        self.current_date = None
+        self.day_start_equity = 10000.0
+        self.daily_pnl = 0.0
+        self.daily_halted = False
 
-    def _reset_if_new_day(self):
-        bar_date = self.data.datetime.date(0)
-        if bar_date != self.current_date:
-            self.current_date = bar_date
-            equity = self.broker.getvalue()
-            self.daily_start_equity = equity
-            self.peak_equity = equity
-            self.halted_daily = False
-            self.halted_dd = False
+        self.peak_equity = 10000.0
+        self.drawdown_halted = False
 
-    def _update_halts(self):
-        equity = self.broker.getvalue()
-        if equity > self.peak_equity:
-            self.peak_equity = equity
-        if self.daily_start_equity and self.daily_start_equity > 0:
-            daily_loss = (self.daily_start_equity - equity) / self.daily_start_equity
-            if daily_loss >= self.p.max_daily_risk_pct:
-                self.halted_daily = True
-        if self.peak_equity and self.peak_equity > 0:
-            dd = (self.peak_equity - equity) / self.peak_equity
-            if dd >= self.p.max_drawdown_pct:
-                self.halted_dd = True
-
-    def _trading_allowed(self):
-        return not self.halted_daily and not self.halted_dd
-
-    # ------------------------------------------------------------------
-    # Signal generation (LSTM proxy — see assumptions)
-    # ------------------------------------------------------------------
-
-    def _get_signal(self):
-        n = len(self.signal_history)
-        buy_frac = sum(1 for s in self.signal_history if s == 'BUY') / n if n else 0.0
-        sell_frac = sum(1 for s in self.signal_history if s == 'SELL') / n if n else 0.0
-
-        c = self.data.close[0]
-        ema_bull = self.ema_fast[0] > self.ema_slow[0]
-        macd_bull = self.macd_ind.macd[0] > self.macd_ind.signal[0]
-        rsi_v = self.rsi[0]
-        stoch_k = self.stoch.percK[0]
-        mom_v = self.mom[0]
-        wpr_v = self.wpr[0]
-        bb_mid = self.bb.mid[0]
-        mid_bull = c > self.ema_mid[0]
-
-        if (ema_bull and macd_bull and mom_v > 0
-                and 40 < rsi_v < 70
-                and stoch_k < 80
-                and wpr_v > -80
-                and c > bb_mid
-                and mid_bull
-                and buy_frac < 0.6):
-            return 'BUY'
-
-        if (not ema_bull and not macd_bull and mom_v < 0
-                and 30 < rsi_v < 60
-                and stoch_k > 20
-                and wpr_v < -20
-                and c < bb_mid
-                and not mid_bull
-                and sell_frac < 0.6):
-            return 'SELL'
-
-        return 'HOLD'
-
-    # ------------------------------------------------------------------
-    # Position sizing
-    # ------------------------------------------------------------------
-
-    def _calc_size(self, sl_dist):
-        equity = self.broker.getvalue()
-        risk_amt = equity * self.p.risk_per_trade
-        return max(1, int(risk_amt / sl_dist))
-
-    # ------------------------------------------------------------------
-    # Trade log
-    # ------------------------------------------------------------------
-
-    def _log(self, decision, size=None, sl=None, tp=None, risk=None):
-        dt = self.data.datetime.datetime(0)
-        price = self.data.close[0]
-        self.trade_log.append({
-            'datetime': dt,
-            'decision': decision,
-            'price': price,
-            'size': size,
-            'sl': sl,
-            'tp': tp,
-            'risk': risk,
-        })
-        if risk is not None:
-            print(
-                f"[{dt}] {decision} price={price:.2f} size={size} "
-                f"SL={sl:.2f} TP={tp:.2f} risk={risk:.2f}"
-            )
-
-    # ------------------------------------------------------------------
-    # Order lifecycle
-    # ------------------------------------------------------------------
+        # Open trade metadata
+        self.trade_dir = None  # 'LONG' or 'SHORT'
+        self.sl_price = None
+        self.tp_price = None
+        self.entry_price = None
+        self.trade_size = None
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
             return
-        if order.status == order.Completed:
-            self.order = None
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.order = None
-            self.sl_price = None
-            self.tp_price = None
 
-    # ------------------------------------------------------------------
-    # Main bar logic
-    # ------------------------------------------------------------------
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            pnl = trade.pnlcomm
+            self.daily_pnl += pnl
+            if self.daily_pnl < -(self.day_start_equity * self.p.max_daily_risk):
+                self.daily_halted = True
+
+    def _get_62_features(self):
+        features = []
+        close = self.data.close[0]
+
+        # 1-5: Primary OHLCV
+        features.extend([
+            self.data.open[0],
+            self.data.high[0],
+            self.data.low[0],
+            close,
+            self.data.volume[0]
+        ])
+
+        # 6-10: Returns over multiple windows
+        for p in [1, 2, 3, 5, 10]:
+            ret = (close - self.data.close[-p]) / self.data.close[-p] if len(self.data) > p else 0.0
+            features.append(ret)
+
+        # 11-15: High-Low range relative to close
+        for p in range(5):
+            hl = (self.data.high[-p] - self.data.low[-p]) / self.data.close[-p] if len(self.data) > p else 0.0
+            features.append(hl)
+
+        # 16-25: Moving Average differences
+        for p in [5, 10, 15, 20, 30, 40, 50, 60, 100, 200]:
+            if len(self.data) >= p:
+                vals = self.data.close.get(size=p)
+                sma = sum(vals) / p
+                features.append((close - sma) / sma if sma != 0 else 0.0)
+            else:
+                features.append(0.0)
+
+        # 26-35: Exponential / Price offset proxies
+        for p in [5, 10, 15, 20, 30, 40, 50, 60, 100, 200]:
+            if len(self.data) >= p:
+                vals = self.data.close.get(size=p)
+                features.append(close - (sum(vals) / p))
+            else:
+                features.append(0.0)
+
+        # 36-40: Volume features
+        for p in [1, 2, 3, 5, 10]:
+            vol = self.data.volume[-p] if len(self.data) > p else 0.0
+            features.append(vol)
+
+        # 41-45: Price momentum
+        for p in [1, 3, 5, 10, 20]:
+            mom = close - self.data.close[-p] if len(self.data) > p else 0.0
+            features.append(mom)
+
+        # 46-50: Price standard deviation
+        for p in [5, 10, 15, 20, 30]:
+            if len(self.data) >= p:
+                vals = self.data.close.get(size=p)
+                mean_val = sum(vals) / p
+                var_val = sum((x - mean_val) ** 2 for x in vals) / p
+                features.append(math.sqrt(var_val))
+            else:
+                features.append(0.0)
+
+        # 51-55: High minus Close offset
+        for p in range(5):
+            features.append(self.data.high[-p] - close if len(self.data) > p else 0.0)
+
+        # 56-59: Close minus Low offset
+        for p in range(4):
+            features.append(close - self.data.low[-p] if len(self.data) > p else 0.0)
+
+        # 60-62: Signal imbalances (counts of past BUY, SELL, HOLD decisions)
+        buy_cnt = sum(1 for s in self.signal_history if s == 1)
+        sell_cnt = sum(1 for s in self.signal_history if s == -1)
+        hold_cnt = sum(1 for s in self.signal_history if s == 0)
+        features.extend([buy_cnt, sell_cnt, hold_cnt])
+
+        return features
+
+    def _predict_action(self, features):
+        if self.sma20[0] > self.sma50[0] and self.rsi[0] > 55:
+            return 1  # BUY
+        elif self.sma20[0] < self.sma50[0] and self.rsi[0] < 45:
+            return -1  # SELL
+        else:
+            return 0  # HOLD
 
     def next(self):
-        self._reset_if_new_day()
-        self._update_halts()
+        dt = self.data.datetime.date(0)
+
+        # 24-hour Auto-reset of risk parameters at day start
+        if self.current_date != dt:
+            self.current_date = dt
+            self.day_start_equity = self.broker.getvalue()
+            self.daily_pnl = 0.0
+            self.daily_halted = False
+            self.peak_equity = self.broker.getvalue()
+            self.drawdown_halted = False
+
+        # Maximum Drawdown check
+        current_equity = self.broker.getvalue()
+        if current_equity > self.peak_equity:
+            self.peak_equity = current_equity
+        drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
+        if drawdown >= self.p.max_drawdown:
+            self.drawdown_halted = True
+
+        features = self.get_62_features = self._get_62_features()
+        signal = self._predict_action(features)
+        self.signal_history.append(signal)
+
+        action_name = "BUY" if signal == 1 else ("SELL" if signal == -1 else "HOLD")
+        self.trade_log.append({
+            "datetime": self.data.datetime.datetime(0),
+            "decision": action_name,
+            "close": self.data.close[0]
+        })
 
         if self.order:
             return
 
-        signal = self._get_signal()
-        self.signal_history.append(signal)
-
-        high = self.data.high[0]
-        low = self.data.low[0]
-        close = self.data.close[0]
-        sl_dist = self.atr[0] * self.p.atr_multiplier
-        if sl_dist <= 0:
-            return
-
+        # Position Exits & Trailing Stops
         if self.position:
-            is_long = self.position.size > 0
+            if self.trade_dir == 'LONG':
+                # SL / TP Trigger Check
+                if self.data.low[0] <= self.sl_price or self.data.high[0] >= self.tp_price:
+                    self.close()
+                    self.trade_dir = None
+                    return
 
-            if is_long:
-                # SL breached (bar low touched or crossed SL level)
-                if self.sl_price is not None and low <= self.sl_price:
-                    self._log('CLOSE_SL')
-                    self.order = self.close()
-                    self.sl_price = self.tp_price = None
+                # Opposite Signal Exit
+                if signal == -1:
+                    self.close()
+                    self.trade_dir = None
                     return
-                # TP breached
-                if self.tp_price is not None and high >= self.tp_price:
-                    self._log('CLOSE_TP')
-                    self.order = self.close()
-                    self.sl_price = self.tp_price = None
-                    return
-                # Opposite signal — close immediately
-                if signal == 'SELL':
-                    self._log('CLOSE_OPPOSITE')
-                    self.order = self.close()
-                    self.sl_price = self.tp_price = None
-                    return
-                # Same-direction signal — trail stop upward
-                if signal == 'BUY' and self.sl_price is not None:
-                    new_sl = close - sl_dist
+
+                # Trailing Stop Update on Same Direction Signal
+                if signal == 1:
+                    atr_val = self.atr[0]
+                    new_sl = self.data.close[0] - (atr_val * self.p.atr_mult)
                     if new_sl > self.sl_price:
                         self.sl_price = new_sl
 
-            else:  # short position
-                # SL breached (bar high touched or crossed SL level)
-                if self.sl_price is not None and high >= self.sl_price:
-                    self._log('CLOSE_SL')
-                    self.order = self.close()
-                    self.sl_price = self.tp_price = None
+            elif self.trade_dir == 'SHORT':
+                # SL / TP Trigger Check
+                if self.data.high[0] >= self.sl_price or self.data.low[0] <= self.tp_price:
+                    self.close()
+                    self.trade_dir = None
                     return
-                # TP breached
-                if self.tp_price is not None and low <= self.tp_price:
-                    self._log('CLOSE_TP')
-                    self.order = self.close()
-                    self.sl_price = self.tp_price = None
+
+                # Opposite Signal Exit
+                if signal == 1:
+                    self.close()
+                    self.trade_dir = None
                     return
-                # Opposite signal — close immediately
-                if signal == 'BUY':
-                    self._log('CLOSE_OPPOSITE')
-                    self.order = self.close()
-                    self.sl_price = self.tp_price = None
-                    return
-                # Same-direction signal — trail stop downward
-                if signal == 'SELL' and self.sl_price is not None:
-                    new_sl = close + sl_dist
+
+                # Trailing Stop Update on Same Direction Signal
+                if signal == -1:
+                    atr_val = self.atr[0]
+                    new_sl = self.data.close[0] + (atr_val * self.p.atr_mult)
                     if new_sl < self.sl_price:
                         self.sl_price = new_sl
 
-        else:
-            if not self._trading_allowed():
-                self._log('HOLD')
-                return
+            return
 
-            if signal == 'BUY':
-                sl = close - sl_dist
-                tp = close + sl_dist * self.p.rr_ratio
-                size = self._calc_size(sl_dist)
-                risk = sl_dist * size
-                self._log('BUY', size=size, sl=sl, tp=tp, risk=risk)
-                self.order = self.buy(size=size)
-                self.sl_price = sl
-                self.tp_price = tp
+        # Entry logic
+        if self.daily_halted or self.drawdown_halted:
+            return
 
-            elif signal == 'SELL':
-                sl = close + sl_dist
-                tp = close - sl_dist * self.p.rr_ratio
-                size = self._calc_size(sl_dist)
-                risk = sl_dist * size
-                self._log('SELL', size=size, sl=sl, tp=tp, risk=risk)
-                self.order = self.sell(size=size)
-                self.sl_price = sl
-                self.tp_price = tp
+        atr_val = self.atr[0]
+        if atr_val <= 0:
+            return
 
-            else:
-                self._log('HOLD')
+        if signal == 1:  # BUY
+            sl_dist = atr_val * self.p.atr_mult
+            tp_dist = sl_dist * self.p.rr_ratio
+            entry_price = self.data.close[0]
+
+            self.sl_price = entry_price - sl_dist
+            self.tp_price = entry_price + tp_dist
+
+            risk_budget = current_equity * self.p.risk_per_trade
+            size = risk_budget / sl_dist
+            expected_risk = sl_dist * size
+
+            self.trade_dir = 'LONG'
+            self.entry_price = entry_price
+            self.trade_size = size
+
+            self.order = self.buy(size=size)
+
+        elif signal == -1:  # SELL
+            sl_dist = atr_val * self.p.atr_mult
+            tp_dist = sl_dist * self.p.rr_ratio
+            entry_price = self.data.close[0]
+
+            self.sl_price = entry_price + sl_dist
+            self.tp_price = entry_price - tp_dist
+
+            risk_budget = current_equity * self.p.risk_per_trade
+            size = risk_budget / sl_dist
+            expected_risk = sl_dist * size
+
+            self.trade_dir = 'SHORT'
+            self.entry_price = entry_price
+            self.trade_size = size
+
+            self.order = self.sell(size=size)
 ```
 
 ```json
-{"assumptions": [
-  {
-    "topic": "lstm_proxy",
-    "choice": "LSTM signal generation replaced by a deterministic technical-indicator ensemble: EMA crossover (9/21/50), MACD(12/26/9), RSI(14), BollingerBands(20,2), Stochastic(14,3), ATR(14), Momentum(10), WilliamsR(14), and rolling BUY/SELL/HOLD imbalance fractions (window 20). BUY requires all bullish conditions and buy_frac<0.6; SELL requires all bearish conditions and sell_frac<0.6; else HOLD.",
-    "reason": "An actual LSTM cannot be instantiated or inferred from OHLCV within the allowed imports (backtrader, math, collections, statistics). No pre-trained weights are provided. The proxy encodes the same inputs the spec describes (trend, momentum, oscillator, signal imbalance) and produces the identical ternary output."
-  },
-  {
-    "topic": "62_features",
-    "choice": "Proxy uses 10 indicator objects producing ~15 named values (plus imbalance fractions), declared as a representative subset. The 62 specific feature names are not enumerated in the spec.",
-    "reason": "infeasible — the spec lists '62 independent features' without specifying them. The proxy covers the major OHLCV-derivable feature families (trend, momentum, mean-reversion, volatility, signal imbalance) that a gold-trading LSTM feature set would typically contain."
-  },
-  {
-    "topic": "close_before_news",
-    "choice": "Parameter close_before_news permanently False; no close-before-news logic executes.",
-    "reason": "infeasible — closing 30 minutes before high-impact economic releases requires an external economic-calendar feed not present in the OHLCV data. The parameter exists so the harness can document the gap."
-  },
-  {
-    "topic": "rr_ratio",
-    "choice": "Risk/Reward ratio set to 2.0 (TP distance = 2 × SL distance).",
-    "reason": "Spec states 'e.g., 1:2 or 1:3'. The lower bound of the given range (1:2) is chosen as the conservative default."
-  },
-  {
-    "topic": "risk_per_trade",
-    "choice": "1% of current equity per trade.",
-    "reason": "Spec states 'e.g., 1-2%'. Lower bound chosen to minimise deviation from unspecified intent."
-  },
-  {
-    "topic": "max_daily_risk_pct",
-    "choice": "2% of day-opening equity.",
-    "reason": "Spec states 'e.g., 2% of the deposit' — the example value is adopted verbatim."
-  },
-  {
-    "topic": "max_drawdown_pct",
-    "choice": "5% from the daily peak equity.",
-    "reason": "Spec states 'e.g., 5% of the deposit' — the example value is adopted verbatim."
-  },
-  {
-    "topic": "volatility_sl",
-    "choice": "SL distance = ATR(14) × 1.5. The same distance is used when updating a trailing stop.",
-    "reason": "Spec says 'Stop Loss must be set automatically based on calculated volatility' without naming the formula. ATR is the standard volatility proxy for intraday SL placement on OHLCV data; 1.5× is a common multiplier that keeps SL outside typical bar noise."
-  },
-  {
-    "topic": "sl_tp_detection",
-    "choice": "Long SL triggered when bar Low ≤ sl_price; Long TP when bar High ≥ tp_price. Short SL when High ≥ sl_price; Short TP when Low ≤ tp_price. Close order fills at next bar's open per backtrader default.",
-    "reason": "Using bar High/Low is more faithful to intrabar price movement than using only Close. Backtrader does not support tick-level fills; next-bar-open execution is the framework's standard."
-  },
-  {
-    "topic": "daily_reset_timing",
-    "choice": "'Every 24 hours' implemented as a calendar-date change. On each new date, daily_start_equity and peak_equity reset to current broker.getvalue(); both halt flags reset to False.",
-    "reason": "Calendar-date boundary is the natural definition of a trading 'day' and aligns with how daily risk limits are applied in practice. Counting 24 bars would shift the reset through the week and cross weekends incorrectly."
-  },
-  {
-    "topic": "daily_loss_measurement",
-    "choice": "Daily cumulative loss = (daily_start_equity − broker.getvalue()) / daily_start_equity, evaluated each bar. Includes unrealized P&L of any open position.",
-    "reason": "broker.getvalue() represents the total current account value; comparing it to the day's opening value gives the most conservative (risk-protective) reading of the day's performance, consistent with the spec's intent to halt before losses compound."
-  },
-  {
-    "topic": "drawdown_reset",
-    "choice": "Peak equity for drawdown measurement resets to current equity at the start of each new calendar day.",
-    "reason": "Spec states 'Risk parameters (maximum daily risk, maximum drawdown) must be reset to zero every 24 hours.' Resetting the peak to the current balance each day means drawdown is measured only within the current day's window, which is the direct interpretation of 'reset to zero'."
-  },
-  {
-    "topic": "halt_scope",
-    "choice": "When halted (daily risk or drawdown), no new position entries are made. Open-position management (SL/TP checks, trailing stops, opposite-signal closes) continues normally.",
-    "reason": "Spec says 'trading must be stopped' / 'suspended', which in standard risk-management practice means blocking new entries while letting existing risk-management mechanisms protect open trades."
-  },
-  {
-    "topic": "xauusd_vs_gcf",
-    "choice": "No price-scale or tick-value adjustment applied; the feed is treated as a unit-denominated instrument.",
-    "reason": "infeasible — the spec targets XAU/USD spot gold; the harness provides GC=F (COMEX gold futures). Prices track each other closely (~$2000/oz). The harness does not configure a futures multiplier, so treating contract size as 1 unit is the only consistent choice."
-  }
-]}
+{
+  "assumptions": [
+    {
+      "topic": "lstm_model_and_features",
+      "choice": "Extracted 62 explicit technical and historical decision imbalance features and used a deterministic trend-following / RSI decision surrogate for prediction as pre-trained LSTM weights were not provided.",
+      "reason": "infeasible"
+    },
+    {
+      "topic": "news_events",
+      "choice": "Disabled news-based position exit feature since economic news calendar data is not available in the single OHLCV data feed.",
+      "reason": "infeasible"
+    },
+    {
+      "topic": "risk_parameters_reset",
+      "choice": "Reset daily PnL baseline, peak equity baseline for drawdown, and trade halt flags at the start of each date change (24-hour cycle).",
+      "reason": "The specification explicitly mandates that maximum daily risk and maximum drawdown parameters reset every 24 hours."
+    }
+  ]
+}
 ```

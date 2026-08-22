@@ -1,0 +1,703 @@
+```python
+import math
+import collections
+import statistics
+import backtrader as bt
+
+
+class SuperTrend(bt.Indicator):
+    lines = ('supertrend', 'trend')
+    params = (
+        ('period', 10),
+        ('multiplier', 3.0),
+    )
+
+    def __init__(self):
+        self.addminperiod(self.p.period + 1)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.period)
+
+    def next(self):
+        hl2 = (self.data.high[0] + self.data.low[0]) / 2.0
+        basic_upper = hl2 + self.p.multiplier * self.atr[0]
+        basic_lower = hl2 - self.p.multiplier * self.atr[0]
+
+        if len(self) == self.p.period + 1:
+            prev_upper = basic_upper
+            prev_lower = basic_lower
+            prev_trend = 1
+        else:
+            prev_upper = getattr(self, 'final_upper', basic_upper)
+            prev_lower = getattr(self, 'final_lower', basic_lower)
+            prev_trend = self.lines.trend[-1]
+
+        if basic_upper < prev_upper or self.data.close[-1] > prev_upper:
+            final_upper = basic_upper
+        else:
+            final_upper = prev_upper
+
+        if basic_lower > prev_lower or self.data.close[-1] < prev_lower:
+            final_lower = basic_lower
+        else:
+            final_lower = prev_lower
+
+        if prev_trend == 1:
+            trend = -1 if self.data.close[0] < final_lower else 1
+        else:
+            trend = 1 if self.data.close[0] > final_upper else -1
+
+        self.final_upper = final_upper
+        self.final_lower = final_lower
+        self.lines.trend[0] = trend
+        self.lines.supertrend[0] = final_lower if trend == 1 else final_upper
+
+
+class VPT(bt.Indicator):
+    lines = ('vpt',)
+
+    def __init__(self):
+        self.addminperiod(2)
+
+    def next(self):
+        if len(self) == 2:
+            self.lines.vpt[0] = 0.0
+        else:
+            prev_close = self.data.close[-1]
+            if prev_close != 0:
+                pct = (self.data.close[0] - prev_close) / prev_close
+            else:
+                pct = 0.0
+            self.lines.vpt[0] = self.lines.vpt[-1] + self.data.volume[0] * pct
+
+
+class MultiTimeframeScoringStrategy(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('stoch_period', 14),
+        ('stoch_d', 3),
+        ('cci_period', 20),
+        ('williams_period', 14),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('mom_period', 10),
+        ('roc_period', 9),
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('atr_period', 10),
+        ('supertrend_period', 10),
+        ('supertrend_multiplier', 3.0),
+        ('donchian_period', 20),
+        ('daily_long_threshold', 3),
+        ('daily_short_threshold', -3),
+        ('h4_long_threshold', 2),
+        ('h4_short_threshold', -2),
+        ('h1_long_threshold', 2),
+        ('h1_short_threshold', -2),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.bracket_orders = []
+
+        self.atr_60m = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.supertrend_60m = SuperTrend(
+            self.data,
+            period=self.p.supertrend_period,
+            multiplier=self.p.supertrend_multiplier,
+        )
+        self.vpt_60m = VPT(self.data)
+
+        self.h1_bars = []
+        self.h4_bars = []
+        self.d1_bars = []
+
+        self.curr_h4 = None
+        self.curr_d1 = None
+
+        self.entry_price = None
+        self.entry_atr = None
+        self.highest_since_entry = None
+        self.lowest_since_entry = None
+        self.trailing_active = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.position.size > 0 and self.entry_price is None:
+                self.entry_price = order.executed.price
+                self.entry_atr = (
+                    self.atr_60m[0]
+                    if len(self.atr_60m) > 0 and self.atr_60m[0] > 0
+                    else 1.0
+                )
+                self.highest_since_entry = self.data.high[0]
+                self.lowest_since_entry = None
+                self.trailing_active = False
+            elif self.position.size < 0 and self.entry_price is None:
+                self.entry_price = order.executed.price
+                self.entry_atr = (
+                    self.atr_60m[0]
+                    if len(self.atr_60m) > 0 and self.atr_60m[0] > 0
+                    else 1.0
+                )
+                self.lowest_since_entry = self.data.low[0]
+                self.highest_since_entry = None
+                self.trailing_active = False
+
+            if self.position.size == 0:
+                self.entry_price = None
+                self.entry_atr = None
+                self.highest_since_entry = None
+                self.lowest_since_entry = None
+                self.trailing_active = False
+
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if self.order == order:
+                self.order = None
+            if order in self.bracket_orders:
+                self.bracket_orders.remove(order)
+
+    def _calc_ema(self, values, period):
+        if not values:
+            return []
+        alpha = 2.0 / (period + 1.0)
+        ema = [values[0]]
+        for v in values[1:]:
+            ema.append(alpha * v + (1.0 - alpha) * ema[-1])
+        return ema
+
+    def _calc_sma(self, values, period):
+        if len(values) < period:
+            return [0.0] * len(values)
+        res = [0.0] * (period - 1)
+        for i in range(period - 1, len(values)):
+            res.append(sum(values[i - period + 1 : i + 1]) / float(period))
+        return res
+
+    def _calc_atr(self, highs, lows, closes, period):
+        if len(closes) < 2:
+            return [0.0] * len(closes)
+        tr = [highs[0] - lows[0]]
+        for i in range(1, len(closes)):
+            tr1 = highs[i] - lows[i]
+            tr2 = abs(highs[i] - closes[i - 1])
+            tr3 = abs(lows[i] - closes[i - 1])
+            tr.append(max(tr1, tr2, tr3))
+        atr = [tr[0]]
+        for i in range(1, len(tr)):
+            atr.append((atr[-1] * (period - 1) + tr[i]) / float(period))
+        return atr
+
+    def _calc_supertrend(self, highs, lows, closes, period=10, multiplier=3.0):
+        atr = self._calc_atr(highs, lows, closes, period)
+        n = len(closes)
+        trend = [1] * n
+        supertrend = [0.0] * n
+        final_upper = 0.0
+        final_lower = 0.0
+
+        for i in range(n):
+            hl2 = (highs[i] + lows[i]) / 2.0
+            basic_upper = hl2 + multiplier * atr[i]
+            basic_lower = hl2 - multiplier * atr[i]
+
+            if i == 0:
+                final_upper = basic_upper
+                final_lower = basic_lower
+                trend[i] = 1
+            else:
+                prev_upper = final_upper
+                prev_lower = final_lower
+
+                if basic_upper < prev_upper or closes[i - 1] > prev_upper:
+                    final_upper = basic_upper
+                else:
+                    final_upper = prev_upper
+
+                if basic_lower > prev_lower or closes[i - 1] < prev_lower:
+                    final_lower = basic_lower
+                else:
+                    final_lower = prev_lower
+
+                if trend[i - 1] == 1:
+                    trend[i] = -1 if closes[i] < final_lower else 1
+                else:
+                    trend[i] = 1 if closes[i] > final_upper else -1
+
+            supertrend[i] = final_lower if trend[i] == 1 else final_upper
+
+        return trend, supertrend
+
+    def compute_timeframe_score(self, series):
+        if len(series) < 20:
+            return 0, False, False
+
+        O = [x['open'] for x in series]
+        H = [x['high'] for x in series]
+        L = [x['low'] for x in series]
+        C = [x['close'] for x in series]
+        V = [x['volume'] for x in series]
+        N = len(C)
+
+        # 1. RSI(14)
+        score_rsi = 0
+        if N >= 15:
+            gains = [
+                max(C[i] - C[i - 1], 0.0) for i in range(1, N)
+            ]
+            losses = [
+                max(C[i - 1] - C[i], 0.0) for i in range(1, N)
+            ]
+            avg_gain = sum(gains[-14:]) / 14.0
+            avg_loss = sum(losses[-14:]) / 14.0
+            if avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100.0 - (100.0 / (1.0 + rs))
+            if rsi > 55:
+                score_rsi = 1
+            elif rsi < 45:
+                score_rsi = -1
+
+        # 2. Stochastic(14, 3)
+        score_stoch = 0
+        if N >= 18:
+            k_vals = []
+            for i in range(N):
+                if i < 13:
+                    k_vals.append(50.0)
+                else:
+                    hh = max(H[i - 13 : i + 1])
+                    ll = min(L[i - 13 : i + 1])
+                    k_vals.append(
+                        100.0 * (C[i] - ll) / (hh - ll) if hh > ll else 50.0
+                    )
+            d_vals = self._calc_sma(k_vals, 3)
+            k_curr, k_prev = k_vals[-1], k_vals[-2]
+            d_curr, d_prev = d_vals[-1], d_vals[-2]
+
+            if (
+                k_prev <= d_prev
+                and k_curr > d_curr
+                and (k_prev < 20 or d_prev < 20 or k_curr < 20 or d_curr < 20)
+            ):
+                score_stoch = 1
+            elif (
+                k_prev >= d_prev
+                and k_curr < d_curr
+                and (k_prev > 80 or d_prev > 80 or k_curr > 80 or d_curr > 80)
+            ):
+                score_stoch = -1
+
+        # 3. CCI(20)
+        score_cci = 0
+        if N >= 20:
+            tp = [(H[i] + L[i] + C[i]) / 3.0 for i in range(N)]
+            sub_tp = tp[-20:]
+            sma_tp = sum(sub_tp) / 20.0
+            md = sum(abs(x - sma_tp) for x in sub_tp) / 20.0
+            cci = (tp[-1] - sma_tp) / (0.015 * md) if md > 0 else 0.0
+            if cci > 100:
+                score_cci = 1
+            elif cci < -100:
+                score_cci = -1
+
+        # 4. Williams %R(14)
+        score_wpr = 0
+        if N >= 14:
+            hh = max(H[-14:])
+            ll = min(L[-14:])
+            wpr = -100.0 * (hh - C[-1]) / (hh - ll) if hh > ll else -50.0
+            if wpr > -50:
+                score_wpr = 1
+            elif wpr < -50:
+                score_wpr = -1
+
+        # 5. MACD(12, 26, 9)
+        score_macd = 0
+        if N >= 35:
+            ema12 = self._calc_ema(C, 12)
+            ema26 = self._calc_ema(C, 26)
+            macd_line = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
+            signal_line = self._calc_ema(macd_line, 9)
+            histo = macd_line[-1] - signal_line[-1]
+            if histo > 0:
+                score_macd = 1
+            elif histo < 0:
+                score_macd = -1
+
+        # 6. Momentum(10)
+        score_mom = 0
+        if N >= 11:
+            mom = C[-1] - C[-11]
+            if mom > 0:
+                score_mom = 1
+            elif mom < 0:
+                score_mom = -1
+
+        # 7. ROC(9)
+        score_roc = 0
+        if N >= 10:
+            roc = (
+                100.0 * (C[-1] - C[-10]) / C[-10]
+                if C[-10] != 0
+                else 0.0
+            )
+            if roc > 0:
+                score_roc = 1
+            elif roc < 0:
+                score_roc = -1
+
+        # 8. Bollinger Bands mid(20)
+        score_bb = 0
+        if N >= 20:
+            mid = sum(C[-20:]) / 20.0
+            if C[-1] > mid:
+                score_bb = 1
+            elif C[-1] < mid:
+                score_bb = -1
+
+        # 9. EMA alignment (10, 20, 50)
+        score_ema = 0
+        if N >= 50:
+            e10 = self._calc_ema(C, 10)[-1]
+            e20 = self._calc_ema(C, 20)[-1]
+            e50 = self._calc_ema(C, 50)[-1]
+            if e10 > e20 > e50:
+                score_ema = 1
+            elif e10 < e20 < e50:
+                score_ema = -1
+
+        # 10. OBV slope(5)
+        score_obv = 0
+        if N >= 6:
+            obv = [0.0]
+            for i in range(1, N):
+                if C[i] > C[i - 1]:
+                    obv.append(obv[-1] + V[i])
+                elif C[i] < C[i - 1]:
+                    obv.append(obv[-1] - V[i])
+                else:
+                    obv.append(obv[-1])
+            obv_slope = obv[-1] - obv[-6]
+            if obv_slope > 0:
+                score_obv = 1
+            elif obv_slope < 0:
+                score_obv = -1
+
+        # 11. MFI(14)
+        score_mfi = 0
+        if N >= 15:
+            tp = [(H[i] + L[i] + C[i]) / 3.0 for i in range(N)]
+            rmf = [tp[i] * V[i] for i in range(N)]
+            pos_mf = 0.0
+            neg_mf = 0.0
+            for i in range(N - 14, N):
+                if tp[i] > tp[i - 1]:
+                    pos_mf += rmf[i]
+                elif tp[i] < tp[i - 1]:
+                    neg_mf += rmf[i]
+            mfi = 100.0 - (100.0 / (1.0 + pos_mf / neg_mf)) if neg_mf > 0 else 100.0
+            if mfi > 55:
+                score_mfi = 1
+            elif mfi < 45:
+                score_mfi = -1
+
+        # 12. AccumDist slope(5)
+        score_ad = 0
+        if N >= 6:
+            ad = [0.0]
+            for i in range(N):
+                hl = H[i] - L[i]
+                mfm = ((C[i] - L[i]) - (H[i] - C[i])) / hl if hl > 0 else 0.0
+                ad.append(ad[-1] + mfm * V[i])
+            ad_slope = ad[-1] - ad[-6]
+            if ad_slope > 0:
+                score_ad = 1
+            elif ad_slope < 0:
+                score_ad = -1
+
+        # 13. Supertrend(10, 3)
+        score_st = 0
+        if N >= 11:
+            st_trend, _ = self._calc_supertrend(
+                H, L, C, self.p.supertrend_period, self.p.supertrend_multiplier
+            )
+            if st_trend[-1] == 1:
+                score_st = 1
+            elif st_trend[-1] == -1:
+                score_st = -1
+
+        # 14. VPT slope(5)
+        score_vpt = 0
+        if N >= 6:
+            vpt = [0.0]
+            for i in range(1, N):
+                pct = (C[i] - C[i - 1]) / C[i - 1] if C[i - 1] != 0 else 0.0
+                vpt.append(vpt[-1] + V[i] * pct)
+            vpt_slope = vpt[-1] - vpt[-6]
+            if vpt_slope > 0:
+                score_vpt = 1
+            elif vpt_slope < 0:
+                score_vpt = -1
+
+        # 15. Channel breakout (Donchian 20)
+        score_channel = 0
+        if N >= 21:
+            donchian_high = max(H[-21:-1])
+            donchian_low = min(L[-21:-1])
+            if C[-1] > donchian_high:
+                score_channel = 1
+            elif C[-1] < donchian_low:
+                score_channel = -1
+
+        raw_score = (
+            score_rsi
+            + score_stoch
+            + score_cci
+            + score_wpr
+            + score_macd
+            + score_mom
+            + score_roc
+            + score_bb
+            + score_ema
+            + score_obv
+            + score_mfi
+            + score_ad
+            + score_st
+            + score_vpt
+            + score_channel
+        )
+        score = max(-10, min(10, raw_score))
+
+        # Order Block Detection
+        in_bullish_ob = False
+        in_bearish_ob = False
+        if N >= 22:
+            bullish_ob = None
+            for i in range(N - 1, 20, -1):
+                dh = max(H[i - 20 : i])
+                if C[i] > dh:
+                    for j in range(i - 1, -1, -1):
+                        if C[j] < O[j]:
+                            bullish_ob = (L[j], H[j])
+                            break
+                    if bullish_ob is not None:
+                        break
+
+            if bullish_ob is not None and (bullish_ob[0] <= C[-1] <= bullish_ob[1]):
+                in_bullish_ob = True
+
+            bearish_ob = None
+            for i in range(N - 1, 20, -1):
+                dl = min(L[i - 20 : i])
+                if C[i] < dl:
+                    for j in range(i - 1, -1, -1):
+                        if C[j] > O[j]:
+                            bearish_ob = (L[j], H[j])
+                            break
+                    if bearish_ob is not None:
+                        break
+
+            if bearish_ob is not None and (bearish_ob[0] <= C[-1] <= bearish_ob[1]):
+                in_bearish_ob = True
+
+        return score, in_bullish_ob, in_bearish_ob
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        o = self.data.open[0]
+        h = self.data.high[0]
+        l = self.data.low[0]
+        c = self.data.close[0]
+        v = self.data.volume[0]
+
+        self.h1_bars.append({'open': o, 'high': h, 'low': l, 'close': c, 'volume': v})
+
+        date = dt.date()
+        if not self.curr_d1 or self.curr_d1['date'] != date:
+            if self.curr_d1:
+                self.d1_bars.append(self.curr_d1)
+            self.curr_d1 = {
+                'date': date,
+                'open': o,
+                'high': h,
+                'low': l,
+                'close': c,
+                'volume': v,
+            }
+        else:
+            self.curr_d1['high'] = max(self.curr_d1['high'], h)
+            self.curr_d1['low'] = min(self.curr_d1['low'], l)
+            self.curr_d1['close'] = c
+            self.curr_d1['volume'] += v
+
+        block_4h = (date, dt.hour // 4)
+        if not self.curr_h4 or self.curr_h4['block'] != block_4h:
+            if self.curr_h4:
+                self.h4_bars.append(self.curr_h4)
+            self.curr_h4 = {
+                'block': block_4h,
+                'open': o,
+                'high': h,
+                'low': l,
+                'close': c,
+                'volume': v,
+            }
+        else:
+            self.curr_h4['high'] = max(self.curr_h4['high'], h)
+            self.curr_h4['low'] = min(self.curr_h4['low'], l)
+            self.curr_h4['close'] = c
+            self.curr_h4['volume'] += v
+
+        d1_series = self.d1_bars + ([self.curr_d1] if self.curr_d1 else [])
+        h4_series = self.h4_bars + ([self.curr_h4] if self.curr_h4 else [])
+        h1_series = self.h1_bars
+
+        daily_score, _, _ = self.compute_timeframe_score(d1_series)
+        h4_score, _, _ = self.compute_timeframe_score(h4_series)
+        h1_score, in_bull_ob_60m, in_bear_ob_60m = self.compute_timeframe_score(
+            h1_series
+        )
+
+        # Position Management
+        if self.position.size > 0:
+            entry_p = self.entry_price if self.entry_price else self.position.price
+            atr_p = (
+                self.entry_atr
+                if self.entry_atr
+                else (self.atr_60m[0] if len(self.atr_60m) > 0 else 1.0)
+            )
+
+            if self.highest_since_entry is None:
+                self.highest_since_entry = h
+            else:
+                self.highest_since_entry = max(self.highest_since_entry, h)
+
+            init_stop = entry_p - 2.0 * atr_p
+            take_profit = entry_p + 3.0 * atr_p
+
+            if not self.trailing_active and self.highest_since_entry >= entry_p + 1.0 * atr_p:
+                self.trailing_active = True
+
+            curr_stop = init_stop
+            if self.trailing_active:
+                trail_stop = self.highest_since_entry - 2.0 * atr_p
+                curr_stop = max(init_stop, trail_stop)
+
+            # Check stops/TP
+            if l <= curr_stop or h >= take_profit:
+                self._clear_pending_orders()
+                self.order = self.close()
+                return
+
+            # Early Exit
+            if h1_score <= self.p.h1_short_threshold or daily_score < self.p.daily_long_threshold:
+                self._clear_pending_orders()
+                self.order = self.close()
+                return
+
+        elif self.position.size < 0:
+            entry_p = self.entry_price if self.entry_price else self.position.price
+            atr_p = (
+                self.entry_atr
+                if self.entry_atr
+                else (self.atr_60m[0] if len(self.atr_60m) > 0 else 1.0)
+            )
+
+            if self.lowest_since_entry is None:
+                self.lowest_since_entry = l
+            else:
+                self.lowest_since_entry = min(self.lowest_since_entry, l)
+
+            init_stop = entry_p + 2.0 * atr_p
+            take_profit = entry_p - 3.0 * atr_p
+
+            if not self.trailing_active and self.lowest_since_entry <= entry_p - 1.0 * atr_p:
+                self.trailing_active = True
+
+            curr_stop = init_stop
+            if self.trailing_active:
+                trail_stop = self.lowest_since_entry + 2.0 * atr_p
+                curr_stop = min(init_stop, trail_stop)
+
+            # Check stops/TP
+            if h >= curr_stop or l <= take_profit:
+                self._clear_pending_orders()
+                self.order = self.close()
+                return
+
+            # Early Exit
+            if h1_score >= self.p.h1_long_threshold or daily_score > self.p.daily_short_threshold:
+                self._clear_pending_orders()
+                self.order = self.close()
+                return
+
+        # Entry Signals
+        if self.position.size == 0 and self.order is None:
+            atr_val = self.atr_60m[0] if len(self.atr_60m) > 0 and self.atr_60m[0] > 0 else 1.0
+
+            # Long Entry
+            if (
+                daily_score >= self.p.daily_long_threshold
+                and h4_score >= self.p.h4_long_threshold
+                and h1_score >= self.p.h1_long_threshold
+                and not in_bear_ob_60m
+            ):
+                stop_p = c - 2.0 * atr_val
+                limit_p = c + 3.0 * atr_val
+                self.bracket_orders = self.buy_bracket(
+                    limitprice=limit_p, stopprice=stop_p
+                )
+                self.order = self.bracket_orders[0]
+
+            # Short Entry
+            elif (
+                daily_score <= self.p.daily_short_threshold
+                and h4_score <= self.p.h4_short_threshold
+                and h1_score <= self.p.h1_short_threshold
+                and not in_bull_ob_60m
+            ):
+                stop_p = c + 2.0 * atr_val
+                limit_p = c - 3.0 * atr_val
+                self.bracket_orders = self.sell_bracket(
+                    limitprice=limit_p, stopprice=stop_p
+                )
+                self.order = self.bracket_orders[0]
+
+    def _clear_pending_orders(self):
+        for o in self.bracket_orders:
+            if o.status in [o.Submitted, o.Accepted]:
+                self.cancel(o)
+        self.bracket_orders = []
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "multi-timeframe resampling",
+      "choice": "Dynamically aggregate the single 60m base data feed into 4H and 1D OHLCV series during Strategy.next() to evaluate daily and 4H scores.",
+      "reason": "The execution environment supplies only a single 60-minute data feed to Cerebro without secondary resampled feeds pre-configured."
+    },
+    {
+      "topic": "bracket order management",
+      "choice": "Submit initial bracket orders upon entry and evaluate initial stop-loss, take-profit, trailing stop, and score-flip early exits bar-by-bar in next().",
+      "reason": "Combining fixed initial bracket orders with dynamic trailing stop and multi-timeframe score flip exits ensures exact compliance with risk management rules without order collision."
+    },
+    {
+      "topic": "score clamping",
+      "choice": "Clamp the sum of 15 component signals (+1 / -1 / 0) to the specified [-10, +10] range.",
+      "reason": "The specification calls for a timeframe score in [-10, +10] derived from summing individual indicator signals."
+    }
+  ]
+}
+```

@@ -1,0 +1,74 @@
+{
+  "task_id": 199,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\n\n\nclass SpotWheelProxy(bt.Strategy):\n    params = (\n        (\"sma_len\", 200),\n        (\"bb_len\", 20),\n        (\"bb_dev\", 2.0),\n        (\"atr_len\", 14),\n        (\"volp_lookback\", 500),\n        (\"volp_thresh\", 70),\n        (\"risk_per_trade\", 0.015),\n        (\"max_alloc\", 0.15),\n        (\"cc_timeout\", 35),\n        (\"cc_overrun\", 0.10),\n    )\n\n    def __init__(self):\n        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_len)\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_len, devfactor=self.p.bb_dev\n        )\n        self.w = (self.bb.top - self.bb.bot) / self.bb.mid\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_len)\n        self.crossover = bt.indicators.CrossOver(self.data.close, self.bb.bot)\n\n        dollar_vol = self.data.volume * self.data.close\n        self.avg_dollar_vol = bt.indicators.SMA(dollar_vol, period=20)\n\n        self.order = None\n        self.phase = None\n        self.entry_price = 0.0\n        self.stop_price = 0.0\n        self.bars_since_partial = 0\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed]:\n            if order.isbuy():\n                self.entry_price = order.executed.price\n                self.stop_price = min(\n                    self.entry_price * 0.90,\n                    self.entry_price - 1.5 * self.atr[0],\n                )\n                self.phase = \"CSP\"\n                self.bars_since_partial = 0\n            elif order.issell():\n                if self.position.size == 0:\n                    self.phase = None\n                    self.entry_price = 0.0\n                    self.stop_price = 0.0\n                    self.bars_since_partial = 0\n\n        self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if len(self.w) < self.p.volp_lookback:\n            return\n\n        if not self.position:\n            w_vals = self.w.get(size=self.p.volp_lookback)\n            curr_w = self.w[0]\n            w_percentile = (\n                sum(1 for v in w_vals if v <= curr_w) / float(len(w_vals))\n            ) * 100.0\n\n            trend_filter = self.data.close[0] > self.sma[0]\n            vol_filter = w_percentile > self.p.volp_thresh\n            price_filter = 50.0 <= self.data.close[0] <= 500.0\n            liq_filter = self.avg_dollar_vol[0] > 50000000.0\n            signal = self.crossover[0] == 1\n\n            if trend_filter and vol_filter and price_filter and liq_filter and signal:\n                equity = self.broker.getvalue()\n                entry_est = self.data.close[0]\n                stop_est = min(entry_est * 0.90, entry_est - 1.5 * self.atr[0])\n                risk_per_share = entry_est - stop_est\n\n                if risk_per_share > 0:\n                    risk_dollars = equity * self.p.risk_per_trade\n                    max_dollars = equity * self.p.max_alloc\n                    size_risk = risk_dollars / risk_per_share\n                    size_max = max_dollars / entry_est\n                    size = int(min(size_risk, size_max))\n\n                    if size > 0:\n                        self.order = self.buy(size=size)\n        else:\n            if self.phase == \"CSP\":\n                if self.data.low[0] <= self.stop_price:\n                    self.order = self.close()\n                    return\n\n                if self.data.high[0] >= self.bb.mid[0]:\n                    half_size = max(1, int(self.position.size * 0.5))\n                    self.order = self.sell(size=half_size)\n                    self.phase = \"CC\"\n                    self.stop_price = max(self.stop_price, self.entry_price)\n                    self.bars_since_partial = 0\n\n            elif self.phase == \"CC\":\n                self.bars_since_partial += 1\n\n                if self.data.close[0] >= self.entry_price + 0.5 * self.atr[0]:\n                    self.stop_price = max(\n                        self.stop_price, self.data.close[0] - self.atr[0]\n                    )\n\n                if self.data.low[0] <= self.stop_price:\n                    self.order = self.close()\n                    return\n\n                if (\n                    self.data.high[0] >= self.bb.top[0]\n                    or self.data.high[0]\n                    >= self.entry_price * (1.0 + self.p.cc_overrun)\n                ):\n                    self.order = self.close()\n                    return\n\n                if self.bars_since_partial >= self.p.cc_timeout:\n                    self.order = self.close()\n                    return",
+  "assumptions": [
+    {
+      "topic": "entry_price_estimation",
+      "choice": "Used close[0] as estimated entry price for sizing calculation, then recalculated initial stop with order.executed.price upon execution completion.",
+      "reason": "Execution occurs at market after the signal bar closes, so exact entry price is only known in notify_order."
+    },
+    {
+      "topic": "order_execution_type",
+      "choice": "Executed entry, partial exit, and full exit signals using standard market orders.",
+      "reason": "The specification explicitly permits 'at market on the signal bar' as an execution method."
+    },
+    {
+      "topic": "rolling_percentile_calculation",
+      "choice": "Computed empirical percentile as count(w <= current_w) / 500 * 100 over a sliding window of 500 bars of W.",
+      "reason": "Standard definition of empirical cumulative distribution function matching lookback window specifications."
+    },
+    {
+      "topic": "intrabar_exit_evaluation",
+      "choice": "Evaluated stop loss using low[0] and profit targets using high[0] during next().",
+      "reason": "Intrabar highs/lows reflect price touches required for reaching Bollinger lines and stop thresholds."
+    },
+    {
+      "topic": "trailing_stop_logic",
+      "choice": "Implemented breakeven stop initially upon partial exit, trailing upwards by 1.0*ATR once close price rises >= entry + 0.5*ATR.",
+      "reason": "Explicitly aligns with the specification choice for trailing stop after partial profit-taking."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 2,
+  "tape": [
+    {
+      "dt": "2024-08-08T04:00:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 211.27982425167653
+    },
+    {
+      "dt": "2024-08-13T04:00:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 217.3804327308566
+    },
+    {
+      "dt": "2024-09-04T04:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 220.01072730838987
+    },
+    {
+      "dt": "2025-01-15T05:00:00",
+      "side": "BUY",
+      "size": 6.0,
+      "price": 233.1503884256181
+    },
+    {
+      "dt": "2025-01-29T05:00:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 232.63368426706174
+    },
+    {
+      "dt": "2025-01-30T05:00:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 237.15482584661257
+    }
+  ]
+}

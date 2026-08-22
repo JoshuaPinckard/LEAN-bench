@@ -1,0 +1,244 @@
+{
+  "task_id": 293,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\n\n\nclass MeanReversionBB(bt.Strategy):\n    params = (\n        ('bb_period', 20),\n        ('bb_dev', 2.0),\n        ('rsi_period', 14),\n        ('stoch_period', 14),\n        ('ema_fast', 5),\n        ('ema_slow', 10),\n        ('vol_fast', 20),\n        ('vol_slow', 50),\n        ('atr_period', 14),\n        ('risk_pct', 0.02),\n    )\n\n    def __init__(self):\n        self.boll = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev\n        )\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.stoch = bt.indicators.Stochastic(self.data, period=self.p.stoch_period)\n        self.ema5 = bt.indicators.EMA(self.data.close, period=self.p.ema_fast)\n        self.ema10 = bt.indicators.EMA(self.data.close, period=self.p.ema_slow)\n        self.ema_crossover = bt.indicators.CrossOver(self.ema5, self.ema10)\n        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_fast)\n        self.vol_sma50 = bt.indicators.SMA(self.data.volume, period=self.p.vol_slow)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        self.entry_order = None\n        self.stop_order = None\n        self.pending_stop_dist = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed]:\n            if order == self.entry_order:\n                self.entry_order = None\n                fill_price = order.executed.price\n                size = abs(order.executed.size)\n                if order.isbuy():\n                    stop_price = fill_price - self.pending_stop_dist\n                    self.stop_order = self.sell(size=size, price=stop_price, exectype=bt.Order.Stop)\n                else:\n                    stop_price = fill_price + self.pending_stop_dist\n                    self.stop_order = self.buy(size=size, price=stop_price, exectype=bt.Order.Stop)\n            elif order == self.stop_order:\n                self.stop_order = None\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            if order == self.entry_order:\n                self.entry_order = None\n            elif order == self.stop_order:\n                self.stop_order = None\n\n    def next(self):\n        if self.entry_order:\n            return\n\n        if self.position:\n            if self.position.size > 0:\n                target_hit = self.data.high[0] >= self.boll.lines.mid[0]\n                deteriorated = (self.ema_crossover[0] < 0) or (self.rsi[0] >= 50)\n                if target_hit or deteriorated:\n                    if self.stop_order:\n                        self.cancel(self.stop_order)\n                        self.stop_order = None\n                    self.close()\n            elif self.position.size < 0:\n                target_hit = self.data.low[0] <= self.boll.lines.mid[0]\n                deteriorated = (self.ema_crossover[0] > 0) or (self.rsi[0] <= 50)\n                if target_hit or deteriorated:\n                    if self.stop_order:\n                        self.cancel(self.stop_order)\n                        self.stop_order = None\n                    self.close()\n            return\n\n        mid = self.boll.lines.mid[0]\n        top = self.boll.lines.top[0]\n        bot = self.boll.lines.bot[0]\n\n        if mid == 0:\n            return\n\n        bb_width = (top - bot) / mid\n        if not (0.03 <= bb_width <= 0.20):\n            return\n\n        if self.vol_sma20[0] <= self.vol_sma50[0]:\n            return\n\n        bar_range = self.data.high[0] - self.data.low[0]\n        if bar_range > 3.0 * self.atr[0]:\n            return\n\n        close = self.data.close[0]\n        rsi_val = self.rsi[0]\n        stoch_k = self.stoch.lines.percK[0]\n\n        long_signal = (close < bot) and (rsi_val < 35) and (stoch_k < 20)\n        short_signal = (close > top) and (rsi_val > 65) and (stoch_k > 80)\n\n        if not (long_signal or short_signal):\n            return\n\n        stddev = (top - mid) / 2.0\n        z_score = abs(close - mid) / stddev if stddev > 0 else 0.0\n        multiplier = max(0.5, min(1.5, z_score - 1.0))\n\n        dist_atr = 1.5 * self.atr[0]\n\n        if long_signal:\n            bb3_lower = mid - 3.0 * stddev\n            dist_bb3 = close - bb3_lower\n            stop_dist = max(dist_bb3, dist_atr)\n            if stop_dist <= 0:\n                return\n            risk_amt = self.broker.getvalue() * self.p.risk_pct\n            size = int((risk_amt / stop_dist) * multiplier)\n            if size > 0:\n                self.pending_stop_dist = stop_dist\n                self.entry_order = self.buy(size=size)\n\n        elif short_signal:\n            bb3_upper = mid + 3.0 * stddev\n            dist_bb3 = bb3_upper - close\n            stop_dist = max(dist_bb3, dist_atr)\n            if stop_dist <= 0:\n                return\n            risk_amt = self.broker.getvalue() * self.p.risk_pct\n            size = int((risk_amt / stop_dist) * multiplier)\n            if size > 0:\n                self.pending_stop_dist = stop_dist\n                self.entry_order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "Deterioration Exit Condition",
+      "choice": "Close position immediately if EMA(5) crosses EMA(10) against position or RSI reaches/crosses 50 prior to touching SMA(20)",
+      "reason": "The spec states alternative exit on deterioration \u2014 if EMA(5) crosses EMA(10) against position or RSI returns to ~50 and price has not reached SMA(20). Checking these on open positions prior to SMA(20) target reach exacts this behavior."
+    },
+    {
+      "topic": "Stop Loss Execution and Calculation",
+      "choice": "Calculate stop distance at signal time relative to close, then submit a native stop order upon entry fill at fill_price +/- stop_distance",
+      "reason": "Placing a protective stop order upon entry order completion enforces strict risk management using actual fill price while retaining signal bar calculated stop distance."
+    },
+    {
+      "topic": "Deviation Strength Multiplier Mapping",
+      "choice": "Compute z-score = abs(close - SMA20) / stddev, and linearly map [1.5, 2.5] to multiplier [0.5, 1.5] clipped to range [0.5, 1.5]",
+      "reason": "The specification states multiplier = clip(deviation beyond 1.5\u03c3 to 2.5\u03c3, 0.5\u20131.5), which directly corresponds to z-score - 1.0 clamped between 0.5 and 1.5."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 18,
+  "tape": [
+    {
+      "dt": "2020-07-09T04:00:00",
+      "side": "SELL",
+      "size": -66.0,
+      "price": 93.20401878936576
+    },
+    {
+      "dt": "2020-07-13T04:00:00",
+      "side": "BUY",
+      "size": 66.0,
+      "price": 96.35828017098567
+    },
+    {
+      "dt": "2020-08-04T04:00:00",
+      "side": "SELL",
+      "size": -64.0,
+      "price": 105.6651273181697
+    },
+    {
+      "dt": "2020-08-06T04:00:00",
+      "side": "BUY",
+      "size": 64.0,
+      "price": 110.24610652109337
+    },
+    {
+      "dt": "2021-01-26T05:00:00",
+      "side": "SELL",
+      "size": -47.0,
+      "price": 139.52852500725305
+    },
+    {
+      "dt": "2021-02-01T05:00:00",
+      "side": "BUY",
+      "size": 47.0,
+      "price": 129.95780442586786
+    },
+    {
+      "dt": "2021-11-24T05:00:00",
+      "side": "SELL",
+      "size": -51.0,
+      "price": 157.1551520319611
+    },
+    {
+      "dt": "2021-11-30T05:00:00",
+      "side": "BUY",
+      "size": 51.0,
+      "price": 161.59562958679686
+    },
+    {
+      "dt": "2021-12-09T05:00:00",
+      "side": "SELL",
+      "size": -34.0,
+      "price": 170.9985052389604
+    },
+    {
+      "dt": "2021-12-13T05:00:00",
+      "side": "BUY",
+      "size": 34.0,
+      "price": 177.3263058381813
+    },
+    {
+      "dt": "2022-05-12T04:00:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 139.96043637411066
+    },
+    {
+      "dt": "2022-05-20T04:00:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 131.4455972521318
+    },
+    {
+      "dt": "2022-09-30T04:00:00",
+      "side": "BUY",
+      "size": 38.0,
+      "price": 138.69211755301987
+    },
+    {
+      "dt": "2022-10-19T04:00:00",
+      "side": "SELL",
+      "size": -38.0,
+      "price": 139.09458913180654
+    },
+    {
+      "dt": "2023-06-02T04:00:00",
+      "side": "SELL",
+      "size": -61.0,
+      "price": 178.52716847079088
+    },
+    {
+      "dt": "2023-06-15T04:00:00",
+      "side": "BUY",
+      "size": 61.0,
+      "price": 182.4658348981315
+    },
+    {
+      "dt": "2023-07-03T04:00:00",
+      "side": "SELL",
+      "size": -61.0,
+      "price": 191.10095251247643
+    },
+    {
+      "dt": "2023-07-11T04:00:00",
+      "side": "BUY",
+      "size": 61.0,
+      "price": 186.5447760995126
+    },
+    {
+      "dt": "2024-03-06T05:00:00",
+      "side": "BUY",
+      "size": 54.0,
+      "price": 169.36121186741923
+    },
+    {
+      "dt": "2024-03-19T04:00:00",
+      "side": "SELL",
+      "size": -54.0,
+      "price": 172.60863428037308
+    },
+    {
+      "dt": "2024-06-14T04:00:00",
+      "side": "SELL",
+      "size": -40.0,
+      "price": 212.01345147179217
+    },
+    {
+      "dt": "2024-07-03T04:00:00",
+      "side": "BUY",
+      "size": 40.0,
+      "price": 218.8764271776343
+    },
+    {
+      "dt": "2024-07-11T04:00:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 229.40281699319425
+    },
+    {
+      "dt": "2024-07-24T04:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 222.0762625279836
+    },
+    {
+      "dt": "2024-12-03T05:00:00",
+      "side": "SELL",
+      "size": -41.0,
+      "price": 238.287560999784
+    },
+    {
+      "dt": "2024-12-09T05:00:00",
+      "side": "BUY",
+      "size": 41.0,
+      "price": 243.7870410397891
+    },
+    {
+      "dt": "2025-01-14T05:00:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 233.25971079858908
+    },
+    {
+      "dt": "2025-01-21T05:00:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 222.57792910461188
+    },
+    {
+      "dt": "2025-01-22T05:00:00",
+      "side": "BUY",
+      "size": 18.0,
+      "price": 218.39466636780546
+    },
+    {
+      "dt": "2025-01-29T05:00:00",
+      "side": "SELL",
+      "size": -18.0,
+      "price": 232.6336842670617
+    },
+    {
+      "dt": "2025-07-03T04:00:00",
+      "side": "SELL",
+      "size": -39.0,
+      "price": 211.31168447150716
+    },
+    {
+      "dt": "2025-07-30T04:00:00",
+      "side": "BUY",
+      "size": 39.0,
+      "price": 211.06266703997417
+    },
+    {
+      "dt": "2025-08-11T04:00:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 227.27701087414155
+    },
+    {
+      "dt": "2025-09-03T04:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 236.54080133953738
+    },
+    {
+      "dt": "2025-09-23T04:00:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 255.15815615601056
+    },
+    {
+      "dt": "2025-10-13T04:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 248.6764678182016
+    }
+  ]
+}

@@ -1,72 +1,32 @@
 {
   "task_id": 306,
   "ref_idx": 2,
-  "model": "sonnet",
-  "code": "import backtrader as bt\nimport math\nimport numpy as np\nfrom hmmlearn.hmm import GaussianHMM\n\n\nclass QCBAuditStrategy(bt.Strategy):\n\n    params = (\n        ('macd_fast', 12),\n        ('macd_slow', 26),\n        ('macd_signal', 9),\n        ('atr_period', 14),\n        ('hmm_window', 390),\n        ('base_k', 1.0),\n        ('size', 1),\n    )\n\n    def __init__(self):\n        self.macd_ind = bt.indicators.MACD(\n            self.data.close,\n            period1=self.p.macd_fast,\n            period2=self.p.macd_slow,\n            period_signal=self.p.macd_signal,\n        )\n        self.atr_ind = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.macd_cross = bt.indicators.CrossOver(\n            self.macd_ind.macd, self.macd_ind.signal\n        )\n\n        # k = base_k * (slow_period / fast_period) = 1.0 * (26/12)\n        self.k = self.p.base_k * (self.p.macd_slow / self.p.macd_fast)\n\n        self.order = None\n        self.stop_order = None\n\n        self.hmm_model = None\n        self.bull_hmm_state = None  # raw HMM state index that maps to \"bull\"\n\n        self.cur_logical = None   # 1 = bull, 0 = bear\n        self.prev_logical = None\n\n        self.last_fit_date = None\n\n    # ------------------------------------------------------------------\n    # Order lifecycle\n    # ------------------------------------------------------------------\n\n    def notify_order(self, order):\n        if order.status in [\n            order.Completed, order.Canceled, order.Margin, order.Rejected\n        ]:\n            if order is self.order:\n                self.order = None\n            if order is self.stop_order:\n                self.stop_order = None\n\n    # ------------------------------------------------------------------\n    # HMM helpers\n    # ------------------------------------------------------------------\n\n    def _get_past_closes(self, n):\n        \"\"\"Up to n closes ending at previous bar (no current bar), chronological.\"\"\"\n        available = len(self.data) - 1\n        n_use = min(n, available)\n        if n_use < 1:\n            return []\n        return [self.data.close[-n_use + i] for i in range(n_use)]\n\n    def _log_returns(self, closes):\n        if len(closes) < 2:\n            return []\n        return [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]\n\n    def _fit_hmm(self):\n        \"\"\"Refit on past data only; called once per day at session open.\"\"\"\n        closes = self._get_past_closes(self.p.hmm_window + 1)\n        rets = self._log_returns(closes)\n        if len(rets) < 4:\n            return\n        X = np.array(rets, dtype=float).reshape(-1, 1)\n        model = GaussianHMM(\n            n_components=2, covariance_type='diag',\n            n_iter=100, random_state=42,\n        )\n        try:\n            model.fit(X)\n        except Exception:\n            return\n        self.hmm_model = model\n        self.bull_hmm_state = int(np.argmax(model.means_.flatten()))\n\n    def _infer_state(self):\n        \"\"\"Viterbi-decode rolling window ending at current bar; update logical state.\"\"\"\n        if self.hmm_model is None:\n            return\n        n_use = min(self.p.hmm_window + 1, len(self.data))\n        if n_use < 2:\n            return\n        # Chronological closes from -(n_use-1) bars ago through current bar (index 0)\n        closes = [self.data.close[-(n_use - 1) + i] for i in range(n_use)]\n        rets = self._log_returns(closes)\n        if not rets:\n            return\n        X = np.array(rets, dtype=float).reshape(-1, 1)\n        try:\n            states = self.hmm_model.predict(X)\n        except Exception:\n            return\n        logical = 1 if int(states[-1]) == self.bull_hmm_state else 0\n        self.prev_logical = self.cur_logical\n        self.cur_logical = logical\n\n    # ------------------------------------------------------------------\n    # ATR stop management\n    # ------------------------------------------------------------------\n\n    def _update_stop(self):\n        \"\"\"Cancel existing stop and place refreshed ATR stop for current bar.\"\"\"\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n            self.stop_order = None\n        dist = self.atr_ind[0] * self.k\n        if self.position.size > 0:\n            self.stop_order = self.sell(\n                exectype=bt.Order.Stop,\n                price=self.data.close[0] - dist,\n                size=abs(self.position.size),\n            )\n        elif self.position.size < 0:\n            self.stop_order = self.buy(\n                exectype=bt.Order.Stop,\n                price=self.data.close[0] + dist,\n                size=abs(self.position.size),\n            )\n\n    # ------------------------------------------------------------------\n    # Main logic\n    # ------------------------------------------------------------------\n\n    def next(self):\n        current_date = self.data.datetime.date(0)\n\n        # Session open: refit HMM on past data only, reset state tracking\n        if current_date != self.last_fit_date:\n            self.last_fit_date = current_date\n            self.prev_logical = None\n            self.cur_logical = None\n            self._fit_hmm()\n\n        # Infer current bar's hidden state\n        self._infer_state()\n\n        cross_up = self.macd_cross[0] > 0\n        cross_dn = self.macd_cross[0] < 0\n\n        # \"Transitions into\" = prior state was NOT the target AND current IS\n        to_bull = (\n            self.prev_logical is not None\n            and self.prev_logical != 1\n            and self.cur_logical == 1\n        )\n        to_bear = (\n            self.prev_logical is not None\n            and self.prev_logical != 0\n            and self.cur_logical == 0\n        )\n\n        pos = self.position.size\n\n        if pos > 0:\n            # Exit long on opposite confirmation\n            if self.order is None and cross_dn and to_bear:\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.order = self.close()\n            elif self.order is None:\n                self._update_stop()\n\n        elif pos < 0:\n            # Exit short on opposite confirmation\n            if self.order is None and cross_up and to_bull:\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.order = self.close()\n            elif self.order is None:\n                self._update_stop()\n\n        else:\n            # Entry: require HMM fitted and no pending order\n            if self.order is None and self.hmm_model is not None:\n                if cross_up and to_bull:\n                    self.order = self.buy(size=self.p.size)\n                elif cross_dn and to_bear:\n                    self.order = self.sell(size=self.p.size)",
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import math\nimport collections\nimport statistics\nimport numpy as np\nfrom hmmlearn import hmm\nimport backtrader as bt\n\n\nclass HMMMACDStrategy(bt.Strategy):\n    params = (\n        ('fast_period', 12),\n        ('slow_period', 26),\n        ('signal_period', 9),\n        ('atr_period', 14),\n        ('base_k', 1.0),\n        ('window_size', 390),\n    )\n\n    def __init__(self):\n        self.macd = bt.indicators.MACD(\n            self.data.close,\n            period_me1=self.p.fast_period,\n            period_me2=self.p.slow_period,\n            period_signal=self.p.signal_period\n        )\n        self.crossover = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        self.k = self.p.base_k * (self.p.slow_period / self.p.fast_period)\n\n        self.order = None\n        self.stop_order = None\n\n        self.log_returns = []\n        self.model = None\n        self.bull_state_idx = None\n        self.bear_state_idx = None\n        self.prev_regime = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            if order == self.order:\n                self.order = None\n            if order == self.stop_order:\n                self.stop_order = None\n\n    def next(self):\n        if len(self) > 1:\n            log_ret = math.log(self.data.close[0] / self.data.close[-1])\n        else:\n            log_ret = 0.0\n        self.log_returns.append(log_ret)\n\n        is_session_open = (len(self) == 1) or (self.data.datetime.date(0) != self.data.datetime.date(-1))\n\n        if is_session_open and len(self.log_returns) >= self.p.window_size:\n            X_train = np.array(self.log_returns[-self.p.window_size:]).reshape(-1, 1)\n            model = hmm.GaussianHMM(n_components=2, covariance_type=\"diag\", n_iter=100, random_state=42)\n            try:\n                model.fit(X_train)\n                self.model = model\n                if self.model.means_[1][0] > self.model.means_[0][0]:\n                    self.bull_state_idx = 1\n                    self.bear_state_idx = 0\n                else:\n                    self.bull_state_idx = 0\n                    self.bear_state_idx = 1\n            except Exception:\n                pass\n\n        current_regime = None\n        if self.model is not None and len(self.log_returns) >= self.p.window_size:\n            X_seq = np.array(self.log_returns[-self.p.window_size:]).reshape(-1, 1)\n            try:\n                states = self.model.predict(X_seq)\n                last_state = states[-1]\n                if last_state == self.bull_state_idx:\n                    current_regime = 'bull'\n                else:\n                    current_regime = 'bear'\n            except Exception:\n                current_regime = None\n\n        hmm_trans_bull = False\n        hmm_trans_bear = False\n        if current_regime is not None and self.prev_regime is not None:\n            if current_regime == 'bull' and self.prev_regime == 'bear':\n                hmm_trans_bull = True\n            elif current_regime == 'bear' and self.prev_regime == 'bull':\n                hmm_trans_bear = True\n\n        if current_regime is not None:\n            self.prev_regime = current_regime\n\n        macd_cross_up = self.crossover[0] > 0\n        macd_cross_down = self.crossover[0] < 0\n\n        if self.order is not None:\n            return\n\n        if not self.position:\n            if macd_cross_up and hmm_trans_bull:\n                self.order = self.buy()\n            elif macd_cross_down and hmm_trans_bear:\n                self.order = self.sell()\n        else:\n            if self.position.size > 0:\n                if macd_cross_down and hmm_trans_bear:\n                    if self.stop_order:\n                        self.cancel(self.stop_order)\n                        self.stop_order = None\n                    self.order = self.close()\n                    return\n            elif self.position.size < 0:\n                if macd_cross_up and hmm_trans_bull:\n                    if self.stop_order:\n                        self.cancel(self.stop_order)\n                        self.stop_order = None\n                    self.order = self.close()\n                    return\n\n            if self.stop_order:\n                self.cancel(self.stop_order)\n                self.stop_order = None\n\n            stop_dist = self.atr[0] * self.k\n            if self.position.size > 0:\n                stop_price = self.position.price - stop_dist\n                self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price)\n            elif self.position.size < 0:\n                stop_price = self.position.price + stop_dist\n                self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price)",
   "assumptions": [
     {
+      "topic": "stop_loss_anchor",
+      "choice": "Stop-loss price is calculated relative to position entry price (self.position.price) and updated each bar using the latest ATR(14) value.",
+      "reason": "The specification defines stop distance as ATR(14) * k and specifies updating stop orders each bar while in position."
+    },
+    {
+      "topic": "hmm_fitting_params",
+      "choice": "GaussianHMM is initialized with n_components=2, covariance_type='diag', n_iter=100, and random_state=42.",
+      "reason": "Standard deterministic parameters for hmmlearn GaussianHMM fitting on 1D continuous log returns."
+    },
+    {
+      "topic": "hmm_warmup",
+      "choice": "HMM model fitting and inference begin once 390 bars of close-to-close log returns have accumulated.",
+      "reason": "The specification requires training on a rolling window of the last 390 bars of log returns."
+    },
+    {
       "topic": "position_sizing",
-      "choice": "Fixed 1 share per trade (size=1).",
-      "reason": "Spec offers 'fixed (e.g., 1 share) or percent-of-equity sizing'; the parenthetical example is taken as the concrete choice."
-    },
-    {
-      "topic": "stop_anchor_price",
-      "choice": "Stop placed at current bar's close \u00b1 ATR(14)*k; updated each bar while in position.",
-      "reason": "Spec states 'stop distance = ATR(14)*k' and 'stop orders updated each bar' but does not name an anchor price. Close is the most natural per-bar reference price."
-    },
-    {
-      "topic": "numpy_import",
-      "choice": "numpy imported alongside hmmlearn.",
-      "reason": "hmmlearn requires numpy for array operations. The spec mandates hmmlearn; numpy is its mandatory transitive dependency and cannot be avoided."
-    },
-    {
-      "topic": "hmm_covariance_type",
-      "choice": "'diag' (diagonal covariance) for GaussianHMM.",
-      "reason": "Spec says 'Gaussian HMM' without specifying covariance structure. 'diag' is hmmlearn's default and is mathematically identical to 'full' for the single 1-D feature (log return) used here."
-    },
-    {
-      "topic": "hmm_n_iter",
-      "choice": "100 EM iterations.",
-      "reason": "Spec does not specify. 100 iterations yields reliable convergence; hmmlearn's default of 10 can leave the model under-converged on noisy intraday data."
-    },
-    {
-      "topic": "hmm_random_state",
-      "choice": "random_state=42 for GaussianHMM.",
-      "reason": "Spec does not specify. A fixed seed is required for the audit to produce bit-for-bit reproducible execution traces across runs."
-    },
-    {
-      "topic": "hmm_inference_window",
-      "choice": "Rolling window of up to 390 log-returns ending at the current bar (same length as the training window).",
-      "reason": "Spec specifies the training window (390 log-returns) but is silent on the inference window. Using the same length is symmetric and avoids arbitrary deviation."
-    },
-    {
-      "topic": "hmm_inference_algorithm",
-      "choice": "Viterbi decoding (hmmlearn predict()) on the rolling window; current state = last element of the decoded sequence.",
-      "reason": "Spec says 'infer the current hidden state' without prescribing an algorithm. Viterbi is the canonical HMM state-decoding method and the primary use-case of hmmlearn's predict()."
-    },
-    {
-      "topic": "transition_definition",
-      "choice": "'Transitions into state X on bar t' means prev_logical != X AND cur_logical == X.",
-      "reason": "Natural reading: a bar where the state was already X is a continuation, not a new transition. An already-active state cannot 'transition into' itself."
-    },
-    {
-      "topic": "session_open_detection",
-      "choice": "First bar whose calendar date differs from the previously seen date triggers the daily refit.",
-      "reason": "Spec says 'refit once per day at the session open'. Calendar-date change on the 5-min AAPL feed is the minimal, lookahead-free proxy for session open without requiring time-of-day logic the spec explicitly forbids filtering on."
-    },
-    {
-      "topic": "state_reset_at_refit",
-      "choice": "prev_logical and cur_logical are reset to None at each daily refit; no HMM state transition is detected on the session-open bar itself.",
-      "reason": "Each daily fit assigns raw-state labels independently. Carrying the prior model's logical state into the new model's context would create a spurious cross-model transition. The first transition of the new day can only be detected from the second bar onward."
-    },
-    {
-      "topic": "hmm_fit_failure",
-      "choice": "If GaussianHMM.fit() raises an exception, the previously fitted model and bull_hmm_state are retained unchanged.",
-      "reason": "Spec does not address fit failures. Retaining the last valid model is safer than trading without a regime filter or crashing the strategy."
+      "choice": "Default unit position size (1 share via plain self.buy() and self.sell()) is used.",
+      "reason": "Complies with Canonical Default 1 as position sizing is stated as flexible/optional."
     }
   ],
   "success": false,
-  "error": "Traceback (most recent call last):\n  File \"<string>\", line 5, in <module>\nModuleNotFoundError: No module named 'hmmlearn'",
+  "error": "Traceback (most recent call last):\n  File \"<string>\", line 6, in <module>\nModuleNotFoundError: No module named 'hmmlearn'",
   "total_trades": 0,
   "tape": []
 }

@@ -1,54 +1,262 @@
 {
   "task_id": 136,
   "ref_idx": 2,
-  "model": "sonnet",
-  "code": "import backtrader as bt\n\n\nclass QCBStrategy(bt.Strategy):\n\n    ENTRY_LEVEL = 179.33\n    TP1_LEVEL = 184.89\n    TP2_LEVEL = 192.95\n    RISK_PCT = 0.02\n\n    def __init__(self):\n        self.ema8 = bt.indicators.EMA(self.data.close, period=8)\n        self.order = None\n        self.tp1_done = False\n        self.trailing_stop_level = None\n        self.entry_size = 0\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            if order is self.order:\n                self.order = None\n                if order.status == order.Completed and order.isbuy():\n                    self.entry_size = order.executed.size\n\n    def next(self):\n        if self.order:\n            return\n\n        if not self.position:\n            self.tp1_done = False\n            self.trailing_stop_level = None\n\n            if self.data.close[0] > self.ENTRY_LEVEL:\n                entry_price = self.data.close[0]\n                initial_stop = self.ema8[0]\n                risk_per_share = entry_price - initial_stop\n\n                if risk_per_share <= 0:\n                    return\n\n                portfolio_value = self.broker.getvalue()\n                risk_amount = portfolio_value * self.RISK_PCT\n                size = int(risk_amount / risk_per_share)\n\n                if size <= 0:\n                    return\n\n                self.trailing_stop_level = initial_stop\n                self.order = self.buy(size=size)\n\n        else:\n            # Advance trailing stop to current EMA level but never retreat\n            self.trailing_stop_level = max(self.trailing_stop_level, self.ema8[0])\n            close = self.data.close[0]\n\n            # Final take-profit: close the remaining position\n            if self.tp1_done and close >= self.TP2_LEVEL:\n                self.order = self.close()\n                return\n\n            # Take-profit 1: close 50% of original entry size\n            if not self.tp1_done and close >= self.TP1_LEVEL:\n                tp1_size = self.entry_size // 2\n                if tp1_size > 0:\n                    self.order = self.sell(size=tp1_size)\n                self.tp1_done = True\n                return\n\n            # Trailing stop: close entire remaining position\n            if close <= self.trailing_stop_level:\n                self.order = self.close()",
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import math\nimport backtrader as bt\n\n\nclass NVDABreakoutStrategy(bt.Strategy):\n    params = (\n        ('ema_period', 8),\n        ('breakout_level', 179.33),\n        ('tp1_level', 184.89),\n        ('tp2_level', 192.95),\n        ('risk_pct', 0.02),\n    )\n\n    def __init__(self):\n        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)\n        self.order = None\n        self.stop_price = 0.0\n        self.tp1_done = False\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if not self.position:\n            if self.data.close[0] > self.p.breakout_level:\n                entry_price = self.data.close[0]\n                init_stop = self.ema[0]\n                risk_per_share = entry_price - init_stop\n\n                if risk_per_share > 0:\n                    capital = self.broker.getvalue()\n                    max_risk = capital * self.p.risk_pct\n                    size = int(max_risk / risk_per_share)\n\n                    cash = self.broker.getcash()\n                    max_cash_size = int(cash / entry_price)\n                    size = min(size, max_cash_size)\n\n                    if size > 0:\n                        self.order = self.buy(size=size)\n                        self.stop_price = init_stop\n                        self.tp1_done = False\n        else:\n            self.stop_price = max(self.stop_price, self.ema[0])\n\n            if self.data.low[0] <= self.stop_price:\n                self.order = self.close()\n            elif self.data.high[0] >= self.p.tp2_level:\n                self.order = self.close()\n            elif not self.tp1_done and self.data.high[0] >= self.p.tp1_level:\n                half_size = max(1, self.position.size // 2)\n                self.order = self.sell(size=half_size)\n                self.tp1_done = True",
   "assumptions": [
     {
-      "topic": "trailing stop interpretation",
-      "choice": "Stop level is placed AT the EMA(8) value and updated each bar as max(prev_stop_level, ema8[0]), so it ratchets upward with price but never retreats.",
-      "reason": "Literal reading of 'lagging by a distance equal to the value of the 8-period EMA' would set stop = close - EMA; since EMA \u2248 $180\u2013$900 across the feed, that yields a stop near zero or negative\u2014meaningless for risk management. The only sensible reading consistent with the clarifying sentence ('will not fall below its previous value') is that the EMA line itself is the trailing stop level, locked upward with max()."
+      "topic": "trailing_stop_interpretation",
+      "choice": "Set initial trailing stop at EMA(8) value at signal time, and ratchet upward to max(previous_stop, EMA(8)) on each subsequent bar.",
+      "reason": "Spec states trailing stop lags by a distance equal to the 8-period EMA and moves upward without falling below previous values; placing ratcheted stop at EMA(8) satisfies all stated properties."
     },
     {
-      "topic": "50% partial close size",
-      "choice": "TP1 sell size = entry_size // 2 (integer floor division). If entry_size == 1, tp1_done is set to True without a sell, and the single share is held for TP2 or the trailing stop.",
-      "reason": "Fractional shares are not supported in backtrader. Floor division is the standard rounding choice; the residual share(s) remain for the second exit."
+      "topic": "exit_execution",
+      "choice": "Evaluate exit conditions in next() using current bar High/Low prices and submit market orders upon condition detection.",
+      "reason": "Dynamic EMA trailing stop updates continuously, making per-bar intrabar extreme checks with market order submissions the standard Backtrader implementation choice."
     },
     {
-      "topic": "initial trailing stop timing",
-      "choice": "Trailing stop is initialised to EMA(8) at the close of the signal bar (bar N). The buy order fills at bar N+1 open; the stop is already set before bar N+1's next() runs and is then updated with the bar N+1 EMA via max().",
-      "reason": "Market orders in backtrader fill at the following bar's open. Capturing the EMA at signal time is the closest available approximation; the max() update on bar N+1 corrects any one-bar lag."
-    },
-    {
-      "topic": "risk calculation base",
-      "choice": "broker.getvalue() (total portfolio equity including any open-position mark-to-market) at the close of the signal bar is used as 'total trading capital'.",
-      "reason": "The spec says '2% of total trading capital'; broker.getvalue() is the canonical backtrader measure of total account equity."
-    },
-    {
-      "topic": "TP price condition operator",
-      "choice": "Take-profit triggers when close >= TP level (greater-than-or-equal).",
-      "reason": "The spec says 'upon reaching the price'. On daily bars an exact float equality hit is practically impossible; >= is the standard interpretation of 'reaching or exceeding a price level'."
-    },
-    {
-      "topic": "trailing stop comparison price",
-      "choice": "Closing price is compared against the trailing stop level each bar.",
-      "reason": "All conditions in the spec are evaluated at daily bar close. Intrabar stop simulation would require tick or minute data not present in the feed."
-    },
-    {
-      "topic": "re-entry after exit",
-      "choice": "Re-entry is permitted on any subsequent bar where close > 179.33 after the position is fully closed.",
-      "reason": "The spec states an entry condition without restricting it to a single trade lifetime. The canonical default (no re-entry while a position is open) is satisfied; once flat the strategy follows its stated entry rule anew."
+      "topic": "partial_take_profit_rounding",
+      "choice": "Close max(1, position.size // 2) shares when TP1 threshold is reached.",
+      "reason": "Position size must be an integer number of shares; integer division with a minimum of 1 share handles odd-lot or single-share positions cleanly."
     }
   ],
   "success": true,
   "error": null,
-  "total_trades": 1,
+  "total_trades": 18,
   "tape": [
     {
       "dt": "2025-08-05T04:00:00",
       "side": "BUY",
       "size": 49.0,
       "price": 179.38107983649962
+    },
+    {
+      "dt": "2025-08-06T04:00:00",
+      "side": "SELL",
+      "size": -49.0,
+      "price": 176.09546439011424
+    },
+    {
+      "dt": "2025-08-08T04:00:00",
+      "side": "BUY",
+      "size": 54.0,
+      "price": 181.30852119793246
+    },
+    {
+      "dt": "2025-08-13T04:00:00",
+      "side": "SELL",
+      "size": -54.0,
+      "price": 182.37709375214726
+    },
+    {
+      "dt": "2025-08-14T04:00:00",
+      "side": "BUY",
+      "size": 54.0,
+      "price": 179.5108931379294
+    },
+    {
+      "dt": "2025-08-15T04:00:00",
+      "side": "SELL",
+      "size": -54.0,
+      "price": 181.6380820439347
+    },
+    {
+      "dt": "2025-08-19T04:00:00",
+      "side": "BUY",
+      "size": 54.0,
+      "price": 182.1873336556069
+    },
+    {
+      "dt": "2025-08-20T04:00:00",
+      "side": "SELL",
+      "size": -54.0,
+      "price": 174.93699721113848
+    },
+    {
+      "dt": "2025-08-26T04:00:00",
+      "side": "BUY",
+      "size": 53.0,
+      "price": 179.82049655621498
+    },
+    {
+      "dt": "2025-08-27T04:00:00",
+      "side": "SELL",
+      "size": -53.0,
+      "price": 181.73792838079515
+    },
+    {
+      "dt": "2025-08-28T04:00:00",
+      "side": "BUY",
+      "size": 53.0,
+      "price": 180.57950348224864
+    },
+    {
+      "dt": "2025-08-29T04:00:00",
+      "side": "SELL",
+      "size": -53.0,
+      "price": 177.87308356836775
+    },
+    {
+      "dt": "2025-09-23T04:00:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 181.73821238324945
+    },
+    {
+      "dt": "2025-09-24T04:00:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 179.54100413716742
+    },
+    {
+      "dt": "2025-09-30T04:00:00",
+      "side": "BUY",
+      "size": 51.0,
+      "price": 181.848063160254
+    },
+    {
+      "dt": "2025-10-01T04:00:00",
+      "side": "SELL",
+      "size": -25.0,
+      "price": 185.00404300205486
+    },
+    {
+      "dt": "2025-10-07T04:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 185.99277739696942
+    },
+    {
+      "dt": "2025-10-08T04:00:00",
+      "side": "BUY",
+      "size": 51.0,
+      "price": 186.33235229407293
+    },
+    {
+      "dt": "2025-10-09T04:00:00",
+      "side": "SELL",
+      "size": -25.0,
+      "price": 191.9851285494953
+    },
+    {
+      "dt": "2025-10-10T04:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 193.26350393527704
+    },
+    {
+      "dt": "2025-10-14T04:00:00",
+      "side": "BUY",
+      "size": 52.0,
+      "price": 184.53462639606818
+    },
+    {
+      "dt": "2025-10-15T04:00:00",
+      "side": "SELL",
+      "size": -52.0,
+      "price": 184.56460739230218
+    },
+    {
+      "dt": "2025-10-28T04:00:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 192.80410966447576
+    },
+    {
+      "dt": "2025-10-29T04:00:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 207.715080745974
+    },
+    {
+      "dt": "2025-10-30T04:00:00",
+      "side": "BUY",
+      "size": 14.0,
+      "price": 204.88867704045037
+    },
+    {
+      "dt": "2025-10-31T04:00:00",
+      "side": "SELL",
+      "size": -14.0,
+      "price": 206.18701808603035
+    },
+    {
+      "dt": "2025-11-03T05:00:00",
+      "side": "BUY",
+      "size": 35.0,
+      "price": 207.81493866642379
+    },
+    {
+      "dt": "2025-11-04T05:00:00",
+      "side": "SELL",
+      "size": -35.0,
+      "price": 202.7414122562426
+    },
+    {
+      "dt": "2025-11-11T05:00:00",
+      "side": "BUY",
+      "size": 50.0,
+      "price": 194.91140808059743
+    },
+    {
+      "dt": "2025-11-12T05:00:00",
+      "side": "SELL",
+      "size": -50.0,
+      "price": 195.4706988945922
+    },
+    {
+      "dt": "2025-12-03T05:00:00",
+      "side": "BUY",
+      "size": 55.0,
+      "price": 180.84934411279121
+    },
+    {
+      "dt": "2025-12-04T05:00:00",
+      "side": "SELL",
+      "size": -55.0,
+      "price": 181.3987504426599
+    },
+    {
+      "dt": "2025-12-05T05:00:00",
+      "side": "BUY",
+      "size": 55.0,
+      "price": 183.66598269849337
+    },
+    {
+      "dt": "2025-12-08T05:00:00",
+      "side": "SELL",
+      "size": -55.0,
+      "price": 182.41751577930148
+    },
+    {
+      "dt": "2025-12-09T05:00:00",
+      "side": "BUY",
+      "size": 54.0,
+      "price": 185.33395229946424
+    },
+    {
+      "dt": "2025-12-10T05:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 184.74467463147755
+    },
+    {
+      "dt": "2025-12-11T05:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 180.060377409269
+    },
+    {
+      "dt": "2025-12-23T05:00:00",
+      "side": "BUY",
+      "size": 42.0,
+      "price": 182.7471036477755
+    },
+    {
+      "dt": "2025-12-24T05:00:00",
+      "side": "SELL",
+      "size": -21.0,
+      "price": 187.71105179508496
     }
   ]
 }

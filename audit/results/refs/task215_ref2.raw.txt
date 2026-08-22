@@ -1,0 +1,135 @@
+```python
+import backtrader as bt
+
+
+class RRGProxyMomentum(bt.Strategy):
+    params = (
+        ("sma_fast", 50),
+        ("sma_slow", 200),
+        ("macd1", 12),
+        ("macd2", 26),
+        ("macdsig", 9),
+        ("rsi_period", 14),
+        ("atr_period", 14),
+        ("vol_period", 20),
+        ("stop_pct", 0.02),
+        ("take_pct", 0.07),
+        ("use_tp", True),
+        ("rsi_tp_level", 70),
+        ("rsi_cross_level", 50),
+        ("risk_pct", 0.01),
+        ("max_cap_pct", 0.10),
+        ("atr_mult", 2.0),
+        ("use_liquidity_filter", True),
+    )
+
+    def __init__(self):
+        self.sma_fast = bt.indicators.SMA(self.data.close, period=self.p.sma_fast)
+        self.sma_slow = bt.indicators.SMA(self.data.close, period=self.p.sma_slow)
+        self.macd = bt.indicators.MACDHisto(
+            self.data.close,
+            period_me1=self.p.macd1,
+            period_me2=self.p.macd2,
+            period_signal=self.p.macdsig,
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_vol = bt.indicators.SMA(self.data.volume, period=self.p.vol_period)
+
+        self.crossover_macd = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.crossover_rsi = bt.indicators.CrossOver(self.rsi, self.p.rsi_cross_level)
+
+        self.order = None
+        self.entry_price = 0.0
+        self.stop_price = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                stop_dist = max(
+                    self.entry_price * self.p.stop_pct,
+                    self.p.atr_mult * self.atr[0],
+                )
+                self.stop_price = self.entry_price - stop_dist
+            elif order.issell():
+                self.entry_price = 0.0
+                self.stop_price = 0.0
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            leadership = (self.data.close[0] > self.sma_slow[0]) and (
+                self.sma_fast[0] > self.sma_slow[0]
+            )
+            momentum = self.macd.histo[0] > 0
+            acceleration = (self.crossover_macd[0] > 0) or (self.crossover_rsi[0] > 0)
+            liquidity = (not self.p.use_liquidity_filter) or (
+                self.data.volume[0] > self.sma_vol[0]
+            )
+
+            if leadership and momentum and acceleration and liquidity:
+                capital = self.broker.getvalue()
+                current_price = self.data.close[0]
+                stop_per_share = max(
+                    current_price * self.p.stop_pct,
+                    self.p.atr_mult * self.atr[0],
+                )
+
+                if stop_per_share > 0 and current_price > 0:
+                    risk_shares = (capital * self.p.risk_pct) / stop_per_share
+                    cap_shares = (capital * self.p.max_cap_pct) / current_price
+                    size = int(min(risk_shares, cap_shares))
+
+                    if size > 0:
+                        self.order = self.buy(size=size)
+        else:
+            mom_weakening = (self.macd.histo[0] < 0) and (
+                self.data.close[0] > self.sma_slow[0]
+            )
+            trend_reversal = (self.data.close[0] < self.sma_slow[0]) or (
+                self.sma_fast[0] < self.sma_slow[0]
+            )
+            tp_triggered = False
+            if self.p.use_tp:
+                tp_triggered = (
+                    self.data.close[0] >= self.entry_price * (1.0 + self.p.take_pct)
+                ) or (self.rsi[0] > self.p.rsi_tp_level)
+
+            sl_triggered = (self.stop_price > 0.0) and (
+                self.data.low[0] <= self.stop_price
+            )
+
+            if mom_weakening or trend_reversal or tp_triggered or sl_triggered:
+                self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "stop_loss_trigger",
+      "choice": "Evaluated in next() by checking if low[0] falls to or below stop_price",
+      "reason": "The spec defines a stop-loss distance formula; checking low[0] against calculated stop price captures intra-bar breaches while remaining consistent with signal-driven self.close() exits."
+    },
+    {
+      "topic": "position_sizing_shares",
+      "choice": "Truncated to discrete integer shares using int()",
+      "reason": "Single-asset equity trading strategies in standard broker models require discrete share quantities."
+    },
+    {
+      "topic": "entry_stop_price_update",
+      "choice": "Pre-entry order size uses current close for risk calculation, while actual stop_price is anchored to executed price upon buy completion in notify_order",
+      "reason": "Execution slippage can alter actual entry price; recalculating stop_price at order completion guarantees precise adherence to the stop-loss percentage/ATR offset relative to actual fill."
+    }
+  ]
+}
+```

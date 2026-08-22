@@ -1,0 +1,142 @@
+```python
+import math
+import statistics
+import backtrader as bt
+
+
+class MonthlySkewUtilityStrategy(bt.Strategy):
+    params = (
+        ("alpha", 2.0),
+        ("beta", 1.0),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.last_month = None
+        self.u_history = []
+
+        # Technical Indicators
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.sma_vol20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.sma_vol50 = bt.indicators.SMA(self.data.volume, period=50)
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        current_month = current_date.month
+
+        is_first_trading_day = (
+            self.last_month is None or current_month != self.last_month
+        )
+        self.last_month = current_month
+
+        # Calculate daily utility U when sufficient 252-day lookback history is available
+        if len(self) >= 253:
+            close_curr = self.data.close[0]
+            close_prev252 = self.data.close[-252]
+            mu = math.log(close_curr / close_prev252) / 252.0
+
+            sigma = self.atr[0] / close_curr if close_curr > 0 else 0.0
+
+            p_lower_count = 0
+            p_upper_count = 0
+            for k in range(252):
+                c = self.data.close[-k]
+                if c < self.bb.bot[-k]:
+                    p_lower_count += 1
+                elif c > self.bb.top[-k]:
+                    p_upper_count += 1
+
+            p_lower = p_lower_count / 252.0
+            p_upper = p_upper_count / 252.0
+            skew_penalty = max(0.0, p_lower - p_upper)
+
+            u = mu - self.p.alpha * sigma - self.p.beta * skew_penalty
+            self.u_history.append(u)
+        else:
+            u = None
+
+        # Execute rebalance evaluation only on the first trading day of the month
+        if not is_first_trading_day:
+            return
+
+        if self.order:
+            return
+
+        if u is None:
+            return
+
+        # Determine threshold T (median U over last 252 days, or 0 if history < 252 days)
+        if len(self.u_history) >= 252:
+            t_threshold = statistics.median(self.u_history[-252:])
+        else:
+            t_threshold = 0.0
+
+        # Additional entry/filter conditions
+        filter_ok = (
+            (self.data.close[0] > self.sma50[0])
+            and (self.rsi[0] > 45.0)
+            and (self.sma_vol20[0] > self.sma_vol50[0])
+        )
+
+        # Determine position allocation
+        if (not filter_ok) or (u <= 0.0):
+            target_pct = 0.0
+        elif 0.0 < u <= t_threshold:
+            target_pct = 0.5
+        else:
+            target_pct = 1.0
+
+        # Adjust position according to allocation target
+        if target_pct == 0.0:
+            if self.position:
+                self.order = self.close()
+        else:
+            portfolio_val = self.broker.getvalue()
+            target_val = portfolio_val * target_pct
+            price = self.data.close[0]
+            target_shares = int(target_val / (price * 1.001))
+
+            current_shares = self.position.size
+            delta = target_shares - current_shares
+
+            if delta > 0:
+                self.order = self.buy(size=delta)
+            elif delta < 0:
+                self.order = self.sell(size=abs(delta))
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "liquidity_filter_interpretation",
+      "choice": "Require SMA(volume,20) > SMA(volume,50) for long entry",
+      "reason": "The specification states 'avoid entry under low liquidity (SMA(volume,20) > SMA(volume,50))', which parenthetically specifies SMA(volume,20) > SMA(volume,50) as the liquidity condition required for entry."
+    },
+    {
+      "topic": "utility_tracking_frequency",
+      "choice": "Compute daily utility U to build rolling 252-day history for threshold T median",
+      "reason": "The threshold T is defined as the median U over the last 252 days. Tracking daily U values provides a valid time series from which to compute this 252-day rolling median."
+    },
+    {
+      "topic": "commission_buffer_sizing",
+      "choice": "Apply a 0.1% buffer factor to order size calculation",
+      "reason": "Prevents potential order rejections due to cash shortage after deducting the required 0.001 commission fee."
+    }
+  ]
+}
+```

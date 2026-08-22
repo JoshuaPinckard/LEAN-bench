@@ -1,0 +1,182 @@
+```python
+import backtrader as bt
+
+
+class ShortVolProxyPseudoEarnings(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("ema_bbw_period", 100),
+        ("atr_period", 14),
+        ("ema_atr_period", 100),
+        ("rsi_period", 14),
+        ("sma_vol_period", 20),
+        ("risk_pct", 0.015),
+        ("liquidity_threshold", 0.0),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.bars_since_vol_spike = None
+        self.bars_in_trade = 0
+        self.entry_price = None
+        self.stop_loss = None
+
+        # Indicators
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_dev,
+        )
+
+        # Band width BBW = (upper - lower) / mid
+        self.bbw = (self.bb.top - self.bb.bot) / self.bb.mid
+        self.ema_bbw = bt.indicators.EMA(self.bbw, period=self.p.ema_bbw_period)
+
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema_atr = bt.indicators.EMA(self.atr, period=self.p.ema_atr_period)
+
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.sma_vol = bt.indicators.SMA(
+            self.data.volume, period=self.p.sma_vol_period
+        )
+
+        # Combined volatility spike condition:
+        # BBW > 1.5*EMA(BBW,100) and ATR > 1.2*EMA(ATR,100) and volume > 1.2*SMA(volume,20)
+        c1 = self.bbw > (1.5 * self.ema_bbw)
+        c2 = self.atr > (1.2 * self.ema_atr)
+        c3 = self.data.volume > (1.2 * self.sma_vol)
+        self.vol_spike_cond = bt.And(c1, c2, c3)
+        self.vol_spike_cross = bt.indicators.CrossOver(self.vol_spike_cond, 0.5)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.position:
+                self.entry_price = order.executed.price
+                entry_atr = self.atr[0]
+                self.bars_in_trade = 0
+                if self.position.size > 0:
+                    self.stop_loss = self.entry_price - 1.5 * entry_atr
+                else:
+                    self.stop_loss = self.entry_price + 1.5 * entry_atr
+            else:
+                self.entry_price = None
+                self.stop_loss = None
+                self.bars_in_trade = 0
+
+        self.order = None
+
+    def next(self):
+        # Update counter for volatility spike
+        if self.vol_spike_cross[0] > 0:
+            self.bars_since_vol_spike = 0
+        elif self.bars_since_vol_spike is not None:
+            self.bars_since_vol_spike += 1
+
+        if self.order:
+            return
+
+        if not self.position:
+            # Liquidity filter
+            if self.sma_vol[0] <= self.p.liquidity_threshold:
+                return
+
+            # Timing window filter
+            if self.bars_since_vol_spike is None or not (
+                5 <= self.bars_since_vol_spike <= 21
+            ):
+                return
+
+            # Entry direction checks
+            long_cond = (self.data.close[0] < self.bb.bot[0]) and (
+                self.rsi[0] < 40
+            )
+            short_cond = (self.data.close[0] > self.bb.top[0]) and (
+                self.rsi[0] > 60
+            )
+
+            if long_cond or short_cond:
+                equity = self.broker.getvalue()
+                risk_in_dollars = equity * self.p.risk_pct
+                risk_per_share = 1.5 * self.atr[0]
+                if risk_per_share <= 0:
+                    return
+                qty = int(risk_in_dollars / risk_per_share)
+                if qty <= 0:
+                    return
+
+                if long_cond:
+                    self.order = self.buy(size=qty)
+                elif short_cond:
+                    self.order = self.sell(size=qty)
+
+        else:
+            self.bars_in_trade += 1
+
+            # Event exit check ("day after earnings" simulation)
+            gap = abs(self.data.open[0] - self.data.close[-1])
+            event_exit = (
+                (gap > 1.5 * self.atr[0])
+                and (self.data.volume[0] > 1.5 * self.sma_vol[0])
+                and (self.atr[0] > 1.3 * self.ema_atr[0])
+            )
+
+            # Reversion to Bollinger middle band & Stop Loss check
+            if self.position.size > 0:
+                mid_reversion = self.data.close[0] >= self.bb.mid[0]
+                stop_triggered = (
+                    self.stop_loss is not None
+                    and self.data.low[0] <= self.stop_loss
+                )
+            else:
+                mid_reversion = self.data.close[0] <= self.bb.mid[0]
+                stop_triggered = (
+                    self.stop_loss is not None
+                    and self.data.high[0] >= self.stop_loss
+                )
+
+            # Volatility crash exit
+            vol_crash = self.bbw[0] < self.ema_bbw[0]
+
+            # Time exit
+            time_exit = self.bars_in_trade >= 21
+
+            if (
+                event_exit
+                or mid_reversion
+                or vol_crash
+                or time_exit
+                or stop_triggered
+            ):
+                self.order = self.close()
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "liquidity_threshold",
+      "choice": "Set default liquidity_threshold parameter to 0.0.",
+      "reason": "The specification states 'above a specified threshold' without providing a numerical value."
+    },
+    {
+      "topic": "risk_pct",
+      "choice": "Set risk per trade to 1.5% (0.015) of account equity.",
+      "reason": "The specification states risk per trade is 1–2% of equity."
+    },
+    {
+      "topic": "atr_trailing_stop",
+      "choice": "Used fixed stop loss at entry_price +/- 1.5 * entry_atr.",
+      "reason": "Specification lists ATR trailing as optional; a fixed stop-loss from entry price is deterministic and directly matches 'stop-loss 1.5*ATR from the entry price'."
+    },
+    {
+      "topic": "vol_spike_crossing",
+      "choice": "Used CrossOver indicator on combined condition (BBW > 1.5*EMA(BBW,100) and ATR > 1.2*EMA(ATR,100) and Volume > 1.2*SMA(Volume,20)).",
+      "reason": "Accurately captures the first bar where all volatility spike criteria cross from False to True to initialize bars_since_vol_spike counter."
+    }
+  ]
+}
+```

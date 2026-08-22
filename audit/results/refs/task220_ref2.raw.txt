@@ -1,0 +1,283 @@
+```python
+import backtrader as bt
+
+
+class AggressiveCombinedStrategy(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_dev", 2.0),
+        ("rsi_period", 14),
+        ("macd_p1", 12),
+        ("macd_p2", 26),
+        ("macd_p3", 9),
+        ("ema_period", 50),
+        ("atr_period", 14),
+        ("risk_pct", 0.015),
+        ("scalp_tp_atr", 1.25),
+        ("scalp_time_stop", 4),
+        ("swing_tp_atr", 2.5),
+        ("swing_time_stop", 7),
+        ("swing_stop_atr", 1.5),
+        ("vol_filter_thresh", 0.03),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_p1,
+            period_me2=self.p.macd_p2,
+            period_signal=self.p.macd_p3,
+        )
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.crossover_bot = bt.indicators.CrossOver(
+            self.data.close, self.bb.lines.bot
+        )
+        self.crossover_top = bt.indicators.CrossOver(
+            self.bb.lines.top, self.data.close
+        )
+        self.macd_cross = bt.indicators.CrossOver(
+            self.macd.lines.macd, self.macd.lines.signal
+        )
+
+        self.order = None
+        self.trade_type = None
+        self.trade_dir = 0
+        self.entry_price = 0.0
+        self.entry_atr = 0.0
+        self.stop_price = 0.0
+        self.bars_in_trade = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            self.order = None
+            if self.position:
+                self.entry_price = order.executed.price
+                self.bars_in_trade = 0
+            else:
+                self.trade_type = None
+                self.trade_dir = 0
+                self.entry_price = 0.0
+                self.entry_atr = 0.0
+                self.stop_price = 0.0
+                self.bars_in_trade = 0
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self.bars_in_trade += 1
+
+            if self.trade_type == "scalp":
+                if self.position.size > 0:
+                    tp_cond = (
+                        self.data.close[0] >= self.bb.lines.mid[0]
+                    ) or (
+                        self.data.close[0]
+                        >= self.entry_price
+                        + self.p.scalp_tp_atr * self.entry_atr
+                    )
+                    sl_cond = self.data.low[0] <= self.stop_price
+                    time_cond = self.bars_in_trade >= self.p.scalp_time_stop
+                    if tp_cond or sl_cond or time_cond:
+                        self.order = self.close()
+                elif self.position.size < 0:
+                    tp_cond = (
+                        self.data.close[0] <= self.bb.lines.mid[0]
+                    ) or (
+                        self.data.close[0]
+                        <= self.entry_price
+                        - self.p.scalp_tp_atr * self.entry_atr
+                    )
+                    sl_cond = self.data.high[0] >= self.stop_price
+                    time_cond = self.bars_in_trade >= self.p.scalp_time_stop
+                    if tp_cond or sl_cond or time_cond:
+                        self.order = self.close()
+
+            elif self.trade_type == "swing":
+                if self.position.size > 0:
+                    tp_cond = (
+                        self.data.close[0]
+                        >= self.entry_price
+                        + self.p.swing_tp_atr * self.entry_atr
+                    ) or (self.data.high[0] >= self.bb.lines.top[0])
+                    rev_macd = self.macd_cross[0] == -1
+                    time_cond = self.bars_in_trade >= self.p.swing_time_stop
+                    sl_cond = self.data.low[0] <= self.stop_price
+                    if tp_cond or rev_macd or time_cond or sl_cond:
+                        self.order = self.close()
+                elif self.position.size < 0:
+                    tp_cond = (
+                        self.data.close[0]
+                        <= self.entry_price
+                        - self.p.swing_tp_atr * self.entry_atr
+                    ) or (self.data.low[0] <= self.bb.lines.bot[0])
+                    rev_macd = self.macd_cross[0] == 1
+                    time_cond = self.bars_in_trade >= self.p.swing_time_stop
+                    sl_cond = self.data.high[0] >= self.stop_price
+                    if tp_cond or rev_macd or time_cond or sl_cond:
+                        self.order = self.close()
+            return
+
+        if self.atr[0] / self.data.close[0] > self.p.vol_filter_thresh:
+            return
+
+        hist = self.macd.lines.macd - self.macd.lines.signal
+        hist_moving_to_zero = abs(hist[0]) < abs(hist[-1]) < abs(hist[-2])
+
+        scalp_long_rsi = 40 <= self.rsi[0] <= 60
+        scalp_long_mom = (self.macd_cross[0] == 1) or hist_moving_to_zero
+        if (
+            self.crossover_bot[0] == 1
+            and scalp_long_rsi
+            and scalp_long_mom
+        ):
+            local_low = min(
+                self.data.low[0], self.data.low[-1], self.data.low[-2]
+            )
+            stop_price = local_low - 1.0 * self.atr[0]
+            stop_dist = max(0.01, self.data.close[0] - stop_price)
+            risk_amt = self.broker.getvalue() * self.p.risk_pct
+            size = int(risk_amt / stop_dist)
+            if size > 0:
+                self.trade_type = "scalp"
+                self.trade_dir = 1
+                self.entry_atr = self.atr[0]
+                self.stop_price = stop_price
+                self.order = self.buy(size=size)
+            return
+
+        scalp_short_rsi = 40 <= self.rsi[0] <= 60
+        scalp_short_mom = (self.macd_cross[0] == -1) or hist_moving_to_zero
+        if (
+            self.crossover_top[0] == 1
+            and scalp_short_rsi
+            and scalp_short_mom
+        ):
+            local_high = max(
+                self.data.high[0], self.data.high[-1], self.data.high[-2]
+            )
+            stop_price = local_high + 1.0 * self.atr[0]
+            stop_dist = max(0.01, stop_price - self.data.close[0])
+            risk_amt = self.broker.getvalue() * self.p.risk_pct
+            size = int(risk_amt / stop_dist)
+            if size > 0:
+                self.trade_type = "scalp"
+                self.trade_dir = -1
+                self.entry_atr = self.atr[0]
+                self.stop_price = stop_price
+                self.order = self.sell(size=size)
+            return
+
+        swing_long_trend = (
+            self.data.close[0] > self.ema[0] and self.ema[0] > self.ema[-1]
+        )
+        swing_long_macd = (self.macd.lines.macd[0] > self.macd.lines.signal[0]) and (
+            self.macd.lines.macd[0] > 0
+        )
+        swing_pullback = (
+            abs(self.data.close[0] - self.bb.lines.mid[0]) <= 0.5 * self.atr[0]
+        )
+        swing_long_rsi = (40 <= self.rsi[0] <= 60) or (
+            self.rsi[-1] <= 40 and self.rsi[0] > 40
+        )
+
+        if (
+            swing_long_trend
+            and swing_long_macd
+            and swing_pullback
+            and swing_long_rsi
+        ):
+            stop_price = self.data.close[0] - self.p.swing_stop_atr * self.atr[0]
+            stop_dist = max(0.01, self.p.swing_stop_atr * self.atr[0])
+            risk_amt = self.broker.getvalue() * self.p.risk_pct
+            size = int(risk_amt / stop_dist)
+            if size > 0:
+                self.trade_type = "swing"
+                self.trade_dir = 1
+                self.entry_atr = self.atr[0]
+                self.stop_price = stop_price
+                self.order = self.buy(size=size)
+            return
+
+        swing_short_trend = (
+            self.data.close[0] < self.ema[0] and self.ema[0] < self.ema[-1]
+        )
+        swing_short_macd = (self.macd.lines.macd[0] < self.macd.lines.signal[0]) and (
+            self.macd.lines.macd[0] < 0
+        )
+        swing_short_rsi = (40 <= self.rsi[0] <= 60) or (
+            self.rsi[-1] >= 60 and self.rsi[0] < 60
+        )
+
+        if (
+            swing_short_trend
+            and swing_short_macd
+            and swing_pullback
+            and swing_short_rsi
+        ):
+            stop_price = self.data.close[0] + self.p.swing_stop_atr * self.atr[0]
+            stop_dist = max(0.01, self.p.swing_stop_atr * self.atr[0])
+            risk_amt = self.broker.getvalue() * self.p.risk_pct
+            size = int(risk_amt / stop_dist)
+            if size > 0:
+                self.trade_type = "swing"
+                self.trade_dir = -1
+                self.entry_atr = self.atr[0]
+                self.stop_price = stop_price
+                self.order = self.sell(size=size)
+            return
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "risk_per_trade",
+      "choice": "Fixed at 1.5% (0.015) of total account value",
+      "reason": "The specification specifies risk per trade of 1–2% of capital; 1.5% is chosen as the midpoint."
+    },
+    {
+      "topic": "scalp_take_profit_atr",
+      "choice": "Fixed at 1.25 ATR from entry price",
+      "reason": "The specification specifies scalp take-profit at bb.mid or +1...1.5 ATR; 1.25 ATR is chosen as the midpoint."
+    },
+    {
+      "topic": "scalp_time_stop",
+      "choice": "Fixed at 4 bars",
+      "reason": "The specification states time stop of 3–5 bars for scalp trades; 4 bars is chosen as the midpoint."
+    },
+    {
+      "topic": "swing_take_profit_atr",
+      "choice": "Fixed at 2.5 ATR from entry price",
+      "reason": "The specification states take-profit of 2–3 ATR for swing trades; 2.5 ATR is chosen as the midpoint."
+    },
+    {
+      "topic": "swing_time_stop",
+      "choice": "Fixed at 7 bars",
+      "reason": "The specification states time stop of 5–10 bars for swing trades; 7 bars is chosen as a representative value."
+    },
+    {
+      "topic": "swing_stop_distance",
+      "choice": "1.5 ATR from entry price for position sizing and emergency stop",
+      "reason": "The specification is silent on exact initial stop distance for swing position sizing; 1.5 ATR provides a symmetric ATR-based risk control."
+    },
+    {
+      "topic": "local_extreme_lookback",
+      "choice": "3 bars lookback (including current bar)",
+      "reason": "Scalp stop distance relies on local extreme beyond touch point; 3 bars covers the touch and close-back-inside sequence."
+    }
+  ]
+}
+```

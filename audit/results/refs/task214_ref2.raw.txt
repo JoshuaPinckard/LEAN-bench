@@ -1,0 +1,165 @@
+```python
+import backtrader as bt
+
+
+class HybridCoreOverlayStrategy(bt.Strategy):
+    params = dict(
+        sma_fast=50,
+        sma_slow=200,
+        atr_period=14,
+        core_pct=0.50,
+        overlay_pct=0.05,
+        max_overlays=5,
+        time_stop_bars=10,
+    )
+
+    def __init__(self):
+        self.sma50 = bt.ind.SMA(self.data.close, period=self.p.sma_fast)
+        self.sma200 = bt.ind.SMA(self.data.close, period=self.p.sma_slow)
+        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)
+
+        self.L = self.sma50 - 1.0 * self.atr
+        self.crossover = bt.ind.CrossOver(self.data.close, self.L)
+
+        self.order = None
+        self.pending_type = None
+        self.pending_trade_info = None
+
+        self.core_shares = 0
+        self.overlay_trades = []
+        self.last_rebalance_month = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.pending_type == "core":
+                exec_size = (
+                    order.executed.size
+                    if order.isbuy()
+                    else -order.executed.size
+                )
+                self.core_shares += exec_size
+            elif self.pending_type == "overlay_buy":
+                self.overlay_trades.append(
+                    {
+                        "size": order.executed.size,
+                        "entry_price": order.executed.price,
+                        "entry_atr": self.pending_trade_info.get(
+                            "atr", self.atr[0]
+                        ),
+                        "bar_idx": len(self),
+                    }
+                )
+            elif self.pending_type == "overlay_sell":
+                pass
+
+        self.order = None
+        self.pending_type = None
+        self.pending_trade_info = None
+
+    def next(self):
+        if self.order:
+            return
+
+        current_month = self.data.datetime.date(0).month
+
+        # 1. Monthly core rebalancing to 50% capital
+        if self.last_rebalance_month != current_month:
+            self.last_rebalance_month = current_month
+            target_core_val = self.broker.getvalue() * self.p.core_pct
+            target_core_shares = int(target_core_val / self.data.close[0])
+            diff = target_core_shares - self.core_shares
+            if diff != 0:
+                self.pending_type = "core"
+                if diff > 0:
+                    self.order = self.buy(size=diff)
+                else:
+                    self.order = self.sell(size=abs(diff))
+                return
+
+        close = self.data.close[0]
+        sma50 = self.sma50[0]
+        sma200 = self.sma200[0]
+        atr = self.atr[0]
+
+        # 2. Emergency mode: close all active overlay positions if SMA_50 < SMA_200 and Close < 0.9 * SMA_200
+        if sma50 < sma200 and close < 0.9 * sma200:
+            if self.overlay_trades:
+                total_overlay_size = sum(t["size"] for t in self.overlay_trades)
+                self.overlay_trades.clear()
+                if total_overlay_size > 0:
+                    self.pending_type = "overlay_sell"
+                    self.order = self.sell(size=total_overlay_size)
+                    return
+
+        # 3. Covered-call proxy exit: Close >= U = SMA_50 + 1*ATR_14
+        if close >= (sma50 + 1.0 * atr):
+            if self.overlay_trades:
+                total_overlay_size = sum(t["size"] for t in self.overlay_trades)
+                self.overlay_trades.clear()
+                if total_overlay_size > 0:
+                    self.pending_type = "overlay_sell"
+                    self.order = self.sell(size=total_overlay_size)
+                    return
+
+        # 4. Individual overlay exits (Take-Profit, Stop-Loss, Time-Stop)
+        trades_to_keep = []
+        exit_size = 0
+        for t in self.overlay_trades:
+            tp1 = t["entry_price"] + 0.5 * t["entry_atr"]
+            tp2 = sma50 + 0.5 * atr
+            sl = min(
+                t["entry_price"] - 1.5 * t["entry_atr"], t["entry_price"] * 0.90
+            )
+            age = len(self) - t["bar_idx"]
+
+            if close >= tp1 or close >= tp2 or close <= sl or age >= self.p.time_stop_bars:
+                exit_size += t["size"]
+            else:
+                trades_to_keep.append(t)
+
+        if exit_size > 0:
+            self.overlay_trades = trades_to_keep
+            self.pending_type = "overlay_sell"
+            self.order = self.sell(size=exit_size)
+            return
+
+        # 5. Overlay entry logic
+        if (
+            sma50 >= sma200
+            and self.crossover[0] > 0
+            and close >= 0.9 * sma50
+            and close <= sma50
+            and len(self.overlay_trades) < self.p.max_overlays
+        ):
+            overlay_val = self.broker.getvalue() * self.p.overlay_pct
+            size = int(overlay_val / close)
+            if size > 0:
+                self.pending_type = "overlay_buy"
+                self.pending_trade_info = {"atr": atr}
+                self.order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "core_rebalance_frequency",
+      "choice": "Rebalance core position to target 50% capital on the first trading bar of each calendar month.",
+      "reason": "The specification states to rebalance the 50% core periodically without defining exact frequency; monthly rebalancing is standard."
+    },
+    {
+      "topic": "covered_call_overlay_exit_percentage",
+      "choice": "Close 100% of active overlay positions when Close >= SMA_50 + 1*ATR_14.",
+      "reason": "The specification allows closing 50-100% of overlay positions at discretion; choosing 100% provides deterministic execution trace comparison."
+    },
+    {
+      "topic": "overlay_entry_reference_values",
+      "choice": "Record entry price as actual executed price and entry ATR at execution time upon order completion.",
+      "reason": "Backtrader processes market orders on the bar after signal generation."
+    }
+  ]
+}
+```

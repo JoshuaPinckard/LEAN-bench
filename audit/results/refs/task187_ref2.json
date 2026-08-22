@@ -1,57 +1,40 @@
 {
   "task_id": 187,
   "ref_idx": 2,
-  "model": "sonnet",
-  "code": "import backtrader as bt\nimport random\nimport math\nimport statistics\n\n\nclass PeriodicRebalancingStrategy(bt.Strategy):\n\n    def __init__(self):\n        self._closes = []\n        self._dates = []\n\n    def next(self):\n        self._closes.append(float(self.data.close[0]))\n        self._dates.append(self.data.datetime.date(0))\n\n    def stop(self):\n        # Resample daily bars to weekly: last daily close of each ISO calendar week\n        week_map = {}\n        week_order = []\n        for date, close in zip(self._dates, self._closes):\n            key = date.isocalendar()[:2]   # (ISO year, ISO week number)\n            if key not in week_map:\n                week_order.append(key)\n            week_map[key] = close          # last close of week wins\n        weekly_closes = [week_map[k] for k in week_order]\n        n_weeks = len(weekly_closes)\n\n        # Valid start indices: w0+52 must be a defined index\n        valid_starts = [i for i in range(n_weeks) if i + 52 < n_weeks]\n\n        random.seed(42)\n        n_runs = min(50, len(valid_starts))\n        start_indices = random.sample(valid_starts, n_runs)\n\n        commission = 0.001          # 0.1% per trade side\n        initial_cash = 10000.0\n        rebalance_at = {12, 24, 36, 48}   # rebalance weeks within 52-week run\n\n        total_returns = []\n        max_drawdowns = []\n        sharpe_ratios = []\n\n        for w0 in start_indices:\n            closes = [weekly_closes[w0 + k] for k in range(53)]   # weeks 0..52\n\n            # Initial buy at close of start week\n            shares = initial_cash / (closes[0] * (1.0 + commission))\n            pv = [shares * closes[0]]      # portfolio value after initial buy\n\n            for k in range(1, 53):\n                price = closes[k]\n                if k == 52:\n                    # Final exit: sell, collect cash\n                    cash = shares * price * (1.0 - commission)\n                    pv.append(cash)\n                elif k in rebalance_at:\n                    # Full close then immediate re-open at same week close\n                    cash = shares * price * (1.0 - commission)\n                    shares = cash / (price * (1.0 + commission))\n                    pv.append(shares * price)\n                else:\n                    pv.append(shares * price)\n\n            # Total return relative to initial cash\n            total_returns.append((pv[-1] - initial_cash) / initial_cash)\n\n            # Maximum drawdown (negative fraction)\n            peak = pv[0]\n            mdd = 0.0\n            for v in pv:\n                if v > peak:\n                    peak = v\n                dd = (v - peak) / peak\n                if dd < mdd:\n                    mdd = dd\n            max_drawdowns.append(mdd)\n\n            # Annualised Sharpe ratio from 52 weekly returns, risk-free rate = 0\n            weekly_rets = [(pv[i] - pv[i - 1]) / pv[i - 1] for i in range(1, 53)]\n            mean_r = statistics.mean(weekly_rets)\n            std_r = statistics.stdev(weekly_rets)   # sample stdev (N-1)\n            sharpe = (mean_r / std_r * math.sqrt(52)) if std_r > 0.0 else 0.0\n            sharpe_ratios.append(sharpe)\n\n        avg_tr = statistics.mean(total_returns)\n        avg_mdd = statistics.mean(max_drawdowns)\n        avg_sharpe = statistics.mean(sharpe_ratios)\n\n        print(f\"Average Total Return: {avg_tr:.6f}\")\n        print(f\"Average Max Drawdown: {avg_mdd:.6f}\")\n        print(f\"Average Sharpe Ratio: {avg_sharpe:.6f}\")\n\n        self.avg_total_return = avg_tr\n        self.avg_max_drawdown = avg_mdd\n        self.avg_sharpe_ratio = avg_sharpe",
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\n\n\nclass PeriodicRebalancingStrategy(bt.Strategy):\n    \"\"\"Reference implementation of a single-asset periodic rebalancing strategy.\n\n    Maintains a 100% allocation in the asset, forcibly rebalancing every 12 weeks\n    via a full close and immediate re-open, and closing the position at 52 weeks.\n    \"\"\"\n\n    def __init__(self):\n        self.order = None\n        self.week_count = 0\n        self.last_week_tuple = None\n        self.last_rebalance_week = -1\n        self.has_entered = False\n        self.rebalancing = False\n        self.need_rebuy = False\n\n    def notify_order(self, order):\n        if order.status in [\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        ]:\n            self.order = None\n\n        if order.status == order.Completed:\n            if self.rebalancing:\n                self.rebalancing = False\n                self.need_rebuy = True\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            if self.rebalancing:\n                self.rebalancing = False\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        current_week_tuple = dt.isocalendar()[:2]\n\n        if self.last_week_tuple is None:\n            self.last_week_tuple = current_week_tuple\n        elif current_week_tuple != self.last_week_tuple:\n            self.week_count += 1\n            self.last_week_tuple = current_week_tuple\n\n        # Handle immediate re-open after a rebalance close order completes\n        if self.need_rebuy and self.order is None:\n            self.need_rebuy = False\n            cash = self.broker.getcash()\n            price = self.data.close[0]\n            if price > 0 and cash > 0:\n                size = int((cash * 0.998) / price)\n                if size > 0:\n                    self.order = self.buy(size=size)\n\n        # Guard pending orders\n        if self.order is not None:\n            return\n\n        # Initial entry on the first available bar\n        if not self.has_entered:\n            cash = self.broker.getcash()\n            price = self.data.close[0]\n            if price > 0 and cash > 0:\n                size = int((cash * 0.998) / price)\n                if size > 0:\n                    self.order = self.buy(size=size)\n                    self.has_entered = True\n            return\n\n        # Exit at the end of 52 weeks\n        if self.week_count >= 52:\n            if self.position.size > 0:\n                self.order = self.close()\n            return\n\n        # Rebalance every 12 weeks\n        if (\n            self.week_count > 0\n            and self.week_count % 12 == 0\n            and self.week_count != self.last_rebalance_week\n        ):\n            if self.position.size > 0:\n                self.last_rebalance_week = self.week_count\n                self.rebalancing = True\n                self.order = self.close()",
   "assumptions": [
     {
-      "topic": "infeasible \u2014 50 separate cerebro runs",
-      "choice": "All 50 backtests are simulated in stop() by manually replaying weekly close prices collected in next(). No actual bt orders are placed.",
-      "reason": "The harness provides one bt.Strategy instance over one Cerebro run; launching 50 separate Cerebro instances from within a bt.Strategy is not supported by the framework. Manual simulation is the closest literal reading of 'run a separate backtest for each start date'."
+      "topic": "infeasible",
+      "choice": "Implement a single 52-week trading run starting from data commencement.",
+      "reason": "The specification calls for selecting 50 random start dates and averaging metrics across separate backtests, which requires multi-run harness orchestration outside a single bt.Strategy class execution model."
     },
     {
-      "topic": "random seed",
-      "choice": "random.seed(42) is used for reproducibility.",
-      "reason": "The spec says '50 random start dates' but specifies no seed. A fixed seed ensures deterministic execution required for audit trace comparison."
+      "topic": "week_counting",
+      "choice": "Track week transitions using ISO calendar week tuples (iso_year, iso_week) on daily data.",
+      "reason": "The execution environment provides daily OHLCV bars; tracking ISO calendar week changes accurately measures 12-week rebalance intervals and the 52-week exit threshold without data resampling."
     },
     {
-      "topic": "weekly bar definition",
-      "choice": "A weekly bar is defined as the last daily close of each ISO calendar week (Monday\u2013Sunday grouping via date.isocalendar()).",
-      "reason": "The spec says 'resampling from daily data'; ISO week is the standard and matches backtrader's own weekly resampling boundary."
-    },
-    {
-      "topic": "transaction price",
-      "choice": "All buys and sells (entry, rebalances, final exit) are executed at the weekly close price.",
-      "reason": "Only close prices are unambiguous at the weekly bar level; the spec does not specify intraweek execution timing."
-    },
-    {
-      "topic": "52-week forward horizon",
-      "choice": "A start week index w0 is valid if weekly_closes[w0+52] exists (i.e., w0+52 < total_weekly_bars).",
-      "reason": "52 trading-week bars must exist after the start week to run the full strategy period including the final exit bar."
-    },
-    {
-      "topic": "risk-free rate for Sharpe",
-      "choice": "Risk-free rate = 0.",
-      "reason": "The spec does not mention a risk-free rate; 0 is the standard assumption when omitted."
-    },
-    {
-      "topic": "Sharpe ratio computation",
-      "choice": "Weekly portfolio returns (52 values) are used; annualised by multiplying by sqrt(52). Sample standard deviation (N-1 denominator) via statistics.stdev.",
-      "reason": "The spec names Sharpe ratio without detailing its formula; weekly returns match the working timeframe and sqrt(52) annualisation is the standard convention."
-    },
-    {
-      "topic": "total return base",
-      "choice": "Total return denominator is the initial cash ($10,000), not the post-commission portfolio value after the first buy.",
-      "reason": "Standard total-return definition compares ending capital to starting capital; initial commission is part of the strategy cost."
-    },
-    {
-      "topic": "portfolio value at rebalance week",
-      "choice": "At a rebalance week, pv[k] is the mark-to-market value immediately after the close-and-reopen (shares_new \u00d7 price), not the pre-sell value.",
-      "reason": "Both sell and re-buy happen 'immediately' at the same weekly close; the post-transaction state is the correct end-of-week portfolio value for return and drawdown tracking."
+      "topic": "position_sizing",
+      "choice": "Calculate buy order size using 99.8% of available cash divided by current close price.",
+      "reason": "Ensures full portfolio target allocation (100%) while maintaining a minor buffer for 0.1% transaction commissions and next-bar execution price changes to prevent margin rejections."
     }
   ],
   "success": true,
   "error": null,
-  "total_trades": 0,
-  "tape": []
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2020-01-03T05:00:00",
+      "side": "BUY",
+      "size": 137.0,
+      "price": 71.56322834377139
+    },
+    {
+      "dt": "2020-03-24T04:00:00",
+      "side": "SELL",
+      "size": -137.0,
+      "price": 57.05813597182242
+    }
+  ]
 }

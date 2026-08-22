@@ -1,0 +1,37 @@
+{
+  "task_id": 35,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import backtrader as bt\n\n\nclass IntradayVWAP(bt.Indicator):\n    lines = ('vwap',)\n\n    def __init__(self):\n        self.addminperiod(1)\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        prev_dt = self.data.datetime.date(-1) if len(self) > 1 else None\n\n        tp = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0\n        vol = self.data.volume[0]\n\n        if prev_dt is None or dt != prev_dt:\n            self.cum_tp_vol = tp * vol\n            self.cum_vol = vol\n        else:\n            self.cum_tp_vol += tp * vol\n            self.cum_vol += vol\n\n        self.lines.vwap[0] = self.cum_tp_vol / self.cum_vol if self.cum_vol > 0 else self.data.close[0]\n\n\nclass TSI(bt.Indicator):\n    lines = ('tsi',)\n    params = (('r', 25), ('s', 13),)\n\n    def __init__(self):\n        m = self.data.close - self.data.close(-1)\n        abs_m = bt.abs(m)\n        ema_r_m = bt.indicators.EMA(m, period=self.p.r)\n        ema_s_r_m = bt.indicators.EMA(ema_r_m, period=self.p.s)\n        ema_r_abs = bt.indicators.EMA(abs_m, period=self.p.r)\n        ema_s_r_abs = bt.indicators.EMA(ema_r_abs, period=self.p.s)\n        self.lines.tsi = 100.0 * (ema_s_r_m / (ema_s_r_abs + 1e-9))\n\n\nclass PVT(bt.Indicator):\n    lines = ('pvt',)\n\n    def __init__(self):\n        close_diff = self.data.close - self.data.close(-1)\n        ret = close_diff / self.data.close(-1)\n        self.lines.pvt = bt.indicators.Cumulative(self.data.volume * ret)\n\n\nclass TrendChannelBreakout(bt.Strategy):\n    params = (\n        ('risk_pct', 0.01),\n        ('stop_loss_pct', 0.01),\n        ('rsi_threshold', 50.0),\n        ('max_volatility_pct', 0.0),\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data.close, period=14)\n        self.tsi = TSI(self.data.close, r=self.p.r if hasattr(self.p, 'r') else 25, s=13)\n        self.sma20 = bt.indicators.SMA(self.data.close, period=20)\n        self.sma50 = bt.indicators.SMA(self.data.close, period=50)\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=20)\n        self.vwap = IntradayVWAP(self.data)\n        self.pvt = PVT(self.data)\n\n        self.order = None\n        self.buy_price = None\n\n        self.current_date = None\n        self.upper_channel = None\n        self.lower_channel = None\n        self.day_skipped = False\n        self.entry_upper_channel = None\n        self.stop_price = None\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            if order.status == order.Completed:\n                if order.isbuy():\n                    self.buy_price = order.executed.price\n            self.order = None\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        t = self.data.datetime.time(0)\n\n        if dt != self.current_date:\n            self.current_date = dt\n            self.upper_channel = None\n            self.lower_channel = None\n            self.day_skipped = False\n\n        if (t.hour == 9 and t.minute >= 55) and self.upper_channel is None:\n            self.upper_channel = self.data.high[0]\n\n        if (t.hour > 9 or (t.hour == 10 and t.minute >= 0)) and self.lower_channel is None and self.upper_channel is not None:\n            self.lower_channel = self.data.low[0]\n            if self.p.max_volatility_pct > 0.0 and self.lower_channel > 0:\n                ch_range = (self.upper_channel - self.lower_channel) / self.lower_channel\n                if ch_range > self.p.max_volatility_pct:\n                    self.day_skipped = True\n\n        if self.order:\n            return\n\n        if self.position:\n            if self.stop_price is not None and self.data.low[0] <= self.stop_price:\n                self.order = self.close()\n                return\n\n            if self.data.low[0] <= self.sma50[0]:\n                self.order = self.close()\n                return\n\n            target_channel = self.entry_upper_channel if self.entry_upper_channel is not None else self.upper_channel\n            if target_channel is not None and self.data.close[0] <= target_channel:\n                self.order = self.close()\n                return\n\n        else:\n            if self.upper_channel is None or self.lower_channel is None or self.day_skipped:\n                return\n\n            if not (10 <= t.hour < 15):\n                return\n\n            if t.minute % 5 != 0:\n                return\n\n            cond_breakout = self.data.close[0] > self.upper_channel\n            cond_trend = self.sma20[0] > self.sma50[0]\n            cond_momentum = (self.rsi[0] > self.p.rsi_threshold) and (self.tsi[0] > 0)\n            cond_volume = self.data.volume[0] > self.vol_sma[0]\n\n            if cond_breakout and cond_trend and cond_momentum and cond_volume:\n                stop_calc = min(self.data.close[0] * (1.0 - self.p.stop_loss_pct), self.lower_channel)\n                risk_per_share = self.data.close[0] - stop_calc\n                if risk_per_share <= 0:\n                    risk_per_share = self.data.close[0] * self.p.stop_loss_pct\n\n                account_val = self.broker.getvalue()\n                cash = self.broker.getcash()\n                risk_amount = account_val * self.p.risk_pct\n                size = int(risk_amount / risk_per_share)\n                max_size = int(cash / self.data.close[0])\n                size = min(size, max_size)\n\n                if size > 0:\n                    self.stop_price = stop_calc\n                    self.entry_upper_channel = self.upper_channel\n                    self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Evaluate 5-minute execution signals on 1-minute data at 5-minute interval boundaries (minutes modulo 5 == 0)",
+      "reason": " execution environment provides a single 1m SPY PandasData feed rather than separate 1m and 5m data feeds."
+    },
+    {
+      "topic": "trend_filter_and_take_profit",
+      "choice": "Used SMA 20 > SMA 50 for entry trend filter bias, and SMA 50 low crossing for the dynamic lower trend line take-profit level",
+      "reason": "The specification explicitly suggests SMA 20 > SMA 50 as the bullish trend bias proxy for the white trend lines."
+    },
+    {
+      "topic": "stop_loss_placement",
+      "choice": "Placed stop loss at min(entry_price * (1 - 0.01), lower_channel)",
+      "reason": "The spec mandates placing the stop-loss below the lower channel line while using a fixed percentage risk per trade."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Position size = (account_value * risk_pct) / (entry_price - stop_loss_price), capped by available cash",
+      "reason": "Spec calls for position sizing based on fixed 1% risk of account value per trade."
+    },
+    {
+      "topic": "volatility_filter",
+      "choice": "Volatility filter is marked optional in spec and defaulted to disabled (max_volatility_pct = 0.0)",
+      "reason": "No numerical threshold for range excessive volatility was provided in the specification."
+    }
+  ],
+  "success": false,
+  "error": "Backtest error: 'Lines_LineSeries_LineSeriesStub' object has no attribute 'close'",
+  "total_trades": 0,
+  "tape": []
+}

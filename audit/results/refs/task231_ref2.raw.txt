@@ -1,0 +1,169 @@
+```python
+import math
+import backtrader as bt
+
+
+class ImpliedVolatilityETFStrategy(bt.Strategy):
+    params = (
+        ('iv_short_period', 10),
+        ('iv_long_period', 30),
+        ('calc_iv_ma_period', 10),
+        ('vix_period', 390),
+        ('volume_ma_period', 390),
+        ('iv_dev_threshold', 0.15),
+        ('iv_stability_threshold', 0.05),
+        ('exit_dev_threshold', 0.05),
+        ('time_exit_bars', 6),
+        ('pos_size_pct', 0.10),
+        ('stop_loss_pct', 0.02),
+        ('take_profit_pct', 0.01),
+        ('vix_threshold', 30.0),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.entry_bar = 0
+
+        # Log returns calculation
+        log_return = bt.indicators.Log(self.data.close / self.data.close(-1))
+
+        # Annualization factor for 5-minute bars (252 days * 78 bars/day)
+        ann_factor = math.sqrt(252 * 78) * 100.0
+
+        # Current ETF IV proxy (10-bar annualized historical volatility)
+        self.current_iv = bt.indicators.StandardDeviation(log_return, period=self.p.iv_short_period) * ann_factor
+
+        # Calculated IV proxy (30-bar annualized historical volatility smoothed with 10-bar SMA)
+        calc_iv_raw = bt.indicators.StandardDeviation(log_return, period=self.p.iv_long_period) * ann_factor
+        self.calc_iv = bt.indicators.SMA(calc_iv_raw, period=self.p.calc_iv_ma_period)
+
+        # Market Volatility (VIX) proxy (390-bar annualized historical volatility)
+        self.vix_proxy = bt.indicators.StandardDeviation(log_return, period=self.p.vix_period) * ann_factor
+
+        # Volume moving average for liquidity check
+        self.volume_ma = bt.indicators.SMA(self.data.volume, period=self.p.volume_ma_period)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if self.position:
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+            else:
+                self.entry_price = None
+                self.entry_bar = 0
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            bars_held = len(self) - self.entry_bar
+            current_iv = self.current_iv[0]
+            calc_iv = self.calc_iv[0]
+
+            if calc_iv == 0:
+                return
+
+            iv_diff_pct = abs(current_iv - calc_iv) / calc_iv
+
+            if self.position.size > 0:
+                # Stop-loss: 2% of entry price
+                if self.data.low[0] <= self.entry_price * (1.0 - self.p.stop_loss_pct):
+                    self.order = self.close()
+                    return
+                # Take-profit: 1% of entry price
+                if self.data.high[0] >= self.entry_price * (1.0 + self.p.take_profit_pct):
+                    self.order = self.close()
+                    return
+                # IV approaches calculated IV (difference less than 5%)
+                if iv_diff_pct < self.p.exit_dev_threshold:
+                    self.order = self.close()
+                    return
+                # 30 minutes after entry (6 bars of 5m)
+                if bars_held >= self.p.time_exit_bars:
+                    self.order = self.close()
+                    return
+
+            elif self.position.size < 0:
+                # Stop-loss: 2% of entry price
+                if self.data.high[0] >= self.entry_price * (1.0 + self.p.stop_loss_pct):
+                    self.order = self.close()
+                    return
+                # Take-profit: 1% of entry price
+                if self.data.low[0] <= self.entry_price * (1.0 - self.p.take_profit_pct):
+                    self.order = self.close()
+                    return
+                # IV approaches calculated IV (difference less than 5%)
+                if iv_diff_pct < self.p.exit_dev_threshold:
+                    self.order = self.close()
+                    return
+                # 30 minutes after entry (6 bars of 5m)
+                if bars_held >= self.p.time_exit_bars:
+                    self.order = self.close()
+                    return
+
+        else:
+            current_iv = self.current_iv[0]
+            calc_iv = self.calc_iv[0]
+            calc_iv_prev = self.calc_iv[-1]
+
+            if calc_iv == 0 or calc_iv_prev == 0:
+                return
+
+            # Stability check: calculated IV does not change by more than 5% over last 5 minutes (1 bar)
+            calc_iv_change = abs(calc_iv - calc_iv_prev) / calc_iv_prev
+            if calc_iv_change > self.p.iv_stability_threshold:
+                return
+
+            # High liquidity check: volume above average
+            if self.data.volume[0] <= self.volume_ma[0]:
+                return
+
+            # Exclude trades if VIX proxy is above 30%
+            if self.vix_proxy[0] > self.p.vix_threshold:
+                return
+
+            dev = (current_iv - calc_iv) / calc_iv
+
+            # Buy (long): current ETF IV is below calculated IV by 15% or more
+            if dev <= -self.p.iv_dev_threshold:
+                cash = self.broker.getvalue() * self.p.pos_size_pct
+                size = int(cash / self.data.close[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
+
+            # Sell (short): current ETF IV is above calculated IV by 15% or more
+            elif dev >= self.p.iv_dev_threshold:
+                cash = self.broker.getvalue() * self.p.pos_size_pct
+                size = int(cash / self.data.close[0])
+                if size > 0:
+                    self.order = self.sell(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Proxy implied volatility (IV) and market volatility (VIX) using annualized historical volatility of 5-minute close log returns.",
+      "reason": "Option chain data, component IVs, and VIX index values are not provided in the single OHLCV price feed."
+    },
+    {
+      "topic": "indicator_parameters",
+      "choice": "Current IV uses a 10-bar window, raw calculated IV uses a 30-bar window (then smoothed with a 10-bar SMA), and VIX uses a 390-bar window (5 trading days).",
+      "reason": "The specification omitted lookback window lengths for component IV and market volatility calculations."
+    },
+    {
+      "topic": "volume_ma_period",
+      "choice": "Daily average volume is computed using a 390-bar (5 trading days) simple moving average of 5-minute volume.",
+      "reason": "The specification required trading volume to be above the daily average on intraday 5-minute bars."
+    }
+  ]
+}
+```

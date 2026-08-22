@@ -1,0 +1,177 @@
+```python
+import math
+import backtrader as bt
+
+
+class BounceSupportUptrend(bt.Strategy):
+    params = (
+        ("ema_fast", 20),
+        ("ema_slow", 50),
+        ("rsi_period", 14),
+        ("vol_period", 20),
+        ("atr_period", 14),
+        ("return_period", 20),
+        ("return_threshold", 0.15),
+        ("rsi_low", 40.0),
+        ("rsi_high", 60.0),
+        ("vol_mult", 1.2),
+        ("rr_ratio", 2.0),
+        ("risk_pct", 0.01),
+        ("atr_mult", 0.5),
+        ("swing_period", 5),
+    )
+
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_fast)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=self.p.ema_slow)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.vol_period
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if self.order and order.ref == self.order.ref:
+                self.order = None
+            if self.stop_order and order.ref == self.stop_order.ref:
+                self.stop_order = None
+            if self.limit_order and order.ref == self.limit_order.ref:
+                self.limit_order = None
+
+    def next(self):
+        if self.position:
+            # Early exit on close below EMA(20)
+            if self.data.close[0] < self.ema20[0]:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                if self.limit_order:
+                    self.cancel(self.limit_order)
+                    self.limit_order = None
+                self.close()
+            return
+
+        if self.order is not None:
+            return
+
+        if len(self.data) <= self.p.return_period:
+            return
+
+        # Filter 1: 20-bar return >= 15%
+        ret_20 = (
+            self.data.close[0] - self.data.close[-self.p.return_period]
+        ) / self.data.close[-self.p.return_period]
+        if ret_20 < self.p.return_threshold:
+            return
+
+        # Filter 2: Long-term trend up (EMA50 > EMA50[-1])
+        if not (self.ema50[0] > self.ema50[-1]):
+            return
+
+        # Entry (a): Close above EMA20 and EMA20 is rising
+        if not (
+            self.data.close[0] > self.ema20[0]
+            and self.ema20[0] > self.ema20[-1]
+        ):
+            return
+
+        # Entry (b): Support test & confirmed bounce
+        test_curr = self.data.low[0] <= self.ema20[0]
+        test_prev = self.data.low[-1] <= self.ema20[-1]
+        if not (test_curr or test_prev):
+            return
+
+        if not (self.data.close[0] > self.ema20[0]):
+            return
+
+        if not (self.data.close[0] > self.data.high[-1]):
+            return
+
+        # Entry (c): RSI in 40–60 range
+        if not (self.p.rsi_low <= self.rsi[0] <= self.p.rsi_high):
+            return
+
+        # Entry (d): Volume > 1.2 * SMA(volume, 20)
+        if not (self.data.volume[0] > self.p.vol_mult * self.vol_sma[0]):
+            return
+
+        # Risk and Target calculation
+        hh20 = max([self.data.high[-i] for i in range(self.p.return_period)])
+        swing_low5 = min(
+            [self.data.low[-i] for i in range(self.p.swing_period)]
+        )
+
+        test_lows = []
+        if test_curr:
+            test_lows.append(self.data.low[0])
+        if test_prev:
+            test_lows.append(self.data.low[-1])
+        test_candle_low = min(test_lows) if test_lows else self.data.low[0]
+
+        support_level = min(swing_low5, test_candle_low)
+        stop_loss = support_level - self.p.atr_mult * self.atr[0]
+
+        entry_price = self.data.close[0]
+        risk = entry_price - stop_loss
+        reward = hh20 - entry_price
+
+        if risk <= 0:
+            return
+
+        # Profit/Risk ratio >= 2
+        if reward < self.p.rr_ratio * risk:
+            return
+
+        # Position Sizing: 1% risk per trade
+        capital = self.broker.getvalue()
+        risk_cash = capital * self.p.risk_pct
+        size = math.floor(risk_cash / risk)
+
+        if size <= 0:
+            return
+
+        orders = self.buy_bracket(
+            size=size,
+            exectype=bt.Order.Market,
+            limitprice=hh20,
+            stopprice=stop_loss,
+        )
+        self.order = orders[0]
+        self.stop_order = orders[1]
+        self.limit_order = orders[2]
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "risk_percentage",
+      "choice": "Selected 1% (0.01) risk per trade.",
+      "reason": "The specification calls for 1–2% risk of capital per trade; 1% was chosen as the baseline."
+    },
+    {
+      "topic": "hh20_calculation",
+      "choice": "HH20 computed as max(high) over the current and 19 preceding bars.",
+      "reason": "The specification defines HH20 as the maximum over the last 20 bars."
+    },
+    {
+      "topic": "test_candle_low",
+      "choice": "Defined as the minimum low among current and/or previous bars that tested EMA(20) (low <= EMA20).",
+      "reason": "The specification references 'low of the EMA20 test candle' in conjunction with a potential 2-bar support test window."
+    }
+  ]
+}
+```

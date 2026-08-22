@@ -1,0 +1,92 @@
+{
+  "task_id": 258,
+  "ref_idx": 2,
+  "model": "gemini-3.6-flash(vertex)",
+  "code": "import math\nimport backtrader as bt\n\n\nclass ZonalStrategy(bt.Strategy):\n    params = (\n        ('zone_period', 20),\n        ('sma_period', 50),\n        ('sma_slope_bars', 5),\n        ('atr_period', 14),\n        ('atr_threshold', 0.015),\n        ('win_rate_period', 100),\n        ('min_win_rate', 0.60),\n        ('max_units', 3),\n        ('tp_atr_mult', 1.0),\n        ('sl_atr_mult', 2.5),\n        ('risk_pct', 0.01),\n    )\n\n    def __init__(self):\n        self.order = None\n        self.pending_order_type = None\n        self.pending_atr = None\n        self.units = []  # List of dicts: {'size': int, 'price': float, 'atr': float}\n        self.trade_history = []  # List of bools: True for win, False for loss\n\n        # Indicators\n        self.support_level = bt.ind.Lowest(self.data.low, period=self.p.zone_period)\n        self.resistance_level = bt.ind.Highest(self.data.high, period=self.p.zone_period)\n        self.sma50 = bt.ind.SMA(self.data.close, period=self.p.sma_period)\n        self.atr14 = bt.ind.ATR(self.data, period=self.p.atr_period)\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status == order.Completed:\n            if self.pending_order_type == 'buy_entry':\n                self.units.append({\n                    'size': order.executed.size,\n                    'price': order.executed.price,\n                    'atr': self.pending_atr if self.pending_atr is not None else self.atr14[0]\n                })\n            elif self.pending_order_type == 'sell_entry':\n                self.units.append({\n                    'size': abs(order.executed.size),\n                    'price': order.executed.price,\n                    'atr': self.pending_atr if self.pending_atr is not None else self.atr14[0]\n                })\n\n            if self.position.size == 0:\n                self.units.clear()\n\n        self.order = None\n        self.pending_order_type = None\n        self.pending_atr = None\n\n    def notify_trade(self, trade):\n        if trade.isclosed:\n            is_win = trade.pnlcomm > 0\n            self.trade_history.append(is_win)\n\n    def next(self):\n        if self.position.size == 0 and len(self.units) > 0:\n            self.units.clear()\n\n        if self.order is not None:\n            return\n\n        close = self.data.close[0]\n        high = self.data.high[0]\n        low = self.data.low[0]\n\n        supp_level = self.support_level[0]\n        res_level = self.resistance_level[0]\n\n        supp_lower = supp_level - 0.01 * close\n        supp_upper = supp_level + 0.01 * close\n\n        res_lower = res_level - 0.01 * close\n        res_upper = res_level + 0.01 * close\n\n        # Check exits for open positions\n        if self.position.size > 0:\n            # Additional exit for long: bar closes above upper boundary of resistance zone\n            if close > res_upper:\n                self.order = self.close()\n                self.pending_order_type = 'exit'\n                self.units.clear()\n                return\n\n            # TP / SL per unit for long\n            units_to_exit = []\n            for i, unit in enumerate(self.units):\n                tp_price = unit['price'] + self.p.tp_atr_mult * unit['atr']\n                sl_price = unit['price'] - self.p.sl_atr_mult * unit['atr']\n                if high >= tp_price or low <= sl_price:\n                    units_to_exit.append(i)\n\n            if units_to_exit:\n                if len(units_to_exit) == len(self.units):\n                    self.order = self.close()\n                    self.pending_order_type = 'exit'\n                    self.units.clear()\n                else:\n                    exit_size = sum(self.units[i]['size'] for i in units_to_exit)\n                    self.order = self.sell(size=exit_size)\n                    self.pending_order_type = 'exit'\n                    for i in sorted(units_to_exit, reverse=True):\n                        self.units.pop(i)\n                return\n\n        elif self.position.size < 0:\n            # Additional exit for short: bar closes below lower boundary of support zone\n            if close < supp_lower:\n                self.order = self.close()\n                self.pending_order_type = 'exit'\n                self.units.clear()\n                return\n\n            # TP / SL per unit for short\n            units_to_exit = []\n            for i, unit in enumerate(self.units):\n                tp_price = unit['price'] - self.p.tp_atr_mult * unit['atr']\n                sl_price = unit['price'] + self.p.sl_atr_mult * unit['atr']\n                if low <= tp_price or high >= sl_price:\n                    units_to_exit.append(i)\n\n            if units_to_exit:\n                if len(units_to_exit) == len(self.units):\n                    self.order = self.close()\n                    self.pending_order_type = 'exit'\n                    self.units.clear()\n                else:\n                    exit_size = sum(self.units[i]['size'] for i in units_to_exit)\n                    self.order = self.buy(size=exit_size)\n                    self.pending_order_type = 'exit'\n                    for i in sorted(units_to_exit, reverse=True):\n                        self.units.pop(i)\n                return\n\n        # Filters\n        volatility_ok = (self.atr14[0] / close) > self.p.atr_threshold\n\n        if len(self.trade_history) == 0:\n            win_rate = 1.0\n        else:\n            recent_trades = self.trade_history[-self.p.win_rate_period:]\n            win_rate = sum(recent_trades) / len(recent_trades)\n\n        win_rate_ok = win_rate >= self.p.min_win_rate\n\n        if not (volatility_ok and win_rate_ok):\n            return\n\n        # Check Long Entry\n        if self.position.size >= 0 and len(self.units) < self.p.max_units:\n            touches_support = (high >= supp_lower) and (low <= supp_upper)\n            closes_above_support = close > supp_upper\n            sma_up = self.sma50[0] > self.sma50[-self.p.sma_slope_bars]\n\n            if touches_support and closes_above_support and sma_up:\n                equity = self.broker.getvalue()\n                qty = math.floor(self.p.risk_pct * equity / close)\n                if qty > 0:\n                    self.order = self.buy(size=qty)\n                    self.pending_order_type = 'buy_entry'\n                    self.pending_atr = self.atr14[0]\n                    return\n\n        # Check Short Entry\n        if self.position.size <= 0 and len(self.units) < self.p.max_units:\n            touches_resistance = (high >= res_lower) and (low <= res_upper)\n            closes_below_resistance = close < res_lower\n            sma_down = self.sma50[0] < self.sma50[-self.p.sma_slope_bars]\n\n            if touches_resistance and closes_below_resistance and sma_down:\n                equity = self.broker.getvalue()\n                qty = math.floor(self.p.risk_pct * equity / close)\n                if qty > 0:\n                    self.order = self.sell(size=qty)\n                    self.pending_order_type = 'sell_entry'\n                    self.pending_atr = self.atr14[0]\n                    return",
+  "assumptions": [
+    {
+      "topic": "support_resistance_levels",
+      "choice": "Support level is computed as `bt.ind.Lowest(self.data.low, period=20)` and resistance level as `bt.ind.Highest(self.data.high, period=20)`.",
+      "reason": "The spec defines support as the minimum over the last 20 bars and resistance as the maximum over the last 20 bars; using Low and High prices is standard for price levels."
+    },
+    {
+      "topic": "initial_win_rate",
+      "choice": "When no prior trade history exists (total completed trades == 0), win_rate is set to 1.0 (100%), allowing the strategy to take its initial trades.",
+      "reason": "If initialized to 0% with 0 trades, the win rate filter (>= 60%) would permanently block all trade execution."
+    },
+    {
+      "topic": "win_rate_definition",
+      "choice": "Trade win rate is calculated over closed position trades recorded in Backtrader's `notify_trade` callback when `trade.isclosed` is True, with `pnlcomm > 0` considered a win.",
+      "reason": "This aligns with Backtrader's canonical trade lifecycle tracking mechanism."
+    },
+    {
+      "topic": "unit_level_tp_sl",
+      "choice": "Take-profit (+1xATR) and stop-loss (-2.5xATR) targets are tracked per individual unit based on that unit's executed price and ATR at signal time. High/Low price checks trigger partial or full exits.",
+      "reason": "The specification allows up to 3 open units and defines TP/SL relative to entry price; tracking each unit individually ensures precise execution per unit."
+    },
+    {
+      "topic": "additional_exit_trigger",
+      "choice": "The additional exit condition is evaluated on bar Close against the opposite zone boundary and closes all open units when triggered.",
+      "reason": "The spec explicitly states 'when the bar closes outside the opposite zone', dictating a Close price check."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 2,
+  "tape": [
+    {
+      "dt": "2020-04-16T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 69.37453866907585
+    },
+    {
+      "dt": "2020-04-20T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 67.09808863903048
+    },
+    {
+      "dt": "2020-04-22T04:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 66.05039726124157
+    },
+    {
+      "dt": "2020-04-29T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 68.73482721743544
+    },
+    {
+      "dt": "2020-05-04T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 69.80665406694762
+    },
+    {
+      "dt": "2020-05-06T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 72.53210878963873
+    },
+    {
+      "dt": "2020-05-11T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 74.57775171164975
+    },
+    {
+      "dt": "2020-05-12T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 76.93296121988755
+    },
+    {
+      "dt": "2020-06-04T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 78.52088097581583
+    }
+  ]
+}

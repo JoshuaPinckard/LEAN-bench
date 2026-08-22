@@ -1,0 +1,221 @@
+```python
+import math
+import collections
+import statistics
+import backtrader as bt
+
+
+class FVGOrderBlockStrategy(bt.Strategy):
+    """
+    Reference implementation of Fair Value Gap (FVG) and Order Block Trading Strategy.
+    
+    1-Hour Timeframe: Aggregated from 1-minute bars to identify 1-hour FVGs.
+    1-Minute Timeframe: Used for Order Block detection, ADX trend filtering, entry triggers, and stop loss calculation.
+    """
+    params = (
+        ('ob_body_ratio', 0.70),      # Order Block candle body to total range ratio (>= 70%)
+        ('adx_period', 14),           # Period for ADX trend filter
+        ('adx_threshold', 20.0),       # ADX threshold to filter out strong sideways movement
+        ('risk_pct', 0.01),           # Fixed risk per trade (1% of portfolio capital)
+        ('fallback_rr', 2.0),         # Fallback Risk:Reward ratio if no 1h FVG above entry
+    )
+
+    def __init__(self):
+        self.order = None
+        self.sl_price = None
+        self.tp_price = None
+
+        # Indicators on 1-minute data
+        self.adx = bt.indicators.ADX(self.data, period=self.p.adx_period)
+
+        # 1-hour Candle Aggregation Tracking
+        self.h1_candles = []
+        self.current_h1 = None
+        self.last_hour = None
+
+        # 1-hour FVG Storage
+        self.h1_fvgs = []
+
+        # Order Block Tracking on 1-minute timeframe
+        self.last_ob_high = None
+        self.last_ob_low = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def _update_h1_candles(self):
+        dt = self.data.datetime.datetime(0)
+        current_hour = dt.hour
+
+        if self.last_hour is None:
+            self.last_hour = current_hour
+            self.current_h1 = {
+                'open': self.data.open[0],
+                'high': self.data.high[0],
+                'low': self.data.low[0],
+                'close': self.data.close[0],
+                'time': dt
+            }
+            return
+
+        if current_hour != self.last_hour:
+            # Finalize previous 1-hour candle
+            self.h1_candles.append(self.current_h1)
+            self._check_new_h1_fvg()
+
+            # Initialize new 1-hour candle
+            self.last_hour = current_hour
+            self.current_h1 = {
+                'open': self.data.open[0],
+                'high': self.data.high[0],
+                'low': self.data.low[0],
+                'close': self.data.close[0],
+                'time': dt
+            }
+        else:
+            # Update running 1-hour candle
+            self.current_h1['high'] = max(self.current_h1['high'], self.data.high[0])
+            self.current_h1['low'] = min(self.current_h1['low'], self.data.low[0])
+            self.current_h1['close'] = self.data.close[0]
+
+    def _check_new_h1_fvg(self):
+        if len(self.h1_candles) < 3:
+            return
+
+        c1 = self.h1_candles[-3]
+        c2 = self.h1_candles[-2]
+        c3 = self.h1_candles[-1]
+
+        # Bullish FVG: Low of candle 3 is greater than High of candle 1
+        if c3['low'] > c1['high']:
+            fvg = {
+                'type': 'bullish',
+                'bottom': c1['high'],
+                'top': c3['low'],
+                'time': c3['time']
+            }
+            self.h1_fvgs.append(fvg)
+
+        # Bearish FVG: High of candle 3 is less than Low of candle 1
+        elif c3['high'] < c1['low']:
+            fvg = {
+                'type': 'bearish',
+                'bottom': c3['high'],
+                'top': c1['low'],
+                'time': c3['time']
+            }
+            self.h1_fvgs.append(fvg)
+
+    def next(self):
+        self._update_h1_candles()
+
+        # Manage existing open position
+        if self.position:
+            if self.sl_price is not None and self.data.low[0] <= self.sl_price:
+                self.close()
+                self.sl_price = None
+                self.tp_price = None
+                return
+            if self.tp_price is not None and self.data.high[0] >= self.tp_price:
+                self.close()
+                self.sl_price = None
+                self.tp_price = None
+                return
+            return
+
+        # Guard pending order
+        if self.order:
+            return
+
+        # Identify 1-minute Order Block (candle body >= 70% of candle range)
+        candle_height = self.data.high[0] - self.data.low[0]
+        if candle_height > 0:
+            body = abs(self.data.close[0] - self.data.open[0])
+            if (body / candle_height) >= self.p.ob_body_ratio:
+                self.last_ob_high = self.data.high[0]
+                self.last_ob_low = self.data.low[0]
+
+        if self.last_ob_high is None:
+            return
+
+        # Trend Filter: Do not trade if market is in strong sideways movement
+        if self.adx[0] < self.p.adx_threshold:
+            return
+
+        # Condition 1: Price retraces to touch/enter a 1-hour Bullish FVG zone
+        in_fvg = False
+        current_price = self.data.close[0]
+        for fvg in reversed(self.h1_fvgs):
+            if fvg['type'] == 'bullish':
+                if self.data.low[0] <= fvg['top'] and self.data.high[0] >= fvg['bottom']:
+                    in_fvg = True
+                    break
+
+        if not in_fvg:
+            return
+
+        # Condition 2 & 3: Price breaks upward the last significant Order Block high and confirms strength
+        if self.data.close[0] > self.last_ob_high and self.data.close[0] > self.data.open[0]:
+            sl = self.data.low[0]
+            if sl >= current_price:
+                return
+
+            # Take profit: Level of the next 1-hour FVG above entry point
+            tp = None
+            for fvg in reversed(self.h1_fvgs):
+                if fvg['bottom'] > current_price:
+                    tp = fvg['bottom']
+                    break
+
+            if tp is None or tp <= current_price:
+                risk = current_price - sl
+                tp = current_price + risk * self.p.fallback_rr
+
+            # Position Sizing: Risk limited to fixed percentage of capital by stop loss
+            account_value = self.broker.getvalue()
+            risk_amount = account_value * self.p.risk_pct
+            risk_per_unit = current_price - sl
+
+            if risk_per_unit <= 0:
+                return
+
+            size = risk_amount / risk_per_unit
+
+            # Cash availability cap
+            cash = self.broker.getcash()
+            max_size = (cash * 0.95) / current_price
+            size = min(size, max_size)
+
+            if size > 0:
+                self.sl_price = sl
+                self.tp_price = tp
+                self.order = self.buy(size=size)
+```
+
+```json
+{
+  "assumptions": [
+    {
+      "topic": "1-Hour Timeframe Aggregation",
+      "choice": "Aggregated 1-hour candles dynamically inside next() from 1-minute bars",
+      "reason": "The execution environment provides a single 1-minute data feed self.data without multi-data feed setup capability."
+    },
+    {
+      "topic": "Order Block Definition",
+      "choice": "1-minute bar where abs(close - open) / (high - low) >= 0.70; last_ob_high stored as high of this candle",
+      "reason": "Specification defines 1m Order Block as the last significant high/low before a strong move with body >= 70% of total height."
+    },
+    {
+      "topic": "Trend / Sideways Filter",
+      "choice": "ADX(14) >= 20 required on 1m feed to allow entries",
+      "reason": "Specification demands filtering out strong sideways movement without a clear trend."
+    },
+    {
+      "topic": "Take Profit Fallback",
+      "choice": "Used a 2:1 Risk:Reward fallback ratio if no 1-hour FVG exists above the entry price",
+      "reason": "Specification states TP is set at the level of the next 1h FVG above entry point, requiring a fallback when no such FVG exists."
+    }
+  ]
+}
+```
