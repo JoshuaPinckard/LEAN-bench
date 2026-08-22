@@ -40,9 +40,9 @@ bare-model comparison on the cells the paper leans on:
 H5. **The ask asymmetry is the models', not the harnesses'.** Cells:
     BL-01b at high effort, n=30 per model. Surfaces, symmetric-bare:
     gemini via Vertex (pinned); gpt-5.6 via the OpenAI API (owner-
-    approved, small; subject to a zero-cost model-availability check -
-    if the gpt-5.6 models are not API-available, that is disclosed and
-    codex remains CLI-only in this leg); claude via the CLI with
+    approved, small; availability check PASSED 2026-08-22: gpt-5.6-luna,
+    -terra, -sol all exist on the API by exact name; micro-test call
+    completed with the reasoning-effort parameter, 34 tokens); claude via the CLI with
     --system-prompt full replacement (near-bare; residual = a one-line
     SDK identity preamble + a date/email context block, disclosed - the
     subscription-funding substitute for the Anthropic API). One
