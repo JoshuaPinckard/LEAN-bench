@@ -1,0 +1,116 @@
+```python
+import backtrader as bt
+import math
+
+
+class MSTRSqueezeMomentum(bt.Strategy):
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.width = self.bb.top - self.bb.bot
+        self.width_sma20 = bt.indicators.SimpleMovingAverage(self.width, period=20)
+        self.atr_sma20 = bt.indicators.SimpleMovingAverage(self.atr, period=20)
+
+        self.sma_vol20 = bt.indicators.SimpleMovingAverage(self.data.volume, period=20)
+        self.sma_vol3 = bt.indicators.SimpleMovingAverage(self.data.volume, period=3)
+
+        self.cross_mid = bt.indicators.CrossOver(self.data.close, self.bb.mid)
+
+        self.order = None
+        self.order_kind = None
+        self.entry_price = None
+        self.stop_level = None
+
+        self.cycle_state = "ready"
+
+    def notify_order(self, order):
+        if order.status not in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            return
+
+        if order.status == order.Completed:
+            if self.order_kind == "entry":
+                self.entry_price = order.executed.price
+                self.stop_level = min(
+                    self.bb.bot[0],
+                    self.entry_price - 1.5 * self.atr[0],
+                )
+            elif self.order_kind == "exit" and not self.position:
+                self.entry_price = None
+                self.stop_level = None
+                self.cycle_state = "need_expansion"
+
+        self.order = None
+        self.order_kind = None
+
+    def next(self):
+        if self.order:
+            return
+
+        volatility_squeeze = (
+            self.width[0] < 0.75 * self.width_sma20[0]
+            and self.atr[0] < self.atr_sma20[0]
+        )
+        expansion = self.width[0] > self.width_sma20[0]
+
+        if self.position:
+            take_profit = self.data.high[0] >= self.entry_price + 2 * self.atr[0]
+            stop_loss = self.data.low[0] <= self.stop_level
+            acceleration = self.data.close[0] > self.bb.top[0] and self.rsi[0] > 50
+
+            if take_profit or stop_loss or acceleration:
+                self.order = self.close()
+                self.order_kind = "exit"
+            return
+
+        if self.cycle_state == "need_expansion":
+            if expansion:
+                self.cycle_state = "need_squeeze"
+            return
+
+        if self.cycle_state == "need_squeeze":
+            if volatility_squeeze:
+                self.cycle_state = "ready"
+            else:
+                return
+
+        narrow_range = (
+            self.data.close[0] >= self.bb.mid[0] - 0.25 * self.width[0]
+            and self.data.close[0] <= self.bb.mid[0] + 0.25 * self.width[0]
+        )
+        oversold = self.rsi[0] < 35
+        abnormal_volume = self.sma_vol3[0] > 1.5 * self.sma_vol20[0]
+        momentum_trigger = self.cross_mid[0] > 0
+
+        if (
+            volatility_squeeze
+            and narrow_range
+            and oversold
+            and abnormal_volume
+            and momentum_trigger
+        ):
+            estimated_entry_price = self.data.close[0]
+            estimated_stop_level = min(
+                self.bb.bot[0],
+                estimated_entry_price - 1.5 * self.atr[0],
+            )
+            risk_per_share = estimated_entry_price - estimated_stop_level
+
+            if risk_per_share > 0:
+                size = math.floor(
+                    0.02 * self.broker.getvalue() / risk_per_share
+                )
+                if size > 0:
+                    self.order = self.buy(size=size)
+                    self.order_kind = "entry"
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Risk sizing uses the signal bar close and its calculated stop as the estimate of entry price and stop.","reason":"A standard Backtrader market order fills on the following bar, so its actual execution price and entry-bar indicator values are unavailable when the order size must be submitted."},{"topic":"entry stop","choice":"After entry execution, stop_level is calculated from the actual fill price and the Bollinger lower band and ATR on the execution bar.","reason":"This is the closest literal interpretation of entry_price and 'bb.bot on the entry bar' under Backtrader market-order timing."},{"topic":"exit execution","choice":"When an OHLC exit condition is observed, self.close() submits a standard market exit order.","reason":"The canonical convention defines an exit as self.close(); the resulting execution follows Backtrader's normal order timing."},{"topic":"take-profit ATR","choice":"The take-profit threshold uses the current bar's ATR(14).","reason":"The specification writes entry_price + 2 * ATR(14) without stating that ATR is fixed at entry."},{"topic":"zero size","choice":"No order is submitted when the specified floored risk-based size is zero.","reason":"A zero-share order cannot open a position."}]}
+```

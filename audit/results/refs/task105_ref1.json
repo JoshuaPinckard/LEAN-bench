@@ -1,0 +1,77 @@
+{
+  "task_id": 105,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\nfrom collections import deque\n\n\nclass LiquidityMomentumImbalanceStrategy(bt.Strategy):\n    params = (\n        ('risk_fraction', 0.01),\n        ('profile_bins', 10),\n    )\n\n    def __init__(self):\n        self.addminperiod(25)\n\n        self._bars = deque(maxlen=24)\n        self._pending = None\n        self._pending_kind = None\n        self._pending_trade = None\n\n        self._direction = None\n        self._stop = None\n        self._target = None\n\n        self._day = None\n        self._day_high = None\n        self._day_low = None\n        self._previous_day_high = None\n        self._previous_day_low = None\n\n        self._pre_long = False\n        self._pre_short = False\n        self._after_long = False\n        self._after_short = False\n        self._overnight_long = False\n        self._overnight_short = False\n\n        self._bull_bos = False\n        self._bear_bos = False\n        self._bull_ob = None\n        self._bear_ob = None\n        self._bull_fvgs = []\n        self._bear_fvgs = []\n\n    def _session(self, dt):\n        minute = dt.hour * 60 + dt.minute\n        if 4 * 60 <= minute < 9 * 60 + 30:\n            return 'premarket'\n        if 9 * 60 + 30 <= minute < 16 * 60:\n            return 'main'\n        if 16 * 60 <= minute < 20 * 60:\n            return 'afterhours'\n        return 'other'\n\n    def _profile_nodes(self):\n        prices = [(bar['h'] + bar['l'] + bar['c']) / 3.0 for bar in self._bars]\n        lower = min(bar['l'] for bar in self._bars)\n        upper = max(bar['h'] for bar in self._bars)\n\n        if upper <= lower:\n            return lower, lower\n\n        width = (upper - lower) / float(self.p.profile_bins)\n        bins = [0.0] * self.p.profile_bins\n\n        for bar, price in zip(self._bars, prices):\n            index = min(int((price - lower) / width), self.p.profile_bins - 1)\n            bins[index] += bar['v']\n\n        occupied = [i for i, volume in enumerate(bins) if volume > 0]\n        hvn_index = max(occupied, key=lambda i: bins[i])\n        lvn_index = min(occupied, key=lambda i: bins[i])\n\n        return (\n            lower + (hvn_index + 0.5) * width,\n            lower + (lvn_index + 0.5) * width,\n        )\n\n    def _last_opposite_candle(self, bullish):\n        for bar in reversed(self._bars):\n            if bullish and bar['c'] < bar['o']:\n                return (bar['l'], bar['h'])\n            if not bullish and bar['c'] > bar['o']:\n                return (bar['l'], bar['h'])\n        return None\n\n    def _submit_entry(self, direction, stop, target):\n        entry = self.data.close[0]\n        distance = abs(entry - stop)\n        if distance <= 0:\n            return\n\n        capital_risk = self.broker.getvalue() * self.p.risk_fraction\n        size = math.floor(capital_risk / distance)\n        if size <= 0:\n            return\n\n        self._pending_trade = (direction, stop, target)\n        self._pending_kind = direction + '_entry'\n        if direction == 'long':\n            self._pending = self.buy(size=size)\n        else:\n            self._pending = self.sell(size=size)\n\n    def notify_order(self, order):\n        if order.status not in (\n            order.Completed, order.Canceled, order.Margin, order.Rejected\n        ):\n            return\n\n        if order is not self._pending:\n            return\n\n        if order.status == order.Completed:\n            if self._pending_kind == 'long_entry':\n                self._direction, self._stop, self._target = self._pending_trade\n            elif self._pending_kind == 'short_entry':\n                self._direction, self._stop, self._target = self._pending_trade\n            elif self._pending_kind == 'exit':\n                self._direction = None\n                self._stop = None\n                self._target = None\n\n        if order.status != order.Completed and self._pending_kind != 'exit':\n            self._pending_trade = None\n\n        self._pending = None\n        self._pending_kind = None\n\n    def next(self):\n        dt = self.data.datetime.datetime(0)\n        session = self._session(dt)\n        current_day = dt.date()\n\n        o = self.data.open[0]\n        h = self.data.high[0]\n        l = self.data.low[0]\n        c = self.data.close[0]\n        v = self.data.volume[0]\n\n        if self._day != current_day:\n            if self._day is not None:\n                self._previous_day_high = self._day_high\n                self._previous_day_low = self._day_low\n                self._overnight_long = self._after_long\n                self._overnight_short = self._after_short\n\n            self._day = current_day\n            self._day_high = h\n            self._day_low = l\n            self._pre_long = False\n            self._pre_short = False\n            self._after_long = False\n            self._after_short = False\n            self._bull_bos = False\n            self._bear_bos = False\n            self._bull_ob = None\n            self._bear_ob = None\n            self._bull_fvgs = []\n            self._bear_fvgs = []\n        else:\n            self._day_high = max(self._day_high, h)\n            self._day_low = min(self._day_low, l)\n\n        if (\n            session in ('premarket', 'afterhours')\n            and self._previous_day_low is not None\n            and l <= self._previous_day_low\n            and c > self._previous_day_low\n        ):\n            if session == 'premarket':\n                self._pre_long = True\n            else:\n                self._after_long = True\n\n        if (\n            session in ('premarket', 'afterhours')\n            and self._previous_day_high is not None\n            and h >= self._previous_day_high\n            and c < self._previous_day_high\n        ):\n            if session == 'premarket':\n                self._pre_short = True\n            else:\n                self._after_short = True\n\n        if self._pending is not None:\n            self._bars.append({'o': o, 'h': h, 'l': l, 'c': c, 'v': v})\n            return\n\n        if self.position.size:\n            if self._direction == 'long':\n                if l <= self._stop or h >= self._target:\n                    self._pending_kind = 'exit'\n                    self._pending = self.close()\n            elif self._direction == 'short':\n                if h >= self._stop or l <= self._target:\n                    self._pending_kind = 'exit'\n                    self._pending = self.close()\n\n            self._bars.append({'o': o, 'h': h, 'l': l, 'c': c, 'v': v})\n            return\n\n        if session == 'main' and len(self._bars) == 24:\n            range_low = min(bar['l'] for bar in self._bars)\n            range_high = max(bar['h'] for bar in self._bars)\n            price_range = range_high - range_low\n\n            if price_range > 0:\n                fib382 = range_low + price_range * 0.382\n                fib500 = range_low + price_range * 0.500\n                fib618 = range_low + price_range * 0.618\n                fib786 = range_low + price_range * 0.786\n                fib214 = range_low + price_range * 0.214\n                equilibrium = sum(bar['c'] for bar in self._bars) / 24.0\n                hvn, lvn = self._profile_nodes()\n\n                recent_high = max(bar['h'] for bar in list(self._bars)[-5:])\n                recent_low = min(bar['l'] for bar in list(self._bars)[-5:])\n                profile_confirms_bos = l <= hvn <= h\n\n                if h > recent_high and profile_confirms_bos:\n                    self._bull_bos = True\n                    self._bull_ob = self._last_opposite_candle(True)\n\n                if l < recent_low and profile_confirms_bos:\n                    self._bear_bos = True\n                    self._bear_ob = self._last_opposite_candle(False)\n\n                prior_close = self._bars[-1]['c']\n                bullish_context = c > equilibrium and c > fib500\n                bearish_context = c < equilibrium and c < fib500\n                long_liquidity = self._pre_long or self._overnight_long\n                short_liquidity = self._pre_short or self._overnight_short\n\n                bullish_fvg_break = any(\n                    prior_close <= upper and c > upper\n                    for lower, upper in self._bull_fvgs\n                )\n                bearish_fvg_break = any(\n                    prior_close >= lower and c < lower\n                    for lower, upper in self._bear_fvgs\n                )\n\n                bull_ob_entry = (\n                    self._bull_ob is not None\n                    and l <= self._bull_ob[1]\n                    and h >= self._bull_ob[0]\n                )\n                bear_ob_entry = (\n                    self._bear_ob is not None\n                    and l <= self._bear_ob[1]\n                    and h >= self._bear_ob[0]\n                )\n\n                crossed_618 = prior_close < fib618 <= c\n                crossed_382 = prior_close > fib382 >= c\n\n                if (\n                    bullish_context\n                    and long_liquidity\n                    and self._bull_bos\n                    and crossed_618\n                    and (bullish_fvg_break or bull_ob_entry)\n                ):\n                    stop = (\n                        self._bull_ob[0]\n                        if bull_ob_entry and self._bull_ob is not None\n                        else lvn if lvn < c else range_low\n                    )\n                    self._submit_entry('long', stop, fib786)\n\n                elif (\n                    bearish_context\n                    and short_liquidity\n                    and self._bear_bos\n                    and crossed_382\n                    and (bearish_fvg_break or bear_ob_entry)\n                ):\n                    stop = (\n                        self._bear_ob[1]\n                        if bear_ob_entry and self._bear_ob is not None\n                        else hvn if hvn > c else range_high\n                    )\n                    self._submit_entry('short', stop, fib214)\n\n                if self._bull_bos and self._bars[-2]['h'] < l:\n                    self._bull_fvgs.append((self._bars[-2]['h'], l))\n                if self._bear_bos and self._bars[-2]['l'] > h:\n                    self._bear_fvgs.append((h, self._bars[-2]['l']))\n\n        self._bars.append({'o': o, 'h': h, 'l': l, 'c': c, 'v': v})",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Pre-market is 04:00-09:30 and after-hours is 16:00-20:00 in the feed timestamp timezone; signals require bars in those windows.",
+      "reason": "The supplied feed contains only 09:30-15:30 bars, so literal pre-market/after-hours tests cannot occur unless such bars are present."
+    },
+    {
+      "topic": "previous-day levels",
+      "choice": "Previous-day High and Low are the extrema of all supplied bars for the preceding calendar trading date.",
+      "reason": "The specification identifies the previous day's High/Low but does not define session boundaries for their calculation."
+    },
+    {
+      "topic": "24-hour calculations",
+      "choice": "Fibonacci range, Equilibrium, and Volume Profile use the preceding 24 one-hour bars, excluding the current bar.",
+      "reason": "This is the literal available implementation of the stated last-24-hours examples without look-ahead."
+    },
+    {
+      "topic": "fibonacci anchors",
+      "choice": "0% is the 24-bar Low and 100% is the 24-bar High.",
+      "reason": "The specification gives percentages but not orientation."
+    },
+    {
+      "topic": "liquidity bounce",
+      "choice": "A long test is Low at or below the previous-day Low followed by a Close above it; a short test is High at or above the previous-day High followed by a Close below it.",
+      "reason": "This defines the stated tested-and-bounced confirmation using OHLC data."
+    },
+    {
+      "topic": "after-hours sequencing",
+      "choice": "A pre-market liquidity signal applies to that day's main session; an after-hours signal applies to the next supplied trading day's main session.",
+      "reason": "This preserves the stated requirement that the liquidity event occurs before the main-session setup."
+    },
+    {
+      "topic": "BOS",
+      "choice": "A bullish BOS is a High above the prior five-bar High and a bearish BOS is a Low below the prior five-bar Low.",
+      "reason": "The specification says new high/new low without defining swing length."
+    },
+    {
+      "topic": "volume-profile confirmation",
+      "choice": "The 24-bar Volume Profile uses ten equal-width price bins, volume-weighted by each bar's typical price; BOS is confirmed when its bar spans the High Volume Node.",
+      "reason": "The specification requires Volume Profile confirmation but provides no binning or confirmation rule."
+    },
+    {
+      "topic": "order-blocks",
+      "choice": "A bullish OB is the most recent bearish candle before a bullish BOS; a bearish OB is the most recent bullish candle before a bearish BOS; each zone is that candle's Low-to-High range.",
+      "reason": "The specification names OB zones but does not give a construction rule."
+    },
+    {
+      "topic": "fair-value-gaps",
+      "choice": "A bullish FVG is created when the current Low exceeds the High two bars earlier, and a bearish FVG when the current High is below the Low two bars earlier; zone boundaries are the resulting gap edges.",
+      "reason": "The specification names FVG zones but does not define their OHLC construction."
+    },
+    {
+      "topic": "targets-and-stops",
+      "choice": "Take-profit uses the stated 78.6%/21.4% Fibonacci level. OB entries use the corresponding OB boundary as stop; FVG entries use the nearest appropriately sided LVN/HVN, falling back to the 24-bar range boundary.",
+      "reason": "The specification provides alternatives but no priority rule; OHLC data cannot represent an offset below/above an exact zone boundary."
+    },
+    {
+      "topic": "intrabar-exit-order",
+      "choice": "If both stop and target are touched in one bar, the stop is evaluated first.",
+      "reason": "OHLC bars do not reveal intrabar price order."
+    },
+    {
+      "topic": "risk-sizing",
+      "choice": "Risk per trade is fixed at 1% of current broker equity; share quantity is floor(1% equity divided by entry-to-stop distance).",
+      "reason": "The specification permits 1-2% but does not select a value or rounding method."
+    }
+  ],
+  "success": false,
+  "error": "Backtest error: 'NoneType' object is not callable",
+  "total_trades": 0,
+  "tape": []
+}

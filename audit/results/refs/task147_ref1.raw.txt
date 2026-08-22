@@ -1,0 +1,161 @@
+```python
+import backtrader as bt
+
+
+class GridMartingaleStrategy(bt.Strategy):
+    params = (
+        ("base_volume", 1),
+        ("grid_distance", 0.01),
+        ("take_profit_margin", 0.005),
+        ("max_reinvestment_levels", 5),
+    )
+
+    def __init__(self):
+        self.pending_orders = {}
+        self.grid_orders = []
+        self.take_profit_order = None
+        self.reinvestment_order = None
+        self.direction = 0
+        self.reinvestment_level = 0
+        self.refreshing_grid = False
+
+    def _track(self, order, role):
+        self.pending_orders[order.ref] = (order, role)
+        return order
+
+    def _cancel_orders(self, orders):
+        for order in list(orders):
+            if order and order.ref in self.pending_orders:
+                self.cancel(order)
+
+    def _cancel_all_active_orders(self):
+        self._cancel_orders([item[0] for item in self.pending_orders.values()])
+
+    def _place_grid(self):
+        if self.position.size or self.pending_orders:
+            return
+
+        price = self.data.close[0]
+        buy_order = self._track(
+            self.buy(
+                size=self.p.base_volume,
+                exectype=bt.Order.Limit,
+                price=price * (1.0 - self.p.grid_distance),
+            ),
+            "grid_buy",
+        )
+        sell_order = self._track(
+            self.sell(
+                size=self.p.base_volume,
+                exectype=bt.Order.Limit,
+                price=price * (1.0 + self.p.grid_distance),
+                oco=buy_order,
+            ),
+            "grid_sell",
+        )
+        self.grid_orders = [buy_order, sell_order]
+        self.refreshing_grid = False
+
+    def _place_position_orders(self):
+        if not self.position.size:
+            return
+
+        self._cancel_orders([self.take_profit_order, self.reinvestment_order])
+
+        average_price = self.position.price
+        position_size = abs(self.position.size)
+
+        if self.position.size > 0:
+            self.take_profit_order = self._track(
+                self.sell(
+                    size=position_size,
+                    exectype=bt.Order.Limit,
+                    price=average_price * (1.0 + self.p.take_profit_margin),
+                ),
+                "take_profit",
+            )
+            if self.reinvestment_level < self.p.max_reinvestment_levels:
+                next_size = self.p.base_volume * (2 ** (self.reinvestment_level + 1))
+                self.reinvestment_order = self._track(
+                    self.buy(
+                        size=next_size,
+                        exectype=bt.Order.Limit,
+                        price=average_price * (1.0 - self.p.grid_distance),
+                    ),
+                    "reinvestment",
+                )
+            else:
+                self.reinvestment_order = None
+        else:
+            self.take_profit_order = self._track(
+                self.buy(
+                    size=position_size,
+                    exectype=bt.Order.Limit,
+                    price=average_price * (1.0 - self.p.take_profit_margin),
+                ),
+                "take_profit",
+            )
+            if self.reinvestment_level < self.p.max_reinvestment_levels:
+                next_size = self.p.base_volume * (2 ** (self.reinvestment_level + 1))
+                self.reinvestment_order = self._track(
+                    self.sell(
+                        size=next_size,
+                        exectype=bt.Order.Limit,
+                        price=average_price * (1.0 + self.p.grid_distance),
+                    ),
+                    "reinvestment",
+                )
+            else:
+                self.reinvestment_order = None
+
+    def notify_order(self, order):
+        tracked = self.pending_orders.get(order.ref)
+        role = tracked[1] if tracked else None
+
+        if order.status in (
+            bt.Order.Completed,
+            bt.Order.Canceled,
+            bt.Order.Margin,
+            bt.Order.Rejected,
+        ):
+            self.pending_orders.pop(order.ref, None)
+
+        if order.status != bt.Order.Completed:
+            return
+
+        if role in ("grid_buy", "grid_sell"):
+            self.direction = 1 if order.isbuy() else -1
+            self.reinvestment_level = 0
+            self._cancel_orders(
+                [grid_order for grid_order in self.grid_orders if grid_order.ref != order.ref]
+            )
+            self.grid_orders = []
+            self._place_position_orders()
+
+        elif role == "reinvestment":
+            self.reinvestment_level += 1
+            self._place_position_orders()
+
+        elif role == "take_profit":
+            self.direction = 0
+            self.reinvestment_level = 0
+            self.take_profit_order = None
+            self.reinvestment_order = None
+            self.grid_orders = []
+            self._cancel_all_active_orders()
+            self._place_grid()
+
+    def next(self):
+        if self.position.size:
+            return
+
+        if self.grid_orders and not self.pending_orders:
+            self.grid_orders = []
+
+        if not self.pending_orders:
+            self._place_grid()
+```
+
+```json
+{"assumptions":[{"topic":"grid distance","choice":"Use a 1% distance from the current close for initial and reinvestment grid orders.","reason":"The specification requires a distance but does not set one; 1% is the only numerical grid-threshold example provided."},{"topic":"take-profit margin","choice":"Use 0.5% from the averaged entry price.","reason":"The specification gives 0.5% as the stated overall-profit-margin example."},{"topic":"base volume","choice":"Expose base_volume as a strategy parameter with default 1.","reason":"The specification says the user sets the initial volume but supplies no numeric default."},{"topic":"short positions","choice":"Treat the initial limit sell grid order as a short perpetual-futures entry and use buy orders to close it.","reason":"A two-sided perpetual-futures buy/sell grid requires short entries for the sell side to open a position."},{"topic":"grid maintenance","choice":"Maintain one OCO pair of buy/sell limit orders while flat; after one fills, cancel its counterpart and manage only that position.","reason":"This implements the required grid while enforcing the single-position rule and preventing both sides from opening on the same bar."},{"topic":"trailing orders","choice":"Do not enable trailing entry or trailing exit orders.","reason":"Both trailing mechanisms are explicitly optional and no trailing parameters are specified."},{"topic":"maximum reinvestment","choice":"Allow at most five reinvestments after the base entry; each uses base_volume multiplied by 2 to the next level.","reason":"The specification's explicit example is no more than five reinvestment levels."},{"topic":"infeasible","choice":"Use the supplied AAPL OHLCV feed as the price source and emulate perpetual-futures long/short order behavior.","reason":"The harness provides no perpetual-futures contract, funding, leverage, liquidation, or order-book data."}]}
+```

@@ -1,131 +1,142 @@
 ```python
 import backtrader as bt
 import math
-import collections
-import statistics
 
 
 class FutureReturnDistributionStrategy(bt.Strategy):
     params = (
-        ('fast_ma', 13),
-        ('slow_ma', 40),
-        ('rsi_period', 14),
-        ('macd_fast', 12),
-        ('macd_slow', 26),
-        ('macd_signal', 9),
-        ('bars_per_window', 6),        # 6 x 5min = one 30-minute candle
-        ('ma_crosses_required', 1),    # ma_crosses must equal 1
-        ('rsi_threshold', 70.0),       # avg_rsi must be above 70
-        ('hold_periods', 6),           # close after 6 x 30-minute periods
-        ('stop_loss', 0.015),          # 1.5% below entry
-        ('take_profit', 0.030),        # 3.0% above entry
-        ('capital_fraction', 0.99),    # ~100% of available capital
+        ("fast_sma_period", 13),
+        ("slow_sma_period", 40),
+        ("rsi_period", 14),
+        ("macd_fast_period", 12),
+        ("macd_slow_period", 26),
+        ("macd_signal_period", 9),
+        ("stop_loss", 0.015),
+        ("take_profit", 0.03),
+        ("holding_periods", 6),
     )
 
     def __init__(self):
-        # --- Indicators computed on the 5-minute feed ---
-        # Two moving averages: fast SMA(13), slow SMA(40)
-        self.fast_sma = bt.indicators.SMA(self.data.close, period=self.p.fast_ma)
-        self.slow_sma = bt.indicators.SMA(self.data.close, period=self.p.slow_ma)
-        # +1 when fast crosses above slow (used to count bullish crossovers)
-        self.crossover = bt.indicators.CrossOver(self.fast_sma, self.slow_sma)
-        # RSI with the standard period of 14
+        self.fast_sma = bt.indicators.SMA(
+            self.data.close, period=self.p.fast_sma_period
+        )
+        self.slow_sma = bt.indicators.SMA(
+            self.data.close, period=self.p.slow_sma_period
+        )
         self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
-        # MACD with default settings (12/26/9) -- required indicator in the set.
-        self.macd = bt.indicators.MACD(
-            self.data.close,
-            period_me1=self.p.macd_fast,
-            period_me2=self.p.macd_slow,
-            period_signal=self.p.macd_signal,
+
+        self.macd_fast = bt.indicators.EMA(
+            self.data.close, period=self.p.macd_fast_period
+        )
+        self.macd_slow = bt.indicators.EMA(
+            self.data.close, period=self.p.macd_slow_period
+        )
+        self.macd = self.macd_fast - self.macd_slow
+        self.macd_signal = bt.indicators.SMA(
+            self.macd, period=self.p.macd_signal_period
         )
 
-        # --- Order / position bookkeeping ---
         self.order = None
         self.entry_price = None
-        self.entry_bucket_id = None
+        self.entry_period_index = None
+        self.pending_entry_period_index = None
 
-        # --- 30-minute window aggregation state ---
-        self.cur_bucket_key = None
-        self.bucket_id = -1
-        self.window_crosses = 0
-        self.window_rsi = []
+        self.current_30m_key = None
+        self.period_index = -1
+        self.ma_crosses = 0
+        self.rsi_total = 0.0
+        self.rsi_count = 0
+        self.previous_fast_sma = None
+        self.previous_slow_sma = None
 
-    def _bucket_key(self, dt):
-        # Identify the clock-aligned 30-minute window this 5-minute bar belongs to.
-        minutes = dt.hour * 60 + dt.minute
-        return (dt.year, dt.month, dt.day, minutes // 30)
+    def _thirty_minute_key(self):
+        dt = self.data.datetime.datetime(0)
+        session_minutes = dt.hour * 60 + dt.minute
+        return (dt.date(), session_minutes // 30)
+
+    def _is_thirty_minute_close(self):
+        return self.data.datetime.datetime(0).minute % 30 == 25
+
+    def _entry_size(self):
+        price = self.data.close[0]
+        commission = self.broker.getcommissioninfo(self.data).p.commission
+        return self.broker.getcash() / (price * (1.0 + commission))
+
+    def next(self):
+        key = self._thirty_minute_key()
+
+        if key != self.current_30m_key:
+            self.current_30m_key = key
+            self.period_index += 1
+            self.ma_crosses = 0
+            self.rsi_total = 0.0
+            self.rsi_count = 0
+
+        fast = self.fast_sma[0]
+        slow = self.slow_sma[0]
+        rsi = self.rsi[0]
+
+        if (
+            self.previous_fast_sma is not None
+            and fast > slow
+            and self.previous_fast_sma <= self.previous_slow_sma
+        ):
+            self.ma_crosses += 1
+
+        if not math.isnan(rsi):
+            self.rsi_total += rsi
+            self.rsi_count += 1
+
+        self.previous_fast_sma = fast
+        self.previous_slow_sma = slow
+
+        if self.order is None and self.position and self.entry_price is not None:
+            if (
+                self.data.low[0] <= self.entry_price * (1.0 - self.p.stop_loss)
+                or self.data.high[0] >= self.entry_price * (1.0 + self.p.take_profit)
+            ):
+                self.order = self.close()
+                return
+
+        if (
+            self.order is None
+            and self.position
+            and self._is_thirty_minute_close()
+            and self.period_index - self.entry_period_index >= self.p.holding_periods
+        ):
+            self.order = self.close()
+            return
+
+        if (
+            self.order is None
+            and not self.position
+            and self._is_thirty_minute_close()
+            and self.rsi_count > 0
+        ):
+            avg_rsi = self.rsi_total / self.rsi_count
+
+            if self.ma_crosses == 1 and avg_rsi > 70:
+                self.pending_entry_period_index = self.period_index
+                self.order = self.buy(size=self._entry_size())
 
     def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
-            return
         if order.status == order.Completed:
             if order.isbuy():
                 self.entry_price = order.executed.price
-                self.entry_bucket_id = self.bucket_id
-        if order.status in (order.Completed, order.Canceled,
-                            order.Margin, order.Rejected):
+                self.entry_period_index = self.pending_entry_period_index
+            else:
+                self.entry_price = None
+                self.entry_period_index = None
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
             self.order = None
-
-    def notify_trade(self, trade):
-        if trade.isclosed:
-            self.entry_price = None
-            self.entry_bucket_id = None
-
-    def _finalize_window(self):
-        # Evaluate the just-completed 30-minute candle for an entry.
-        n = len(self.window_rsi)
-        if n < self.p.bars_per_window:
-            # Only act on full 30-minute candles (ignore partial warm-up windows).
-            return
-
-        ma_crosses = self.window_crosses
-        avg_rsi = statistics.mean(self.window_rsi)
-
-        if self.order or self.position:
-            return
-
-        # Entry filter: exactly one bullish MA crossover and average RSI above 70.
-        if ma_crosses == self.p.ma_crosses_required and avg_rsi > self.p.rsi_threshold:
-            price = self.data.close[0]
-            cash = self.broker.get_cash()
-            size = int((cash * self.p.capital_fraction) / price)
-            if size > 0:
-                self.order = self.buy(size=size)
-
-    def next(self):
-        dt = self.data.datetime.datetime(0)
-        key = self._bucket_key(dt)
-
-        # Detect a 30-minute window boundary.
-        if key != self.cur_bucket_key:
-            if self.cur_bucket_key is not None:
-                self._finalize_window()
-            self.cur_bucket_key = key
-            self.bucket_id += 1
-            self.window_crosses = 0
-            self.window_rsi = []
-
-        # Accumulate this 5-minute bar into the current 30-minute window.
-        if self.crossover[0] > 0:
-            self.window_crosses += 1
-        self.window_rsi.append(self.rsi[0])
-
-        # --- Position management (checked on every 5-minute bar) ---
-        if self.position and not self.order and self.entry_price is not None:
-            stop_price = self.entry_price * (1.0 - self.p.stop_loss)
-            take_price = self.entry_price * (1.0 + self.p.take_profit)
-
-            if self.data.low[0] <= stop_price:
-                # Stop-loss: price dropped 1.5% below entry.
-                self.order = self.close()
-            elif self.data.high[0] >= take_price:
-                # Take-profit: price rose 3.0% above entry.
-                self.order = self.close()
-            elif (self.entry_bucket_id is not None and
-                  (self.bucket_id - self.entry_bucket_id) >= self.p.hold_periods):
-                # Fixed holding period: 6 x 30-minute periods after opening.
-                self.order = self.close()
 ```
+
 ```json
-{"assumptions": [{"topic": "indicator timeframe", "choice": "SMA(13), SMA(40) and RSI(14) are computed on the 5-minute feed, then aggregated per 30-minute window (upward crossovers counted across the 6 five-minute bars; avg_rsi = mean of the 6 five-minute RSI values).", "reason": "The spec states ma_crosses are 'based on 5-minute data' and avg_rsi is the 'average RSI over the 30-minute period'; counting multiple intra-window crosses is only possible with 5-minute SMAs, so 'aggregate into 30-minute candles' is read as the decision cadence / feature aggregation, not as recomputing indicators on 30-minute OHLC."}, {"topic": "30-minute aggregation mechanism", "choice": "Aggregation is done manually inside the strategy by bucketing 5-minute bars into clock-aligned 30-minute windows (minute // 30), rather than via cerebro.resampledata.", "reason": "The harness fixes a single 5-minute PandasData feed and forbids top-level cerebro setup, so no resampled feed can be added."}, {"topic": "window completion / decision timing", "choice": "A 30-minute candle is finalized when the first bar of the next window arrives; the entry is evaluated then and the market buy fills at the following bar's open. Only complete 6-bar windows are evaluated.", "reason": "Bars are streamed one at a time; next-bar fill is the standard backtrader convention, and partial windows during warm-up must be skipped."}, {"topic": "MACD usage", "choice": "MACD(12/26/9) is instantiated as a required indicator but is not referenced by the entry/exit logic.", "reason": "The spec's explicit entry filter uses only ma_crosses and avg_rsi; adding a MACD condition would invent a filter the spec does not state."}, {"topic": "position sizing", "choice": "Buy size = int(available_cash * 0.99 / price), approximating 100% of available capital.", "reason": "The spec asks for ~100% of capital; a 0.99 factor leaves headroom for the 0.1% commission and next-bar fill to avoid margin rejection."}, {"topic": "stop-loss / take-profit trigger", "choice": "Checked on every 5-minute bar against the bar's low (-1.5%) and high (+3.0%); exit executed with a market self.close() that fills at the next bar's open.", "reason": "The environment is OHLCV with market orders; intrabar touch of low/high is the closest literal reading of 'price drops/rises', and market close is the canonical exit."}, {"topic": "holding period counting", "choice": "The 6 30-minute periods are counted as 6 subsequent trading windows (monotonic), so overnight gaps are skipped and a position may be held across sessions; no end-of-day flat rule is added.", "reason": "Literal reading of 'close after 6 30-minute periods'; the spec is silent on session boundaries."}, {"topic": "infeasible", "choice": "The strategy is applied to the single provided AAPL 5-minute feed (~3 months) instead of 30-50 liquid S&P 500 tickers over several years.", "reason": "The harness supplies only one data feed and a fixed date range; a multi-asset universe and multi-year history are not available in this environment."}]}
+{"assumptions":[{"topic":"30-minute aggregation","choice":"30-minute periods are formed from consecutive 5-minute bars; SMA crossover counting and RSI averaging use the specified 5-minute indicator values within each period.","reason":"The specification explicitly defines crossover counting from 5-minute data and RSI averaging over each 30-minute period, despite also describing 30-minute aggregation before indicator calculation."},{"topic":"30-minute candle completion","choice":"A 30-minute candle completes on bars timestamped at minutes 25 and 55, treating timestamps as 5-minute bar start times.","reason":"The supplied feed contains 5-minute OHLCV bars and no separate resampled data feed."},{"topic":"position sizing","choice":"Entry size uses all available cash divided by the current close plus the stated 0.001 commission.","reason":"This is the closest executable interpretation of a 100% available-capital position when a market order executes on the next bar."},{"topic":"stop-loss and take-profit execution","choice":"The strategy submits a market close order when a 5-minute bar low reaches the 1.5% stop or its high reaches the 3.0% target.","reason":"OHLCV data cannot establish intrabar trigger order or guarantee execution at an exact stop/target price."},{"topic":"infeasible","choice":"Only AAPL and the supplied 2026 date range are used.","reason":"The harness provides one AAPL 5-minute feed only; testing 30-50 tickers and several years of historical data cannot be implemented in this environment."}]}
 ```

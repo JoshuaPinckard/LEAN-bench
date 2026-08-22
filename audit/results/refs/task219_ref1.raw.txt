@@ -1,0 +1,258 @@
+```python
+import backtrader as bt
+
+
+class CapitulationShortSqueezeStrategy(bt.Strategy):
+    params = (
+        ("bb_period", 126),
+        ("bb_devfactor", 2),
+        ("rsi_period", 14),
+        ("ema_period", 200),
+        ("atr_period", 14),
+        ("volume_sma_period", 20),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor,
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.volume_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.volume_sma_period
+        )
+
+        self.range_resistance = bt.indicators.Max(self.bb.mid, self.ema)
+        self.breakout_cross = bt.indicators.CrossOver(
+            self.data.close, self.range_resistance
+        )
+        self.lower_return_cross = bt.indicators.CrossOver(
+            self.data.close, self.bb.bot
+        )
+        self.upper_return_cross = bt.indicators.CrossOver(
+            self.bb.top, self.data.close
+        )
+
+        self.order = None
+        self.order_role = None
+        self.entry_request = None
+        self.capitulation_signal = None
+        self.short_signal = None
+
+        self.trade_side = None
+        self.entry_price = None
+        self.entry_size = None
+        self.stop_price = None
+        self.tp1_done = False
+        self.tp2_done = False
+
+    def _reset_trade_state(self):
+        self.trade_side = None
+        self.entry_price = None
+        self.entry_size = None
+        self.stop_price = None
+        self.tp1_done = False
+        self.tp2_done = False
+
+    def _submit_entry(self, side, setup, signal_stop, reference=None, signal_atr=None):
+        self.entry_request = {
+            "side": side,
+            "setup": setup,
+            "signal_stop": signal_stop,
+            "reference": reference,
+            "signal_atr": signal_atr,
+        }
+        self.order_role = "entry"
+        self.order = self.buy() if side == "long" else self.sell()
+
+    def _submit_partial_close(self, fraction, role):
+        size = min(abs(self.position.size), self.entry_size * fraction)
+        if size > 0:
+            self.order_role = role
+            self.order = self.close(size=size)
+
+    def _submit_full_close(self, role):
+        self.order_role = role
+        self.order = self.close()
+
+    def notify_order(self, order):
+        if order.status not in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            return
+
+        role = self.order_role if order is self.order else None
+
+        if order.status == order.Completed:
+            if role == "entry" and self.entry_request is not None:
+                request = self.entry_request
+                self.trade_side = request["side"]
+                self.entry_price = order.executed.price
+                self.entry_size = abs(order.executed.size)
+
+                if request["setup"] == "breakout":
+                    self.stop_price = max(
+                        request["reference"],
+                        self.entry_price - request["signal_atr"],
+                    )
+                else:
+                    self.stop_price = request["signal_stop"]
+
+                self.tp1_done = False
+                self.tp2_done = False
+                self.entry_request = None
+
+            elif role == "tp1":
+                self.tp1_done = True
+                self.stop_price = self.entry_price
+
+            elif role == "tp2":
+                self.tp2_done = True
+
+            if role != "entry" and not self.position:
+                self._reset_trade_state()
+
+        elif role == "entry":
+            self.entry_request = None
+
+        if order is self.order:
+            self.order = None
+            self.order_role = None
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        if self.position:
+            close = self.data.close[0]
+            high = self.data.high[0]
+            low = self.data.low[0]
+            atr = self.atr[0]
+
+            if self.trade_side == "long":
+                if close >= self.ema[0] + 1.5 * atr:
+                    self._submit_full_close("impulse_exit")
+                    return
+
+                if low <= self.stop_price:
+                    self._submit_full_close("stop_exit")
+                    return
+
+                if not self.tp1_done and high >= self.bb.mid[0]:
+                    self._submit_partial_close(0.50, "tp1")
+                    return
+
+                if not self.tp2_done and high >= self.bb.top[0]:
+                    self._submit_partial_close(0.30, "tp2")
+                    return
+
+                if self.tp1_done and self.tp2_done:
+                    if high >= self.bb.top[0] + 0.5 * atr:
+                        self._submit_full_close("tp3")
+                        return
+                    self.stop_price = max(self.stop_price, close - 2.0 * atr)
+
+            else:
+                if high >= self.stop_price:
+                    self._submit_full_close("short_stop_exit")
+                    return
+
+                if not self.tp1_done and low <= self.bb.mid[0]:
+                    self._submit_partial_close(0.50, "tp1")
+                    return
+
+                if not self.tp2_done and low <= self.bb.bot[0]:
+                    self._submit_partial_close(0.30, "tp2")
+                    return
+
+                if self.tp1_done and self.tp2_done:
+                    self.stop_price = min(self.stop_price, close + 2.0 * atr)
+
+            return
+
+        current_bar = len(self)
+
+        if self.capitulation_signal is not None:
+            if current_bar == self.capitulation_signal["bar"] + 1:
+                bullish_reversal = (
+                    self.data.high[0] - self.data.low[0] >= 1.2 * self.atr[0]
+                    and self.data.close[0] > self.data.open[0]
+                )
+                if self.lower_return_cross[0] > 0 or bullish_reversal:
+                    self._submit_entry(
+                        "long",
+                        "capitulation",
+                        self.capitulation_signal["stop"],
+                    )
+                    self.capitulation_signal = None
+                    return
+            self.capitulation_signal = None
+
+        if self.short_signal is not None:
+            if current_bar == self.short_signal["bar"] + 1:
+                bearish_reversal = (
+                    self.data.high[0] - self.data.low[0] >= 1.2 * self.atr[0]
+                    and self.data.close[0] < self.data.open[0]
+                )
+                if self.upper_return_cross[0] < 0 or bearish_reversal:
+                    self._submit_entry(
+                        "short",
+                        "capitulation",
+                        self.short_signal["stop"],
+                    )
+                    self.short_signal = None
+                    return
+            self.short_signal = None
+
+        volume = self.data.volume[0]
+        volume_average = self.volume_sma[0]
+        close = self.data.close[0]
+        atr = self.atr[0]
+
+        if (
+            close < self.bb.bot[0]
+            and self.rsi[0] < 30
+            and volume >= 1.8 * volume_average
+        ):
+            local_low = min(self.data.low[-offset] for offset in range(5))
+            self.capitulation_signal = {
+                "bar": current_bar,
+                "stop": local_low - atr,
+            }
+            return
+
+        if (
+            self.breakout_cross[0] > 0
+            and volume >= 1.5 * volume_average
+            and self.rsi[0] > 50
+        ):
+            self._submit_entry(
+                "long",
+                "breakout",
+                None,
+                reference=self.range_resistance[0],
+                signal_atr=atr,
+            )
+            return
+
+        if (
+            close > self.bb.top[0]
+            and self.rsi[0] > 70
+            and volume >= 1.8 * volume_average
+        ):
+            local_high = max(self.data.high[-offset] for offset in range(5))
+            self.short_signal = {
+                "bar": current_bar,
+                "stop": local_high + atr,
+            }
+```
+
+```json
+{"assumptions":[{"topic":"Bollinger parameter spelling","choice":"Used Backtrader's `period=126` argument for the specification's `periode=126`.","reason":"`periode` is not a Backtrader BollingerBands parameter."},{"topic":"Capitulation signal window","choice":"Reversal confirmation is evaluated only on the immediately following bar.","reason":"The specification says confirmation occurs 'on the next candle'."},{"topic":"Local low/high window","choice":"Used the last 5 bars, including the signal bar, for `min(low of the last 3-5 bars)` and the symmetrical short high.","reason":"The specification provides a 3-5-bar range but does not select one exact length."},{"topic":"Hedging short","choice":"Implemented the optional symmetrical short setup, with 50% and 30% scale-outs and the remaining position managed by its stated trailing stop.","reason":"The short setup is specified as symmetrical, while its exact scale-out percentages are otherwise unstated."},{"topic":"Target and stop triggering","choice":"Profit targets trigger when the bar high/low reaches their level; stops trigger when the bar low/high reaches the stop. Submitted `close` orders execute under normal Backtrader timing.","reason":"This is the closest OHLCV-only reading of 'reaching' targets and stop-loss levels without adding unrequested order types."},{"topic":"Volatility filter","choice":"Did not apply the optional Bollinger-width median filter.","reason":"The specification states it may be added rather than requiring it."},{"topic":"Concurrent exit conditions","choice":"The stated long strong-impulse full exit is checked before stop and scale-out conditions.","reason":"The specification does not define precedence when multiple exit conditions occur on one bar."}]}
+```

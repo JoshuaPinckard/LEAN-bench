@@ -1,0 +1,139 @@
+```python
+import backtrader as bt
+import math
+from collections import deque
+
+
+class GapRiskStrategy(bt.Strategy):
+    params = (
+        ("atr_period", 14),
+        ("sma_period", 20),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+
+        self.order = None
+        self._entry_order = False
+        self._atr_history = deque(maxlen=20)
+
+        self.entry_price = None
+        self.entry_atr = None
+        self.stop_price = None
+        self.trailing_active = False
+        self.best_price = None
+
+    def notify_order(self, order):
+        if order.status in (bt.Order.Completed, bt.Order.Canceled,
+                            bt.Order.Margin, bt.Order.Rejected):
+            if order.status == bt.Order.Completed and self._entry_order:
+                self.entry_price = order.executed.price
+                self.entry_atr = float(self.atr[0])
+                self.trailing_active = False
+                self.best_price = self.entry_price
+
+                if order.isbuy():
+                    self.stop_price = self.entry_price - 1.5 * self.entry_atr
+                else:
+                    self.stop_price = self.entry_price + 1.5 * self.entry_atr
+
+            self.order = None
+            self._entry_order = False
+
+    def _volatility_allowed(self):
+        if len(self._atr_history) < 20:
+            return False
+
+        prior_five_average = sum(list(self._atr_history)[-5:]) / 5.0
+        prior_twenty_average = sum(self._atr_history) / 20.0
+        return prior_five_average <= 1.5 * prior_twenty_average
+
+    def _submit_entry(self, is_long):
+        atr_value = float(self.atr[0])
+        if atr_value <= 0.0:
+            return
+
+        capital = self.broker.getvalue()
+        risk_per_share = 1.5 * atr_value
+        size = math.floor((capital * 0.015) / risk_per_share)
+
+        if size < 1:
+            return
+
+        self._entry_order = True
+        self.order = self.buy(size=size) if is_long else self.sell(size=size)
+
+    def _manage_stops(self):
+        if not self.position or self.order is not None:
+            return
+
+        atr_value = float(self.atr[0])
+
+        if self.position.size > 0:
+            self.best_price = max(self.best_price, float(self.data.high[0]))
+
+            if (not self.trailing_active and
+                    self.best_price >= self.entry_price + atr_value):
+                self.trailing_active = True
+
+            if self.trailing_active:
+                self.stop_price = max(
+                    self.stop_price,
+                    self.best_price - atr_value
+                )
+
+            if float(self.data.low[0]) <= self.stop_price:
+                self.order = self.close()
+                return
+
+        else:
+            self.best_price = min(self.best_price, float(self.data.low[0]))
+
+            if (not self.trailing_active and
+                    self.best_price <= self.entry_price - atr_value):
+                self.trailing_active = True
+
+            if self.trailing_active:
+                self.stop_price = min(
+                    self.stop_price,
+                    self.best_price + atr_value
+                )
+
+            if float(self.data.high[0]) >= self.stop_price:
+                self.order = self.close()
+
+    def next(self):
+        self._manage_stops()
+
+        if self.position and self.order is None:
+            self.order = self.close()
+
+        if not self.position and self.order is None and self._volatility_allowed():
+            close_now = float(self.data.close[0])
+            close_previous = float(self.data.close[-1])
+            open_now = float(self.data.open[0])
+
+            crossed_above_sma = (
+                close_now > float(self.sma[0]) and
+                close_previous <= float(self.sma[-1])
+            )
+            crossed_below_sma = (
+                close_now < float(self.sma[0]) and
+                close_previous >= float(self.sma[-1])
+            )
+
+            long_gap_prohibited = open_now <= close_previous * 0.98
+            short_gap_prohibited = open_now >= close_previous * 1.02
+
+            if crossed_above_sma and not long_gap_prohibited:
+                self._submit_entry(is_long=True)
+            elif crossed_below_sma and not short_gap_prohibited:
+                self._submit_entry(is_long=False)
+
+        self._atr_history.append(float(self.atr[0]))
+```
+
+```json
+{"assumptions":[{"topic":"primary entry logic","choice":"Use a close-price crossover of SMA(20): buy on a cross above and sell short on a cross below.","reason":"The specification requires main buy/sell logic but does not select one; this uses the required SMA(20) trend indicator without adding another indicator."},{"topic":"ATR volatility filter","choice":"Compare the average ATR(14) of the preceding 5 completed trading days with 1.5 times the average ATR(14) of the preceding 20 completed trading days.","reason":"This is the literal operational reading of ATR value over the previous 5 days and its average over the last 20 days."},{"topic":"premarket activity","choice":"Do not use a separate premarket-volume measurement.","reason":"The supplied daily OHLCV feed contains no premarket-session volume."},{"topic":"opening gap","choice":"Apply the specified gap thresholds to the supplied daily session Open and prior daily Close.","reason":"These are the available values matching the stated opening-price comparison."},{"topic":"stop execution","choice":"On each daily bar, use Low for long-stop detection and High for short-stop detection; trailing reference prices use High for longs and Low for shorts.","reason":"Daily OHLCV does not provide intrabar ordering or executable intraday stop events."},{"topic":"ATR for stops","choice":"Set the initial stop from ATR(14) at entry execution and evaluate trailing activation/distance using current ATR(14).","reason":"The specification names ATR(14) but does not fix its sampling time for trailing updates."},{"topic":"time-based exit","choice":"Submit self.close() for every open position when each daily bar is processed.","reason":"A 1-day feed has no bar or timestamp 15 minutes before the market close; this is the closest available end-of-session exit attempt."},{"topic":"risk sizing","choice":"Use floor(1.5% of broker value divided by 1.5 ATR(14)) shares.","reason":"This makes the price-distance loss at the stated initial stop no greater than 1.5% of trading capital; commissions are not included because the specification defines the limit as stop-loss loss."}]}
+```

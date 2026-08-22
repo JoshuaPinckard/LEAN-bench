@@ -1,0 +1,267 @@
+```python
+import backtrader as bt
+import math
+
+
+class HMMMACDATRStrategy(bt.Strategy):
+    params = (
+        ("fast_period", 12),
+        ("slow_period", 26),
+        ("signal_period", 9),
+        ("atr_period", 14),
+        ("hmm_window", 390),
+        ("base_k", 1.0),
+        ("hmm_iterations", 20),
+    )
+
+    def __init__(self):
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.fast_period,
+            period_me2=self.p.slow_period,
+            period_signal=self.p.signal_period,
+        )
+        self.macd_cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.stop_order = None
+        self.last_session_date = None
+        self.hmm = None
+        self.previous_state = None
+
+    def _fit_hmm(self, observations):
+        n = len(observations)
+        overall_mean = sum(observations) / n
+        overall_var = sum((x - overall_mean) ** 2 for x in observations) / n
+        overall_var = max(overall_var, 1e-12)
+
+        ordered = sorted(observations)
+        means = [ordered[n // 4], ordered[(3 * n) // 4]]
+        variances = [overall_var, overall_var]
+        startprob = [0.5, 0.5]
+        transmat = [[0.95, 0.05], [0.05, 0.95]]
+
+        for _ in range(self.p.hmm_iterations):
+            emissions = []
+            for x in observations:
+                row = []
+                for state in range(2):
+                    variance = max(variances[state], 1e-12)
+                    density = math.exp(
+                        -((x - means[state]) ** 2) / (2.0 * variance)
+                    ) / math.sqrt(2.0 * math.pi * variance)
+                    row.append(max(density, 1e-300))
+                emissions.append(row)
+
+            alpha = [[0.0, 0.0] for _ in range(n)]
+            scales = [0.0] * n
+            for state in range(2):
+                alpha[0][state] = startprob[state] * emissions[0][state]
+            scales[0] = max(sum(alpha[0]), 1e-300)
+            alpha[0] = [value / scales[0] for value in alpha[0]]
+
+            for t in range(1, n):
+                for state in range(2):
+                    alpha[t][state] = emissions[t][state] * sum(
+                        alpha[t - 1][previous] * transmat[previous][state]
+                        for previous in range(2)
+                    )
+                scales[t] = max(sum(alpha[t]), 1e-300)
+                alpha[t] = [value / scales[t] for value in alpha[t]]
+
+            beta = [[1.0, 1.0] for _ in range(n)]
+            for t in range(n - 2, -1, -1):
+                for state in range(2):
+                    beta[t][state] = sum(
+                        transmat[state][next_state]
+                        * emissions[t + 1][next_state]
+                        * beta[t + 1][next_state]
+                        for next_state in range(2)
+                    ) / scales[t + 1]
+
+            gamma = [[0.0, 0.0] for _ in range(n)]
+            for t in range(n):
+                total = sum(alpha[t][state] * beta[t][state] for state in range(2))
+                total = max(total, 1e-300)
+                for state in range(2):
+                    gamma[t][state] = alpha[t][state] * beta[t][state] / total
+
+            startprob = list(gamma[0])
+
+            for state in range(2):
+                denominator = sum(gamma[t][state] for t in range(n - 1))
+                denominator = max(denominator, 1e-300)
+                for next_state in range(2):
+                    numerator = 0.0
+                    for t in range(n - 1):
+                        numerator += (
+                            alpha[t][state]
+                            * transmat[state][next_state]
+                            * emissions[t + 1][next_state]
+                            * beta[t + 1][next_state]
+                            / scales[t + 1]
+                        )
+                    transmat[state][next_state] = numerator / denominator
+
+            for state in range(2):
+                weight = max(sum(gamma[t][state] for t in range(n)), 1e-300)
+                means[state] = sum(
+                    gamma[t][state] * observations[t] for t in range(n)
+                ) / weight
+                variances[state] = max(
+                    sum(
+                        gamma[t][state] * (observations[t] - means[state]) ** 2
+                        for t in range(n)
+                    ) / weight,
+                    1e-12,
+                )
+
+        # State 1 is bull (higher mean); state 0 is bear (lower mean).
+        if means[0] > means[1]:
+            startprob.reverse()
+            means.reverse()
+            variances.reverse()
+            transmat = [
+                [transmat[1][1], transmat[1][0]],
+                [transmat[0][1], transmat[0][0]],
+            ]
+
+        return startprob, transmat, means, variances
+
+    def _infer_state(self, observations):
+        startprob, transmat, means, variances = self.hmm
+        scores = [
+            math.log(max(startprob[state], 1e-300))
+            + self._log_density(observations[0], means[state], variances[state])
+            for state in range(2)
+        ]
+
+        for value in observations[1:]:
+            next_scores = [0.0, 0.0]
+            for state in range(2):
+                next_scores[state] = self._log_density(
+                    value, means[state], variances[state]
+                ) + max(
+                    scores[previous] + math.log(max(transmat[previous][state], 1e-300))
+                    for previous in range(2)
+                )
+            scores = next_scores
+
+        return 1 if scores[1] > scores[0] else 0
+
+    def _log_density(self, value, mean, variance):
+        variance = max(variance, 1e-12)
+        return (
+            -0.5 * math.log(2.0 * math.pi * variance)
+            - ((value - mean) ** 2) / (2.0 * variance)
+        )
+
+    def _cancel_stop(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+
+        if current_date != self.last_session_date:
+            self.last_session_date = current_date
+
+            if len(self.data) >= self.p.hmm_window + 2:
+                past_closes = [
+                    self.data.close[-offset]
+                    for offset in range(self.p.hmm_window + 1, 0, -1)
+                ]
+                past_returns = [
+                    math.log(past_closes[i] / past_closes[i - 1])
+                    for i in range(1, len(past_closes))
+                ]
+                self.hmm = self._fit_hmm(past_returns)
+
+        if self.hmm is None or len(self.data) < 2:
+            return
+
+        available_returns = min(self.p.hmm_window, len(self.data) - 1)
+        closes = [
+            self.data.close[-offset]
+            for offset in range(available_returns, -1, -1)
+        ]
+        returns = [
+            math.log(closes[i] / closes[i - 1])
+            for i in range(1, len(closes))
+        ]
+        current_state = self._infer_state(returns)
+
+        transitioned_to_bull = (
+            self.previous_state is not None
+            and self.previous_state != 1
+            and current_state == 1
+        )
+        transitioned_to_bear = (
+            self.previous_state is not None
+            and self.previous_state != 0
+            and current_state == 0
+        )
+
+        cross_up = self.macd_cross[0] > 0
+        cross_down = self.macd_cross[0] < 0
+        opposite_long_confirmation = cross_down and transitioned_to_bear
+        opposite_short_confirmation = cross_up and transitioned_to_bull
+
+        if self.position.size > 0 and opposite_long_confirmation and self.order is None:
+            self._cancel_stop()
+            self.order = self.close()
+        elif self.position.size < 0 and opposite_short_confirmation and self.order is None:
+            self._cancel_stop()
+            self.order = self.close()
+        elif self.position.size == 0 and self.order is None:
+            if cross_up and transitioned_to_bull:
+                self.order = self.buy(size=1)
+            elif cross_down and transitioned_to_bear:
+                self.order = self.sell(size=1)
+
+        if self.position.size != 0 and self.order is None:
+            self._cancel_stop()
+            distance = self.atr[0] * (
+                self.p.base_k * (self.p.slow_period / self.p.fast_period)
+            )
+
+            if self.position.size > 0:
+                self.stop_order = self.sell(
+                    size=abs(self.position.size),
+                    exectype=bt.Order.Stop,
+                    price=self.data.close[0] - distance,
+                )
+            else:
+                self.stop_order = self.buy(
+                    size=abs(self.position.size),
+                    exectype=bt.Order.Stop,
+                    price=self.data.close[0] + distance,
+                )
+
+        self.previous_state = current_state
+
+    def notify_order(self, order):
+        if order == self.stop_order:
+            if order.status in [
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.stop_order = None
+
+        if order == self.order:
+            if order.status in [
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Implemented a manual two-state Gaussian HMM with standard Baum-Welch fitting and Viterbi state inference.","reason":"The required hmmlearn import is incompatible with the explicitly permitted import list, which limits imports to backtrader, math, collections, and statistics."},{"topic":"HMM refit timing","choice":"A session open is interpreted as the first supplied 5-minute bar of each calendar trading date; fitting uses closes through the immediately preceding bar.","reason":"The feed provides intraday OHLCV bars but no separate session-open event."},{"topic":"HMM inference","choice":"The current state is the final Viterbi state inferred from the most recent available close-to-close returns, capped at 390 observations.","reason":"The specification requires current hidden-state inference but does not prescribe a decoding method."},{"topic":"position sizing","choice":"Each entry uses exactly 1 share.","reason":"The specification permits fixed sizing and does not require a specific share count."},{"topic":"stop update price","choice":"Each bar, the active stop is cancelled and replaced using that bar's close plus or minus ATR(14) times 26/12.","reason":"The specification requires stop orders updated each bar but does not state which intrabar reference price determines the recalculated stop."}]} 
+```

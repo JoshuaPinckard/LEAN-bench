@@ -2,122 +2,136 @@
 import backtrader as bt
 
 
-class TrendPullbackScaleIn(bt.Strategy):
+class TrendFollowingPullbackStrategy(bt.Strategy):
     params = (
         ('atr_period', 14),
         ('ema_period', 50),
-        ('high_lookback', 20),      # window used for the initial "recent high"
-        ('pullback_mult', 1.5),     # pullback / stop distance in ATR
-        ('tp_mult', 2.5),           # take-profit distance in ATR
-        ('max_entries', 4),         # max consecutive entries in one direction
-        ('risk_per_entry', 0.01),   # 1% of capital per individual position
+        ('pullback_atr', 1.5),
+        ('take_profit_atr', 2.5),
+        ('max_entries', 4),
+        ('capital_fraction', 0.01),
     )
 
     def __init__(self):
-        # --- Indicators (exactly as specified) ---
         self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
-        self.ema = bt.indicators.ExponentialMovingAverage(
-            self.data.close, period=self.p.ema_period)
-        # rolling "recent high" used for the initial pullback trigger
-        self.recent_high = bt.indicators.Highest(
-            self.data.high, period=self.p.high_lookback)
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
 
-        # --- State ---
-        self.order = None            # pending-order guard
-        self._action = None          # what the pending order is doing
-        self.entries = []            # open scaled entries: {size, price, atr, stop}
-        self.entry_count = 0         # consecutive entries made this sequence
-        self.pivot = None            # highest high since last entry ("next high")
-        self.tp_level = None         # take-profit from the initial entry point
+        self.entry_order = None
+        self.exit_order = None
+        self.stop_orders = []
+        self.entries = []
+        self.recent_high = None
+        self.entry_high = None
+        self.entries_in_direction = 0
 
     def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
-            return
-
-        if order.status == order.Completed:
-            action = self._action
-            if action is not None and action[0] == 'buy':
-                atr = action[1]
-                price = order.executed.price
-                size = order.executed.size
-                # per-position stop-loss: 1.5 ATR below this entry point
-                stop = price - self.p.pullback_mult * atr
-                self.entries.append(
-                    {'size': size, 'price': price, 'atr': atr, 'stop': stop})
-                self.entry_count += 1
-                if self.entry_count == 1:
-                    # take-profit measured from the initial entry point
-                    self.tp_level = price + self.p.tp_mult * atr
-                # start tracking a fresh "next high" for the following scale-in
-                self.pivot = None
-            elif action is not None and action[0] == 'stop':
-                e = action[1]
-                if e in self.entries:
-                    self.entries.remove(e)
-            elif action is not None and action[0] == 'exit':
-                self.entries = []
-
         if order.status in (order.Completed, order.Canceled,
                             order.Margin, order.Rejected):
-            self.order = None
-            self._action = None
+            if order is self.entry_order:
+                self.entry_order = None
+
+                if order.status == order.Completed:
+                    atr_at_entry = float(self.atr[0])
+                    entry_price = order.executed.price
+                    size = order.executed.size
+                    stop_price = entry_price - self.p.pullback_atr * atr_at_entry
+
+                    self.entries.append({
+                        'price': entry_price,
+                        'size': size,
+                        'atr': atr_at_entry,
+                        'stop_price': stop_price,
+                    })
+
+                    stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=stop_price
+                    )
+                    self.stop_orders.append(stop_order)
+                    self.entry_high = float(self.data.high[0])
+
+            if order is self.exit_order:
+                self.exit_order = None
+
+            if order in self.stop_orders:
+                self.stop_orders.remove(order)
+
+                if order.status == order.Completed:
+                    remaining = abs(order.executed.size)
+                    for entry in self.entries:
+                        if remaining <= 0:
+                            break
+                        removed = min(entry['size'], remaining)
+                        entry['size'] -= removed
+                        remaining -= removed
+                    self.entries = [e for e in self.entries if e['size'] > 0]
+
+    def _cancel_stops(self):
+        for order in list(self.stop_orders):
+            self.cancel(order)
+        self.stop_orders = []
+
+    def _close_entire_position(self):
+        if self.exit_order is None and self.position.size:
+            self._cancel_stops()
+            self.exit_order = self.close()
+            self.entries = []
+            self.entries_in_direction = 0
+            self.recent_high = None
+            self.entry_high = None
 
     def next(self):
-        if self.order:
-            return
+        close = float(self.data.close[0])
+        high = float(self.data.high[0])
+        atr = float(self.atr[0])
 
-        price = self.data.close[0]
-        atr = self.atr[0]
-        ema = self.ema[0]
-
-        if self.position:
-            # track the highest high since the last entry (the "next high")
-            if self.pivot is None:
-                self.pivot = self.data.high[0]
-            else:
-                self.pivot = max(self.pivot, self.data.high[0])
-
-            # Exit 1: take-profit of 2.5 ATR from the entry point -> close all
-            if self.tp_level is not None and price >= self.tp_level:
-                self.order = self.close()
-                self._action = ('exit',)
+        if self.position.size:
+            if close < float(self.ema[0]):
+                self._close_entire_position()
                 return
 
-            # Exit 2: price closes below EMA(50) -> close the entire position
-            if price < ema:
-                self.order = self.close()
-                self._action = ('exit',)
-                return
-
-            # Risk mgmt: per-position stop-loss 1.5 ATR below its entry point
-            for e in self.entries:
-                if price <= e['stop']:
-                    self.order = self.sell(size=e['size'])
-                    self._action = ('stop', e)
+            for entry in self.entries:
+                take_profit = entry['price'] + self.p.take_profit_atr * entry['atr']
+                if high >= take_profit:
+                    self._close_entire_position()
                     return
 
-            # Entry 3: scale in on a further 1.5 ATR pullback from the next high
-            # Entry 4: cap consecutive entries at 4 (also caps risk at 4%)
-            if (self.entry_count < self.p.max_entries
-                    and price > ema
-                    and price <= self.pivot - self.p.pullback_mult * atr):
-                size = self.p.risk_per_entry * self.broker.getvalue() / price
-                self.order = self.buy(size=size)
-                self._action = ('buy', atr)
+            if self.entry_high is None or high > self.entry_high:
+                self.entry_high = high
+
+            if (self.entry_order is None and
+                    self.exit_order is None and
+                    self.entries_in_direction < self.p.max_entries and
+                    close <= self.entry_high - self.p.pullback_atr * atr):
+                capital = self.broker.getvalue()
+                size = (capital * self.p.capital_fraction) / close
+                if size > 0:
+                    self.entry_order = self.buy(size=size)
+                    self.entries_in_direction += 1
             return
 
-        # Flat -> start of a new sequence; reset all sequence state
-        self.entry_count = 0
-        self.entries = []
-        self.pivot = None
-        self.tp_level = None
+        if self.entry_order is not None or self.exit_order is not None:
+            return
 
-        # Entry 1 & 2: bullish trend + 1.5 ATR pullback from a recent high
-        if price > ema and price <= self.recent_high[0] - self.p.pullback_mult * atr:
-            size = self.p.risk_per_entry * self.broker.getvalue() / price
-            self.order = self.buy(size=size)
-            self._action = ('buy', atr)
+        self.entries = []
+        self.entries_in_direction = 0
+        self.entry_high = None
+
+        if close > float(self.ema[0]):
+            if self.recent_high is None or high > self.recent_high:
+                self.recent_high = high
+
+            if close <= self.recent_high - self.p.pullback_atr * atr:
+                capital = self.broker.getvalue()
+                size = (capital * self.p.capital_fraction) / close
+                if size > 0:
+                    self.entry_order = self.buy(size=size)
+                    self.entries_in_direction = 1
+        else:
+            self.recent_high = None
 ```
+
 ```json
-{"assumptions": [{"topic": "recent high / next high", "choice": "The initial 'recent high' is the highest high over a 20-bar lookback (Highest(high,20)); the 'next high' used for scale-ins is the highest high recorded since the previous entry, reset after each fill.", "reason": "The spec references a 'recent high' and 'the next high' but never defines the lookback/derivation, so a rolling-high definition is chosen and declared."}, {"topic": "signal evaluation price", "choice": "All price conditions (1.5 ATR pullback, 2.5 ATR take-profit, 1.5 ATR stop, EMA relation) are evaluated on the daily close; orders fill at the next bar's open per backtrader mechanics.", "reason": "The EMA exit is explicitly close-based ('closes below EMA'); using close for every condition keeps the D1 logic consistent and deterministic."}, {"topic": "take-profit reference (multi-entry)", "choice": "Take-profit for the whole position = initial (first) entry fill price + 2.5*ATR captured at that first entry; fixed for the sequence and closes the entire position when reached.", "reason": "'2.5 ATR from the entry point' is singular, read as the position's initial entry; ATR is frozen at entry to make it a fixed distance."}, {"topic": "per-position stop-loss & partial close", "choice": "Each scaled entry carries its own stop = its fill price - 1.5*ATR(at that entry); when an individual stop triggers, only that individual entry is closed (partial sell), while take-profit and the EMA rule close the entire position.", "reason": "'a stop-loss for each position ... the position is forcibly closed' reads per individual scaled position; this also produces the spec's intended 'several consecutive losing trades' laddering."}, {"topic": "position sizing (1% of capital)", "choice": "Each entry's notional = 1% of current portfolio value: size = 0.01*broker.getvalue()/close (fractional shares allowed).", "reason": "Spec: 'size of each individual position must be 1% of the total trading capital.'"}, {"topic": "max total risk 4%", "choice": "Enforced by capping consecutive entries at 4 (each 1% -> up to 4%); no scaling beyond 4 and no new/scaled positions until fully flat, at which point counters reset.", "reason": "The spec itself equates 4% max risk with 4 consecutive entries at 1%, and rule 4 blocks new entries after the fourth until all positions close."}, {"topic": "instrument mismatch (infeasible)", "choice": "The strategy logic is instrument-agnostic trend-following; it is run on the harness-fixed AAPL 1d feed rather than an ETF, with no logic change.", "reason": "Spec targets ETFs but the execution environment fixes the data feed to AAPL; only the asset differs, not the rules."}, {"topic": "timeframe D1", "choice": "No resampling; the supplied feed is already daily bars, satisfying the D1 requirement natively.", "reason": "Additional rule 1 requires the daily timeframe, which the environment already provides."}, {"topic": "infeasible", "choice": "The 'perform two-year backtest before going live' and live-account instructions are treated as operational/meta guidance and are not implemented as in-strategy trading logic.", "reason": "These are not expressible as strategy execution rules; the harness supplies the fixed 2020-2025 backtest data and cerebro setup."}]}
+{"assumptions":[{"topic":"recent high","choice":"The recent high is the highest daily High observed while Close remains above EMA(50).","reason":"The specification does not define a lookback window for 'recent high'."},{"topic":"pullback measurement","choice":"A pullback is triggered when the daily Close is at or below the relevant high minus 1.5 times the current ATR(14).","reason":"The specification does not state whether High, Low, Close, or intraday data determines the pullback."},{"topic":"next high for scaling","choice":"After each filled entry, the next-high reference begins at that bar's High and is updated to later higher daily High values.","reason":"The specification names a 'next high' but does not define its initialization or observation period."},{"topic":"position sizing","choice":"Each entry size is 1% of current broker total value divided by the current Close.","reason":"'Total trading capital' is not specified as starting capital versus current equity; current broker value directly represents total trading capital."},{"topic":"take profit execution","choice":"If a daily High reaches any open entry's entry price plus 2.5 ATR recorded at that entry, the entire position is closed.","reason":"The strategy requires the entire position to close upon a take-profit level but does not define treatment of multiple scaled entries."},{"topic":"stop-loss execution","choice":"Each filled entry receives its own Backtrader stop order at entry price minus 1.5 ATR recorded at entry.","reason":"This most literally implements a stop-loss for each individual position using daily OHLC execution."},{"topic":"daily timeframe","choice":"The strategy operates directly on the supplied daily data feed.","reason":"The harness supplies only D1 bars."},{"topic":"infeasible","choice":"No separate live-account two-year pre-trade backtest is performed within the strategy class.","reason":"The harness executes one fixed historical feed and does not provide a live-account workflow or a separate backtesting phase."}]}
 ```

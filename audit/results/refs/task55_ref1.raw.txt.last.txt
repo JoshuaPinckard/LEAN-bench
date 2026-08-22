@@ -1,0 +1,165 @@
+```python
+import backtrader as bt
+import math
+
+
+class RSIBearishDivergenceLiquidityExhaustion(bt.Strategy):
+    params = (
+        ("rsi_period", 14),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+
+        self.previous_peak = None
+        self.signal_peak_high = None
+
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.exit_order = None
+
+        self.current_week = None
+        self.current_week_close = None
+        self.completed_weekly_closes = []
+
+    def _update_weekly_close(self):
+        bar_datetime = self.data.datetime.datetime(0)
+        iso_calendar = bar_datetime.isocalendar()
+        week = (iso_calendar.year, iso_calendar.week)
+
+        if self.current_week is None:
+            self.current_week = week
+            self.current_week_close = float(self.data.close[0])
+        elif week != self.current_week:
+            self.completed_weekly_closes.append(self.current_week_close)
+            self.completed_weekly_closes = self.completed_weekly_closes[-2:]
+            self.current_week = week
+            self.current_week_close = float(self.data.close[0])
+        else:
+            self.current_week_close = float(self.data.close[0])
+
+    def _weekly_trend_is_upward(self):
+        return (
+            len(self.completed_weekly_closes) == 2
+            and self.completed_weekly_closes[-1] > self.completed_weekly_closes[-2]
+        )
+
+    def next(self):
+        self._update_weekly_close()
+
+        if (
+            self.position.size < 0
+            and self.rsi[0] > 50
+            and self.exit_order is None
+        ):
+            if self.stop_order is not None:
+                self.cancel(self.stop_order)
+            if self.target_order is not None:
+                self.cancel(self.target_order)
+            self.exit_order = self.close()
+
+        pivot_high = float(self.data.high[-1])
+        is_local_high = (
+            pivot_high > float(self.data.high[-2])
+            and pivot_high > float(self.data.high[0])
+        )
+
+        if not is_local_high:
+            return
+
+        pivot_rsi = float(self.rsi[-1])
+        pivot_volume = float(self.data.volume[-1])
+
+        if self.previous_peak is not None:
+            previous_high, previous_rsi, previous_volume = self.previous_peak
+
+            bearish_divergence_with_liquidity_exhaustion = (
+                pivot_high > previous_high
+                and pivot_rsi < previous_rsi
+                and pivot_volume < previous_volume
+            )
+
+            no_active_trade_or_orders = (
+                not self.position
+                and self.entry_order is None
+                and self.stop_order is None
+                and self.target_order is None
+                and self.exit_order is None
+            )
+
+            if (
+                bearish_divergence_with_liquidity_exhaustion
+                and no_active_trade_or_orders
+                and not self._weekly_trend_is_upward()
+            ):
+                estimated_entry = float(self.data.close[0])
+                estimated_stop = max(pivot_high, estimated_entry * 1.01)
+                risk_per_share = estimated_stop - estimated_entry
+                risk_capital = self.broker.getvalue() * 0.01
+
+                if risk_per_share > 0:
+                    size = math.floor(risk_capital / risk_per_share)
+                    if size > 0:
+                        self.signal_peak_high = pivot_high
+                        self.entry_order = self.sell(size=size)
+
+        self.previous_peak = (pivot_high, pivot_rsi, pivot_volume)
+
+    def notify_order(self, order):
+        terminal_statuses = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        )
+
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                stop_price = max(self.signal_peak_high, entry_price * 1.01)
+                risk_per_share = stop_price - entry_price
+                target_price = entry_price - (2.0 * risk_per_share)
+
+                self.entry_order = None
+                self.stop_order = self.buy(
+                    size=abs(self.position.size),
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                )
+                self.target_order = self.buy(
+                    size=abs(self.position.size),
+                    exectype=bt.Order.Limit,
+                    price=target_price,
+                )
+            elif order.status in terminal_statuses:
+                self.entry_order = None
+                self.signal_peak_high = None
+            return
+
+        if order is self.stop_order:
+            if order.status == order.Completed:
+                self.stop_order = None
+                if self.target_order is not None:
+                    self.cancel(self.target_order)
+            elif order.status in terminal_statuses:
+                self.stop_order = None
+            return
+
+        if order is self.target_order:
+            if order.status == order.Completed:
+                self.target_order = None
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+            elif order.status in terminal_statuses:
+                self.target_order = None
+            return
+
+        if order is self.exit_order and order.status in terminal_statuses:
+            self.exit_order = None
+```
+
+```json
+{"assumptions":[{"topic":"local high","choice":"A local high is a strict three-bar swing high: the prior bar's High exceeds both the bar before it and the current bar. The signal is evaluated when that high is confirmed.","reason":"The specification does not define the local-high lookback or confirmation method."},{"topic":"stop-loss and take-profit","choice":"The stop is the greater of the confirmed last local high and 1% above the actual short entry price. Take-profit is two times the resulting per-share risk below entry.","reason":"The specification gives 1% and 1:2 or 1:3 as alternatives; this selects the stated 1% example and the first stated R/R option while ensuring the stop is above the last peak."},{"topic":"risk sizing","choice":"Risk is capped at 1% of current broker equity, using the signal-bar Close to calculate the entry order size.","reason":"The specification permits 1-2% but does not select a value; actual market fills may differ from the signal Close."},{"topic":"higher timeframe trend","choice":"Weekly data is synthesized from the H1 feed. The higher-timeframe trend is upward when the most recently completed weekly Close is greater than the preceding completed weekly Close.","reason":"No separate weekly feed or weekly-trend definition is supplied."},{"topic":"timeframe","choice":"All divergence and volume conditions are evaluated on the supplied H1 bars.","reason":"H1 is within the stated intended timeframe range and is the only supplied execution timeframe."}]}
+```

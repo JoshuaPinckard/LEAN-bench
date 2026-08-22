@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+
+
+class StateBasedTradingStrategy(bt.Strategy):
+    params = (
+        ("capital_fraction", 0.10),
+        ("stop_loss_fraction", 0.02),
+        ("take_profit_fraction", 0.04),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=20)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.macd = bt.indicators.MACD(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+
+        self.order = None
+        self.entry_order = None
+        self.stop_order = None
+        self.take_order = None
+
+    def _state(self):
+        close = self.data.close[0]
+
+        return (
+            "above_sma" if close >= self.sma[0] else "below_sma",
+            "oversold" if self.rsi[0] < 30 else
+            "overbought" if self.rsi[0] > 70 else "neutral_rsi",
+            "bullish_macd" if self.macd.macd[0] >= self.macd.signal[0]
+            else "bearish_macd",
+            "below_lower_band" if close <= self.bbands.bot[0] else
+            "above_upper_band" if close >= self.bbands.top[0]
+            else "inside_bands",
+        )
+
+    def _signal(self):
+        state = self._state()
+        _, rsi_state, macd_state, band_state = state
+
+        if (rsi_state == "oversold" and
+                macd_state == "bullish_macd" and
+                band_state == "below_lower_band"):
+            return "BUY"
+
+        if (rsi_state == "overbought" and
+                macd_state == "bearish_macd" and
+                band_state == "above_upper_band"):
+            return "SELL"
+
+        return "NOTHING"
+
+    def _cancel_protection(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.take_order is not None:
+            self.cancel(self.take_order)
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        signal = self._signal()
+
+        if self.position.size > 0:
+            if signal == "SELL":
+                self._cancel_protection()
+                self.order = self.close()
+            return
+
+        if self.position.size < 0:
+            if signal == "BUY":
+                self._cancel_protection()
+                self.order = self.close()
+            return
+
+        if self.stop_order is not None or self.take_order is not None:
+            return
+
+        size = (self.broker.getvalue() * self.p.capital_fraction) / self.data.close[0]
+
+        if signal == "BUY":
+            self.entry_order = self.buy(size=size)
+            self.order = self.entry_order
+        elif signal == "SELL":
+            self.entry_order = self.sell(size=size)
+            self.order = self.entry_order
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal:
+            return
+
+        if self.entry_order is not None and order.ref == self.entry_order.ref:
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if order.isbuy():
+                    self.stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price * (1.0 - self.p.stop_loss_fraction),
+                    )
+                    self.take_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price * (1.0 + self.p.take_profit_fraction),
+                        oco=self.stop_order,
+                    )
+                else:
+                    self.stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price * (1.0 + self.p.stop_loss_fraction),
+                    )
+                    self.take_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price * (1.0 - self.p.take_profit_fraction),
+                        oco=self.stop_order,
+                    )
+
+            self.entry_order = None
+            self.order = None
+            return
+
+        if self.stop_order is not None and order.ref == self.stop_order.ref:
+            self.stop_order = None
+            return
+
+        if self.take_order is not None and order.ref == self.take_order.ref:
+            self.take_order = None
+            return
+
+        if self.order is not None and order.ref == self.order.ref:
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"state discretization and policy","choice":"States contain SMA relation, RSI buckets (<30, 30-70, >70), MACD-versus-signal direction, and Bollinger-band location. BUY is oversold/bullish-MACD/below-lower-band; SELL is overbought/bearish-MACD/above-upper-band; all other states produce NOTHING.","reason":"The specification requires discretized states but does not define state boundaries, a trained policy, Q-learning parameters, rewards, or a state-to-action mapping."},{"topic":"exit states","choice":"A SELL signal closes an open long position and a BUY signal closes an open short position.","reason":"The specification names exit states but does not define separate exit-state mappings."},{"topic":"position sizing","choice":"Order size is 10% of current broker total value divided by the current close.","reason":"This implements 10% of total trading capital; the specification does not define share rounding."},{"topic":"order timing","choice":"Entries use market orders; stop-loss and take-profit orders are submitted after the entry fills, using the actual executed entry price.","reason":"The entry price is unknown until a market order executes, while the required 2% stop-loss and 4% take-profit are defined from entry price."}]}
+```

@@ -1,80 +1,111 @@
 ```python
 import backtrader as bt
+import math
 
 
-class NvdaResistanceBreakoutStrategy(bt.Strategy):
-    params = dict(
-        ema_period=8,
-        entry_level=179.33,
-        tp1_level=184.89,
-        tp2_level=192.95,
-        risk_per_trade=0.02,
-    )
+class NVDAResistanceEMAStrategy(bt.Strategy):
+    params = (("ema_period", 8),)
 
     def __init__(self):
-        # Indicator: 8-period Exponential Moving Average.
-        self.ema = bt.indicators.ExponentialMovingAverage(
-            self.data.close, period=self.p.ema_period
-        )
-        self.order = None        # guards pending orders
-        self.trail_stop = None   # current trailing-stop price level
-        self.tp1_done = False     # first (50%) take-profit already taken
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.order = None
+        self.stop_order = None
+        self.order_role = None
+        self.stop_level = None
+        self.first_take_profit_taken = False
+        self.entry_stop_level = None
 
-    def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
+    def _place_stop(self):
+        if not self.position or self.stop_level is None:
             return
-        if order.status in (order.Completed, order.Canceled,
-                             order.Margin, order.Rejected):
-            self.order = None
+
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+
+        self.stop_order = self.sell(
+            size=self.position.size,
+            exectype=bt.Order.Stop,
+            price=self.stop_level,
+        )
+
+    def _cancel_stop(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
 
     def next(self):
-        # Only one working order at a time.
-        if self.order:
+        if self.order is not None:
             return
 
-        # Flat: look for a breakout entry above the resistance level.
         if not self.position:
-            self.trail_stop = None
-            self.tp1_done = False
+            if self.data.close[0] > 179.33:
+                initial_stop = self.data.close[0] - self.ema[0]
+                potential_loss_per_share = self.data.close[0] - initial_stop
 
-            # Entry: closing price of the current bar exceeds 179.33.
-            if self.data.close[0] > self.p.entry_level:
-                # The trailing-stop distance equals the EMA value, so the
-                # potential loss per share (entry - initial stop) == EMA.
-                risk_per_share = self.ema[0]
-                if risk_per_share > 0:
-                    cash_risk = self.p.risk_per_trade * self.broker.getvalue()
-                    size = int(cash_risk / risk_per_share)
-                    if size >= 1:
+                if potential_loss_per_share > 0:
+                    size = (self.broker.getvalue() * 0.02) / potential_loss_per_share
+                    if size > 0:
+                        self.entry_stop_level = initial_stop
+                        self.order_role = "entry"
                         self.order = self.buy(size=size)
             return
 
-        # In a position: maintain the trailing stop (ratchets upward only,
-        # lagging the close by a distance equal to the 8-period EMA value).
-        candidate = self.data.close[0] - self.ema[0]
-        if self.trail_stop is None:
-            self.trail_stop = candidate
-        else:
-            self.trail_stop = max(self.trail_stop, candidate)
-
-        # Trailing stop hit -> exit the whole position (risk management first).
-        if self.data.low[0] <= self.trail_stop:
+        if self.data.high[0] >= 192.95:
+            self._cancel_stop()
+            self.order_role = "final_take_profit"
             self.order = self.close()
             return
 
-        # Final take-profit: close the remaining part upon reaching 192.95.
-        if self.tp1_done:
-            if self.data.high[0] >= self.p.tp2_level:
-                self.order = self.close()
+        if not self.first_take_profit_taken and self.data.high[0] >= 184.89:
+            self._cancel_stop()
+            self.order_role = "partial_take_profit"
+            self.order = self.sell(size=self.position.size * 0.5)
             return
 
-        # First take-profit: close 50% of the position upon reaching 184.89.
-        if self.data.high[0] >= self.p.tp1_level:
-            half = abs(self.position.size) / 2.0
-            if half > 0:
-                self.order = self.sell(size=half)
-                self.tp1_done = True
+        candidate_stop = self.data.high[0] - self.ema[0]
+        if self.stop_level is None or candidate_stop > self.stop_level:
+            self.stop_level = candidate_stop
+            self._place_stop()
+
+    def notify_order(self, order):
+        if order is self.stop_order:
+            if order.status in [
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.stop_order = None
+            return
+
+        if order is not self.order:
+            return
+
+        if order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            self.order_role = None
+            return
+
+        if order.status != order.Completed:
+            return
+
+        role = self.order_role
+        self.order = None
+        self.order_role = None
+
+        if role == "entry":
+            self.stop_level = self.entry_stop_level
+            self.entry_stop_level = None
+            self.first_take_profit_taken = False
+            self._place_stop()
+        elif role == "partial_take_profit":
+            self.first_take_profit_taken = True
+            if self.position:
+                self._place_stop()
+        elif role == "final_take_profit":
+            self.first_take_profit_taken = False
+            self.stop_level = None
 ```
+
 ```json
-{"assumptions": [{"topic": "trailing-stop distance", "choice": "Read literally: the stop lags the price by a distance equal to the current 8-period EMA value, i.e. stop_level = close - EMA(8), ratcheted so it only moves up (max of previous and new candidate).", "reason": "The spec explicitly says 'lagging by a distance equal to the value of the 8-period EMA', so the trail distance is the EMA value itself, not the price-minus-EMA difference."}, {"topic": "position sizing", "choice": "risk_per_share = EMA(8) at the signal bar (since entry - initial stop = EMA), size = floor(0.02 * broker.getvalue() / EMA); require size >= 1 else no trade.", "reason": "Spec: 'potential loss from the stop-loss does not exceed 2% of total trading capital.' The initial stop distance equals the EMA value, and 'total trading capital' is taken as the broker's current account value."}, {"topic": "trailing-stop reference price / trigger", "choice": "The stop follows the bar close (close - EMA, ratcheted up); it is triggered when the bar low <= stop level, exiting the full remaining position at market.", "reason": "Spec says the stop 'follows the price' and 'will not fall below its previous value' but does not name a specific price; close is used for tracking and low for the intrabar breach test."}, {"topic": "take-profit trigger / execution", "choice": "'Upon reaching price P' is detected when the bar high >= P; TP1 sells 50% of the current position, TP2 closes the remainder. Exits are market orders (filled next bar open per backtrader).", "reason": "OHLCV daily bars: 'reaching' a level means an intrabar touch (high), and market orders are the canonical default. 50% of a small/odd position can be fractional; backtrader permits fractional sizing."}, {"topic": "exit priority within a bar", "choice": "Trailing stop is evaluated before the take-profits on each bar.", "reason": "The spec frames the trailing stop as risk management; protective exits are given precedence where the spec is silent on ordering."}, {"topic": "re-entry / timeframe", "choice": "One position at a time; after a full exit a new breakout entry may occur. Strategy runs on the daily feed as provided.", "reason": "Canonical single-position default; the feed is already D1, matching the spec's D1 requirement, so no gap."}]}
+{"assumptions":[{"topic":"trailing-stop calculation","choice":"The trailing-stop candidate is High minus the 8-period EMA, ratcheted upward only.","reason":"The specification defines the EMA as the trailing distance and says the stop follows rising price; High represents the daily price reached."},{"topic":"target-price detection","choice":"Take-profit levels are detected when the bar High reaches or exceeds the stated price.","reason":"“Upon reaching the price” is interpreted as an intraday price touch on daily OHLC bars."},{"topic":"same-bar target overlap","choice":"If High reaches 192.95, the final take-profit closes the entire remaining position instead of submitting a separate 50% exit first.","reason":"Both thresholds are satisfied, and the final rule requires the remaining position to be closed."},{"topic":"position sizing","choice":"Position size is 2% of current broker value divided by initial stop-loss distance, allowing fractional share sizes.","reason":"This exactly caps the calculated initial stop-loss exposure at 2% while allowing a literal 50% partial close."}]}
 ```

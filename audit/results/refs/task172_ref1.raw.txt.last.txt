@@ -1,0 +1,208 @@
+```python
+import backtrader as bt
+
+
+class SPTDivergenceBreakout(bt.Strategy):
+    def __init__(self):
+        self.entry_order = None
+        self.alt_exit_order = None
+        self.stop_order = None
+        self.target_order = None
+
+        self.pending_4h = []
+        self.bars_4h = []
+        self.previous_close = None
+        self.initial_gains = []
+        self.initial_losses = []
+        self.average_gain = None
+        self.average_loss = None
+
+        self.previous_local_low = None
+        self.previous_local_high = None
+        self.bullish_divergence_ready = False
+        self.entry_4h_index = None
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed, order.Canceled, order.Margin, order.Rejected
+        )
+
+        if order.status not in terminal:
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+            if order.status == order.Completed:
+                self.entry_4h_index = len(self.bars_4h)
+                entry_price = order.executed.price
+                size = order.executed.size
+                self.stop_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Stop,
+                    price=entry_price * 0.98,
+                )
+                self.target_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=entry_price * 1.06,
+                    oco=self.stop_order,
+                )
+
+        elif order is self.alt_exit_order:
+            self.alt_exit_order = None
+            if order.status == order.Completed:
+                self.entry_4h_index = None
+
+        elif order is self.stop_order:
+            self.stop_order = None
+            if order.status == order.Completed:
+                self.entry_4h_index = None
+
+        elif order is self.target_order:
+            self.target_order = None
+            if order.status == order.Completed:
+                self.entry_4h_index = None
+
+    def _rsi(self, close):
+        if self.previous_close is None:
+            self.previous_close = close
+            return None
+
+        change = close - self.previous_close
+        self.previous_close = close
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+
+        if self.average_gain is None:
+            self.initial_gains.append(gain)
+            self.initial_losses.append(loss)
+            if len(self.initial_gains) < 14:
+                return None
+            self.average_gain = sum(self.initial_gains) / 14.0
+            self.average_loss = sum(self.initial_losses) / 14.0
+        else:
+            self.average_gain = ((self.average_gain * 13.0) + gain) / 14.0
+            self.average_loss = ((self.average_loss * 13.0) + loss) / 14.0
+
+        if self.average_loss == 0:
+            return 100.0
+        rs = self.average_gain / self.average_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def _cancel_protection(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.target_order is not None:
+            self.cancel(self.target_order)
+
+    def _process_4h_bar(self, bar):
+        rsi = self._rsi(bar["close"])
+        bar["rsi"] = rsi
+        self.bars_4h.append(bar)
+
+        bearish_divergence = False
+
+        if len(self.bars_4h) >= 3:
+            left = self.bars_4h[-3]
+            pivot = self.bars_4h[-2]
+            right = self.bars_4h[-1]
+
+            if (
+                pivot["low"] < left["low"]
+                and pivot["low"] < right["low"]
+                and pivot["rsi"] is not None
+            ):
+                if (
+                    self.previous_local_low is not None
+                    and pivot["low"] < self.previous_local_low["price"]
+                    and pivot["rsi"] > self.previous_local_low["rsi"]
+                ):
+                    self.bullish_divergence_ready = True
+                self.previous_local_low = {
+                    "price": pivot["low"],
+                    "rsi": pivot["rsi"],
+                }
+
+            if (
+                pivot["high"] > left["high"]
+                and pivot["high"] > right["high"]
+                and pivot["rsi"] is not None
+            ):
+                if (
+                    self.previous_local_high is not None
+                    and pivot["high"] > self.previous_local_high["price"]
+                    and pivot["rsi"] < self.previous_local_high["rsi"]
+                ):
+                    bearish_divergence = True
+                self.previous_local_high = {
+                    "price": pivot["high"],
+                    "rsi": pivot["rsi"],
+                }
+
+        if self.position.size > 0 and self.alt_exit_order is None:
+            post_entry = self.bars_4h[self.entry_4h_index:] if self.entry_4h_index is not None else []
+            close_below_recent_low = (
+                len(post_entry) >= 11
+                and bar["close"] < min(item["low"] for item in post_entry[-11:-1])
+            )
+
+            if bearish_divergence or close_below_recent_low:
+                self._cancel_protection()
+                self.alt_exit_order = self.close()
+            return
+
+        if (
+            self.position.size == 0
+            and self.entry_order is None
+            and self.alt_exit_order is None
+            and self.stop_order is None
+            and self.target_order is None
+            and self.bullish_divergence_ready
+            and len(self.bars_4h) >= 21
+            and bar["rsi"] is not None
+        ):
+            dt = bar["datetime"]
+            in_time_filter = dt.year == 2025 and dt.month in (11, 12)
+            resistance = max(item["high"] for item in self.bars_4h[-21:-1])
+            average_volume = sum(
+                item["volume"] for item in self.bars_4h[-20:]
+            ) / 20.0
+
+            if (
+                in_time_filter
+                and bar["close"] > resistance
+                and bar["volume"] > average_volume
+            ):
+                capital = self.broker.getvalue()
+                size = (capital * 0.01) / (0.02 * bar["close"])
+                self.entry_order = self.buy(size=size)
+
+    def next(self):
+        self.pending_4h.append({
+            "datetime": self.data.datetime.datetime(0),
+            "open": self.data.open[0],
+            "high": self.data.high[0],
+            "low": self.data.low[0],
+            "close": self.data.close[0],
+            "volume": self.data.volume[0],
+        })
+
+        if len(self.pending_4h) != 4:
+            return
+
+        source = self.pending_4h
+        bar = {
+            "datetime": source[-1]["datetime"],
+            "open": source[0]["open"],
+            "high": max(item["high"] for item in source),
+            "low": min(item["low"] for item in source),
+            "close": source[-1]["close"],
+            "volume": sum(item["volume"] for item in source),
+        }
+        self.pending_4h = []
+        self._process_4h_bar(bar)
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Constructed each 4-hour bar from four consecutive supplied 1-hour bars.","reason":"The harness supplies only self.data and does not expose Cerebro setup for native 4-hour resampling."},{"topic":"local extrema","choice":"A local low/high is a confirmed three-bar pivot, respectively lower/higher than both adjacent completed 4-hour bars.","reason":"The specification does not define local-low or local-high detection."},{"topic":"divergence lifetime","choice":"A confirmed bullish divergence remains eligible until a qualifying breakout entry occurs.","reason":"No expiry or invalidation rule is specified."},{"topic":"lookback windows","choice":"Breakout resistance and post-entry low comparisons use prior bars only; volume SMA includes the current bar.","reason":"Including the current bar in a high/low comparison would make the stated close condition impossible."},{"topic":"entry pricing","choice":"Sizing uses the qualifying breakout close; protective prices use the actual executed entry price.","reason":"The market order's execution price is unavailable at signal time, while stop-loss and take-profit are explicitly relative to entry price."},{"topic":"capital","choice":"Capital is current broker equity from broker.getvalue().","reason":"The specification does not define capital as cash-only versus account equity."}]}
+```

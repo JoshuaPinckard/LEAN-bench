@@ -1,0 +1,273 @@
+```python
+import backtrader as bt
+
+
+class FVGSwingFailureBreakoutStrategy(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+        ("reward_to_risk", 3.33),
+        ("max_holding_bars", 48),  # 4 hours of 5-minute bars
+    )
+
+    def __init__(self):
+        self.pending_order = None
+        self._pending_kind = None
+
+        self._current_4h = None
+        self._four_hour_bars = []
+        self._fvg_zones = []
+        self._fvg_returned = False
+
+        self._swing_candidate = None
+        self._swing_failure = None
+        self._mss_confirmed = False
+
+        self._previous_5m = None
+        self._last_strong_candle = None
+        self._order_block = None
+
+        self._entry_price = None
+        self._entry_stop = None
+        self._take_profit_50 = None
+        self._take_profit_100 = None
+        self._entry_bar = None
+        self._first_portion_closed = False
+
+    def _reset_trade_state(self):
+        self._entry_price = None
+        self._entry_stop = None
+        self._take_profit_50 = None
+        self._take_profit_100 = None
+        self._entry_bar = None
+        self._first_portion_closed = False
+
+    def _four_hour_key(self):
+        dt = self.data.datetime.datetime(0)
+        return (dt.year, dt.month, dt.day, dt.hour // 4)
+
+    def _update_four_hour_bar(self):
+        key = self._four_hour_key()
+        bar = {
+            "key": key,
+            "open": self.data.open[0],
+            "high": self.data.high[0],
+            "low": self.data.low[0],
+            "close": self.data.close[0],
+        }
+
+        if self._current_4h is None:
+            self._current_4h = bar
+            return
+
+        if key == self._current_4h["key"]:
+            self._current_4h["high"] = max(self._current_4h["high"], bar["high"])
+            self._current_4h["low"] = min(self._current_4h["low"], bar["low"])
+            self._current_4h["close"] = bar["close"]
+            return
+
+        self._process_completed_four_hour_bar(self._current_4h)
+        self._current_4h = bar
+
+    def _process_completed_four_hour_bar(self, bar):
+        previous = self._four_hour_bars[-1] if self._four_hour_bars else None
+
+        # A return must occur after an FVG has already formed.
+        for zone in self._fvg_zones:
+            if bar["low"] <= zone["top"] and bar["high"] >= zone["bottom"]:
+                self._fvg_returned = True
+
+        if previous is not None:
+            previous_bullish = previous["close"] > previous["open"]
+            previous_bearish = previous["close"] < previous["open"]
+            current_bullish = bar["close"] > bar["open"]
+            current_bearish = bar["close"] < bar["open"]
+
+            previous_body_low = min(previous["open"], previous["close"])
+            previous_body_high = max(previous["open"], previous["close"])
+            current_body_low = min(bar["open"], bar["close"])
+            current_body_high = max(bar["open"], bar["close"])
+            bodies_do_not_overlap = (
+                previous_body_high < current_body_low
+                or current_body_high < previous_body_low
+            )
+
+            if (
+                previous_bullish
+                and current_bearish
+                and previous["high"] < bar["low"]
+                and bodies_do_not_overlap
+            ):
+                self._fvg_zones.append(
+                    {"bottom": previous["high"], "top": bar["low"]}
+                )
+
+            if (
+                previous_bearish
+                and current_bullish
+                and bar["high"] < previous["low"]
+                and bodies_do_not_overlap
+            ):
+                self._fvg_zones.append(
+                    {"bottom": bar["high"], "top": previous["low"]}
+                )
+
+            # Higher high followed by a later lower high is the bullish swing
+            # failure described in the specification.
+            if (
+                self._swing_candidate is not None
+                and bar["high"] < self._swing_candidate["high"]
+            ):
+                self._swing_failure = self._swing_candidate
+                self._swing_candidate = None
+
+            # MSS: break the low that preceded the higher high.
+            if (
+                self._fvg_returned
+                and self._swing_failure is not None
+                and bar["low"] < self._swing_failure["previous_low"]
+            ):
+                self._mss_confirmed = True
+                self._last_strong_candle = None
+                self._order_block = None
+
+            if bar["high"] > previous["high"]:
+                self._swing_candidate = {
+                    "high": bar["high"],
+                    "previous_low": previous["low"],
+                }
+
+        self._four_hour_bars.append(bar)
+
+    def _update_order_block(self):
+        open_ = self.data.open[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        close = self.data.close[0]
+        body = abs(close - open_)
+        candle_range = high - low
+
+        if self._mss_confirmed and self._previous_5m is not None:
+            sharp_upward_move = (
+                close > open_
+                and candle_range > self._previous_5m["range"]
+            )
+
+            if sharp_upward_move and self._last_strong_candle is not None:
+                self._order_block = self._last_strong_candle
+
+            if body > self._previous_5m["body"]:
+                self._last_strong_candle = {
+                    "bottom": min(open_, close),
+                    "top": max(open_, close),
+                }
+
+        self._previous_5m = {
+            "close": close,
+            "body": body,
+            "range": candle_range,
+        }
+
+    def _weekend(self):
+        return self.data.datetime.datetime(0).weekday() >= 5
+
+    def _submit_entry_if_breakout(self):
+        if (
+            self.pending_order is not None
+            or self.position
+            or not self._mss_confirmed
+            or self._order_block is None
+            or self._weekend()
+            or self._previous_5m is None
+        ):
+            return
+
+        breakout = (
+            self._previous_5m["close"] <= self._order_block["top"]
+            and self.data.high[0] > self._order_block["top"]
+        )
+        stop = self._order_block["bottom"]
+        estimated_entry = self.data.close[0]
+        unit_risk = estimated_entry - stop
+
+        if not breakout or unit_risk <= 0:
+            return
+
+        risk_amount = self.broker.getvalue() * self.p.risk_fraction
+        size = risk_amount / unit_risk
+        if size <= 0:
+            return
+
+        self._entry_stop = stop
+        self.pending_order = self.buy(size=size)
+        self._pending_kind = "entry"
+
+    def _manage_position(self):
+        if not self.position or self.pending_order is not None:
+            return
+
+        if self.data.low[0] <= self._entry_stop:
+            self.pending_order = self.close()
+            self._pending_kind = "exit"
+            return
+
+        if not self._first_portion_closed and self.data.high[0] >= self._take_profit_50:
+            self.pending_order = self.close(size=self.position.size / 2.0)
+            self._pending_kind = "partial"
+            return
+
+        if self._first_portion_closed and self.data.high[0] >= self._take_profit_100:
+            self.pending_order = self.close()
+            self._pending_kind = "exit"
+            return
+
+        if len(self) - self._entry_bar > self.p.max_holding_bars:
+            self.pending_order = self.close()
+            self._pending_kind = "exit"
+
+    def next(self):
+        self._update_four_hour_bar()
+        self._update_order_block()
+
+        if self.position:
+            self._manage_position()
+        else:
+            self._submit_entry_if_breakout()
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Submitted,
+            order.Accepted,
+        ):
+            return
+
+        kind = self._pending_kind
+
+        if order.status == order.Completed:
+            if kind == "entry":
+                self._entry_price = order.executed.price
+                risk = self._entry_price - self._entry_stop
+                self._take_profit_50 = self._entry_price + (
+                    risk * self.p.reward_to_risk * 0.5
+                )
+                self._take_profit_100 = self._entry_price + (
+                    risk * self.p.reward_to_risk
+                )
+                self._entry_bar = len(self)
+            elif kind == "partial":
+                self._first_portion_closed = True
+            elif kind == "exit" and not self.position:
+                self._reset_trade_state()
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_order = None
+            self._pending_kind = None
+```
+
+```json
+{"assumptions":[{"topic":"4-hour timeframe","choice":"Aggregate the supplied UTC 5-minute bars into completed UTC-aligned 4-hour OHLC bars.","reason":"The harness supplies only one 5-minute feed."},{"topic":"FVG formalization","choice":"Use a bullish candle followed by a bearish candle with prior high below current low, or a bearish candle followed by a bullish candle with current high below prior low; require their bodies not to overlap.","reason":"This is the literal two-candle reading of the stated FVG definition."},{"topic":"FVG return","choice":"Treat a later completed 4-hour bar whose range intersects any previously formed FVG zone as price entering that zone.","reason":"The specification requires price to return to, rather than merely form, the zone."},{"topic":"swing failure and MSS","choice":"For the stated long setup, define the swing failure as a higher high followed by a later lower high, then confirm MSS when a 4-hour low breaks the low preceding that higher high.","reason":"This follows the explicit long-condition examples, despite their directional terminology being otherwise ambiguous."},{"topic":"strong candle and sharp move","choice":"A strong 5-minute candle has a body larger than the immediately preceding candle body; a sharp upward move is a bullish candle with range larger than the immediately preceding candle range. The last such strong candle before that move supplies its body as the Order Block.","reason":"The specification provides no numerical definition for strong or sharp."},{"topic":"breakout","choice":"An upward Order Block breakout occurs when the prior 5-minute close is at or below the Order Block body top and the current 5-minute high exceeds it.","reason":"The specification does not state whether a wick or close constitutes breakout."},{"topic":"risk and reward","choice":"Risk per trade is 1% of current broker value and total take-profit is 3.33 times entry-to-stop risk; size is risk amount divided by that price risk.","reason":"The specification supplies 1% and 1:3.33 as examples but no alternative fixed values."},{"topic":"stop-loss","choice":"Use the lower side of the long Order Block body as the stop-loss.","reason":"This is the opposite side of the stated Order Block."},{"topic":"partial exits","choice":"Close half the current position at 50% of the total take-profit and all remaining position at 100%. If stop and target are both touched in one OHLC bar, process the stop first.","reason":"Intrabar ordering is unavailable from 5-minute OHLC data."},{"topic":"maximum holding time","choice":"Force-close only after more than 48 five-minute bars from entry, representing more than 4 hours.","reason":"The stated range is 3-4 hours; 4 hours is selected as the upper bound."},{"topic":"weekends","choice":"Do not submit new entries on Saturday or Sunday UTC; continue managing existing positions.","reason":"The strategy is stated to be inactive on weekends, while exits remain necessary for stated risk management."}]}
+```

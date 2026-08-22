@@ -1,0 +1,224 @@
+```python
+import backtrader as bt
+
+
+class TradingFairValueGaps(bt.Strategy):
+    params = (
+        ("stop_offset", 1.0),
+        ("volume_lookback", 20),
+        ("volume_multiplier", 1.5),
+    )
+
+    def __init__(self):
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_fvg = None
+        self.active_fvgs = []
+        self.volumes = []
+        self.session_date = None
+        self.session_high = None
+        self.session_low = None
+        self.previous_session_high = None
+        self.previous_session_low = None
+
+    def _in_ny_session(self):
+        now = self.data.datetime.datetime(0)
+        current = now.hour * 60 + now.minute
+        return 9 * 60 + 30 <= current <= 16 * 60
+
+    def _update_session_levels(self):
+        now = self.data.datetime.datetime(0)
+        date = now.date()
+
+        if self.session_date != date:
+            if self.session_date is not None:
+                self.previous_session_high = self.session_high
+                self.previous_session_low = self.session_low
+            self.session_date = date
+            self.session_high = None
+            self.session_low = None
+            self.active_fvgs = []
+
+        high = self.data.high[0]
+        low = self.data.low[0]
+        self.session_high = high if self.session_high is None else max(self.session_high, high)
+        self.session_low = low if self.session_low is None else min(self.session_low, low)
+
+    def _reversal_signal(self):
+        open_ = self.data.open[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        close = self.data.close[0]
+
+        body = abs(close - open_)
+        candle_range = high - low
+        if candle_range <= 0:
+            return False
+
+        effective_body = max(body, 1e-12)
+        upper_wick = high - max(open_, close)
+        lower_wick = min(open_, close) - low
+
+        hammer = lower_wick >= 2 * effective_body and upper_wick <= effective_body
+        shooting_star = upper_wick >= 2 * effective_body and lower_wick <= effective_body
+        long_wick = upper_wick >= 2 * effective_body or lower_wick >= 2 * effective_body
+
+        volume_spike = False
+        if len(self.volumes) >= self.p.volume_lookback:
+            average_volume = sum(self.volumes[-self.p.volume_lookback:]) / self.p.volume_lookback
+            volume_spike = average_volume > 0 and self.data.volume[0] >= (
+                average_volume * self.p.volume_multiplier
+            )
+
+        return hammer or shooting_star or long_wick or volume_spike
+
+    def _create_fvg(self):
+        if len(self) < 3 or not self._in_ny_session():
+            return
+
+        first_dt = self.data.datetime.datetime(-2)
+        second_dt = self.data.datetime.datetime(-1)
+        third_dt = self.data.datetime.datetime(0)
+
+        if (
+            first_dt.date() != third_dt.date()
+            or second_dt.date() != third_dt.date()
+            or not (9 * 60 + 30 <= first_dt.hour * 60 + first_dt.minute <= 16 * 60)
+            or not (9 * 60 + 30 <= second_dt.hour * 60 + second_dt.minute <= 16 * 60)
+        ):
+            return
+
+        first_high = self.data.high[-2]
+        first_low = self.data.low[-2]
+        third_high = self.data.high[0]
+        third_low = self.data.low[0]
+
+        if third_low > first_high:
+            self.active_fvgs.append(
+                {
+                    "side": "bullish",
+                    "lower": first_high,
+                    "upper": third_low,
+                    "date": third_dt.date(),
+                }
+            )
+        elif third_high < first_low:
+            self.active_fvgs.append(
+                {
+                    "side": "bearish",
+                    "lower": third_high,
+                    "upper": first_low,
+                    "date": third_dt.date(),
+                }
+            )
+
+    def _mitigate_fvgs(self):
+        close = self.data.close[0]
+        remaining = []
+
+        for fvg in self.active_fvgs:
+            if fvg["side"] == "bullish":
+                mitigated = close <= fvg["upper"]
+            else:
+                mitigated = close >= fvg["lower"]
+
+            if not mitigated:
+                remaining.append(fvg)
+
+        self.active_fvgs = remaining
+
+    def _enter_from_fvg(self):
+        if (
+            not self._in_ny_session()
+            or self.position
+            or self.entry_order is not None
+            or self.stop_order is not None
+            or self.target_order is not None
+            or not self._reversal_signal()
+        ):
+            return
+
+        high = self.data.high[0]
+        low = self.data.low[0]
+        current_date = self.data.datetime.datetime(0).date()
+
+        for fvg in reversed(self.active_fvgs):
+            if fvg["date"] != current_date:
+                continue
+
+            retraced_into_gap = low <= fvg["upper"] and high >= fvg["lower"]
+            if not retraced_into_gap:
+                continue
+
+            if fvg["side"] == "bullish" and self.previous_session_high is not None:
+                self.entry_fvg = fvg
+                self.entry_order = self.buy()
+                return
+
+            if fvg["side"] == "bearish" and self.previous_session_low is not None:
+                self.entry_fvg = fvg
+                self.entry_order = self.sell()
+                return
+
+    def next(self):
+        if not self._in_ny_session():
+            return
+
+        self._update_session_levels()
+        self._mitigate_fvgs()
+        self._enter_from_fvg()
+        self._create_fvg()
+
+        self.volumes.append(self.data.volume[0])
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+
+            if order.status == order.Completed and self.entry_fvg is not None:
+                size = abs(order.executed.size)
+
+                if self.entry_fvg["side"] == "bullish":
+                    self.stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=self.entry_fvg["lower"] - self.p.stop_offset,
+                    )
+                    self.target_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=self.previous_session_high,
+                    )
+                else:
+                    self.stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=self.entry_fvg["upper"] + self.p.stop_offset,
+                    )
+                    self.target_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=self.previous_session_low,
+                    )
+            return
+
+        if order is self.stop_order:
+            if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+                self.stop_order = None
+                if order.status == order.Completed and self.target_order is not None:
+                    self.cancel(self.target_order)
+            return
+
+        if order is self.target_order:
+            if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+                self.target_order = None
+                if order.status == order.Completed and self.stop_order is not None:
+                    self.cancel(self.stop_order)
+```
+
+```json
+{"assumptions":[{"topic":"FVG boundaries","choice":"Uses the stated OHLC boundaries: bullish FVG from first-candle high to third-candle low; bearish FVG from third-candle high to first-candle low.","reason":"The specification explicitly defines these boundaries despite its general reference to candle bodies."},{"topic":"Three-candle pattern","choice":"Any three consecutive NY-session candles meeting the stated gap boundary relationship form an FVG; no additional sharp-move threshold is imposed.","reason":"No quantitative definition of a sharp price move is provided."},{"topic":"Mitigation","choice":"A bullish FVG is removed after a later close at or below its upper boundary; a bearish FVG is removed after a later close at or above its lower boundary.","reason":"This is the literal close-inside-or-beyond interpretation of the stated By Close mitigation rule."},{"topic":"FVG lifetime","choice":"FVGs are used only during the session in which they form and are cleared at the next session.","reason":"The strategy describes these levels as acting during the same NY session."},{"topic":"Reversal signal","choice":"A signal is a hammer, shooting star, either wick at least twice the candle body, or volume at least 1.5 times the prior 20-bar average.","reason":"The specification supplies qualitative examples but no definitions or thresholds; these choices make each listed signal testable."},{"topic":"Stop-loss offset","choice":"A few points is implemented as 1.0 price unit beyond the applicable FVG boundary.","reason":"The specification does not define the number of points."},{"topic":"Take-profit","choice":"Uses previous session high for longs and previous session low for shorts.","reason":"These are the first explicitly listed take-profit alternatives and are available from the single OHLCV feed."},{"topic":"Position sizing","choice":"Entries use plain self.buy() and self.sell() without an explicit size; protective exits use the filled entry size.","reason":"The specification permits, but does not require, different sizing by FVG type; canonical defaults require plain entry sizing when unspecified."},{"topic":"Order timing","choice":"Entries are standard Backtrader market orders and execute under the harness broker's normal next-bar behavior.","reason":"The specification permits entry immediately after confirmation and provides no execution-price or cheat-on-close instruction."}]}

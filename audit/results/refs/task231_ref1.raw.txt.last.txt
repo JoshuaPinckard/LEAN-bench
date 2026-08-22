@@ -1,0 +1,144 @@
+```python
+import backtrader as bt
+import math
+
+
+class ImpliedVolatilityETFStrategy(bt.Strategy):
+    params = (
+        ("component_iv_period", 10),
+        ("etf_iv_period", 5),
+        ("calculated_iv_ma_period", 10),
+        ("daily_bars", 78),
+        ("annualization_days", 252),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_bar = None
+
+        self.log_return = bt.indicators.LogReturn(self.data.close, period=1)
+        annualization = math.sqrt(self.p.annualization_days * self.p.daily_bars)
+
+        self.component_iv = (
+            bt.indicators.StandardDeviation(
+                self.log_return, period=self.p.component_iv_period
+            )
+            * annualization
+        )
+        self.current_etf_iv = (
+            bt.indicators.StandardDeviation(
+                self.log_return, period=self.p.etf_iv_period
+            )
+            * annualization
+        )
+
+        self.calculated_iv = self.component_iv
+        self.smoothed_calculated_iv = bt.indicators.SimpleMovingAverage(
+            self.calculated_iv, period=self.p.calculated_iv_ma_period
+        )
+
+        self.average_bar_volume = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.daily_bars
+        )
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if order is self.order:
+                if order.status == order.Completed and order.isbuy() != bool(self.position):
+                    self.entry_bar = len(self)
+                    entry_price = order.executed.price
+
+                    if self.position.size > 0:
+                        self.stop_order = self.sell(
+                            size=self.position.size,
+                            exectype=bt.Order.Stop,
+                            price=entry_price * 0.98,
+                        )
+                        self.target_order = self.sell(
+                            size=self.position.size,
+                            exectype=bt.Order.Limit,
+                            price=entry_price * 1.01,
+                            oco=self.stop_order,
+                        )
+                    elif self.position.size < 0:
+                        size = abs(self.position.size)
+                        self.stop_order = self.buy(
+                            size=size,
+                            exectype=bt.Order.Stop,
+                            price=entry_price * 1.02,
+                        )
+                        self.target_order = self.buy(
+                            size=size,
+                            exectype=bt.Order.Limit,
+                            price=entry_price * 0.99,
+                            oco=self.stop_order,
+                        )
+
+                self.order = None
+
+            if order is self.stop_order:
+                self.stop_order = None
+
+            if order is self.target_order:
+                self.target_order = None
+
+            if not self.position:
+                self.entry_bar = None
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        calculated_iv = self.smoothed_calculated_iv[0]
+        previous_calculated_iv = self.smoothed_calculated_iv[-1]
+        current_iv = self.current_etf_iv[0]
+
+        if calculated_iv <= 0 or previous_calculated_iv <= 0:
+            return
+
+        deviation = (current_iv - calculated_iv) / calculated_iv
+        calculated_iv_change = abs(
+            (calculated_iv - previous_calculated_iv) / previous_calculated_iv
+        )
+
+        liquid = self.data.volume[0] > self.average_bar_volume[0]
+        vix_below_30 = current_iv <= 0.30
+        calculated_iv_stable = calculated_iv_change <= 0.05
+
+        if self.position:
+            corrected = abs(deviation) < 0.05
+            timed_out = (
+                self.entry_bar is not None and len(self) - self.entry_bar >= 6
+            )
+
+            if corrected or timed_out:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                if self.target_order is not None:
+                    self.cancel(self.target_order)
+                self.order = self.close()
+            return
+
+        if self.stop_order is not None or self.target_order is not None:
+            return
+
+        if not (liquid and vix_below_30 and calculated_iv_stable):
+            return
+
+        size = (self.broker.getvalue() * 0.10) / self.data.close[0]
+
+        if deviation <= -0.15:
+            self.order = self.buy(size=size)
+        elif deviation >= 0.15:
+            self.order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"The sole AAPL OHLCV feed is treated as the ETF and as its only component with a 100% ETF weight.","reason":"No ETF constituent list, constituent weights, or additional component feeds are available."},{"topic":"infeasible","choice":"Historical realized volatility from 5-minute log returns is used as an IV proxy; 10 bars are used for the component/calculated IV and 5 bars for current ETF IV.","reason":"Historical option prices and quoted implied volatilities are unavailable."},{"topic":"infeasible","choice":"The current ETF realized-volatility proxy is also used as the VIX proxy and is compared with 0.30.","reason":"No VIX feed is available."},{"topic":"liquidity","choice":"High liquidity means current 5-minute volume exceeds the trailing 78-bar average 5-minute volume.","reason":"The feed is 5-minute data; 78 bars represent a standard full regular trading day."},{"topic":"stability","choice":"Calculated-IV stability compares the current and previous 5-minute values of the 10-period moving average of calculated IV.","reason":"The feed interval is 5 minutes and the specification requires smoothing the calculated IV with a 10-period moving average."},{"topic":"timing","choice":"Thirty minutes is implemented as six 5-minute bars after the entry order completes.","reason":"The input data interval is fixed at 5 minutes."},{"topic":"sizing","choice":"Order quantity is portfolio value times 10% divided by the current close, with no rounding.","reason":"The specification requires 10% of portfolio value but does not specify share rounding or execution-price sizing."}]}

@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+import math
+
+
+class FixedDateTranches(bt.Strategy):
+    params = (
+        ('schedule', ()),  # ((date, 'buy'/'sell', shares), ...)
+    )
+
+    def __init__(self):
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.crossover = bt.indicators.CrossOver(self.sma20, self.sma50)
+
+        self.pending_orders = set()
+        self._scheduled_dates_handled = set()
+        self._scheduled_mode = bool(self.p.schedule)
+        self._schedule = {}
+
+        for item in self.p.schedule:
+            date_value, action, amount = item
+            self._schedule.setdefault(self._date_key(date_value), []).append(
+                (str(action).lower(), amount)
+            )
+
+        self._previous_value = None
+        self._twr_growth = 1.0
+        self.twr = None
+        self.cagr = None
+        self._trade_cashflows = []
+
+    def _date_key(self, value):
+        if hasattr(value, 'year'):
+            return (value.year, value.month, value.day)
+        text = str(value)
+        return (int(text[0:4]), int(text[5:7]), int(text[8:10]))
+
+    def _current_date_key(self):
+        current = self.data.datetime.date(0)
+        return (current.year, current.month, current.day)
+
+    def _submit_scheduled_orders(self):
+        key = self._current_date_key()
+        if key in self._scheduled_dates_handled or key not in self._schedule:
+            return
+
+        self._scheduled_dates_handled.add(key)
+        for action, amount in self._schedule[key]:
+            if action == 'buy':
+                order = self.buy(size=amount)
+            elif action == 'sell' and self.position.size > 0:
+                order = self.sell(size=amount)
+            else:
+                continue
+            self.pending_orders.add(order.ref)
+
+    def next_open(self):
+        if self._scheduled_mode:
+            self._submit_scheduled_orders()
+
+    def next(self):
+        value = self.broker.getvalue()
+        if self._previous_value is not None and self._previous_value != 0:
+            self._twr_growth *= value / self._previous_value
+        self._previous_value = value
+
+        if self._scheduled_mode:
+            # Fallback when Cerebro was not configured with cheat-on-open.
+            self._submit_scheduled_orders()
+            return
+
+        if self.pending_orders:
+            return
+
+        if not self.position and self.crossover[0] > 0:
+            order = self.buy()
+            self.pending_orders.add(order.ref)
+        elif self.position and self.crossover[0] < 0:
+            order = self.close()
+            self.pending_orders.add(order.ref)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_orders.discard(order.ref)
+
+        if order.status == order.Completed:
+            signed_cashflow = -(
+                order.executed.value + order.executed.comm
+            ) if order.isbuy() else (
+                order.executed.value - order.executed.comm
+            )
+            self._trade_cashflows.append((order.executed.dt, signed_cashflow))
+
+    def _xirr(self, cashflows):
+        if len(cashflows) < 2:
+            return None
+
+        start_date = min(date_num for date_num, _ in cashflows)
+
+        def npv(rate):
+            total = 0.0
+            for date_num, amount in cashflows:
+                years = (date_num - start_date) / 365.2425
+                total += amount / ((1.0 + rate) ** years)
+            return total
+
+        low = -0.999999
+        high = 1.0
+        low_value = npv(low)
+        high_value = npv(high)
+
+        while low_value * high_value > 0 and high < 1000000.0:
+            high *= 2.0
+            high_value = npv(high)
+
+        if low_value * high_value > 0:
+            return None
+
+        for _ in range(100):
+            middle = (low + high) / 2.0
+            middle_value = npv(middle)
+            if abs(middle_value) < 1e-10:
+                return middle
+            if low_value * middle_value <= 0:
+                high = middle
+                high_value = middle_value
+            else:
+                low = middle
+                low_value = middle_value
+
+        return (low + high) / 2.0
+
+    def stop(self):
+        self.twr = self._twr_growth - 1.0
+
+        cashflows = list(self._trade_cashflows)
+        if self.position.size:
+            cashflows.append(
+                (self.data.datetime[0], self.position.size * self.data.close[0])
+            )
+        self.cagr = self._xirr(cashflows)
+```
+
+```json
+{"assumptions":[{"topic":"schedule format","choice":"The `schedule` parameter is an iterable of `(date, action, shares)` tuples; dates may be date/datetime objects or ISO-style `YYYY-MM-DD` strings.","reason":"The specification permits arbitrary dates and amounts but does not prescribe a parameter representation."},{"topic":"tranche amount","choice":"Each tranche amount is interpreted as a fixed number of shares.","reason":"Backtrader order sizing is share-based and the specification calls for fixed tranche size."},{"topic":"scheduled execution timing","choice":"Scheduled orders are submitted in `next_open` when Cerebro uses cheat-on-open; otherwise they are submitted on the matching bar and execute at the next available opening price.","reason":"A normal Backtrader strategy cannot submit an order before the opening of the currently executing bar; the harness configuration does not state that cheat-on-open is enabled."},{"topic":"long-only sells","choice":"A scheduled sell is submitted only while a long position exists.","reason":"The canonical convention is long-only and the specification does not authorize shorting."},{"topic":"metrics display","choice":"Metrics are retained as `self.twr` and `self.cagr` rather than printed.","reason":"The required module must not print; these attributes make the calculated values available to the harness."},{"topic":"TWR","choice":"TWR is the compounded change in total broker portfolio value across bars.","reason":"No external deposits or withdrawals are specified; tranche purchases and sales are internal portfolio reallocations."},{"topic":"CAGR/IRR proxy","choice":"`cagr` is solved as an annual XIRR from actual completed trade cash-flow dates, with any open position valued at the final close.","reason":"This follows the requested use of actual cash-flow dates as a proxy for IRR."}]}
+```

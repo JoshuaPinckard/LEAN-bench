@@ -1,0 +1,141 @@
+```python
+import backtrader as bt
+import math
+
+
+class ATRIntradayRangeReversal(bt.Strategy):
+    params = (
+        ("atr_period", 14),
+        ("range_fraction", 0.80),
+        ("risk_fraction", 0.01),
+        ("zone_atr_fraction", 0.10),
+        ("stop_offset", 0.01),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.order = None
+        self.current_day = None
+        self.hod = None
+        self.lod = None
+        self.range_activated = False
+        self.trade_stop = None
+        self.trade_target = None
+        self.pending_stop = None
+        self.pending_target = None
+
+    def prenext(self):
+        self._update_day_range()
+
+    def next(self):
+        self._update_day_range()
+
+        if self.order:
+            return
+
+        dt = self.data.datetime.datetime(0)
+        hour_minute = (dt.hour, dt.minute)
+
+        if self.position:
+            if self.position.size > 0:
+                if self.data.low[0] <= self.trade_stop:
+                    self.order = self.close()
+                elif self.data.high[0] >= self.trade_target:
+                    self.order = self.close()
+            else:
+                if self.data.high[0] >= self.trade_stop:
+                    self.order = self.close()
+                elif self.data.low[0] <= self.trade_target:
+                    self.order = self.close()
+
+            if hour_minute == (15, 55) and not self.order:
+                self.order = self.close()
+            return
+
+        if hour_minute > (12, 30):
+            return
+
+        atr_value = self.atr[0]
+        if atr_value <= 0:
+            return
+
+        if self.hod - self.lod >= self.p.range_fraction * atr_value:
+            self.range_activated = True
+
+        if not self.range_activated:
+            return
+
+        open_price = self.data.open[0]
+        high_price = self.data.high[0]
+        low_price = self.data.low[0]
+        close_price = self.data.close[0]
+        body = abs(close_price - open_price)
+        lower_wick = min(open_price, close_price) - low_price
+        upper_wick = high_price - max(open_price, close_price)
+        zone_width = self.p.zone_atr_fraction * atr_value
+
+        bullish_pin_bar = (
+            close_price > open_price
+            and lower_wick >= body
+            and upper_wick <= body
+        )
+        bearish_pin_bar = (
+            close_price < open_price
+            and upper_wick >= body
+            and lower_wick <= body
+        )
+
+        if close_price <= self.lod + zone_width and bullish_pin_bar:
+            stop_price = self.lod - self.p.stop_offset
+            risk_per_share = close_price - stop_price
+            size = math.floor(
+                (self.broker.getvalue() * self.p.risk_fraction) / risk_per_share
+            )
+            if size > 0:
+                self.pending_stop = stop_price
+                self.pending_target = self.hod
+                self.order = self.buy(size=size)
+
+        elif close_price >= self.hod - zone_width and bearish_pin_bar:
+            stop_price = self.hod + self.p.stop_offset
+            risk_per_share = stop_price - close_price
+            size = math.floor(
+                (self.broker.getvalue() * self.p.risk_fraction) / risk_per_share
+            )
+            if size > 0:
+                self.pending_stop = stop_price
+                self.pending_target = self.lod
+                self.order = self.sell(size=size)
+
+    def _update_day_range(self):
+        bar_day = self.data.datetime.date(0)
+
+        if bar_day != self.current_day:
+            self.current_day = bar_day
+            self.hod = self.data.high[0]
+            self.lod = self.data.low[0]
+            self.range_activated = False
+        else:
+            self.hod = max(self.hod, self.data.high[0])
+            self.lod = min(self.lod, self.data.low[0])
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order == self.order and not self.position:
+                self.trade_stop = None
+                self.trade_target = None
+            elif order.isbuy() or order.issell():
+                if self.position:
+                    self.trade_stop = self.pending_stop
+                    self.trade_target = self.pending_target
+            self.order = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+            self.pending_stop = None
+            self.pending_target = None
+```
+
+```json
+{"assumptions":[{"topic":"ATR timeframe","choice":"ATR(14) is calculated on the supplied 5-minute bars.","reason":"The environment provides only one 5-minute OHLCV feed and no daily data feed."},{"topic":"first few hours","choice":"The qualifying HOD-LOD range must reach 80% of ATR by 12:30 ET; once reached, the strategy remains activated for that trading day.","reason":"The specification does not define a precise duration for 'the first few hours.'"},{"topic":"support and resistance zones","choice":"A support or resistance zone is within 10% of the current ATR from the current-day LOD or HOD, respectively.","reason":"The term 'close to' has no numeric definition."},{"topic":"reversal signals","choice":"Bullish and bearish pin bars are used: the directional close must exceed the open, the relevant wick must be at least the body, and the opposite wick must not exceed the body.","reason":"The specification gives reversal patterns as examples but supplies no exact pattern definition."},{"topic":"profit and stop levels","choice":"Profit targets are the HOD for longs and LOD for shorts; stops are fixed at $0.01 below the LOD for longs and $0.01 above the HOD for shorts at entry.","reason":"The specification says targets should be close to the opposite boundary and stops slightly beyond the HOD/LOD, without numeric offsets."},{"topic":"risk sizing","choice":"Position size is floor(1% of current broker value divided by the entry-to-stop risk per share).","reason":"The specification gives 1% of trading capital as the stated standard risk-management example but does not otherwise define lot sizing."},{"topic":"no-trend rule","choice":"No additional no-trend filter is applied.","reason":"'Strong trend' and a 'confident' HOD/LOD break have no quantitative definition in the supplied OHLCV-only specification."},{"topic":"day-of-week filter","choice":"No day-of-week filter is applied.","reason":"The specification explicitly marks this filter optional and provides no selected weekday."},{"topic":"end-of-day execution","choice":"A close order is submitted on the 15:55 bar when a position remains open.","reason":"The supplied feed ends at 15:55, so actual fill timing of a final-bar market close depends on the harness broker execution settings; immediate same-bar liquidation cannot be guaranteed by a strategy alone."}]}
+```

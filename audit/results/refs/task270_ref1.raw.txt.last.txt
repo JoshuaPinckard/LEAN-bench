@@ -1,0 +1,145 @@
+```python
+import backtrader as bt
+import math
+
+
+class Strategy(bt.Strategy):
+    params = (
+        ("risk_dollars", 100.0),
+    )
+
+    def __init__(self):
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.ema9 = bt.indicators.EMA(self.data.close, period=9)
+        self.rsi14 = bt.indicators.RSI(self.data.close, period=14)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+        self.bbands = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.crossover = bt.indicators.CrossOver(self.ema9, self.sma20)
+
+        self.session_date = None
+        self.session_open = None
+        self.extreme_opening_gap = False
+
+        self.pending_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_atr = None
+        self.force_exit_submitted = False
+
+    def _update_session(self):
+        dt = self.data.datetime.datetime(0)
+        current_date = dt.date()
+        current_time = dt.time()
+
+        if self.session_date != current_date:
+            self.session_date = current_date
+            self.session_open = None
+            self.extreme_opening_gap = False
+
+        if current_time.hour == 9 and current_time.minute == 30:
+            self.session_open = self.data.open[0]
+            if len(self.data) > 1 and self.data.close[-1] != 0:
+                self.extreme_opening_gap = (
+                    abs(self.data.open[0] - self.data.close[-1]) / self.data.close[-1] > 0.015
+                )
+
+    def prenext(self):
+        self._update_session()
+
+    def next(self):
+        self._update_session()
+        current_time = self.data.datetime.datetime(0).time()
+
+        if self.position and current_time.hour == 15 and current_time.minute >= 45:
+            if not self.force_exit_submitted:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                if self.target_order is not None:
+                    self.cancel(self.target_order)
+                self.pending_order = self.close()
+                self.force_exit_submitted = True
+            return
+
+        if self.position or self.pending_order is not None:
+            return
+
+        if self.session_open is None or self.extreme_opening_gap:
+            return
+
+        in_entry_window = (
+            (current_time.hour == 9 and current_time.minute >= 30)
+            or current_time.hour == 10
+            or (current_time.hour == 11 and current_time.minute <= 30)
+        )
+        if not in_entry_window:
+            return
+
+        close = self.data.close[0]
+        atr = self.atr14[0]
+
+        if (
+            close / self.session_open - 1 <= -0.005
+            and close < self.sma50[0]
+            and self.rsi14[0] < 45
+            and atr / close >= 0.005
+            and atr / close >= 0.004
+            and self.crossover[0] < 0
+        ):
+            size = math.floor(self.p.risk_dollars / (1.5 * atr))
+            if size > 0:
+                self.entry_atr = atr
+                self.pending_order = self.sell(size=size)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.pending_order:
+            if order.status == order.Completed and order.isbuy() and self.force_exit_submitted:
+                self.force_exit_submitted = False
+            elif order.status == order.Completed and order.issell() and not self.force_exit_submitted:
+                entry_price = order.executed.price
+                self.stop_order = self.buy(
+                    size=order.executed.size,
+                    exectype=bt.Order.Stop,
+                    price=entry_price + 1.5 * self.entry_atr,
+                )
+                self.target_order = self.buy(
+                    size=order.executed.size,
+                    exectype=bt.Order.Limit,
+                    price=entry_price - 2 * self.entry_atr,
+                )
+
+            if order.status in (
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.pending_order = None
+
+        if order is self.stop_order and order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order.status == order.Completed and self.target_order is not None:
+                self.cancel(self.target_order)
+            self.stop_order = None
+
+        if order is self.target_order and order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order.status == order.Completed and self.stop_order is not None:
+                self.cancel(self.stop_order)
+            self.target_order = None
+```
+
+```json
+{"assumptions":[{"topic":"risk_dollars","choice":"Default fixed risk is $100, exposed as a strategy parameter.","reason":"The specification permits a fixed risk from $100 to $500 but does not choose one value."},{"topic":"opening_gap_scope","choice":"An extreme opening gap disables entries for the entire session.","reason":"The rule says not to trade during an extreme opening gap; the opening gap is a session-level condition."},{"topic":"previous_close","choice":"Previous close is the immediately preceding available 5-minute bar close.","reason":"Only one OHLCV feed is available."},{"topic":"entry_atr","choice":"ATR used for sizing and stop/target distances is sampled on the bearish-crossover signal bar; entry price is the actual short fill price.","reason":"Sizing and entry qualification occur when the signal is evaluated, while market-order fill price is determined by Backtrader execution."}]}
+```

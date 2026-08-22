@@ -1,0 +1,151 @@
+```python
+import backtrader as bt
+import math
+
+
+class LogisticRegressionStrategy(bt.Strategy):
+    class _FixedTradeCommission(bt.CommInfoBase):
+        params = (
+            ("stocklike", True),
+            ("commtype", bt.CommInfoBase.COMM_FIXED),
+        )
+
+        def _getcommission(self, size, price, pseudoexec):
+            return 10.0
+
+    params = (
+        ("rsi_period", 14),
+        ("momentum_period", 12),
+        ("train_fraction", 0.80),
+        ("buy_threshold", 0.60),
+        ("trade_size", 10),
+        ("learning_rate", 0.05),
+        ("iterations", 1000),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.momentum = bt.indicators.Momentum(
+            self.data.close, period=self.p.momentum_period
+        )
+
+        self.order = None
+        self.training_data = []
+        self.model_ready = False
+        self.means = None
+        self.scales = None
+        self.weights = None
+        self.split_index = None
+
+    def start(self):
+        self.split_index = int(self.data.buflen() * self.p.train_fraction)
+        self.broker.addcommissioninfo(self._FixedTradeCommission())
+
+    def _sigmoid(self, value):
+        if value >= 0:
+            return 1.0 / (1.0 + math.exp(-value))
+        exp_value = math.exp(value)
+        return exp_value / (1.0 + exp_value)
+
+    def _fit_model(self):
+        if not self.training_data:
+            return
+
+        feature_count = 2
+        sample_count = len(self.training_data)
+
+        self.means = [
+            sum(row[0][feature] for row in self.training_data) / sample_count
+            for feature in range(feature_count)
+        ]
+        self.scales = []
+        for feature in range(feature_count):
+            variance = sum(
+                (row[0][feature] - self.means[feature]) ** 2
+                for row in self.training_data
+            ) / sample_count
+            scale = math.sqrt(variance)
+            self.scales.append(scale if scale != 0 else 1.0)
+
+        normalized = [
+            (
+                [
+                    (features[i] - self.means[i]) / self.scales[i]
+                    for i in range(feature_count)
+                ],
+                target,
+            )
+            for features, target in self.training_data
+        ]
+
+        self.weights = [0.0] * (feature_count + 1)
+
+        for _ in range(self.p.iterations):
+            gradients = [0.0] * (feature_count + 1)
+
+            for features, target in normalized:
+                linear_value = self.weights[0] + sum(
+                    self.weights[i + 1] * features[i]
+                    for i in range(feature_count)
+                )
+                error = self._sigmoid(linear_value) - target
+                gradients[0] += error
+                for i in range(feature_count):
+                    gradients[i + 1] += error * features[i]
+
+            for i in range(feature_count + 1):
+                self.weights[i] -= (
+                    self.p.learning_rate * gradients[i] / sample_count
+                )
+
+        self.model_ready = True
+
+    def _upward_probability(self, features):
+        normalized = [
+            (features[i] - self.means[i]) / self.scales[i]
+            for i in range(2)
+        ]
+        linear_value = self.weights[0] + sum(
+            self.weights[i + 1] * normalized[i] for i in range(2)
+        )
+        return self._sigmoid(linear_value)
+
+    def next(self):
+        if self.order:
+            return
+
+        current_index = len(self.data) - 1
+        features = [float(self.rsi[-1]), float(self.momentum[-1])]
+
+        if current_index < self.split_index:
+            target = 1 if self.data.close[0] >= self.data.open[0] else 0
+            self.training_data.append((features, target))
+            return
+
+        if not self.model_ready:
+            self._fit_model()
+
+        if not self.model_ready:
+            return
+
+        upward_probability = self._upward_probability(features)
+
+        if not self.position:
+            if upward_probability > self.p.buy_threshold:
+                self.order = self.buy(size=self.p.trade_size)
+        elif upward_probability < 0.5:
+            self.order = self.close()
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"logistic regression fitting","choice":"Fit a binary logistic-regression model with standardized RSI and momentum features using deterministic batch gradient descent.","reason":"The specification requires logistic regression but does not specify a fitting library, feature scaling, optimizer, or hyperparameters."},{"topic":"RSI calculation","choice":"Use Backtrader's 14-period RSI on closing prices, then use its prior-day value via RSI[-1].","reason":"This applies the stated period and previous-day-close requirement."},{"topic":"momentum calculation","choice":"Use Backtrader's 12-period Momentum on closing prices, then use its prior-day value via Momentum[-1].","reason":"This applies the stated period and previous-day-close requirement."},{"topic":"decline prediction threshold","choice":"Treat logistic-regression prediction 0 as upward probability below 0.5.","reason":"Binary logistic-regression class prediction convention is not otherwise specified."},{"topic":"commission","choice":"Install a commission model that charges exactly $10 per executed order.","reason":"The specification explicitly requires a fixed $10 commission for each buy or sell, overriding the harness's percentage commission setup."}]}
+```

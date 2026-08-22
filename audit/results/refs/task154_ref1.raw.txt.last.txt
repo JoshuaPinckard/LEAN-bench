@@ -1,0 +1,130 @@
+```python
+import backtrader as bt
+
+
+class ReferenceStrategy(bt.Strategy):
+    params = (
+        ('atr_volatility_threshold', 0.002),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=5)
+
+        self.pending_order = None
+        self.entry_order = None
+        self.exit_orders = []
+        self.signal_stop = None
+        self.signal_atr = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed, order.Canceled, order.Margin, order.Rejected
+        ):
+            if order is self.pending_order:
+                self.pending_order = None
+
+            if order is self.entry_order:
+                self.entry_order = None
+
+                if order.status == order.Completed:
+                    self.entry_bar = len(self)
+                    entry_price = order.executed.price
+                    size = abs(self.position.size)
+                    take_profit = (
+                        entry_price + 1.5 * self.signal_atr
+                        if self.position.size > 0
+                        else entry_price - 1.5 * self.signal_atr
+                    )
+
+                    if self.position.size > 0:
+                        tp_order = self.sell(
+                            size=size,
+                            exectype=bt.Order.Limit,
+                            price=take_profit,
+                        )
+                        sl_order = self.sell(
+                            size=size,
+                            exectype=bt.Order.Stop,
+                            price=self.signal_stop,
+                            oco=tp_order,
+                        )
+                    else:
+                        tp_order = self.buy(
+                            size=size,
+                            exectype=bt.Order.Limit,
+                            price=take_profit,
+                        )
+                        sl_order = self.buy(
+                            size=size,
+                            exectype=bt.Order.Stop,
+                            price=self.signal_stop,
+                            oco=tp_order,
+                        )
+
+                    self.exit_orders = [tp_order, sl_order]
+
+            if order in self.exit_orders and order.status == order.Completed:
+                self.exit_orders = []
+                self.entry_bar = None
+
+    def next(self):
+        current_time = self.data.datetime.time(0)
+        session_time = (current_time.hour, current_time.minute)
+
+        if self.pending_order is not None:
+            return
+
+        if self.position:
+            if self.entry_bar is not None and len(self) > self.entry_bar:
+                for order in self.exit_orders:
+                    self.cancel(order)
+                self.exit_orders = []
+                self.pending_order = self.close()
+                self.entry_bar = None
+            return
+
+        if not ((9, 30) <= session_time <= (16, 0)):
+            return
+
+        candle_range = self.data.high[0] - self.data.low[0]
+        close = self.data.close[0]
+        open_price = self.data.open[0]
+        atr = self.atr[0]
+
+        if atr / close < self.p.atr_volatility_threshold:
+            return
+
+        volume_spike = self.data.volume[0] >= 1.2 * self.volume_sma[0]
+        risk_per_share = abs(close - open_price)
+        risk_capital = self.broker.getvalue() * 0.01
+        size = risk_capital / risk_per_share
+
+        if (
+            close > open_price
+            and self.rsi[0] > 50
+            and volume_spike
+            and candle_range >= atr
+        ):
+            self.signal_stop = open_price
+            self.signal_atr = atr
+            self.entry_order = self.buy(size=size)
+            self.pending_order = self.entry_order
+
+        elif (
+            close < open_price
+            and self.rsi[0] < 50
+            and volume_spike
+            and candle_range >= atr
+        ):
+            self.signal_stop = open_price
+            self.signal_atr = atr
+            self.entry_order = self.sell(size=size)
+            self.pending_order = self.entry_order
+```
+
+```json
+{"assumptions":[{"topic":"risk-sizing entry estimate","choice":"Size is calculated from 1% of current broker equity divided by the absolute difference between the signal candle close and its open.","reason":"The actual next-bar market fill is not known when the entry order is submitted; the signal candle close is the closest available prospective entry price."},{"topic":"take-profit price","choice":"Take-profit is submitted after the entry order completes, using its actual execution price plus or minus 1.5 ATR(14).","reason":"The specification defines take-profit from the entry price."},{"topic":"infeasible","choice":"If TP/SL does not trigger, the strategy submits a market close order on the first strategy cycle after the entry bar and cancels outstanding TP/SL orders.","reason":"With standard Backtrader next-bar market execution and no cheat-on-close configuration supplied by the harness, an order cannot be submitted and filled at the close of the same bar in which the entry fills at the open."},{"topic":"session timezone","choice":"Session filtering uses the time supplied by the data feed and includes bars from 09:30 through 16:00 inclusive.","reason":"The feed is specified in exchange time and no separate timezone conversion is available or required."}]}
+```

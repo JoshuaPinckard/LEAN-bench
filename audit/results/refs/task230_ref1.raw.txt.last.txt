@@ -1,0 +1,199 @@
+```python
+import backtrader as bt
+
+
+class WeeklyMACDCrossoverMomentum(bt.Strategy):
+    params = (
+        ('fast_period', 12),
+        ('slow_period', 26),
+        ('signal_period', 9),
+        ('trend_period', 50),
+        ('atr_period', 14),
+        ('volume_period', 50),
+        ('volume_multiplier', 1.3),
+        ('atr_close_limit', 0.04),
+        ('stop_loss', 0.08),
+        ('take_profit', 0.20),
+        ('time_stop_weeks', 6),
+        ('stake', 1),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.entry_week_index = None
+        self.completed_weeks = 0
+
+        self._week_key = None
+        self._week_bar = None
+        self._closes = []
+        self._volumes = []
+        self._macds = []
+        self._fast_ema = None
+        self._slow_ema = None
+        self._signal_ema = None
+        self._previous_week_close = None
+        self._atr = None
+        self._true_ranges = []
+        self._last_nonzero_macd_difference = None
+
+    def _start_week(self, dt, key):
+        price = float(self.data.close[0])
+        self._week_key = key
+        self._week_bar = {
+            'date': dt.date(),
+            'open': float(self.data.open[0]),
+            'high': float(self.data.high[0]),
+            'low': float(self.data.low[0]),
+            'close': price,
+            'volume': float(self.data.volume[0]),
+        }
+
+    def _update_week(self, dt):
+        self._week_bar['date'] = dt.date()
+        self._week_bar['high'] = max(self._week_bar['high'], float(self.data.high[0]))
+        self._week_bar['low'] = min(self._week_bar['low'], float(self.data.low[0]))
+        self._week_bar['close'] = float(self.data.close[0])
+        self._week_bar['volume'] += float(self.data.volume[0])
+
+    def _update_ema(self, values, period, current):
+        if len(values) < period:
+            return None
+        if len(values) == period:
+            return sum(values[-period:]) / period
+        previous = self._fast_ema if period == self.p.fast_period else self._slow_ema
+        return previous + (current - previous) * (2.0 / (period + 1.0))
+
+    def _complete_week(self):
+        bar = self._week_bar
+        self._week_bar = None
+        self._week_key = None
+        self.completed_weeks += 1
+
+        close = bar['close']
+        volume = bar['volume']
+        self._closes.append(close)
+        self._volumes.append(volume)
+
+        if self._previous_week_close is not None:
+            true_range = max(
+                bar['high'] - bar['low'],
+                abs(bar['high'] - self._previous_week_close),
+                abs(bar['low'] - self._previous_week_close),
+            )
+            self._true_ranges.append(true_range)
+            if len(self._true_ranges) == self.p.atr_period:
+                self._atr = sum(self._true_ranges[-self.p.atr_period:]) / self.p.atr_period
+            elif len(self._true_ranges) > self.p.atr_period:
+                self._atr = (
+                    (self._atr * (self.p.atr_period - 1)) + true_range
+                ) / self.p.atr_period
+        self._previous_week_close = close
+
+        if len(self._closes) >= self.p.fast_period:
+            if len(self._closes) == self.p.fast_period:
+                self._fast_ema = sum(self._closes[-self.p.fast_period:]) / self.p.fast_period
+            else:
+                self._fast_ema += (close - self._fast_ema) * (
+                    2.0 / (self.p.fast_period + 1.0)
+                )
+
+        if len(self._closes) >= self.p.slow_period:
+            if len(self._closes) == self.p.slow_period:
+                self._slow_ema = sum(self._closes[-self.p.slow_period:]) / self.p.slow_period
+            else:
+                self._slow_ema += (close - self._slow_ema) * (
+                    2.0 / (self.p.slow_period + 1.0)
+                )
+
+        crossover = 0
+        if self._fast_ema is not None and self._slow_ema is not None:
+            macd = self._fast_ema - self._slow_ema
+            self._macds.append(macd)
+
+            if len(self._macds) == self.p.signal_period:
+                self._signal_ema = sum(self._macds[-self.p.signal_period:]) / self.p.signal_period
+            elif len(self._macds) > self.p.signal_period:
+                self._signal_ema += (macd - self._signal_ema) * (
+                    2.0 / (self.p.signal_period + 1.0)
+                )
+
+            if self._signal_ema is not None:
+                difference = macd - self._signal_ema
+                if difference > 0 and self._last_nonzero_macd_difference is not None:
+                    if self._last_nonzero_macd_difference < 0:
+                        crossover = 1
+                elif difference < 0 and self._last_nonzero_macd_difference is not None:
+                    if self._last_nonzero_macd_difference > 0:
+                        crossover = -1
+
+                if difference != 0:
+                    self._last_nonzero_macd_difference = difference
+
+        if self.order:
+            return
+
+        if self.position:
+            stop_loss_hit = close <= self.entry_price * (1.0 - self.p.stop_loss)
+            take_profit_hit = close >= self.entry_price * (1.0 + self.p.take_profit)
+            time_stop_hit = (
+                self.entry_week_index is not None
+                and self.completed_weeks - self.entry_week_index >= self.p.time_stop_weeks
+            )
+
+            if crossover < 0 or stop_loss_hit or take_profit_hit or time_stop_hit:
+                self.order = self.close()
+            return
+
+        if (
+            crossover > 0
+            and len(self._closes) >= self.p.trend_period
+            and len(self._volumes) >= self.p.volume_period
+            and self._atr is not None
+        ):
+            trend_sma = sum(self._closes[-self.p.trend_period:]) / self.p.trend_period
+            volume_sma = sum(self._volumes[-self.p.volume_period:]) / self.p.volume_period
+
+            if (
+                close > trend_sma
+                and volume > self.p.volume_multiplier * volume_sma
+                and self._atr / close < self.p.atr_close_limit
+            ):
+                self.order = self.buy(size=self.p.stake)
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        iso = dt.isocalendar()
+        week_key = (iso.year, iso.week)
+
+        if self._week_bar is None:
+            self._start_week(dt, week_key)
+        elif week_key != self._week_key:
+            self._complete_week()
+            self._start_week(dt, week_key)
+        else:
+            self._update_week(dt)
+
+        if dt.weekday() == 4 and self._week_bar is not None:
+            self._complete_week()
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order.status == order.Completed:
+                if order.isbuy():
+                    self.entry_price = order.executed.price
+                    self.entry_week_index = self.completed_weeks
+                elif not self.position:
+                    self.entry_price = None
+                    self.entry_week_index = None
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"weekly aggregation","choice":"Weekly OHLCV bars are manually aggregated from the single daily feed; volume is summed, open is the first daily open, high/low are weekly extrema, and close is the final trading close.","reason":"The harness supplies only one daily data feed and strategy code cannot add a Cerebro resampled feed."},{"topic":"holiday-shortened weeks","choice":"A week is completed on Friday when available; if no Friday bar exists, it is completed when the next ISO week begins.","reason":"This preserves the final available trading bar as the weekly close."},{"topic":"order timing","choice":"Orders are submitted when the weekly close becomes known and use Backtrader's normal order execution behavior.","reason":"Without harness-controlled cheat-on-close, a strategy cannot guarantee execution at the already-observed weekly closing price."},{"topic":"stop evaluation","choice":"The percentage stop-loss and take-profit thresholds are evaluated using each completed weekly close.","reason":"The strategy specification defines a weekly-timeframe strategy and does not specify intrabar stop orders or daily monitoring."},{"topic":"time stop","choice":"The six-week holding period is measured as six completed weekly bars after the entry order is filled.","reason":"The specification states a time stop after six weeks but does not define a different calendar-day convention."}]} 
+```

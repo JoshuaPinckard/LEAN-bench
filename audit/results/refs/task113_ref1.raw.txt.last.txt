@@ -1,0 +1,91 @@
+```python
+# complete strategy class
+import backtrader as bt
+import math
+
+
+class PortfolioOptimizationWithCosts(bt.Strategy):
+    params = (
+        ("lookback", 252),
+        ("risk_aversion", 1.0),
+        ("impact_coefficient", 0.001),
+        ("optimization_steps", 10000),
+    )
+
+    def __init__(self):
+        self.pending_order = None
+        self.addminperiod(self.p.lookback + 1)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_order = None
+
+    def _current_weight(self):
+        value = self.broker.getvalue()
+        if value <= 0:
+            return 0.0
+        return max(0.0, self.position.size * self.data.close[0] / value)
+
+    def _objective(self, weight, current_weight, expected_return, covariance):
+        impact_cost = self.p.impact_coefficient * abs(weight - current_weight) ** 1.5
+        return (
+            (expected_return - impact_cost) * weight
+            - self.p.risk_aversion * covariance * weight * weight
+            - self.p.impact_coefficient * abs(weight) ** 1.5
+        )
+
+    def next(self):
+        if self.pending_order is not None:
+            return
+
+        volume = self.data.volume[0]
+        if not math.isfinite(volume) or volume <= 0:
+            target_weight = 0.0
+        else:
+            returns = []
+            for offset in range(self.p.lookback):
+                previous_close = self.data.close[-offset - 1]
+                current_close = self.data.close[-offset]
+                if previous_close > 0:
+                    returns.append(current_close / previous_close - 1.0)
+
+            if len(returns) < 2:
+                return
+
+            mean_daily_return = sum(returns) / len(returns)
+            expected_return = mean_daily_return * self.p.lookback
+            covariance = (
+                sum((item - mean_daily_return) ** 2 for item in returns)
+                / (len(returns) - 1)
+                * self.p.lookback
+            )
+
+            current_weight = min(1.0, self._current_weight())
+            target_weight = current_weight
+            best_value = self._objective(
+                target_weight, current_weight, expected_return, covariance
+            )
+
+            for step in range(self.p.optimization_steps + 1):
+                weight = step / self.p.optimization_steps
+                value = self._objective(
+                    weight, current_weight, expected_return, covariance
+                )
+                if value > best_value:
+                    best_value = value
+                    target_weight = weight
+
+        if abs(target_weight - self._current_weight()) > 0:
+            self.pending_order = self.order_target_percent(
+                target=target_weight
+            )
+```
+
+```json
+{"assumptions":[{"topic":"expected return and covariance","choice":"Use 252 daily close-to-close returns; expected return is their annualized arithmetic mean and covariance is their annualized sample variance.","reason":"The single available asset and daily feed make the return vector and covariance matrix scalar; the specification gives a one-year reinvestment period as its example."},{"topic":"factor model","choice":"Use historical covariance rather than a factor model.","reason":"No factor exposures, factor returns, or multiple assets are available."},{"topic":"impact costs","choice":"Set I(t) = Θ|w-w0|^(3/2), retaining the separate -Θ|w|^(3/2) term exactly present in the stated objective.","reason":"This is the closest literal scalar implementation of the specified trading-volume impact relationship and optimization expression."},{"topic":"parameters","choice":"Use λ=1.0 and Θ=0.001, exposed as strategy parameters.","reason":"The specification requires both coefficients but supplies no numerical values; 0.001 aligns Θ with the stated commission scale without changing the separate commission configured by the harness."},{"topic":"constraints","choice":"Constrain the sole asset weight to 0≤w≤1.","reason":"The environment has one asset and canonical conventions require long-only, non-pyramiding behavior; no specific maximum weight, sector, or turnover bounds were supplied."},{"topic":"optimization","choice":"Numerically maximize the stated objective over 10,001 equally spaced feasible weights each day, retaining w0 as an explicit candidate.","reason":"No optimization library is permitted and the objective contains fractional absolute-value terms; including w0 implements dynamic no-trade selection when costs outweigh benefit."},{"topic":"rebalancing","choice":"Rebalance on every daily iteration with order_target_percent.","reason":"The specification permits daily rebalancing and requires trades to move toward the newly calculated target weights."},{"topic":"liquidity filter","choice":"Treat non-positive or non-finite daily Volume as insufficient liquidity and target zero weight; otherwise retain the asset.","reason":"The specification requires a liquidity filter but provides no liquidity threshold, and OHLCV is the only available liquidity information."}]}
+```

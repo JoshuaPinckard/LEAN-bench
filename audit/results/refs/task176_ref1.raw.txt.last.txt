@@ -1,0 +1,282 @@
+```python
+import backtrader as bt
+import math
+
+
+class SyntheticWheel(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_devfactor', 2),
+        ('atr_period', 14),
+        ('ema_fast_period', 50),
+        ('ema_slow_period', 200),
+        ('rsi_period', 14),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor,
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema50 = bt.indicators.EMA(
+            self.data.close, period=self.p.ema_fast_period
+        )
+        self.ema200 = bt.indicators.EMA(
+            self.data.close, period=self.p.ema_slow_period
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+
+        self.buy_order = None
+        self.sell_order = None
+        self.exit_order = None
+
+        self.last_buy_limit_bar = None
+        self.sell_submitted_bar = None
+        self.sell_replacement_requested = False
+        self.protective_exit_requested = False
+
+        self.tranche_count = 0
+        self.breakeven_price = None
+        self.current_cycle = None
+        self.cycles = []
+
+    def _date(self):
+        return self.data.datetime.date(0).isoformat()
+
+    def _portfolio_value(self):
+        return self.broker.getvalue()
+
+    def _buy_limit(self):
+        return min(float(self.bb.bot[0]), float(self.data.close[0]) * 0.93)
+
+    def _buy_size(self, buy_limit):
+        portfolio_value = self._portfolio_value()
+        tranche_value = portfolio_value * 0.03
+        remaining_value = max(
+            0.0,
+            portfolio_value * 0.09 - (self.position.size * buy_limit),
+        )
+        allowed_value = min(tranche_value, remaining_value)
+        return int(math.floor(allowed_value / buy_limit))
+
+    def _record_buy_fill(self, order):
+        if self.current_cycle is None:
+            self.current_cycle = {
+                'buy_date': self._date(),
+                'buy_limit_price': order.info.limit_price,
+                'limit_sell_date': None,
+                'limit_sell_price': None,
+                'realized_profit': 0.0,
+                'tranches': 0,
+                'current_average_price': 0.0,
+                'cash_flow': 0.0,
+            }
+
+        self.current_cycle['cash_flow'] -= (
+            order.executed.value + order.executed.comm
+        )
+        self.tranche_count += 1
+        self.current_cycle['tranches'] = self.tranche_count
+        self.current_cycle['current_average_price'] = self.position.price
+        self.breakeven_price = self.position.price
+
+    def _record_sell_fill(self, order):
+        if self.current_cycle is not None:
+            self.current_cycle['cash_flow'] += (
+                order.executed.value - order.executed.comm
+            )
+
+    def _submit_sell(self, sell_limit):
+        if (
+            self.position.size <= 0
+            or self.sell_order is not None
+            or self.exit_order is not None
+        ):
+            return
+
+        self.sell_order = self.sell(
+            exectype=bt.Order.Limit,
+            price=sell_limit,
+        )
+        self.sell_order.addinfo(limit_price=sell_limit)
+        self.sell_submitted_bar = len(self)
+        self.sell_replacement_requested = False
+
+        if self.current_cycle is not None:
+            self.current_cycle['limit_sell_date'] = self._date()
+            self.current_cycle['limit_sell_price'] = sell_limit
+
+    def _set_or_replace_sell(self):
+        if self.position.size <= 0 or self.protective_exit_requested:
+            return
+
+        sell_limit = max(float(self.bb.top[0]), self.position.price * 1.07)
+        if self.sell_order is not None:
+            self.sell_replacement_requested = True
+            self.cancel(self.sell_order)
+        else:
+            self._submit_sell(sell_limit)
+
+    def _finish_cycle(self, exit_order):
+        if self.current_cycle is None:
+            return
+
+        self._record_sell_fill(exit_order)
+        self.current_cycle['realized_profit'] = self.current_cycle['cash_flow']
+        self.current_cycle['current_average_price'] = self.position.price
+        self.current_cycle['exit_date'] = self._date()
+        self.current_cycle['exit_price'] = exit_order.executed.price
+        del self.current_cycle['cash_flow']
+        self.cycles.append(self.current_cycle)
+
+        self.current_cycle = None
+        self.tranche_count = 0
+        self.breakeven_price = None
+        self.sell_submitted_bar = None
+        self.sell_replacement_requested = False
+        self.protective_exit_requested = False
+
+    def _request_protective_exit(self):
+        if self.protective_exit_requested or self.exit_order is not None:
+            return
+
+        self.protective_exit_requested = True
+        self.sell_replacement_requested = False
+
+        if self.buy_order is not None:
+            self.cancel(self.buy_order)
+
+        if self.sell_order is not None:
+            self.cancel(self.sell_order)
+        else:
+            self.exit_order = self.close()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.buy_order:
+            if order.status == order.Completed:
+                self.buy_order = None
+                self._record_buy_fill(order)
+                self._set_or_replace_sell()
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+                order.Expired,
+            ):
+                self.buy_order = None
+
+        elif order is self.sell_order:
+            if order.status == order.Completed:
+                self.sell_order = None
+                self._finish_cycle(order)
+                if self.buy_order is not None:
+                    self.cancel(self.buy_order)
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+                order.Expired,
+            ):
+                self.sell_order = None
+                if self.protective_exit_requested and self.position.size > 0:
+                    self.exit_order = self.close()
+                elif self.sell_replacement_requested and self.position.size > 0:
+                    self._submit_sell(
+                        max(float(self.bb.top[0]), self.position.price * 1.07)
+                    )
+
+        elif order is self.exit_order:
+            if order.status == order.Completed:
+                self.exit_order = None
+                self._finish_cycle(order)
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+                order.Expired,
+            ):
+                self.exit_order = None
+                if self.protective_exit_requested and self.position.size > 0:
+                    self.exit_order = self.close()
+
+    def next(self):
+        close = float(self.data.close[0])
+
+        if self.position.size > 0:
+            protective_exit = (
+                close < float(self.ema200[0]) * 0.9
+                or close <= self.position.price - 4.0 * float(self.atr[0])
+            )
+            if protective_exit:
+                self._request_protective_exit()
+                return
+
+            if (
+                self.sell_order is not None
+                and self.sell_submitted_bar is not None
+                and len(self) - self.sell_submitted_bar >= 20
+            ):
+                self._set_or_replace_sell()
+
+            if (
+                self.buy_order is None
+                and self.tranche_count < 3
+                and close <= self.position.price - 1.5 * float(self.atr[0])
+                and float(self.rsi[0]) < 35.0
+            ):
+                buy_limit = self._buy_limit()
+                size = self._buy_size(buy_limit)
+                if size > 0:
+                    self.buy_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=buy_limit,
+                    )
+                    self.buy_order.addinfo(kind='add', limit_price=buy_limit)
+
+            if self.position.size > 0:
+                self.breakeven_price = self.position.price
+            return
+
+        if (
+            self.buy_order is not None
+            or self.sell_order is not None
+            or self.exit_order is not None
+        ):
+            return
+
+        volatility_high = (
+            (float(self.bb.top[0]) - float(self.bb.bot[0]))
+            / float(self.bb.mid[0]) > 0.06
+            or float(self.atr[0]) / close > 0.03
+        )
+        filters_met = (
+            1.0 <= close <= 15.0
+            and volatility_high
+            and float(self.ema50[0]) >= float(self.ema200[0])
+        )
+        cadence_met = (
+            self.last_buy_limit_bar is None
+            or len(self) - self.last_buy_limit_bar >= 20
+        )
+
+        if filters_met and cadence_met:
+            buy_limit = self._buy_limit()
+            size = self._buy_size(buy_limit)
+            if size > 0:
+                self.buy_order = self.buy(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=buy_limit,
+                )
+                self.buy_order.addinfo(kind='entry', limit_price=buy_limit)
+                self.last_buy_limit_bar = len(self)
+```
+
+```json
+{"assumptions":[{"topic":"20-bar cadence","choice":"A bar-index interval is measured from each limit-buy submission and from each covered-call limit-sell submission.","reason":"The specification does not define a calendar-based monthly schedule."},{"topic":"tranche order price","choice":"Averaging tranches use a limit buy at the current BuyLim = min(lowerBB, Close*0.93).","reason":"The specification says to add using the same sizing rule but does not explicitly state the add order price; this is the closest literal reuse of the entry surrogate."},{"topic":"share quantity","choice":"Size is floored to whole shares after applying the 3% tranche cap and remaining 9% exposure cap at the order's limit price.","reason":"Whole-share sizing ensures BuyLim * size never exceeds either stated portfolio allocation limit."},{"topic":"portfolio value","choice":"Portfolio allocation limits use broker.getvalue() at limit-order submission.","reason":"The specification refers to portfolio percentage without specifying a valuation instant."},{"topic":"order replacement","choice":"A sell replacement is submitted after Backtrader confirms cancellation of the existing sell order.","reason":"Backtrader cannot safely replace a live order atomically."},{"topic":"partial profit-taking","choice":"No discretionary partial-profit order is created; breakeven is retained as the position average price while a position remains open.","reason":"The specification describes the accounting effect of partial profit-taking but supplies no partial-exit size or trigger; the stated limit sell closes the position under the canonical close-position convention."},{"topic":"cycle records","choice":"cycles stores submitted limit prices/dates, net realized profit including commissions, tranche count, and average price at the final exit.","reason":"The specification requires these fields but does not prescribe a record schema or whether realized profit is gross or net."}]}

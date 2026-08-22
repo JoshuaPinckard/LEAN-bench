@@ -1,0 +1,229 @@
+```python
+import backtrader as bt
+
+
+class InverseHeadShouldersRSIDivergenceStrategy(bt.Strategy):
+    def __init__(self):
+        self.order = None
+        self.stop_price = None
+        self.target_price = None
+
+        self.daily_pivots = []
+        self.weekly_bars = []
+        self.weekly_lows = []
+        self.weekly_positive_divergence = False
+
+        self.week_key = None
+        self.week_low = None
+        self.week_close = None
+        self.week_gains = []
+        self.week_losses = []
+        self.avg_gain = None
+        self.avg_loss = None
+
+        self.month_key = None
+        self.month_close = None
+        self.completed_month_closes = []
+        self.monthly_bullish = False
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy():
+                if self.stop_price is not None:
+                    self.target_price = order.executed.price + 2.0 * (
+                        order.executed.price - self.stop_price
+                    )
+            else:
+                self.stop_price = None
+                self.target_price = None
+            self.order = None
+
+        elif order.status in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        ):
+            self.order = None
+
+    def _finish_week(self):
+        weekly = {"low": self.week_low, "close": self.week_close, "rsi": None}
+
+        if self.weekly_bars:
+            change = weekly["close"] - self.weekly_bars[-1]["close"]
+            gain = max(change, 0.0)
+            loss = max(-change, 0.0)
+            self.week_gains.append(gain)
+            self.week_losses.append(loss)
+
+            if len(self.week_gains) == 14:
+                self.avg_gain = sum(self.week_gains) / 14.0
+                self.avg_loss = sum(self.week_losses) / 14.0
+            elif len(self.week_gains) > 14:
+                self.avg_gain = ((self.avg_gain * 13.0) + gain) / 14.0
+                self.avg_loss = ((self.avg_loss * 13.0) + loss) / 14.0
+
+            if len(self.week_gains) >= 14:
+                if self.avg_loss == 0.0:
+                    weekly["rsi"] = 100.0
+                else:
+                    rs = self.avg_gain / self.avg_loss
+                    weekly["rsi"] = 100.0 - (100.0 / (1.0 + rs))
+
+        self.weekly_bars.append(weekly)
+
+        if len(self.weekly_bars) >= 3:
+            left = self.weekly_bars[-3]
+            candidate = self.weekly_bars[-2]
+            right = self.weekly_bars[-1]
+
+            if (
+                candidate["rsi"] is not None
+                and left["low"] > candidate["low"]
+                and right["low"] >= candidate["low"]
+            ):
+                self.weekly_lows.append(candidate)
+
+                if len(self.weekly_lows) >= 2:
+                    previous = self.weekly_lows[-2]
+                    latest = self.weekly_lows[-1]
+                    self.weekly_positive_divergence = (
+                        latest["low"] < previous["low"]
+                        and latest["rsi"] > previous["rsi"]
+                    )
+
+    def _update_higher_timeframes(self):
+        current_date = self.data.datetime.date(0)
+        iso_week = current_date.isocalendar()
+        new_week_key = (iso_week[0], iso_week[1])
+        new_month_key = (current_date.year, current_date.month)
+
+        if self.week_key is None:
+            self.week_key = new_week_key
+            self.week_low = self.data.low[0]
+            self.week_close = self.data.close[0]
+        elif new_week_key != self.week_key:
+            self._finish_week()
+            self.week_key = new_week_key
+            self.week_low = self.data.low[0]
+            self.week_close = self.data.close[0]
+        else:
+            self.week_low = min(self.week_low, self.data.low[0])
+            self.week_close = self.data.close[0]
+
+        if self.month_key is None:
+            self.month_key = new_month_key
+            self.month_close = self.data.close[0]
+        elif new_month_key != self.month_key:
+            self.completed_month_closes.append(self.month_close)
+            if len(self.completed_month_closes) >= 2:
+                self.monthly_bullish = (
+                    self.completed_month_closes[-1]
+                    > self.completed_month_closes[-2]
+                )
+            self.month_key = new_month_key
+            self.month_close = self.data.close[0]
+        else:
+            self.month_close = self.data.close[0]
+
+    def _record_daily_pivots(self):
+        if len(self) < 5:
+            return
+
+        pivot_index = len(self) - 3
+        if (
+            self.data.low[-2] < self.data.low[-3]
+            and self.data.low[-2] < self.data.low[-1]
+        ):
+            self.daily_pivots.append(("low", pivot_index, self.data.low[-2]))
+
+        if (
+            self.data.high[-2] > self.data.high[-3]
+            and self.data.high[-2] > self.data.high[-1]
+        ):
+            self.daily_pivots.append(("high", pivot_index, self.data.high[-2]))
+
+    def _inverse_head_shoulders_stop(self):
+        if len(self.daily_pivots) < 5 or len(self) < 2:
+            return None
+
+        pattern = self.daily_pivots[-5:]
+        kinds = [item[0] for item in pattern]
+        if kinds != ["low", "high", "low", "high", "low"]:
+            return None
+
+        left_shoulder, first_neck, head, second_neck, right_shoulder = pattern
+        if not (
+            head[2] < left_shoulder[2]
+            and head[2] < right_shoulder[2]
+        ):
+            return None
+
+        neck_slope = (second_neck[2] - first_neck[2]) / (
+            second_neck[1] - first_neck[1]
+        )
+        current_index = len(self) - 1
+        previous_index = current_index - 1
+        current_neckline = first_neck[2] + neck_slope * (
+            current_index - first_neck[1]
+        )
+        previous_neckline = first_neck[2] + neck_slope * (
+            previous_index - first_neck[1]
+        )
+
+        if (
+            self.data.close[-1] <= previous_neckline
+            and self.data.close[0] > current_neckline
+        ):
+            return right_shoulder[2]
+
+        return None
+
+    def next(self):
+        self._update_higher_timeframes()
+        self._record_daily_pivots()
+
+        if self.order:
+            return
+
+        if self.position:
+            if (
+                self.stop_price is not None
+                and self.data.low[0] <= self.stop_price
+            ):
+                self.order = self.close()
+            elif (
+                self.target_price is not None
+                and self.data.high[0] >= self.target_price
+            ):
+                self.order = self.close()
+            return
+
+        stop = self._inverse_head_shoulders_stop()
+        if (
+            stop is None
+            or not self.weekly_positive_divergence
+            or not self.monthly_bullish
+            or stop >= self.data.close[0]
+        ):
+            return
+
+        capital = self.broker.getvalue()
+        risk_per_share = self.data.close[0] - stop
+        risk_limited_size = int((capital * 0.01) / risk_per_share)
+
+        commission = self.broker.getcommissioninfo(self.data).p.commission
+        affordable_size = int(
+            self.broker.getcash() / (self.data.close[0] * (1.0 + commission))
+        )
+        size = min(risk_limited_size, affordable_size)
+
+        if size > 0:
+            self.stop_price = stop
+            self.target_price = None
+            self.order = self.buy(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"head_and_shoulders_detection","choice":"A daily inverse Head and Shoulders is defined as five most-recent confirmed daily pivots ordered low-high-low-high-low, with the head lower than both shoulders. A pivot is confirmed when its high or low is respectively above or below the highs or lows of the adjacent daily bars.","reason":"The specification requires visual candle-based identification but provides no numerical pattern-recognition definition."},{"topic":"neckline_break","choice":"The neckline is the straight line through the two intervening high pivots; completion requires the daily close to cross from at-or-below the neckline to above it.","reason":"The specification states that price breaks the neckline upward but does not define the neckline geometry or breakout price field."},{"topic":"weekly_rsi_divergence","choice":"Weekly bars are constructed from the supplied daily feed. RSI uses Wilder's 14-period calculation on weekly closes. Positive divergence is identified from the two latest confirmed weekly low pivots: the latest low is lower and its RSI is higher.","reason":"The harness supplies only a daily feed, and the specification does not define weekly swing-low recognition."},{"topic":"monthly_trend","choice":"The higher-timeframe trend is bullish when the latest completed monthly close is above the preceding completed monthly close.","reason":"The specification requires a bullish monthly trend but does not define its measurement."},{"topic":"risk_sizing","choice":"Position size is the largest whole-share amount whose entry-price-to-stop loss is at most 1% of current broker equity, capped by available cash including commission.","reason":"The allowed loss range is 1-2%; 1% is selected as a concrete value within that stated range."},{"topic":"exit_execution","choice":"Stop-loss and take-profit triggers are checked against each daily bar's low and high and submit self.close(); if both are reached in one bar, the stop-loss has precedence.","reason":"The canonical convention defines exits as self.close(), while daily OHLC data cannot determine intrabar trigger order."}]}
+```

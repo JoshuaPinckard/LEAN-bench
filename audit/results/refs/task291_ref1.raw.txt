@@ -2,103 +2,83 @@
 import backtrader as bt
 
 
-class BreakoutRetestStrategy(bt.Strategy):
+class BreakoutRetest(bt.Strategy):
     params = (
-        ('ema_period', 10),          # 10-day EMA (support after breakout)
-        ('breakout_period', 50),     # highest high over last 50 days
-        ('retest_window', 5),        # retest must occur within 5 days
-        ('vol_period', 50),          # average daily volume over last 50 days
-        ('atr_period', 14),          # ATR over 14 days (volatility filter)
-        ('take_profit', 0.10),       # 10% take-profit from entry
-        ('capital_pct', 0.02),       # 2% of total capital per trade
+        ("ema_period", 10),
+        ("breakout_period", 50),
+        ("retest_days", 5),
+        ("atr_period", 14),
+        ("take_profit", 0.10),
+        ("risk_fraction", 0.02),
     )
 
     def __init__(self):
-        # 10-day Exponential Moving Average -> support/stop reference
         self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
-
-        # Breakout level: highest HIGH over the last 50 days PRIOR to current day.
-        # high(-1) excludes the current bar from the 50-day lookback.
         self.breakout_level = bt.indicators.Highest(
-            self.data.high(-1), period=self.p.breakout_period)
-
-        # Average daily volume over the last 50 days (demand confirmation).
-        self.vol_avg = bt.indicators.SMA(
-            self.data.volume, period=self.p.vol_period)
-
-        # ATR(14): named by the volatility filter (see assumptions: no market avg).
+            self.data.high(-1), period=self.p.breakout_period
+        )
+        self.volume_average = bt.indicators.SMA(
+            self.data.volume, period=self.p.breakout_period
+        )
         self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
 
         self.order = None
-        self.watching = False          # inside a post-breakout retest window
-        self.days_since_breakout = 0
+        self.breakout_bars = []
         self.entry_price = None
-        self.stop_level = None         # 10-day EMA at time of entry
+        self.entry_ema_stop = None
 
     def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
-            return
-        if order.status == order.Completed and order.isbuy():
-            self.entry_price = order.executed.price
-        if order.status in (order.Completed, order.Canceled,
-                            order.Margin, order.Rejected):
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.entry_ema_stop = self.ema[0]
+            else:
+                self.entry_price = None
+                self.entry_ema_stop = None
+            self.order = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
             self.order = None
 
     def next(self):
         if self.order:
             return
 
-        # ---- Manage an open position (exits) ----
         if self.position:
-            # Exit 1 - Stop-loss: close below the 10-day EMA (level fixed at entry)
-            if self.data.close[0] < self.stop_level:
+            take_profit_price = self.entry_price * (1.0 + self.p.take_profit)
+
+            if (
+                self.data.close[0] < self.ema[0]
+                or self.data.close[0] < self.entry_ema_stop
+                or self.data.close[0] >= take_profit_price
+            ):
                 self.order = self.close()
-                return
-            # Exit 2 - Take-profit: reaching +10% from the entry price
-            if self.data.high[0] >= self.entry_price * (1.0 + self.p.take_profit):
-                self.order = self.close()
-                return
             return
 
-        # ---- Flat: process an active retest window ----
-        if self.watching:
-            self.days_since_breakout += 1
-            # Retest: pull back to (touch) the 10-day EMA but not close below it,
-            # with volume above the 50-day average (demand confirmation).
-            pulled_back = self.data.low[0] <= self.ema[0]
-            not_below = self.data.close[0] >= self.ema[0]
-            volume_ok = self.data.volume[0] > self.vol_avg[0]
-            if pulled_back and not_below and volume_ok:
-                value = self.broker.getvalue()
-                size = (value * self.p.capital_pct) / self.data.close[0]
-                self.stop_level = self.ema[0]      # stop = EMA at time of entry
-                self.order = self.buy(size=size)
-                self.watching = False
-                return
-            # Window elapsed without a valid retest -> abandon the setup.
-            if self.days_since_breakout >= self.p.retest_window:
-                self.watching = False
-            if self.watching:
-                return
+        current_bar = len(self)
+        self.breakout_bars = [
+            bar for bar in self.breakout_bars
+            if current_bar - bar <= self.p.retest_days
+        ]
 
-        # ---- Look for a new breakout ----
-        # Breakout: today's close exceeds the 50-day breakout level.
+        is_retest = (
+            bool(self.breakout_bars)
+            and self.data.low[0] <= self.ema[0]
+            and self.data.close[0] >= self.ema[0]
+            and self.data.volume[0] > self.volume_average[0]
+        )
+
+        if is_retest:
+            capital_at_risk = self.broker.getvalue() * self.p.risk_fraction
+            size = capital_at_risk / self.data.close[0]
+            self.order = self.buy(size=size)
+            self.breakout_bars = []
+            return
+
         if self.data.close[0] > self.breakout_level[0]:
-            self.watching = True
-            self.days_since_breakout = 0
+            self.breakout_bars.append(current_bar)
 ```
+
 ```json
-{"assumptions": [
-  {"topic": "sector filter", "choice": "Not enforced programmatically; treated as a universe pre-filter that AAPL (a technology stock) satisfies.", "reason": "infeasible: the single OHLCV feed carries no sector or cybersecurity/AI sub-industry metadata, so the filter cannot be evaluated in this environment."},
-  {"topic": "volatility filter", "choice": "ATR(14) is computed but not used to gate entries; no filtering applied.", "reason": "infeasible: 'ATR above the market average' requires a cross-sectional average across many stocks, which is unavailable with one asset feed."},
-  {"topic": "breakout level", "choice": "Highest HIGH over the 50 days strictly prior to the current bar via Highest(high(-1), 50); breakout = close > that level.", "reason": "Spec says 'highest price over the last 50 trading days prior to the current day'; interpreted 'price' as the daily high and excluded the current bar."},
-  {"topic": "retest condition", "choice": "Retest day = low <= EMA (price pulls back to/touches the EMA) AND close >= EMA (does not close below), plus volume > 50-day average.", "reason": "Operationalizes 'pull back to the 10-day EMA but must not close below it' and 'touches or closes near the EMA' with volume confirmation into checkable OHLCV conditions."},
-  {"topic": "volume average", "choice": "SMA of volume over 50 days including the current bar; retest-day volume compared against it.", "reason": "Spec's 'average daily volume over the last 50 days' with no exclusion stated; standard SMA reading."},
-  {"topic": "stop-loss level", "choice": "Fixed at the 10-day EMA value captured at entry; position closed when close < that level.", "reason": "Reconciles exit rule ('close if price closes below the 10-day EMA') with risk-management rule ('stop set at the level of the 10-day EMA at the time of entry'), honoring the more specific entry-time level."},
-  {"topic": "take-profit trigger", "choice": "Fires when the day's high reaches entry_price * 1.10; position closed via self.close() (fills next open).", "reason": "Spec says 'upon reaching a take-profit of 10%'; 'reaching' interpreted as the price level being touched intrabar."},
-  {"topic": "entry price for targets", "choice": "Actual execution fill price captured in notify_order.", "reason": "Take-profit is measured 'from the entry price'; the realized fill is the entry price."},
-  {"topic": "position sizing", "choice": "Dollar allocation = 2% of broker total value / current close; passed as size to buy(), fractional shares permitted.", "reason": "Spec: 'Position size should be 2% of total trading capital per trade'; interpreted as a 2% capital allocation, not risk-based sizing."},
-  {"topic": "exit precedence", "choice": "Stop-loss checked before take-profit when both would trigger on the same bar.", "reason": "Spec does not state ordering; capital-protection (stop) prioritized."},
-  {"topic": "position/window management", "choice": "At most one position; retest window starts only when flat and not already watching, and resets after a fill or after 5 days elapse.", "reason": "Canonical single-position default; window tied to a single breakout per the spec's 'the breakout'."}
-]}
+{"assumptions":[{"topic":"breakout level","choice":"Used the highest High of the 50 trading days preceding the current day.","reason":"The specification says highest price over the prior 50 days; High is the literal daily-bar price extreme."},{"topic":"retest definition","choice":"A retest is a day whose Low reaches or falls below the 10-day EMA and whose Close is at or above it.","reason":"“Near” has no numeric threshold; an EMA touch is the closest literal, non-invented interpretation."},{"topic":"volume average","choice":"Used a 50-day simple average of daily volume including the retest day.","reason":"The specification does not state that the retest day must be excluded."},{"topic":"take-profit measurement","choice":"Triggered when the daily Close is at least 10% above the executed entry price.","reason":"No intraday execution rule or order type is specified."},{"topic":"stop-loss","choice":"Exit if Close is below the current 10-day EMA or below the EMA recorded when the entry order fills.","reason":"This implements both the stated moving-EMA exit and the requirement to set the stop-loss at the EMA at entry."},{"topic":"sector filter","choice":"Treated the supplied AAPL feed as an eligible technology-stock universe member.","reason":"The feed contains no sector or sub-industry metadata, so the filter cannot be evaluated dynamically."},{"topic":"infeasible","choice":"Calculated ATR(14) but did not apply an ATR-versus-market-average filter.","reason":"No market benchmark, market-average volatility series, or additional assets are available in the fixed single-feed environment."}]}
 ```

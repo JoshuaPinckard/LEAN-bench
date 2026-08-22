@@ -1,0 +1,216 @@
+```python
+import backtrader as bt
+import math
+from collections import deque
+
+
+class ORBEMAFuturesStrategy(bt.Strategy):
+    def __init__(self):
+        self.fast_ema = bt.indicators.EMA(self.data.close, period=9)
+        self.slow_ema = bt.indicators.EMA(self.data.close, period=21)
+        self.ema_cross = bt.indicators.CrossOver(self.fast_ema, self.slow_ema)
+
+        self._entry_order = None
+        self._stop_order = None
+        self._target_order = None
+        self._close_order = None
+        self._entry_side = None
+        self._entry_orb_high = None
+        self._entry_orb_low = None
+
+        self._day = None
+        self._day_high = None
+        self._day_low = None
+        self._day_close = None
+        self._previous_day_close = None
+        self._daily_atrs = deque(maxlen=20)
+        self._high_volatility_day = False
+
+        self._orb_high = None
+        self._orb_low = None
+        self._orb_ready = False
+
+    def _pending_order_exists(self):
+        return any((
+            self._entry_order,
+            self._stop_order,
+            self._target_order,
+            self._close_order,
+        ))
+
+    def _update_daily_atr(self, dt):
+        current_day = dt.date()
+        high = float(self.data.high[0])
+        low = float(self.data.low[0])
+        close = float(self.data.close[0])
+
+        if self._day is None:
+            self._day = current_day
+            self._day_high = high
+            self._day_low = low
+            self._day_close = close
+            return
+
+        if current_day != self._day:
+            if self._previous_day_close is None:
+                previous_day_atr = self._day_high - self._day_low
+            else:
+                previous_day_atr = max(
+                    self._day_high - self._day_low,
+                    abs(self._day_high - self._previous_day_close),
+                    abs(self._day_low - self._previous_day_close),
+                )
+
+            self._daily_atrs.append(previous_day_atr)
+            if len(self._daily_atrs) == 20:
+                average_atr = sum(self._daily_atrs) / 20.0
+                self._high_volatility_day = (
+                    previous_day_atr > 1.20 * average_atr
+                )
+            else:
+                self._high_volatility_day = False
+
+            self._previous_day_close = self._day_close
+            self._day = current_day
+            self._day_high = high
+            self._day_low = low
+            self._day_close = close
+            self._orb_high = None
+            self._orb_low = None
+            self._orb_ready = False
+        else:
+            self._day_high = max(self._day_high, high)
+            self._day_low = min(self._day_low, low)
+            self._day_close = close
+
+    def _update_orb(self, tm):
+        if (9, 30) <= tm < (10, 0):
+            high = float(self.data.high[0])
+            low = float(self.data.low[0])
+            self._orb_high = high if self._orb_high is None else max(self._orb_high, high)
+            self._orb_low = low if self._orb_low is None else min(self._orb_low, low)
+        elif tm >= (10, 0) and self._orb_high is not None:
+            self._orb_ready = True
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        tm = (dt.hour, dt.minute)
+
+        self._update_daily_atr(dt)
+        self._update_orb(tm)
+
+        # A market order submitted on the 15:40 bar is executed at 15:45.
+        if tm == (15, 40) and self.position and not self._close_order:
+            if self._stop_order:
+                self.cancel(self._stop_order)
+            if self._target_order:
+                self.cancel(self._target_order)
+            self._close_order = self.close()
+            return
+
+        if (
+            self.position
+            or self._pending_order_exists()
+            or self._high_volatility_day
+            or not self._orb_ready
+            or not ((9, 30) <= tm < (15, 40))
+        ):
+            return
+
+        close = float(self.data.close[0])
+        equity = self.broker.getvalue()
+
+        if self.ema_cross[0] > 0 and close > self._orb_high:
+            stop_distance = close - self._orb_low
+            if stop_distance <= 0:
+                return
+
+            size = math.floor((equity * 0.01) / stop_distance)
+            if size > 0:
+                self._entry_side = "long"
+                self._entry_orb_high = self._orb_high
+                self._entry_orb_low = self._orb_low
+                self._entry_order = self.buy(size=size)
+
+        elif self.ema_cross[0] < 0 and close < self._orb_low:
+            stop_distance = self._orb_high - close
+            if stop_distance <= 0:
+                return
+
+            size = math.floor((equity * 0.01) / stop_distance)
+            if size > 0:
+                self._entry_side = "short"
+                self._entry_orb_high = self._orb_high
+                self._entry_orb_low = self._orb_low
+                self._entry_order = self.sell(size=size)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order is self._entry_order:
+                self._entry_order = None
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if self._entry_side == "long":
+                    stop_price = self._entry_orb_low
+                    target_price = self._entry_orb_high + (0.005 * entry_price)
+                    self._stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                    )
+                    self._target_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self._stop_order,
+                    )
+                else:
+                    stop_price = self._entry_orb_high
+                    target_price = self._entry_orb_low - (0.005 * entry_price)
+                    self._stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                    )
+                    self._target_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self._stop_order,
+                    )
+
+            elif order is self._close_order:
+                self._close_order = None
+                if self._stop_order:
+                    self.cancel(self._stop_order)
+                if self._target_order:
+                    self.cancel(self._target_order)
+
+            elif order is self._stop_order:
+                self._stop_order = None
+                if self._target_order:
+                    self.cancel(self._target_order)
+
+            elif order is self._target_order:
+                self._target_order = None
+                if self._stop_order:
+                    self.cancel(self._stop_order)
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self._entry_order:
+                self._entry_order = None
+            elif order is self._stop_order:
+                self._stop_order = None
+            elif order is self._target_order:
+                self._target_order = None
+            elif order is self._close_order:
+                self._close_order = None
+```
+
+```json
+{"assumptions":[{"topic":"ORB bars","choice":"The opening range uses bars timestamped from 09:30 inclusive through 10:00 exclusive.","reason":"This is the literal first 30 minutes of the stated 09:30 session on 5-minute data."},{"topic":"Breakout price","choice":"A breakout is a current-bar Close strictly above ORB high or strictly below ORB low.","reason":"The specification says price breaks the level but does not select an OHLC field."},{"topic":"ATR","choice":"Previous-day ATR is implemented as that completed session's daily true range; the 20-day average is the mean of the latest 20 completed daily true ranges, including the previous day.","reason":"No ATR lookback period is specified, while the required 20-day comparison is specified."},{"topic":"Risk sizing","choice":"Size is floor(1% of current broker equity divided by the signal Close-to-ORB-stop distance).","reason":"A market order's actual fill price is unavailable when its size must be submitted; the stop distance determines the specified risk size."},{"topic":"Instrument units","choice":"Risk calculations use the feed's price units and share-like broker units, with no futures contract multiplier.","reason":"The supplied AAPL OHLCV feed provides no futures multiplier or contract metadata."},{"topic":"time-based exit","choice":"The close order is submitted on the 15:40 bar so Backtrader's next-bar market execution occurs at 15:45, 15 minutes before the 16:00 close; entries stop at 15:40 for the same execution-timing reason.","reason":"On the fixed 5-minute Backtrader feed, a market order submitted at 15:45 would normally execute on the 15:50 bar rather than at the required exit time."}]} 
+```

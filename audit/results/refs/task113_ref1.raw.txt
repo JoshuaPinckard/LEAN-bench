@@ -1,81 +1,91 @@
 ```python
+# complete strategy class
 import backtrader as bt
+import math
 
 
-class CostAwarePortfolioOptimization(bt.Strategy):
-    # Cost-aware portfolio optimization: at each step maximize
-    #   (r - I(t))'w - lambda * w'Sigma w - Theta * |w - w0|^(3/2)
-    # For this single-asset feed all vectors/matrices collapse to scalars,
-    # so w is the AAPL portfolio weight, r a scalar expected return and
-    # Sigma a scalar variance.
+class PortfolioOptimizationWithCosts(bt.Strategy):
     params = (
-        ('lambda_risk', 1.0),   # lambda: risk aversion coefficient
-        ('theta', 0.01),        # Theta: market-impact scaling coefficient
-        ('period', 252),        # T = 1 year lookback for r and Sigma
-        ('ann_factor', 252),    # bars per year, to annualize r and Sigma
-        ('min_weight', 0.0),    # lower bound l_b on the asset weight
-        ('max_weight', 1.0),    # upper bound u_b on the asset weight
-        ('grid', 200),          # grid resolution for the 1-D optimization
+        ("lookback", 252),
+        ("risk_aversion", 1.0),
+        ("impact_coefficient", 0.001),
+        ("optimization_steps", 10000),
     )
 
     def __init__(self):
-        # daily simple returns
-        ret = self.data.close / self.data.close(-1) - 1.0
-        # expected return r and risk Sigma from historical returns over T = 1 year
-        self.mean_ret = bt.indicators.SMA(ret, period=self.p.period)
-        self.std_ret = bt.indicators.StandardDeviation(ret, period=self.p.period)
-        self.order = None
+        self.pending_order = None
+        self.addminperiod(self.p.lookback + 1)
 
     def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
-            return
-        if order.status in (order.Completed, order.Canceled,
-                             order.Margin, order.Rejected):
-            self.order = None
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_order = None
 
-    def _objective(self, w, w0, r, sigma2):
-        # trading volume t = |w - w0| and impact cost I(t) ~ Theta * t^(3/2)
-        t = abs(w - w0)
-        impact = self.p.theta * (t ** 1.5)
-        # (r - I(t)) w - lambda w Sigma w - Theta |w - w0|^(3/2)
-        return (r - impact) * w - self.p.lambda_risk * sigma2 * w * w - impact
+    def _current_weight(self):
+        value = self.broker.getvalue()
+        if value <= 0:
+            return 0.0
+        return max(0.0, self.position.size * self.data.close[0] / value)
+
+    def _objective(self, weight, current_weight, expected_return, covariance):
+        impact_cost = self.p.impact_coefficient * abs(weight - current_weight) ** 1.5
+        return (
+            (expected_return - impact_cost) * weight
+            - self.p.risk_aversion * covariance * weight * weight
+            - self.p.impact_coefficient * abs(weight) ** 1.5
+        )
 
     def next(self):
-        # guard against overlapping orders
-        if self.order is not None:
+        if self.pending_order is not None:
             return
 
-        # expected return r and variance Sigma over the reinvestment period
-        r = self.mean_ret[0] * self.p.ann_factor
-        sigma2 = (self.std_ret[0] ** 2) * self.p.ann_factor
+        volume = self.data.volume[0]
+        if not math.isfinite(volume) or volume <= 0:
+            target_weight = 0.0
+        else:
+            returns = []
+            for offset in range(self.p.lookback):
+                previous_close = self.data.close[-offset - 1]
+                current_close = self.data.close[-offset]
+                if previous_close > 0:
+                    returns.append(current_close / previous_close - 1.0)
 
-        # current portfolio weight w0 of the asset
-        value = self.broker.getvalue()
-        w0 = 0.0
-        if value > 0:
-            w0 = (self.position.size * self.data.close[0]) / value
+            if len(returns) < 2:
+                return
 
-        # solve  max_w  (r - I(t))w - lambda w Sigma w - Theta |w - w0|^(3/2)
-        # subject to the linear box constraint  min_weight <= w <= max_weight,
-        # by grid search (no external optimizers available in this environment).
-        lb, ub = self.p.min_weight, self.p.max_weight
-        # candidate "do nothing" weight (staying at w0) is the incumbent, so the
-        # optimizer only trades when moving beats staying net of impact cost.
-        best_w = min(max(w0, lb), ub)
-        best_f = self._objective(best_w, w0, r, sigma2)
-        n = self.p.grid
-        for i in range(n + 1):
-            w = lb + (ub - lb) * i / n
-            f = self._objective(w, w0, r, sigma2)
-            if f > best_f:
-                best_f = f
-                best_w = w
+            mean_daily_return = sum(returns) / len(returns)
+            expected_return = mean_daily_return * self.p.lookback
+            covariance = (
+                sum((item - mean_daily_return) ** 2 for item in returns)
+                / (len(returns) - 1)
+                * self.p.lookback
+            )
 
-        # rebalance to the new target weight w* (dynamic rebalancing: the impact
-        # term already suppressed trades whose benefit did not exceed their cost)
-        if abs(best_w - w0) > 1e-9:
-            self.order = self.order_target_percent(target=best_w)
+            current_weight = min(1.0, self._current_weight())
+            target_weight = current_weight
+            best_value = self._objective(
+                target_weight, current_weight, expected_return, covariance
+            )
+
+            for step in range(self.p.optimization_steps + 1):
+                weight = step / self.p.optimization_steps
+                value = self._objective(
+                    weight, current_weight, expected_return, covariance
+                )
+                if value > best_value:
+                    best_value = value
+                    target_weight = weight
+
+        if abs(target_weight - self._current_weight()) > 0:
+            self.pending_order = self.order_target_percent(
+                target=target_weight
+            )
 ```
+
 ```json
-{"assumptions": [{"topic": "single-asset collapse", "choice": "Implemented the portfolio optimizer over the one available asset (AAPL): w, r, w0 are scalars, Sigma is the scalar return variance, and the constraint matrix A is the identity so l_b <= w <= u_b.", "reason": "The harness supplies exactly one PandasData feed, so the vector/matrix objects r, w, Sigma, Theta, A in the spec each reduce to a single element."}, {"topic": "expected return r", "choice": "r = mean of trailing 252 daily simple returns x 252 (annualized), via SMA over the return line.", "reason": "Spec says compute expected return from historical returns over the reinvestment period T=1 year; a factor model needs cross-sectional assets that do not exist here."}, {"topic": "risk Sigma", "choice": "Sigma = variance of trailing 252 daily returns x 252 (annualized), via StandardDeviation squared.", "reason": "Spec: covariance matrix from historical returns over the same period; the factor form Sigma = X'FX + D requires factor data unavailable here, so the plain historical variance is used."}, {"topic": "objective term |w|^(3/2)", "choice": "Read the objective's last term as Theta*|w - w0|^(3/2).", "reason": "The 'Dynamic rebalancing' clause explicitly states the trade-governing term is |w - w0|^(3/2); |w| in the formula is treated as shorthand for the same turnover quantity."}, {"topic": "impact cost I(t)", "choice": "I(t) = Theta * t^(3/2) with t = |w - w0|, entering the objective as (r - I(t))*w.", "reason": "Spec defines impact costs as proportional to trading volume raised to the power 3/2 and t = |w - w0|; kept the (r - I(t))w term literal in addition to the Theta|w - w0|^(3/2) term."}, {"topic": "constraints l_b<=Aw<=u_b", "choice": "Box constraint 0 <= w <= 1 (long-only, no leverage).", "reason": "The listed constraints are 'examples'; full-investment l_b=u_b=w0 would freeze a single-asset book and a 10% cap is only illustrative, so a long-only unleveraged bound is used and short selling is not enabled."}, {"topic": "risk coefficient lambda / Theta", "choice": "lambda=1.0 and Theta=0.01 as declared parameter defaults.", "reason": "Spec leaves numeric values of lambda and Theta unspecified; moderate values that yield meaningful, non-degenerate weights on this data were chosen."}, {"topic": "optimization method", "choice": "1-D grid search over [0,1] with 201 points, keeping w0 as the incumbent.", "reason": "Only backtrader/math/collections/statistics imports are allowed (no scipy); grid search is a deterministic, faithful solver for the scalar concave-plus-penalty objective."}, {"topic": "rebalance frequency", "choice": "Rebalance every bar (daily) via order_target_percent to the target weight w*.", "reason": "Spec: revise 'at each iteration ... for example, daily or weekly'; daily matches the 1d feed and 'at each iteration', and order_target_percent is the literal way to move to target weights."}, {"topic": "warm-up", "choice": "Rely on automatic minperiod (253 bars) from the 252-period return statistics.", "reason": "Estimating r and Sigma over T=1 year inherently needs one year of history; backtrader defers next() until the indicators are ready."}, {"topic": "infeasible", "choice": "Liquidity filters and true order-book market impact are omitted; market impact is approximated only through the Theta*|w - w0|^(3/2) turnover penalty.", "reason": "The spec's liquidity exclusion and real market-impact/order-book information require multiple assets and depth data not present in a single AAPL OHLCV feed."}]}
+{"assumptions":[{"topic":"expected return and covariance","choice":"Use 252 daily close-to-close returns; expected return is their annualized arithmetic mean and covariance is their annualized sample variance.","reason":"The single available asset and daily feed make the return vector and covariance matrix scalar; the specification gives a one-year reinvestment period as its example."},{"topic":"factor model","choice":"Use historical covariance rather than a factor model.","reason":"No factor exposures, factor returns, or multiple assets are available."},{"topic":"impact costs","choice":"Set I(t) = Θ|w-w0|^(3/2), retaining the separate -Θ|w|^(3/2) term exactly present in the stated objective.","reason":"This is the closest literal scalar implementation of the specified trading-volume impact relationship and optimization expression."},{"topic":"parameters","choice":"Use λ=1.0 and Θ=0.001, exposed as strategy parameters.","reason":"The specification requires both coefficients but supplies no numerical values; 0.001 aligns Θ with the stated commission scale without changing the separate commission configured by the harness."},{"topic":"constraints","choice":"Constrain the sole asset weight to 0≤w≤1.","reason":"The environment has one asset and canonical conventions require long-only, non-pyramiding behavior; no specific maximum weight, sector, or turnover bounds were supplied."},{"topic":"optimization","choice":"Numerically maximize the stated objective over 10,001 equally spaced feasible weights each day, retaining w0 as an explicit candidate.","reason":"No optimization library is permitted and the objective contains fractional absolute-value terms; including w0 implements dynamic no-trade selection when costs outweigh benefit."},{"topic":"rebalancing","choice":"Rebalance on every daily iteration with order_target_percent.","reason":"The specification permits daily rebalancing and requires trades to move toward the newly calculated target weights."},{"topic":"liquidity filter","choice":"Treat non-positive or non-finite daily Volume as insufficient liquidity and target zero weight; otherwise retain the asset.","reason":"The specification requires a liquidity filter but provides no liquidity threshold, and OHLCV is the only available liquidity information."}]}
 ```

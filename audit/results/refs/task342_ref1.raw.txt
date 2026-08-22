@@ -1,0 +1,122 @@
+```python
+import backtrader as bt
+import math
+
+
+class ReferenceStrategy(bt.Strategy):
+    params = (
+        ("risk_per_trade", 0.01),
+    )
+
+    def __init__(self):
+        self.stochastic = bt.indicators.StochasticFull(
+            self.data,
+            period=14,
+            period_dfast=3,
+            period_dslow=3,
+        )
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.stop_order = None
+        self.pending_direction = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled,
+                            order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+
+            if order == self.stop_order:
+                self.stop_order = None
+
+            if order.status == order.Completed and order.isbuy():
+                if order.exectype == bt.Order.Market:
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=order.executed.price * 0.98,
+                        size=order.executed.size,
+                    )
+
+            if order.status == order.Completed and order.issell():
+                if order.exectype == bt.Order.Market and order.executed.size < 0:
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop,
+                        price=order.executed.price * 1.02,
+                        size=abs(order.executed.size),
+                    )
+
+    def _entry_size(self, direction):
+        entry_price = self.data.close[0]
+        stop_price = entry_price * (0.98 if direction == "long" else 1.02)
+        stop_distance_dollars = abs(entry_price - stop_price)
+        equity = self.broker.getvalue()
+        return math.floor(
+            (equity * self.p.risk_per_trade) / stop_distance_dollars
+        )
+
+    def _enter(self, direction):
+        size = self._entry_size(direction)
+        if size <= 0:
+            return
+
+        if direction == "long":
+            self.order = self.buy(size=size)
+        else:
+            self.order = self.sell(size=size)
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        k_now = self.stochastic.percK[0]
+        d_now = self.stochastic.percD[0]
+        k_prev = self.stochastic.percK[-1]
+        d_prev = self.stochastic.percD[-1]
+
+        bullish_entry = (
+            k_prev < 20
+            and k_prev <= d_prev
+            and k_now > d_now
+        )
+        bearish_entry = (
+            k_prev > 80
+            and k_prev >= d_prev
+            and k_now < d_now
+        )
+
+        if not self.position:
+            if self.pending_direction is not None:
+                direction = self.pending_direction
+                self.pending_direction = None
+                self._enter(direction)
+            elif bullish_entry:
+                self._enter("long")
+            elif bearish_entry:
+                self._enter("short")
+            return
+
+        long_exit = k_prev >= 50 and k_now < 50
+        short_exit = k_prev <= 50 and k_now > 50
+
+        reverse_to_short = self.position.size > 0 and bearish_entry
+        reverse_to_long = self.position.size < 0 and bullish_entry
+
+        if (
+            (self.position.size > 0 and (long_exit or reverse_to_short))
+            or (self.position.size < 0 and (short_exit or reverse_to_long))
+        ):
+            if reverse_to_short:
+                self.pending_direction = "short"
+            elif reverse_to_long:
+                self.pending_direction = "long"
+
+            if self.stop_order is not None:
+                self.cancel(self.stop_order)
+
+            self.order = self.close()
+```
+
+```json
+{"assumptions":[{"topic":"entry_price_for_sizing","choice":"Use the current bar close as the estimated market-entry price when calculating order size.","reason":"A market order's actual next-bar execution price is unknown when its size must be submitted."},{"topic":"ATR_usage","choice":"Instantiate ATR(period=14) exactly as specified, while applying the explicitly specified fixed-2%-stop-distance sizing formula.","reason":"The stated sizing formula defines stop_distance_dollars from entry and stop prices and does not incorporate ATR."},{"topic":"reversal_timing","choice":"After a reversal signal, submit the close order immediately and submit the new opposite market entry on the next strategy bar after the close completes.","reason":"Without cheat-on-open, Backtrader cannot both confirm the close and enter at that same bar's opening execution."}]}
+```

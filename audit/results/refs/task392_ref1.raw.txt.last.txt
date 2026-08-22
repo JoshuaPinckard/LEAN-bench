@@ -1,0 +1,454 @@
+```python
+import backtrader as bt
+import math
+
+
+class MultiTimeframeStrategy(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('stoch_period', 14),
+        ('cci_period', 20),
+        ('williams_period', 14),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('momentum_period', 10),
+        ('roc_period', 9),
+        ('bb_period', 20),
+        ('bb_devfactor', 2),
+        ('atr_period', 10),
+        ('volume_sma_period', 20),
+        ('mfi_period', 14),
+        ('supertrend_period', 10),
+        ('supertrend_multiplier', 3),
+        ('channel_period', 20),
+        ('daily_long_score', 3),
+        ('daily_short_score', -3),
+        ('confirmation_long_score', 2),
+        ('confirmation_short_score', -2),
+        ('trigger_long_score', 2),
+        ('trigger_short_score', -2),
+        ('stop_atr_multiple', 2.0),
+        ('target_atr_multiple', 3.0),
+        ('trail_activation_atr', 1.0),
+        ('trail_atr_multiple', 2.0),
+        ('use_trailing_stop', True),
+    )
+
+    class Supertrend(bt.Indicator):
+        lines = ('supertrend', 'direction', 'upperband', 'lowerband')
+        params = (('period', 10), ('multiplier', 3.0),)
+
+        def __init__(self):
+            self.atr = bt.ind.ATR(self.data, period=self.p.period)
+            self.midpoint = (self.data.high + self.data.low) / 2.0
+            self.addminperiod(self.p.period + 1)
+
+        def next(self):
+            basic_upper = self.midpoint[0] + self.p.multiplier * self.atr[0]
+            basic_lower = self.midpoint[0] - self.p.multiplier * self.atr[0]
+
+            if len(self) == self._minperiod:
+                upper = basic_upper
+                lower = basic_lower
+                direction = 1 if self.data.close[0] >= basic_lower else -1
+            else:
+                previous_upper = self.lines.upperband[-1]
+                previous_lower = self.lines.lowerband[-1]
+                previous_close = self.data.close[-1]
+
+                upper = (basic_upper if
+                         basic_upper < previous_upper or previous_close > previous_upper
+                         else previous_upper)
+                lower = (basic_lower if
+                         basic_lower > previous_lower or previous_close < previous_lower
+                         else previous_lower)
+
+                previous_direction = self.lines.direction[-1]
+                if self.data.close[0] > upper:
+                    direction = 1
+                elif self.data.close[0] < lower:
+                    direction = -1
+                else:
+                    direction = previous_direction
+
+            self.lines.upperband[0] = upper
+            self.lines.lowerband[0] = lower
+            self.lines.direction[0] = direction
+            self.lines.supertrend[0] = lower if direction > 0 else upper
+
+    class VPT(bt.Indicator):
+        lines = ('vpt',)
+
+        def __init__(self):
+            self.addminperiod(2)
+
+        def next(self):
+            previous = self.lines.vpt[-1] if len(self) > 1 else 0.0
+            previous_close = self.data.close[-1]
+            if previous_close:
+                self.lines.vpt[0] = (
+                    previous +
+                    self.data.volume[0] *
+                    (self.data.close[0] - previous_close) / previous_close
+                )
+            else:
+                self.lines.vpt[0] = previous
+
+    class OBV(bt.Indicator):
+        lines = ('obv',)
+
+        def __init__(self):
+            self.addminperiod(2)
+
+        def next(self):
+            previous = self.lines.obv[-1] if len(self) > 1 else 0.0
+            if self.data.close[0] > self.data.close[-1]:
+                self.lines.obv[0] = previous + self.data.volume[0]
+            elif self.data.close[0] < self.data.close[-1]:
+                self.lines.obv[0] = previous - self.data.volume[0]
+            else:
+                self.lines.obv[0] = previous
+
+    class AccumDist(bt.Indicator):
+        lines = ('ad',)
+
+        def next(self):
+            high_low = self.data.high[0] - self.data.low[0]
+            multiplier = (
+                ((self.data.close[0] - self.data.low[0]) -
+                 (self.data.high[0] - self.data.close[0])) / high_low
+                if high_low else 0.0
+            )
+            previous = self.lines.ad[-1] if len(self) > 1 else 0.0
+            self.lines.ad[0] = previous + multiplier * self.data.volume[0]
+
+    class MFI(bt.Indicator):
+        lines = ('mfi',)
+        params = (('period', 14),)
+
+        def __init__(self):
+            self.typical = (self.data.high + self.data.low + self.data.close) / 3.0
+            self.positive = bt.If(
+                self.typical > self.typical(-1),
+                self.typical * self.data.volume,
+                0.0,
+            )
+            self.negative = bt.If(
+                self.typical < self.typical(-1),
+                self.typical * self.data.volume,
+                0.0,
+            )
+            self.pos_sum = bt.ind.SumN(self.positive, period=self.p.period)
+            self.neg_sum = bt.ind.SumN(self.negative, period=self.p.period)
+
+        def next(self):
+            if self.neg_sum[0] == 0:
+                self.lines.mfi[0] = 100.0
+            else:
+                ratio = self.pos_sum[0] / self.neg_sum[0]
+                self.lines.mfi[0] = 100.0 - (100.0 / (1.0 + ratio))
+
+    class Donchian(bt.Indicator):
+        lines = ('high', 'low')
+        params = (('period', 20),)
+
+        def __init__(self):
+            self.addminperiod(self.p.period + 1)
+
+        def next(self):
+            self.lines.high[0] = max(self.data.high.get(-1, size=self.p.period))
+            self.lines.low[0] = min(self.data.low.get(-1, size=self.p.period))
+
+    class OrderBlock(bt.Indicator):
+        lines = ('bull_zone', 'bear_zone')
+        params = (('period', 20),)
+
+        def __init__(self):
+            self.last_down_high = math.nan
+            self.last_down_low = math.nan
+            self.last_up_high = math.nan
+            self.last_up_low = math.nan
+            self.bull_high = math.nan
+            self.bull_low = math.nan
+            self.bear_high = math.nan
+            self.bear_low = math.nan
+            self.addminperiod(self.p.period + 1)
+
+        def next(self):
+            prior_high = max(self.data.high.get(-1, size=self.p.period))
+            prior_low = min(self.data.low.get(-1, size=self.p.period))
+
+            if self.data.close[0] > self.data.open[0]:
+                self.last_up_high = self.data.high[0]
+                self.last_up_low = self.data.low[0]
+            elif self.data.close[0] < self.data.open[0]:
+                self.last_down_high = self.data.high[0]
+                self.last_down_low = self.data.low[0]
+
+            if self.data.close[0] > prior_high and not math.isnan(self.last_down_high):
+                self.bull_high = self.last_down_high
+                self.bull_low = self.last_down_low
+
+            if self.data.close[0] < prior_low and not math.isnan(self.last_up_high):
+                self.bear_high = self.last_up_high
+                self.bear_low = self.last_up_low
+
+            close = self.data.close[0]
+            self.lines.bull_zone[0] = int(
+                not math.isnan(self.bull_high) and
+                self.bull_low <= close <= self.bull_high
+            )
+            self.lines.bear_zone[0] = int(
+                not math.isnan(self.bear_high) and
+                self.bear_low <= close <= self.bear_high
+            )
+
+    @staticmethod
+    def resampledata(cerebro, data):
+        data4h = cerebro.resampledata(
+            data, timeframe=bt.TimeFrame.Minutes, compression=240
+        )
+        data1d = cerebro.resampledata(
+            data, timeframe=bt.TimeFrame.Days, compression=1
+        )
+        return data4h, data1d
+
+    def __init__(self):
+        self.data60 = self.datas[0]
+        self.data4h = self.datas[1]
+        self.data1d = self.datas[2]
+
+        self.order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.highest_since_entry = None
+        self.lowest_since_entry = None
+        self.closing = False
+
+        self.i60 = self._make_indicators(self.data60)
+        self.i4h = self._make_indicators(self.data4h)
+        self.i1d = self._make_indicators(self.data1d)
+
+    def _make_indicators(self, data):
+        return {
+            'rsi': bt.ind.RSI(data, period=self.p.rsi_period),
+            'stoch': bt.ind.Stochastic(data, period=self.p.stoch_period),
+            'cci': bt.ind.CCI(data, period=self.p.cci_period),
+            'williams': bt.ind.WilliamsR(data, period=self.p.williams_period),
+            'macd': bt.ind.MACDHisto(
+                data,
+                period_me1=self.p.macd_fast,
+                period_me2=self.p.macd_slow,
+                period_signal=self.p.macd_signal,
+            ),
+            'momentum': bt.ind.Momentum(data, period=self.p.momentum_period),
+            'roc': bt.ind.ROC(data, period=self.p.roc_period),
+            'bb': bt.ind.BollingerBands(
+                data, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+            ),
+            'sma10': bt.ind.SMA(data, period=10),
+            'sma20': bt.ind.SMA(data, period=20),
+            'sma50': bt.ind.SMA(data, period=50),
+            'sma100': bt.ind.SMA(data, period=100),
+            'sma200': bt.ind.SMA(data, period=200),
+            'ema10': bt.ind.EMA(data, period=10),
+            'ema20': bt.ind.EMA(data, period=20),
+            'ema50': bt.ind.EMA(data, period=50),
+            'atr': bt.ind.ATR(data, period=self.p.atr_period),
+            'volume_sma': bt.ind.SMA(data.volume, period=self.p.volume_sma_period),
+            'obv': self.OBV(data),
+            'mfi': self.MFI(data, period=self.p.mfi_period),
+            'ad': self.AccumDist(data),
+            'supertrend': self.Supertrend(
+                data,
+                period=self.p.supertrend_period,
+                multiplier=self.p.supertrend_multiplier,
+            ),
+            'vpt': self.VPT(data),
+            'channel': self.Donchian(data, period=self.p.channel_period),
+            'orderblock': self.OrderBlock(data, period=self.p.channel_period),
+        }
+
+    def _score(self, data, ind):
+        score = 0
+
+        score += 1 if ind['rsi'][0] > 55 else -1 if ind['rsi'][0] < 45 else 0
+
+        crossed_up = ind['stoch'].percK[0] > ind['stoch'].percD[0] and \
+            ind['stoch'].percK[-1] <= ind['stoch'].percD[-1]
+        crossed_down = ind['stoch'].percK[0] < ind['stoch'].percD[0] and \
+            ind['stoch'].percK[-1] >= ind['stoch'].percD[-1]
+        score += 1 if crossed_up and ind['stoch'].percK[0] < 20 else \
+            -1 if crossed_down and ind['stoch'].percK[0] > 80 else 0
+
+        score += 1 if ind['cci'][0] > 100 else -1 if ind['cci'][0] < -100 else 0
+        score += 1 if ind['williams'][0] > -50 else -1 if ind['williams'][0] < -50 else 0
+        score += 1 if ind['macd'].histo[0] > 0 else -1 if ind['macd'].histo[0] < 0 else 0
+        score += 1 if ind['momentum'][0] > 0 else -1 if ind['momentum'][0] < 0 else 0
+        score += 1 if ind['roc'][0] > 0 else -1 if ind['roc'][0] < 0 else 0
+        score += 1 if data.close[0] > ind['bb'].mid[0] else \
+            -1 if data.close[0] < ind['bb'].mid[0] else 0
+
+        if ind['ema10'][0] > ind['ema20'][0] > ind['ema50'][0]:
+            score += 1
+        elif ind['ema10'][0] < ind['ema20'][0] < ind['ema50'][0]:
+            score -= 1
+
+        score += 1 if ind['obv'][0] > ind['obv'][-5] else \
+            -1 if ind['obv'][0] < ind['obv'][-5] else 0
+        score += 1 if ind['mfi'][0] > 55 else -1 if ind['mfi'][0] < 45 else 0
+        score += 1 if ind['ad'][0] > ind['ad'][-5] else \
+            -1 if ind['ad'][0] < ind['ad'][-5] else 0
+        score += 1 if ind['supertrend'].direction[0] > 0 else -1
+        score += 1 if ind['vpt'][0] > ind['vpt'][-5] else \
+            -1 if ind['vpt'][0] < ind['vpt'][-5] else 0
+        score += 1 if data.close[0] > ind['channel'].high[0] else \
+            -1 if data.close[0] < ind['channel'].low[0] else 0
+
+        return max(-10, min(10, score))
+
+    def _cancel_protection(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.target_order is not None:
+            self.cancel(self.target_order)
+        self.stop_order = None
+        self.target_order = None
+
+    def _place_bracket(self, is_long):
+        atr = self.i60['atr'][0]
+        price = self.data60.close[0]
+        self.entry_atr = atr
+
+        if is_long:
+            bracket = self.buy_bracket(
+                exectype=bt.Order.Market,
+                price=price,
+                stopprice=price - self.p.stop_atr_multiple * atr,
+                limitprice=price + self.p.target_atr_multiple * atr,
+            )
+        else:
+            bracket = self.sell_bracket(
+                exectype=bt.Order.Market,
+                price=price,
+                stopprice=price + self.p.stop_atr_multiple * atr,
+                limitprice=price - self.p.target_atr_multiple * atr,
+            )
+
+        self.order, self.stop_order, self.target_order = bracket
+
+    def _update_trailing_stop(self):
+        if not self.p.use_trailing_stop or self.entry_price is None:
+            return
+
+        atr = self.entry_atr
+        if self.position.size > 0:
+            self.highest_since_entry = max(self.highest_since_entry, self.data60.high[0])
+            if self.highest_since_entry < self.entry_price + self.p.trail_activation_atr * atr:
+                return
+            new_stop = self.highest_since_entry - self.p.trail_atr_multiple * atr
+            if self.stop_order is not None and new_stop > self.stop_order.created.price:
+                self.cancel(self.stop_order)
+                self.stop_order = self.sell(
+                    exectype=bt.Order.Stop,
+                    price=new_stop,
+                    oco=self.target_order,
+                )
+        else:
+            self.lowest_since_entry = min(self.lowest_since_entry, self.data60.low[0])
+            if self.lowest_since_entry > self.entry_price - self.p.trail_activation_atr * atr:
+                return
+            new_stop = self.lowest_since_entry + self.p.trail_atr_multiple * atr
+            if self.stop_order is not None and new_stop < self.stop_order.created.price:
+                self.cancel(self.stop_order)
+                self.stop_order = self.buy(
+                    exectype=bt.Order.Stop,
+                    price=new_stop,
+                    oco=self.target_order,
+                )
+
+    def next(self):
+        if self.order is not None or self.closing:
+            return
+
+        daily_score = self._score(self.data1d, self.i1d)
+        score4h = self._score(self.data4h, self.i4h)
+        score60 = self._score(self.data60, self.i60)
+
+        if self.position:
+            if self.position.size > 0:
+                if score60 <= self.p.trigger_short_score or daily_score < self.p.daily_long_score:
+                    self._cancel_protection()
+                    self.closing = True
+                    self.order = self.close()
+                    return
+            else:
+                if score60 >= self.p.trigger_long_score or daily_score > self.p.daily_short_score:
+                    self._cancel_protection()
+                    self.closing = True
+                    self.order = self.close()
+                    return
+
+            self._update_trailing_stop()
+            return
+
+        long_allowed = (
+            daily_score >= self.p.daily_long_score and
+            score4h >= self.p.confirmation_long_score and
+            score60 >= self.p.trigger_long_score and
+            not self.i60['orderblock'].bear_zone[0]
+        )
+        short_allowed = (
+            daily_score <= self.p.daily_short_score and
+            score4h <= self.p.confirmation_short_score and
+            score60 <= self.p.trigger_short_score and
+            not self.i60['orderblock'].bull_zone[0]
+        )
+
+        if long_allowed:
+            self._place_bracket(True)
+        elif short_allowed:
+            self._place_bracket(False)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self.entry_price = order.executed.price
+                self.highest_since_entry = self.entry_price
+                self.lowest_since_entry = self.entry_price
+                self.order = None
+            elif order == self.stop_order or order == self.target_order:
+                self.stop_order = None
+                self.target_order = None
+                self.entry_price = None
+                self.entry_atr = None
+                self.highest_since_entry = None
+                self.lowest_since_entry = None
+            elif self.closing:
+                self.closing = False
+                self.order = None
+                self.entry_price = None
+                self.entry_atr = None
+                self.highest_since_entry = None
+                self.lowest_since_entry = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+            if order == self.target_order:
+                self.target_order = None
+            if self.closing:
+                self.closing = False
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"The strategy requires the harness to call MultiTimeframeStrategy.resampledata(cerebro, base_data) before adding the strategy, then supplies the resulting feeds as data1 (4H) and data2 (1D).","reason":"Backtrader resampledata is a Cerebro setup operation and cannot create schedulable additional data feeds from inside an already-instantiated Strategy when the harness supplies only one feed."},{"topic":"score range","choice":"The sum of the 15 stated signal contributions is clamped to [-10,+10].","reason":"The stated individual signals can sum to [-15,+15], while the specification explicitly defines the score range as [-10,+10]."},{"topic":"Donchian breakout","choice":"Donchian high/low use the preceding 20 completed bars, excluding the current bar.","reason":"Including the current high/low makes strict close-above-high and close-below-low breakout conditions impossible on ordinary OHLC bars."},{"topic":"stochastic smoothing","choice":"Backtrader Stochastic defaults are used with period=14.","reason":"The specification names only Stochastic(14) and does not state K/D smoothing periods."},{"topic":"bracket entry reference","choice":"Initial bracket stop and target prices are calculated from the current 60-minute close submitted with the market parent order.","reason":"The exact next-bar market fill price is unavailable when Backtrader bracket child orders must be created."},{"topic":"trailing stop","choice":"Trailing stops are enabled by default and replace the existing stop after the specified favorable move.","reason":"The specification supplies complete trailing-stop behavior but does not state whether it is enabled; use_trailing_stop remains configurable."}]} 
+```

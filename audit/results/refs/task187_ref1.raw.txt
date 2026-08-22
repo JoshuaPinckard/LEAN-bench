@@ -2,80 +2,79 @@
 import backtrader as bt
 
 
-class SingleAssetPeriodicRebalance(bt.Strategy):
-    # Single-asset periodic rebalancing to a constant 100% target weight.
-    # Enter on the start date, force-rebalance (full close + immediate re-open)
-    # every 12 weeks, and close out at the 52-week forward horizon.
-    params = dict(
-        rebalance_weeks=12,   # forced rebalancing period
-        horizon_weeks=52,     # forward horizon after which the position is closed
-        target_pct=0.99,      # practical "100%" weight (headroom for commission / next-open fill)
-    )
+class PeriodicRebalanceStrategy(bt.Strategy):
+    params = (("start_date", None),)
 
     def __init__(self):
-        self.order_pending = False
+        self.pending_order = None
+        self.phase = None
+        self.started = False
+        self.current_week = None
+        self.weeks_elapsed = 0
         self.finished = False
-        self.start_date = None
-        self.next_rebal = self.p.rebalance_weeks
 
-    def _commrate(self):
-        try:
-            return self.broker.getcommissioninfo(self.data).p.commission
-        except Exception:
-            return 0.0
+    def _week_key(self):
+        iso = self.data.datetime.date(0).isocalendar()
+        return (iso[0], iso[1])
 
-    def _open_full(self, close_existing):
-        # Optionally fully close the current position, then (re)open a position
-        # sized to the target weight of the current portfolio value. Doing the
-        # close together with the (re)buy incurs a sell and a buy commission,
-        # modelling rebalancing with transaction costs.
-        if close_existing and self.position:
-            self.close()
-        price = self.data.close[0]
-        comm = self._commrate()
-        value = self.broker.getvalue()
-        size = (value * self.p.target_pct) / (price * (1.0 + comm))
-        if size > 0:
-            self.buy(size=size)
-            self.order_pending = True
+    def _is_selected_start_date(self):
+        if self.p.start_date is None:
+            return True
+        return self.data.datetime.date(0).isoformat() == str(self.p.start_date)[:10]
+
+    def _rebalance(self, final_exit=False):
+        self.phase = "final_exit" if final_exit else "rebalance_close"
+        self.pending_order = self.close()
+
+    def next(self):
+        if self.finished or self.pending_order is not None:
+            return
+
+        if not self.started:
+            if self._is_selected_start_date():
+                self.started = True
+                self.current_week = self._week_key()
+                self.phase = "initial_buy"
+                self.pending_order = self.order_target_percent(target=1.0)
+            return
+
+        week = self._week_key()
+        if week == self.current_week:
+            return
+
+        self.current_week = week
+        self.weeks_elapsed += 1
+
+        if self.weeks_elapsed >= 52:
+            if self.position:
+                self._rebalance(final_exit=True)
+            else:
+                self.finished = True
+        elif self.weeks_elapsed % 12 == 0 and self.position:
+            self._rebalance()
 
     def notify_order(self, order):
         if order.status in (order.Submitted, order.Accepted):
             return
-        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
-            self.order_pending = False
 
-    def next(self):
-        if self.finished:
+        if order.status == order.Completed and self.phase == "rebalance_close":
+            self.phase = "rebalance_buy"
+            self.pending_order = self.order_target_percent(target=1.0)
             return
 
-        dt = self.data.datetime.date(0)
-        if self.start_date is None:
-            self.start_date = dt
-        weeks = (dt - self.start_date).days // 7
-
-        if self.order_pending:
-            return
-
-        # Exit: close at the end of the 52-week horizon and lock in the result.
-        if weeks >= self.p.horizon_weeks:
-            if self.position:
-                self.close()
-                self.order_pending = True
+        if order.status == order.Completed and self.phase == "final_exit":
             self.finished = True
-            return
 
-        # Entry: on the start date buy the asset with (target) 100% of the portfolio.
-        if not self.position:
-            self._open_full(close_existing=False)
-            return
-
-        # Rebalancing: every 12 weeks fully close and immediately re-open at 100%.
-        if weeks >= self.next_rebal:
-            self._open_full(close_existing=True)
-            self.next_rebal += self.p.rebalance_weeks
-            return
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_order = None
+            self.phase = None
 ```
+
 ```json
-{"assumptions": [{"topic": "timeframe", "choice": "Approximate the weekly working timeframe by tracking elapsed calendar weeks as (current_date - start_date).days // 7 on the daily feed; rebalance/exit fire on the first daily bar that crosses each week threshold.", "reason": "The harness fixes a single daily PandasData feed and I output only a Strategy, so I cannot add cerebro.resampledata; measuring 12/52 weeks by calendar-day difference is the closest literal reading of the weekly schedule."}, {"topic": "infeasible", "choice": "Implement a single deterministic 52-week campaign (entry, 12-week rebalances at weeks 12/24/36/48, exit at week 52). The '50 random start dates', per-run storage of total return / max drawdown / Sharpe, and averaging across runs are NOT performed inside the strategy.", "reason": "The output must be one Strategy class run in one backtest over one timeline; running 50 separate backtests and averaging their metrics is an external testing-harness concern that cannot be expressed within a single Strategy instance."}, {"topic": "start date", "choice": "Use the first available bar (2020-01-02) as the start date instead of a random date.", "reason": "This reference implementation is for an audit comparing execution traces; a random start would make traces non-reproducible, and a single backtest has only one timeline."}, {"topic": "position sizing", "choice": "Model the 100% target weight as target_pct=0.99 of portfolio value, sizing each buy as value/(price*(1+commission)) and leaving ~1% headroom.", "reason": "Market orders fill at the next bar's open and commission is charged on top; buying a literal 100% causes margin rejection (leaving no position), so ~99% is the closest faithful reading that keeps the position essentially fully invested."}, {"topic": "rebalancing mechanics", "choice": "At each 12-week mark submit self.close() (full sell of the whole position) plus a same-bar buy sized to the target weight of current portfolio value, both executing at the next open.", "reason": "The spec models rebalancing as a full close and immediate re-open to account for trading costs; issuing both orders incurs a sell commission and a buy commission on the full position while keeping the re-open immediate."}, {"topic": "commissions", "choice": "Rely on the harness-configured broker commission of 0.001 (0.1%) applied automatically to every buy and sell; not re-implemented in-strategy.", "reason": "The broker's fixed 0.1% commission already matches the spec's 0.1% per-trade cost and is charged on each order at rebalancing and final exit."}]}
+{"assumptions":[{"topic":"selected start date","choice":"Expose start_date as an optional strategy parameter; when omitted, use the first available bar.","reason":"The specification requires externally selected random dates but does not provide a selected date to a single strategy run."},{"topic":"weekly timeframe","choice":"Emulate weekly progression by counting ISO-calendar week transitions in the supplied daily feed.","reason":"The harness supplies only self.data as a daily feed and strategy code cannot resample it through Cerebro."},{"topic":"order timing","choice":"Use Backtrader market-order execution; submit the replacement buy immediately when the rebalance close completes.","reason":"A full close and replacement buy cannot both fill on the same bar under standard Backtrader order processing."},{"topic":"infeasible","choice":"Do not select 50 random dates, run separate Cerebro instances, compute analyzers, or report averaged metrics inside the strategy.","reason":"The required output is one strategy class running against one supplied feed; orchestration and final cross-run reporting must be performed by the harness."}]}
 ```

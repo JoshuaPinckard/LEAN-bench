@@ -1,0 +1,125 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionTrendStrategy(bt.Strategy):
+    params = (
+        ("ema_period", 21),
+        ("bb_period", 50),
+        ("bb_devfactor", 1.5),
+        ("capital_fraction", 0.02),
+    )
+
+    def __init__(self):
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor,
+        )
+        self.lower_cross = bt.indicators.CrossOver(self.data.close, self.bbands.bot)
+        self.upper_cross = bt.indicators.CrossOver(self.data.close, self.bbands.top)
+        self.ema_cross = bt.indicators.CrossOver(self.data.close, self.ema)
+
+        self.order = None
+        self.stop_order = None
+        self.take_profit_order = None
+
+    def _cancel_protective_orders(self):
+        for protective_order in (self.stop_order, self.take_profit_order):
+            if protective_order is not None and protective_order.alive():
+                self.cancel(protective_order)
+
+    def _position_size(self):
+        return (self.broker.getvalue() * self.p.capital_fraction) / self.data.close[0]
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        if not self.position:
+            if self.stop_order is not None or self.take_profit_order is not None:
+                return
+
+            ema_distance = abs(self.data.close[0] - self.ema[0]) / self.ema[0]
+
+            if (
+                self.lower_cross[0] > 0
+                and self.data.close[0] > self.ema[0]
+                and ema_distance <= 0.02
+            ):
+                self.order = self.buy(size=self._position_size())
+                self.order.addinfo(kind="entry_long")
+
+            elif (
+                self.upper_cross[0] < 0
+                and self.data.close[0] < self.ema[0]
+                and ema_distance <= 0.02
+            ):
+                self.order = self.sell(size=self._position_size())
+                self.order.addinfo(kind="entry_short")
+
+        elif self.position.size > 0:
+            if self.data.high[0] >= self.bbands.top[0] or self.ema_cross[0] < 0:
+                self._cancel_protective_orders()
+                self.order = self.close()
+                self.order.addinfo(kind="exit_long")
+
+        else:
+            if self.data.low[0] <= self.bbands.bot[0] or self.ema_cross[0] > 0:
+                self._cancel_protective_orders()
+                self.order = self.close()
+                self.order.addinfo(kind="exit_short")
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            kind = order.info.get("kind")
+
+            if order.status == order.Completed:
+                if kind == "entry_long":
+                    self.stop_order = self.sell(
+                        size=order.executed.size,
+                        exectype=bt.Order.Stop,
+                        price=self.bbands.bot[0],
+                    )
+                    self.stop_order.addinfo(kind="stop_long")
+
+                    self.take_profit_order = self.sell(
+                        size=order.executed.size,
+                        exectype=bt.Order.Limit,
+                        price=self.bbands.top[0],
+                    )
+                    self.take_profit_order.addinfo(kind="take_profit_long")
+
+                elif kind == "entry_short":
+                    size = abs(order.executed.size)
+                    self.stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=self.bbands.top[0],
+                    )
+                    self.stop_order.addinfo(kind="stop_short")
+
+                    self.take_profit_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=self.bbands.bot[0],
+                    )
+                    self.take_profit_order.addinfo(kind="take_profit_short")
+
+                elif kind in ("stop_long", "take_profit_long", "stop_short", "take_profit_short"):
+                    self._cancel_protective_orders()
+
+            if order is self.order:
+                self.order = None
+
+            if order is self.stop_order:
+                self.stop_order = None
+
+            if order is self.take_profit_order:
+                self.take_profit_order = None
+```
+
+```json
+{"assumptions":[{"topic":"capital","choice":"Position size is calculated as 2% of current broker portfolio value divided by the current close.","reason":"The specification requires a fixed 2% of capital per trade but does not define capital; current portfolio value is the literal available capital measure in the single-strategy environment."},{"topic":"band touching","choice":"A long upper-band touch uses High >= upper band; a short lower-band touch uses Low <= lower band.","reason":"OHLC bars can establish an intrabar touch only through High and Low."},{"topic":"protective order levels","choice":"Stop-loss and take-profit orders are submitted after entry fills, using the Bollinger Band values on that fill notification bar.","reason":"The specification gives band-based protective levels but does not state that existing orders should be repriced as the bands move."},{"topic":"exit order handling","choice":"A signal-based exit cancels outstanding protective orders before submitting self.close().","reason":"This prevents protective orders from opening a reverse position after the specified position has been closed."}]} 
+```

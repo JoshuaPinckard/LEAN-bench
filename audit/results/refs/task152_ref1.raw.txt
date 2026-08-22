@@ -1,0 +1,163 @@
+```python
+import backtrader as bt
+from collections import deque
+
+
+class LLY1hBullFlag(bt.Strategy):
+    params = (
+        ("risk_percent", 0.02),
+        ("stop_buffer_points", 1.0),
+        ("risk_reward", 2.0),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+        self.target_order = None
+
+        self._day = None
+        self._day_close = None
+        self.daily_closes = deque(maxlen=200)
+
+        self._entry_stop = None
+
+    def _update_daily_close(self):
+        current_day = self.data.datetime.datetime(0).date()
+        current_close = float(self.data.close[0])
+
+        if self._day is None:
+            self._day = current_day
+        elif current_day != self._day:
+            self.daily_closes.append(self._day_close)
+            self._day = current_day
+
+        self._day_close = current_close
+
+    def _daily_sma(self, period):
+        if len(self.daily_closes) < period:
+            return None
+        values = list(self.daily_closes)[-period:]
+        return sum(values) / period
+
+    def next(self):
+        self._update_daily_close()
+
+        if self.order is not None or self.position:
+            return
+
+        if len(self) < 11:
+            return
+
+        sma_50 = self._daily_sma(50)
+        sma_100 = self._daily_sma(100)
+        sma_200 = self._daily_sma(200)
+
+        if sma_50 is None or sma_100 is None or sma_200 is None:
+            return
+
+        price = float(self.data.close[0])
+
+        if not (price > sma_50 and price > sma_100 and price > sma_200):
+            return
+
+        if price <= 774.48:
+            return
+
+        impulse_start = float(self.data.low[-10])
+        impulse_peak = max(float(self.data.high[i]) for i in range(-10, -5))
+        impulse_end_close = float(self.data.close[-6])
+
+        if impulse_peak <= impulse_start or impulse_end_close <= float(self.data.close[-10]):
+            return
+
+        fib_382 = impulse_peak - 0.382 * (impulse_peak - impulse_start)
+
+        flag_high = max(float(self.data.high[i]) for i in range(-5, 0))
+        flag_low = min(float(self.data.low[i]) for i in range(-5, 0))
+
+        if float(self.data.close[-1]) > float(self.data.close[-5]):
+            return
+
+        if any(float(self.data.low[i]) <= fib_382 for i in range(-5, 0)):
+            return
+
+        impulse_volume = sum(float(self.data.volume[i]) for i in range(-10, -5)) / 5.0
+        flag_volume = sum(float(self.data.volume[i]) for i in range(-5, 0)) / 5.0
+
+        if flag_volume >= impulse_volume:
+            return
+
+        if price <= flag_high:
+            return
+
+        channel_stop = flag_low - self.p.stop_buffer_points
+        self._entry_stop = max(channel_stop, fib_382)
+
+        risk_per_share = price - self._entry_stop
+        if risk_per_share <= 0:
+            self._entry_stop = None
+            return
+
+        risk_cash = self.broker.getvalue() * self.p.risk_percent
+        risk_size = int(risk_cash / risk_per_share)
+        affordable_size = int(self.broker.getcash() / price)
+        size = min(risk_size, affordable_size)
+
+        if size <= 0:
+            self._entry_stop = None
+            return
+
+        self.order = self.buy(size=size)
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal:
+            return
+
+        if order is self.order:
+            self.order = None
+
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                stop_price = self._entry_stop
+                target_price = entry_price + (
+                    (entry_price - stop_price) * self.p.risk_reward
+                )
+
+                self.stop_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                )
+                self.target_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=target_price,
+                    oco=self.stop_order,
+                )
+
+            self._entry_stop = None
+            return
+
+        if order is self.stop_order:
+            self.stop_order = None
+            if order.status == order.Completed and self.target_order is not None:
+                self.cancel(self.target_order)
+            return
+
+        if order is self.target_order:
+            self.target_order = None
+            if order.status == order.Completed and self.stop_order is not None:
+                self.cancel(self.stop_order)
+```
+
+```json
+{"assumptions":[{"topic":"daily SMA construction","choice":"Daily SMAs use completed calendar-day closes aggregated from the supplied 1-hour feed; the current hourly close is compared with the most recently available completed-day SMAs.","reason":"The harness supplies only one 1-hour data feed, so daily values must be derived without look-ahead."},{"topic":"weekly support","choice":"The weekly lower-high support filter is implemented as current hourly close strictly greater than 774.48.","reason":"774.48 is the only specified weekly support level; no weekly-bar calculation rule is provided."},{"topic":"bull flag and last upward move","choice":"The prior five hourly bars are the upward impulse and the following five completed hourly bars are the flag; the flag is a downward move when its final close is no higher than its first close. The 0.382 level is peak minus 0.382 times the impulse range, and every flag low must remain strictly above it.","reason":"The specification does not define a significance threshold, channel-fitting method, or lookback duration."},{"topic":"volume comparison","choice":"Average volume across the five flag bars must be strictly lower than average volume across the five impulse bars.","reason":"The specification requires reduced consolidation volume but does not define an averaging period or comparison method."},{"topic":"stop-loss","choice":"A few points below the flag low is implemented as exactly 1.0 point below it; the selected stop is the closer of that price and the 0.382 level, meaning the higher stop price.","reason":"The number of points and tie-breaking method are unspecified."},{"topic":"take-profit","choice":"A fixed 1:2 risk/reward limit order is used instead of deriving nearest resistance or a one-year volume-profile point of control.","reason":"The specification explicitly permits a fixed 1:2 take-profit and does not define resistance ranking or volume-profile methodology."},{"topic":"risk sizing","choice":"Risk is 2% of current broker equity, divided by planned per-share stop risk and capped by available cash at the signal close.","reason":"The specification gives a 1–2% example but no exact percentage; 2% is selected while preserving the stated maximum-risk requirement."},{"topic":"order execution","choice":"The entry is a market buy; after its fill, separate stop and 1:2 limit exit orders are submitted as OCO orders.","reason":"Backtrader market orders fill under the harness broker model, and OCO prevents both exit orders from remaining active after one closes the position."}]}
+```

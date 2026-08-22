@@ -1,0 +1,216 @@
+```python
+import backtrader as bt
+import math
+
+
+class PriceActionVolumeReversal(bt.Strategy):
+    params = (
+        ("volume_period", 20),
+        ("range_period", 20),
+        ("demand_volume_multiple", 1.5),
+        ("demand_range_multiple", 1.5),
+        ("risk_fraction", 0.01),
+        ("stop_buffer_fraction", 0.005),
+        ("reward_risk_multiple", 2.0),
+    )
+
+    def __init__(self):
+        bar_range = self.data.high - self.data.low
+        self.volume_average = bt.indicators.SMA(
+            self.data.volume, period=self.p.volume_period
+        )
+        self.range_average = bt.indicators.SMA(
+            bar_range, period=self.p.range_period
+        )
+
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_context = None
+
+        self.demand = None
+        self.resistance = None
+
+    def _size_for_risk(self, entry_price, stop_price):
+        per_share_risk = abs(entry_price - stop_price)
+        if per_share_risk <= 0:
+            return 0
+
+        capital_at_risk = self.broker.getvalue() * self.p.risk_fraction
+        return math.floor(capital_at_risk / per_share_risk)
+
+    def _submit_long(self, spring_low):
+        estimated_entry = self.data.close[0]
+        estimated_stop = spring_low * (1.0 - self.p.stop_buffer_fraction)
+        size = self._size_for_risk(estimated_entry, estimated_stop)
+
+        if size > 0:
+            self.entry_context = {
+                "direction": "long",
+                "retest_extreme": spring_low,
+            }
+            self.entry_order = self.buy(size=size)
+
+    def _submit_short(self, upthrust_high):
+        estimated_entry = self.data.close[0]
+        estimated_stop = upthrust_high * (1.0 + self.p.stop_buffer_fraction)
+        size = self._size_for_risk(estimated_entry, estimated_stop)
+
+        if size > 0:
+            self.entry_context = {
+                "direction": "short",
+                "retest_extreme": upthrust_high,
+            }
+            self.entry_order = self.sell(size=size)
+
+    def next(self):
+        if self.entry_order is not None or self.position:
+            return
+
+        current_index = len(self) - 1
+
+        if self.demand is not None:
+            bars_after_demand = current_index - self.demand["index"]
+            if bars_after_demand >= 2:
+                rtl_slope = (
+                    self.demand["pre_retest_low"] - self.demand["initial_high"]
+                ) / (current_index - self.demand["index"] - 1)
+                rtl_value = self.demand["initial_high"] + (
+                    rtl_slope * (current_index - self.demand["index"])
+                )
+
+                if (
+                    rtl_slope < 0
+                    and self.data.low[0] <= self.demand["level"]
+                    and self.data.close[0]
+                    >= (self.data.high[0] + self.data.low[0]) / 2.0
+                    and self.data.volume[0] > self.volume_average[0]
+                    and self.data.close[0] > rtl_value
+                ):
+                    self._submit_long(self.data.low[0])
+                    self.demand = None
+                    return
+
+            if current_index > self.demand["index"]:
+                self.demand["pre_retest_low"] = min(
+                    self.demand["pre_retest_low"], self.data.low[0]
+                )
+
+        if self.resistance is not None:
+            bars_after_resistance = current_index - self.resistance["index"]
+            if bars_after_resistance >= 2:
+                rtl_slope = (
+                    self.resistance["pre_retest_low"]
+                    - self.resistance["initial_high"]
+                ) / (current_index - self.resistance["index"] - 1)
+                rtl_value = self.resistance["initial_high"] + (
+                    rtl_slope * (current_index - self.resistance["index"])
+                )
+
+                if (
+                    rtl_slope > 0
+                    and self.data.high[0] >= self.resistance["level"]
+                    and self.data.close[0]
+                    <= (self.data.high[0] + self.data.low[0]) / 2.0
+                    and self.data.volume[0] > self.volume_average[0]
+                    and self.data.close[0] < rtl_value
+                ):
+                    self._submit_short(self.data.high[0])
+                    self.resistance = None
+                    return
+
+            if current_index > self.resistance["index"]:
+                self.resistance["pre_retest_low"] = min(
+                    self.resistance["pre_retest_low"], self.data.low[0]
+                )
+
+        current_range = self.data.high[0] - self.data.low[0]
+        if (
+            self.data.volume[0]
+            >= self.p.demand_volume_multiple * self.volume_average[0]
+            and current_range
+            >= self.p.demand_range_multiple * self.range_average[0]
+        ):
+            self.demand = {
+                "index": current_index,
+                "level": self.data.low[0],
+                "initial_high": self.data.high[0],
+                "pre_retest_low": self.data.low[0],
+            }
+
+        if self.data.high[-1] > self.data.high[-2] and self.data.high[-1] > self.data.high[0]:
+            self.resistance = {
+                "index": current_index - 1,
+                "level": self.data.high[-1],
+                "initial_high": self.data.high[-1],
+                "pre_retest_low": self.data.low[0],
+            }
+
+    def notify_order(self, order):
+        terminal_statuses = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal_statuses:
+            return
+
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if self.entry_context["direction"] == "long":
+                    stop_price = self.entry_context["retest_extreme"] * (
+                        1.0 - self.p.stop_buffer_fraction
+                    )
+                    target_price = entry_price + self.p.reward_risk_multiple * (
+                        entry_price - stop_price
+                    )
+                    self.stop_order = self.sell(
+                        size=size, exectype=bt.Order.Stop, price=stop_price
+                    )
+                    self.target_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self.stop_order,
+                    )
+                else:
+                    stop_price = self.entry_context["retest_extreme"] * (
+                        1.0 + self.p.stop_buffer_fraction
+                    )
+                    target_price = entry_price - self.p.reward_risk_multiple * (
+                        stop_price - entry_price
+                    )
+                    self.stop_order = self.buy(
+                        size=size, exectype=bt.Order.Stop, price=stop_price
+                    )
+                    self.target_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self.stop_order,
+                    )
+
+            self.entry_order = None
+            self.entry_context = None
+            return
+
+        if order is self.stop_order:
+            if order.status == order.Completed and self.target_order is not None:
+                self.cancel(self.target_order)
+            self.stop_order = None
+            return
+
+        if order is self.target_order:
+            if order.status == order.Completed and self.stop_order is not None:
+                self.cancel(self.stop_order)
+            self.target_order = None
+```
+
+```json
+{"assumptions":[{"topic":"risk percentage","choice":"Use 1% of current broker account value as the fixed monetary-risk limit per trade.","reason":"The specification gives a 1–2% common default but does not select one value."},{"topic":"stop placement","choice":"Place the long stop 0.5% below the spring low and the short stop 0.5% above the upthrust high.","reason":"This preserves the required placement beyond the retest extreme while applying the stated reasonable 0.5% fixed-percentage default."},{"topic":"take profit","choice":"Set take profit at two times the actual entry-to-stop risk distance.","reason":"This implements the stated 1:2 risk/reward ratio."},{"topic":"swing high and pre-retest swing low","choice":"A resistance swing high is a bar whose high exceeds both adjacent bars; the pre-retest low is the lowest low after the level-defining bar and before the retest bar.","reason":"The specification requires previous swing highs and lows before retests but does not define their detection rules."},{"topic":"RTL break","choice":"A long RTL break is the retest close above the downward RTL; a short RTL break is the retest close below the upward RTL.","reason":"The specification requires a break but does not define the price field or crossing direction."},{"topic":"infeasible","choice":"For the short RTL, use the resistance-defining swing-high bar as the specification’s referenced 'initial demand bar.'","reason":"Setup 2 references an initial demand bar even though its setup defines a resistance level instead; no separate initial demand bar is available for the short setup."}]}
+```

@@ -1,0 +1,211 @@
+```python
+import backtrader as bt
+import math
+
+
+class ThetaProxySingleAsset(bt.Strategy):
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_ema = bt.indicators.EMA(self.atr, period=14)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.sma = bt.indicators.SMA(self.data.close, period=20)
+        self.width_sma = bt.indicators.SMA(
+            self.bb.top - self.bb.bot, period=20
+        )
+
+        self.ema_atr_cross_atr = bt.indicators.CrossOver(
+            self.atr_ema, self.atr
+        )
+        self.atr_cross_ema = bt.indicators.CrossOver(
+            self.atr, self.atr_ema
+        )
+
+        self.order = None
+        self.pending_kind = None
+        self.pending_size = 0
+        self.pending_unit_risk = None
+        self.pending_sma = None
+
+        self.last_entry_bar = None
+        self.position_entry_bar = None
+        self.entry_price = None
+        self.entry_unit_risk = None
+        self.entry_sma = None
+        self.direction = 0
+        self.units = 0
+        self.last_unit_entry_price = None
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Submitted,
+            order.Accepted,
+            order.Partial,
+        ]:
+            return
+
+        if order.status == order.Completed:
+            if self.pending_kind == "initial":
+                self.last_entry_bar = len(self.data)
+                self.position_entry_bar = len(self.data)
+                self.entry_price = order.executed.price
+                self.entry_unit_risk = self.pending_unit_risk
+                self.entry_sma = self.pending_sma
+                self.direction = 1 if order.isbuy() else -1
+                self.units = 1
+                self.last_unit_entry_price = order.executed.price
+
+            elif self.pending_kind == "pyramid":
+                self.units += 1
+                self.last_unit_entry_price = order.executed.price
+
+            elif self.pending_kind == "exit":
+                self.position_entry_bar = None
+                self.entry_price = None
+                self.entry_unit_risk = None
+                self.entry_sma = None
+                self.direction = 0
+                self.units = 0
+                self.last_unit_entry_price = None
+
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+            self.pending_kind = None
+            self.pending_size = 0
+            self.pending_unit_risk = None
+            self.pending_sma = None
+
+    def _filters_satisfied(self):
+        atr_compressed = (
+            self.atr[0] < self.atr_ema[0]
+            and self.atr[-1] < self.atr_ema[-1]
+        )
+        recent_ema_cross = any(
+            self.ema_atr_cross_atr[i] == 1 for i in (0, -1, -2)
+        )
+
+        no_news_volatility = (
+            (self.bb.top[0] - self.bb.bot[0]) <= 1.5 * self.width_sma[0]
+            and (self.atr[0] / self.data.close[0]) <= 0.04
+        )
+
+        return (atr_compressed or recent_ema_cross) and no_news_volatility
+
+    def _unit_risk(self):
+        return max(
+            self.atr[0],
+            0.5 * abs(self.data.close[0] - self.sma[0]),
+        )
+
+    def _submit_entry(self, direction, kind):
+        unit_risk = self._unit_risk()
+        size = math.floor(
+            (self.broker.getvalue() * 0.015) / unit_risk
+        )
+
+        if size <= 0:
+            return
+
+        self.pending_kind = kind
+        self.pending_size = size
+        self.pending_unit_risk = unit_risk
+        self.pending_sma = self.sma[0]
+
+        if direction == 1:
+            self.order = self.buy(size=size)
+        else:
+            self.order = self.sell(size=size)
+
+    def _submit_exit(self):
+        self.pending_kind = "exit"
+        self.order = self.close()
+
+    def next(self):
+        if self.order:
+            return
+
+        filters_satisfied = self._filters_satisfied()
+
+        if self.position:
+            target = self.entry_price + 0.7 * (
+                self.entry_sma - self.entry_price
+            )
+            stop = self.entry_price - self.direction * (
+                1.5 * self.entry_unit_risk
+            )
+
+            if self.direction == 1:
+                target_or_stop_hit = (
+                    self.data.high[0] >= target
+                    or self.data.low[0] <= stop
+                )
+            else:
+                target_or_stop_hit = (
+                    self.data.low[0] <= target
+                    or self.data.high[0] >= stop
+                )
+
+            time_exit = (
+                len(self.data) - self.position_entry_bar >= 3
+            )
+            volatility_exit = (
+                self.atr_cross_ema[0] == 1
+                or self.data.close[0] > self.bb.top[0] + 0.5 * self.atr[0]
+                or self.data.close[0] < self.bb.bot[0] - 0.5 * self.atr[0]
+            )
+
+            if target_or_stop_hit or time_exit or volatility_exit:
+                self._submit_exit()
+                return
+
+            can_pyramid = (
+                self.units < 3
+                and self.atr[0] < self.atr[-1]
+                and filters_satisfied
+            )
+
+            if can_pyramid and self.direction == 1:
+                if self.data.close[0] <= (
+                    self.last_unit_entry_price - 0.5 * self.atr[0]
+                ):
+                    self._submit_entry(1, "pyramid")
+
+            elif can_pyramid and self.direction == -1:
+                if self.data.close[0] >= (
+                    self.last_unit_entry_price + 0.5 * self.atr[0]
+                ):
+                    self._submit_entry(-1, "pyramid")
+
+            return
+
+        cooldown_complete = (
+            self.last_entry_bar is None
+            or len(self.data) - self.last_entry_bar >= 24
+        )
+
+        if not cooldown_complete or not filters_satisfied:
+            return
+
+        if (
+            self.data.close[0] <= self.bb.bot[0]
+            and self.rsi[0] < 35
+        ):
+            self._submit_entry(1, "initial")
+
+        elif (
+            self.data.close[0] >= self.bb.top[0]
+            and self.rsi[0] > 65
+        ):
+            self._submit_entry(-1, "initial")
+```
+
+```json
+{"assumptions":[{"topic":"target and stop detection","choice":"A target or stop is treated as reached when the bar High/Low touches its level; the resulting self.close() order follows normal Backtrader execution timing.","reason":"The specification says reaching target/stop rather than requiring a closing-price confirmation, while the available feed provides OHLC bars only."},{"topic":"entry reference values","choice":"Target and stop use the actual completed entry price, with SMA(20) and UnitRisk captured when the opening order is submitted.","reason":"The actual entry price is only known on order completion; indicator values available at signal generation are the closest literal reference for the entry decision."},{"topic":"pyramiding exits","choice":"Pyramid additions share the original position's target, stop, and three-bar exit clock; an exit closes the whole position.","reason":"The specification describes exits for 'the position' and specifies closing the position, without separate per-unit exit rules."},{"topic":"pyramiding cooldown","choice":"The 24-bar restriction applies to opening a new flat-to-position trade, while permitted pyramid additions may occur during an open position.","reason":"Applying the cooldown to additions would make the stated pyramiding rule incompatible with the mandatory third-bar time exit."},{"topic":"pyramid deviation reference","choice":"Each further 0.5×ATR deviation is measured from the most recently completed unit's entry price.","reason":"The specification requires further deviation for successive units but does not identify a reference price."},{"topic":"ATR declining","choice":"ATR is considered still declining when current ATR(14) is less than its immediately preceding value.","reason":"No longer lookback period is specified."}]}
+```

@@ -1,0 +1,139 @@
+```python
+import backtrader as bt
+
+
+class LevelRetestEntryStrategy(bt.Strategy):
+    params = (
+        ('risk_fraction', 0.01),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        # Historical levels: the preceding 20 completed hourly bars.
+        self.support = bt.indicators.Lowest(self.data.low(-1), period=20)
+        self.resistance = bt.indicators.Highest(self.data.high(-1), period=20)
+
+        self.order = None
+        self.order_role = None
+        self.pending_trade = None
+
+        self.entry_level = None
+        self.target_price = None
+
+    def _higher_timeframe_bullish(self):
+        bar_index = len(self) - 1
+        if bar_index < 8:
+            return False
+
+        completed_4h_end = (bar_index // 4) * 4 - 1
+        current_offset = completed_4h_end - bar_index
+        previous_offset = current_offset - 4
+
+        return self.data.close[current_offset] > self.data.close[previous_offset]
+
+    def _higher_timeframe_bearish(self):
+        bar_index = len(self) - 1
+        if bar_index < 8:
+            return False
+
+        completed_4h_end = (bar_index // 4) * 4 - 1
+        current_offset = completed_4h_end - bar_index
+        previous_offset = current_offset - 4
+
+        return self.data.close[current_offset] < self.data.close[previous_offset]
+
+    def _bullish_engulfing(self):
+        return (
+            self.data.close[0] > self.data.open[0]
+            and self.data.close[-1] < self.data.open[-1]
+            and self.data.open[0] <= self.data.close[-1]
+            and self.data.close[0] >= self.data.open[-1]
+        )
+
+    def _bearish_engulfing(self):
+        return (
+            self.data.close[0] < self.data.open[0]
+            and self.data.close[-1] > self.data.open[-1]
+            and self.data.open[0] >= self.data.close[-1]
+            and self.data.close[0] <= self.data.open[-1]
+        )
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order.status == order.Completed and self.order_role == 'entry':
+                self.entry_level = self.pending_trade['level']
+                atr_at_entry = float(self.atr[0])
+
+                if order.isbuy():
+                    self.target_price = order.executed.price + (2.0 * atr_at_entry)
+                else:
+                    self.target_price = order.executed.price - (2.0 * atr_at_entry)
+
+            if self.order_role == 'entry' and order.status != order.Completed:
+                self.pending_trade = None
+
+            if self.order_role == 'exit' and order.status == order.Completed:
+                self.entry_level = None
+                self.target_price = None
+
+            self.order = None
+            self.order_role = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0:
+                if (
+                    self.data.high[0] >= self.target_price
+                    or self.data.close[0] < self.entry_level
+                ):
+                    self.order = self.close()
+                    self.order_role = 'exit'
+            else:
+                if (
+                    self.data.low[0] <= self.target_price
+                    or self.data.close[0] > self.entry_level
+                ):
+                    self.order = self.close()
+                    self.order_role = 'exit'
+            return
+
+        if (
+            self.data.low[0] <= self.support[0]
+            and self._bullish_engulfing()
+            and self.rsi[0] > 50
+            and self._higher_timeframe_bullish()
+        ):
+            stop_distance = self.data.close[0] - self.support[0]
+            if stop_distance > 0:
+                size = (self.broker.getvalue() * self.p.risk_fraction) / stop_distance
+                self.pending_trade = {'level': float(self.support[0])}
+                self.order = self.buy(size=size)
+                self.order_role = 'entry'
+
+        elif (
+            self.data.high[0] >= self.resistance[0]
+            and self._bearish_engulfing()
+            and self.rsi[0] < 50
+            and self._higher_timeframe_bearish()
+        ):
+            stop_distance = self.resistance[0] - self.data.close[0]
+            if stop_distance > 0:
+                size = (self.broker.getvalue() * self.p.risk_fraction) / stop_distance
+                self.pending_trade = {'level': float(self.resistance[0])}
+                self.order = self.sell(size=size)
+                self.order_role = 'entry'
+```
+
+```json
+{"assumptions":[{"topic":"candlestick pattern","choice":"Use bullish engulfing for long entries and bearish engulfing for short entries.","reason":"The specification gives these as explicit examples but does not require a particular listed pattern."},{"topic":"historical support and resistance","choice":"Support and resistance are respectively the lowest low and highest high of the 20 hourly bars preceding the signal bar.","reason":"This makes each level historical before the current bar touches or breaks it."},{"topic":"higher timeframe trend","choice":"Construct completed four-hour bars from consecutive groups of four hourly bars, anchored at the first feed bar; bullish means the latest completed four-hour close exceeds the preceding completed four-hour close, and bearish means it is lower.","reason":"The single supplied hourly feed has no separate four-hour data feed, and the specification does not define trend measurement."},{"topic":"take-profit detection","choice":"A long take-profit triggers when the bar high reaches the target and a short take-profit triggers when the bar low reaches the target.","reason":"The specification says price moves the ATR distance without requiring a bar close for take-profit, unlike the explicitly close-based stop-loss."},{"topic":"risk percentage","choice":"Risk 1% of current broker value per trade.","reason":"The stated permitted range is 1-2% and no exact value is specified."},{"topic":"risk sizing execution gap","choice":"Size is calculated from the signal-bar close and its distance to the identified level; the target is based on the actual market-order execution price and ATR at execution.","reason":"A standard Backtrader market order executes on the following bar, so its exact fill price cannot be known when the risk-based size is submitted."},{"topic":"commission in risk sizing","choice":"Risk sizing uses price distance only and does not include commissions.","reason":"The specification defines potential loss through the stop-loss distance and gives no instruction to include transaction costs."}]}
+```

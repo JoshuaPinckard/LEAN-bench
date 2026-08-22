@@ -1,0 +1,64 @@
+{
+  "task_id": 121,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\n\n\nclass PullbackTradingUsingFibonacciLevelsAndEMA(bt.Strategy):\n    params = (\n        (\"ema_period\", 20),\n        (\"risk_fraction\", 0.01),\n        (\"price_increment\", 0.01),\n    )\n\n    def __init__(self):\n        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)\n\n        self.last_significant_low = None\n        self.last_significant_high = None\n\n        self.entry_order = None\n        self.stop_order = None\n        self.tp1_order = None\n        self.tp2_order = None\n\n        self.entry_stop = None\n        self.entry_tp1 = None\n        self.entry_tp2 = None\n        self.move_stop_to_breakeven = False\n\n    def _fibonacci_levels(self):\n        low = self.last_significant_low\n        high = self.last_significant_high\n        distance = high - low\n\n        return [\n            (0.618, high - distance * 0.618),\n            (0.500, high - distance * 0.500),\n            (0.382, high - distance * 0.382),\n            (0.236, high - distance * 0.236),\n        ]\n\n    def _orders_pending(self):\n        return any(\n            order is not None\n            for order in (\n                self.entry_order,\n                self.stop_order,\n                self.tp1_order,\n                self.tp2_order,\n            )\n        )\n\n    def _cancel_exit_orders(self):\n        for order in (self.stop_order, self.tp1_order, self.tp2_order):\n            if order is not None:\n                self.cancel(order)\n\n    def next(self):\n        if (\n            self.data.low[-1] < self.data.low[-2]\n            and self.data.low[-1] < self.data.low[0]\n        ):\n            self.last_significant_low = self.data.low[-1]\n            self.last_significant_high = None\n\n        if (\n            self.last_significant_low is not None\n            and self.data.high[-1] > self.data.high[-2]\n            and self.data.high[-1] > self.data.high[0]\n            and self.data.high[-1] > self.last_significant_low\n        ):\n            self.last_significant_high = self.data.high[-1]\n\n        if self.position or self._orders_pending():\n            return\n\n        if (\n            self.last_significant_low is None\n            or self.last_significant_high is None\n            or self.data.close[0] <= self.ema[0]\n        ):\n            return\n\n        bullish_reversal = (\n            self.data.close[0] > self.data.open[0]\n            and self.data.close[0] > self.data.close[-1]\n        )\n        if not bullish_reversal:\n            return\n\n        fib_levels = self._fibonacci_levels()\n        entry_level = None\n        entry_index = None\n\n        for index, (_, level) in enumerate(fib_levels):\n            if self.data.low[0] <= level <= self.data.high[0]:\n                entry_level = level\n                entry_index = index\n                break\n\n        if entry_level is None:\n            return\n\n        stop_price = self.last_significant_low - self.p.price_increment\n        estimated_entry = self.data.close[0]\n        risk_per_share = estimated_entry - stop_price\n\n        if risk_per_share <= 0:\n            return\n\n        higher_targets = [level for _, level in fib_levels[entry_index + 1:]]\n        higher_targets.append(self.last_significant_high)\n\n        if higher_targets:\n            tp1_price = higher_targets[0]\n        else:\n            return\n\n        if len(higher_targets) >= 2:\n            tp2_price = higher_targets[1]\n        else:\n            tp2_price = estimated_entry + (9.0 * risk_per_share)\n\n        if tp2_price - estimated_entry < 9.0 * risk_per_share:\n            return\n\n        risk_cash = self.broker.getvalue() * self.p.risk_fraction\n        risk_size = math.floor(risk_cash / risk_per_share)\n        affordable_size = math.floor(\n            self.broker.getcash()\n            / (estimated_entry * (1.0 + self.broker.getcommissioninfo(self.data).p.commission))\n        )\n        size = min(risk_size, affordable_size)\n\n        if size <= 0:\n            return\n\n        self.entry_stop = stop_price\n        self.entry_tp1 = tp1_price\n        self.entry_tp2 = tp2_price\n        self.entry_order = self.buy(size=size)\n\n    def notify_order(self, order):\n        terminal_statuses = (\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        )\n\n        if order.status not in terminal_statuses:\n            return\n\n        if order is self.entry_order:\n            self.entry_order = None\n\n            if order.status == order.Completed:\n                size = order.executed.size\n                self.stop_order = self.sell(\n                    size=size,\n                    exectype=bt.Order.Stop,\n                    price=self.entry_stop,\n                )\n                self.tp1_order = self.sell(\n                    size=size / 2.0,\n                    exectype=bt.Order.Limit,\n                    price=self.entry_tp1,\n                )\n            return\n\n        if order is self.tp1_order:\n            self.tp1_order = None\n\n            if order.status == order.Completed and self.position:\n                self.move_stop_to_breakeven = True\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                else:\n                    remaining = self.position.size\n                    self.stop_order = self.sell(\n                        size=remaining,\n                        exectype=bt.Order.Stop,\n                        price=self.position.price,\n                    )\n                    self.tp2_order = self.sell(\n                        size=remaining,\n                        exectype=bt.Order.Limit,\n                        price=self.entry_tp2,\n                    )\n            return\n\n        if order is self.stop_order:\n            self.stop_order = None\n\n            if (\n                order.status == order.Canceled\n                and self.move_stop_to_breakeven\n                and self.position\n            ):\n                self.move_stop_to_breakeven = False\n                remaining = self.position.size\n                self.stop_order = self.sell(\n                    size=remaining,\n                    exectype=bt.Order.Stop,\n                    price=self.position.price,\n                )\n                self.tp2_order = self.sell(\n                    size=remaining,\n                    exectype=bt.Order.Limit,\n                    price=self.entry_tp2,\n                )\n            elif order.status == order.Completed:\n                self.move_stop_to_breakeven = False\n                self._cancel_exit_orders()\n            return\n\n        if order is self.tp2_order:\n            self.tp2_order = None\n\n            if order.status == order.Completed:\n                self._cancel_exit_orders()",
+  "assumptions": [
+    {
+      "topic": "significant swings",
+      "choice": "A significant low/high is a confirmed one-bar local pivot: the prior bar's low/high is lower/higher than both adjacent bars. A new low begins a new Fibonacci swing, and the next confirmed high defines its upper endpoint.",
+      "reason": "The specification requires significant lows and highs but does not define their detection method."
+    },
+    {
+      "topic": "pullback reversal confirmation",
+      "choice": "A Fibonacci level is reached when it lies within the current bar's low-high range; reversal confirmation requires a bullish candle (close above open) and an upswing (close above the previous close).",
+      "reason": "The specification gives bullish candlestick formation or start of an upswing as examples but provides no exact pattern definition."
+    },
+    {
+      "topic": "multiple reached levels",
+      "choice": "When one bar reaches multiple levels, the deepest reached level is selected first: 61.8%, then 50.0%, 38.2%, and 23.6%.",
+      "reason": "The specification does not establish priority among simultaneously reached Fibonacci levels."
+    },
+    {
+      "topic": "stop placement",
+      "choice": "The long stop is one cent below the last significant low.",
+      "reason": "The specification requires a stop beyond the last local low and as close as possible, but does not specify an offset or tick size; $0.01 is used as the smallest assumed price increment."
+    },
+    {
+      "topic": "risk sizing",
+      "choice": "Risk is set to 1% of current broker equity, within the stated 1-2% range. Share quantity is floor(1% equity divided by estimated entry-to-stop risk), capped by available cash including commission.",
+      "reason": "The specification requires stop-based sizing and gives a 1-2% risk range but does not select a precise percentage."
+    },
+    {
+      "topic": "profit targets",
+      "choice": "TP1 and TP2 are the next and subsequent higher Fibonacci levels toward the swing high. If only the swing high remains after a 23.6% entry, TP1 is that high and TP2 is projected at 9R above estimated entry as the required higher-price-high target.",
+      "reason": "A higher future Dow Theory high is unknowable from completed OHLCV bars; the 9R projection is the closest literal executable target satisfying the stated minimum RR goal."
+    },
+    {
+      "topic": "minimum RR",
+      "choice": "An entry is allowed only when TP2 is at least nine times the estimated entry-to-stop risk above the estimated entry.",
+      "reason": "The specification states the goal is RR of at least 1:9."
+    },
+    {
+      "topic": "partial exit",
+      "choice": "Half the position is sold at TP1; after TP1 fills, the stop for the remaining position is moved to breakeven and TP2 is placed.",
+      "reason": "The specification permits partial closure at TP1 and moving the stop to breakeven but does not specify the partial percentage."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Actual market-order fill price and risk cannot be known until the following bar in standard Backtrader execution, so sizing and the 9R test use the signal bar close; gaps can change realized risk and reward.",
+      "reason": "The environment uses normal Backtrader market-order execution rather than guaranteed signal-close fills."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2023-08-30T16:30:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 187.44000244140625
+    }
+  ]
+}

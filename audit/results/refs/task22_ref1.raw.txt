@@ -1,0 +1,161 @@
+```python
+import backtrader as bt
+
+
+class TrendStrategyWithRSIFilterAndHardStopLoss(bt.Strategy):
+    params = (
+        ("rsi_period", 14),
+        ("stop_loss_pct", 0.001),
+        ("take_profit_pct", 0.01),
+        ("risk_pct", 0.01),
+        ("spread_pips", 1),
+        ("pip_size", 0.0001),
+    )
+
+    def __init__(self):
+        self.entry_order = None
+        self.stop_order = None
+        self.take_profit_order = None
+
+        self.current_day = None
+        self.last_close = None
+        self.daily_closes = []
+        self.avg_gain = None
+        self.avg_loss = None
+        self.daily_rsi = None
+
+    def _update_daily_rsi(self, close):
+        self.daily_closes.append(close)
+
+        if len(self.daily_closes) < self.p.rsi_period + 1:
+            self.daily_rsi = None
+            return
+
+        change = self.daily_closes[-1] - self.daily_closes[-2]
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+
+        if len(self.daily_closes) == self.p.rsi_period + 1:
+            changes = [
+                self.daily_closes[i] - self.daily_closes[i - 1]
+                for i in range(1, self.p.rsi_period + 1)
+            ]
+            self.avg_gain = sum(max(value, 0.0) for value in changes) / self.p.rsi_period
+            self.avg_loss = sum(max(-value, 0.0) for value in changes) / self.p.rsi_period
+        else:
+            self.avg_gain = (
+                (self.avg_gain * (self.p.rsi_period - 1)) + gain
+            ) / self.p.rsi_period
+            self.avg_loss = (
+                (self.avg_loss * (self.p.rsi_period - 1)) + loss
+            ) / self.p.rsi_period
+
+        if self.avg_loss == 0.0:
+            self.daily_rsi = 100.0 if self.avg_gain > 0.0 else 50.0
+        elif self.avg_gain == 0.0:
+            self.daily_rsi = 0.0
+        else:
+            rs = self.avg_gain / self.avg_loss
+            self.daily_rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    def _submit_entry(self, is_long):
+        reference_price = self.data.close[0]
+        capital = self.broker.getvalue()
+        size = (capital * self.p.risk_pct) / (
+            reference_price * self.p.stop_loss_pct
+        )
+
+        if is_long:
+            self.entry_order = self.buy(size=size)
+        else:
+            self.entry_order = self.sell(size=size)
+
+    def next(self):
+        day = self.data.datetime.datetime(0).date()
+
+        if self.current_day is None:
+            self.current_day = day
+        elif day != self.current_day:
+            self._update_daily_rsi(self.last_close)
+            self.current_day = day
+
+            if (
+                self.daily_rsi is not None
+                and not self.position
+                and self.entry_order is None
+                and self.stop_order is None
+                and self.take_profit_order is None
+            ):
+                if self.daily_rsi < 30.0:
+                    self._submit_entry(is_long=True)
+                elif self.daily_rsi > 70.0:
+                    self._submit_entry(is_long=False)
+
+        self.last_close = self.data.close[0]
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order is self.entry_order:
+                self.entry_order = None
+
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                spread = self.p.spread_pips * self.p.pip_size
+
+                if order.executed.size > 0:
+                    stop_price = entry_price * (1.0 - self.p.stop_loss_pct)
+                    take_profit_price = (
+                        entry_price * (1.0 + self.p.take_profit_pct) + spread
+                    )
+                    self.stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                    )
+                    self.take_profit_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=take_profit_price,
+                        oco=self.stop_order,
+                    )
+                else:
+                    stop_price = entry_price * (1.0 + self.p.stop_loss_pct)
+                    take_profit_price = (
+                        entry_price * (1.0 - self.p.take_profit_pct) - spread
+                    )
+                    self.stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                    )
+                    self.take_profit_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=take_profit_price,
+                        oco=self.stop_order,
+                    )
+
+            elif order is self.stop_order:
+                self.stop_order = None
+            elif order is self.take_profit_order:
+                self.take_profit_order = None
+
+        elif order.status in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.entry_order:
+                self.entry_order = None
+            elif order is self.stop_order:
+                self.stop_order = None
+            elif order is self.take_profit_order:
+                self.take_profit_order = None
+```
+
+```json
+{"assumptions":[{"topic":"daily RSI construction","choice":"Aggregate the supplied 15-minute bars into daily closes and calculate a 14-period Wilder RSI from completed daily bars.","reason":"The execution environment supplies only one 15-minute feed, while the specification requires a daily RSI."},{"topic":"daily RSI availability","choice":"Evaluate the completed prior day's RSI when the first bar of a new trading day arrives, then submit the entry order; Backtrader executes that market order on the following 15-minute bar.","reason":"A daily close is not known until its trading day has completed, and using it earlier would introduce look-ahead bias."},{"topic":"risk-based size","choice":"Use size = 1% of current broker value divided by 0.1% of the signal-bar close.","reason":"The exact next-bar fill price is unavailable when a standard Backtrader market order is submitted; this is the closest executable calculation to the stated 1% stop-loss risk."},{"topic":"spread","choice":"Use one EUR/USD pip as 0.0001 and add it to the favorable take-profit movement: above the long target and below the short target.","reason":"OHLCV data has no bid/ask prices, so a literal bid/ask spread cannot be applied; this implements the stated requirement that profit requires one pip beyond take-profit."}]}
+```

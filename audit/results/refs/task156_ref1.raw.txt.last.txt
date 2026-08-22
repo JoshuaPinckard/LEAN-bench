@@ -1,0 +1,142 @@
+```python
+import backtrader as bt
+import math
+
+
+class MomentumStrategy(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.entry_direction = 0
+
+        self.ema = bt.indicators.EMA(self.data.close, period=50)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=12,
+            period_me2=26,
+            period_signal=9,
+        )
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=20,
+            devfactor=2,
+        )
+        self.bbwidth = self.bb.top - self.bb.bot
+        self.bbwidth_sma = bt.indicators.SMA(self.bbwidth, period=100)
+        self.squeeze = self.bbwidth <= (self.bbwidth_sma * 0.85)
+
+    def _size_for_risk(self, direction, half_size):
+        capital = self.broker.getvalue()
+        risk_amount = capital * self.p.risk_fraction
+        close = self.data.close[0]
+
+        if direction > 0:
+            per_share_risk = close - (self.ema[0] - 0.5 * self.atr[0])
+        else:
+            per_share_risk = (self.ema[0] + 0.5 * self.atr[0]) - close
+
+        if per_share_risk <= 0:
+            return 0
+
+        risk_size = math.floor(risk_amount / per_share_risk)
+        cash_size = math.floor(self.broker.getcash() / (close * 1.001))
+        size = min(risk_size, cash_size)
+
+        if half_size:
+            size = math.floor(size / 2)
+
+        return max(size, 0)
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if (
+                self.data.datetime.time(0).hour == 15
+                and self.data.datetime.time(0).minute >= 30
+            ):
+                self.order = self.close()
+                return
+
+            if self.entry_direction > 0:
+                stop_hit = self.data.close[0] < (self.ema[0] - 0.5 * self.atr[0])
+                target_hit = self.data.close[0] >= (
+                    self.entry_price + 1.5 * self.atr[0]
+                )
+            else:
+                stop_hit = self.data.close[0] > (self.ema[0] + 0.5 * self.atr[0])
+                target_hit = self.data.close[0] <= (
+                    self.entry_price - 1.5 * self.atr[0]
+                )
+
+            if stop_hit or target_hit:
+                self.order = self.close()
+            return
+
+        squeeze_recent = any(self.squeeze[-i] for i in range(5))
+        expansion = self.bbwidth[0] > self.bbwidth[-1]
+
+        histogram = self.macd.macd[0] - self.macd.signal[0]
+        previous_histogram = self.macd.macd[-1] - self.macd.signal[-1]
+
+        long_trend = (
+            self.data.close[0] > self.ema[0]
+            and (self.data.close[0] - self.ema[0]) > 0.5 * self.atr[0]
+        )
+        short_trend = (
+            self.data.close[0] < self.ema[0]
+            and (self.ema[0] - self.data.close[0]) > 0.5 * self.atr[0]
+        )
+
+        long_confirmation = (
+            squeeze_recent
+            and expansion
+            and histogram > 0
+            and histogram > previous_histogram
+        )
+        short_confirmation = (
+            squeeze_recent
+            and expansion
+            and histogram < 0
+            and histogram < previous_histogram
+        )
+
+        if long_trend:
+            size = self._size_for_risk(1, not long_confirmation)
+            if size > 0:
+                self.order = self.buy(size=size)
+                self.order.addinfo(kind="entry", direction=1)
+
+        elif short_trend:
+            size = self._size_for_risk(-1, not short_confirmation)
+            if size > 0:
+                self.order = self.sell(size=size)
+                self.order.addinfo(kind="entry", direction=-1)
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if getattr(order.info, "kind", None) == "entry":
+                self.entry_price = order.executed.price
+                self.entry_direction = order.info.direction
+            elif not self.position:
+                self.entry_price = None
+                self.entry_direction = 0
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"timeframes","choice":"Apply the rules to the supplied native 30-minute feed.","reason":"The harness supplies only self.data at 30-minute resolution and does not provide 1-hour or 2-hour resampled feeds; the specification does not define cross-timeframe confirmation or parameter-selection behavior."},{"topic":"risk sizing","choice":"Size shares as floor(1% of current broker value divided by the distance from the current close to the stated EMA/ATR trend-change exit threshold), capped by available cash; confirmed entries use this size and trend-only entries use half.","reason":"The specification requires 1% capital risk and half size but does not state a per-share risk distance or buying-power rule; the specified EMA/ATR exit threshold is the literal available loss reference."},{"topic":"kelly","choice":"Use the specified 1% base risk fraction and do not apply the optional Kelly adjustment.","reason":"Kelly use is explicitly optional and no rolling window or trade-history initialization is specified."},{"topic":"metrics","choice":"Do not perform parameter selection within the strategy.","reason":"No candidate parameter sets, selection schedule, or output channel is specified, and the required output is a single strategy class."},{"topic":"RTH execution","choice":"Submit self.close() on the 15:30 30-minute bar, the final regular-session bar start time.","reason":"With standard Backtrader market-order processing, actual fill timing is controlled by the harness; the strategy can only submit the specified close order at the end-of-RTH bar."}]}
+```

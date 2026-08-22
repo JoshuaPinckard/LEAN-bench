@@ -1,0 +1,135 @@
+```python
+import backtrader as bt
+
+
+class RRGProxyMomentum(bt.Strategy):
+    params = (
+        ("stop_pct", 0.02),
+        ("take_pct", 0.07),
+        ("use_tp", True),
+        ("risk_pct", 0.01),
+        ("max_capital_pct", 0.10),
+        ("use_liquidity_filter", False),
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200)
+        self.macd = bt.indicators.MACDHisto(
+            self.data.close,
+            period_me1=12,
+            period_me2=26,
+            period_signal=9,
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.volume_sma20 = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.macd_cross = bt.indicators.CrossOver(
+            self.macd.macd, self.macd.signal
+        )
+        self.rsi_cross = bt.indicators.CrossOver(self.rsi, 50.0)
+
+        self.order = None
+        self.stop_order = None
+        self.exit_requested = False
+        self.entry_price = None
+        self.entry_stop_per_share = None
+        self.pending_stop_per_share = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        is_stop_order = order is self.stop_order
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.entry_stop_per_share = self.pending_stop_per_share
+                self.pending_stop_per_share = None
+                self.stop_order = self.sell(
+                    size=order.executed.size,
+                    exectype=bt.Order.Stop,
+                    price=self.entry_price - self.entry_stop_per_share,
+                )
+            elif is_stop_order:
+                self.stop_order = None
+                self.entry_price = None
+                self.entry_stop_per_share = None
+                self.exit_requested = False
+            else:
+                self.entry_price = None
+                self.entry_stop_per_share = None
+                self.exit_requested = False
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if is_stop_order and order.status != order.Completed:
+                self.stop_order = None
+                if self.exit_requested:
+                    self.exit_requested = False
+                    self.order = self.close()
+                    return
+            if order is self.order:
+                self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            leadership = (
+                self.data.close[0] > self.sma200[0]
+                and self.sma50[0] > self.sma200[0]
+            )
+            momentum = self.macd.histo[0] > 0
+            acceleration = self.macd_cross[0] > 0 or self.rsi_cross[0] > 0
+            liquidity = (
+                not self.p.use_liquidity_filter
+                or self.data.volume[0] > self.volume_sma20[0]
+            )
+
+            if leadership and momentum and acceleration and liquidity:
+                capital = self.broker.getvalue()
+                stop_per_share = max(
+                    self.p.stop_pct * self.data.close[0],
+                    2.0 * self.atr[0],
+                )
+                size = int(min(
+                    (capital * self.p.max_capital_pct) / self.data.close[0],
+                    (capital * self.p.risk_pct) / stop_per_share,
+                ))
+
+                if size > 0:
+                    self.pending_stop_per_share = stop_per_share
+                    self.order = self.buy(size=size)
+            return
+
+        momentum_weakening = (
+            self.macd.histo[0] < 0 and self.data.close[0] > self.sma200[0]
+        )
+        trend_reversal = (
+            self.data.close[0] < self.sma200[0]
+            or self.sma50[0] < self.sma200[0]
+        )
+        take_profit = self.p.use_tp and (
+            self.data.close[0] >= self.entry_price * (1.0 + self.p.take_pct)
+            or self.rsi[0] > 70
+        )
+
+        if momentum_weakening or trend_reversal or take_profit:
+            if self.stop_order:
+                self.exit_requested = True
+                self.cancel(self.stop_order)
+            else:
+                self.order = self.close()
+```
+
+```json
+{"assumptions":[{"topic":"liquidity filter","choice":"Implemented as parameter use_liquidity_filter=False by default.","reason":"The filter is explicitly optional; when enabled, entry requires volume > SMA(volume, 20)."},{"topic":"position-size units","choice":"Converted the 10% capital cap to shares using the current close and rounded the resulting share quantity down to a whole share.","reason":"The risk formula yields shares while 10% of capital is a currency amount; whole-share sizing is the closest literal common equity interpretation."},{"topic":"ATR stop timing","choice":"ATR is sampled on the entry-signal bar and the stop order is placed after the entry fill using the filled entry price.","reason":"The fixed stop requires the actual entry price, while the ATR value available when the entry decision is made determines both risk sizing and the stated stop distance."}]}
+```

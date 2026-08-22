@@ -1,0 +1,137 @@
+```python
+import backtrader as bt
+
+
+class VolumeTrendStrategy(bt.Strategy):
+    params = (
+        ("volume_sma_fast", 10),
+        ("volume_sma_slow", 50),
+        ("price_sma_period", 200),
+        ("stop_loss_pct", 0.01),
+        ("take_profit_pct", 0.02),
+        ("risk_per_trade", 0.01),
+    )
+
+    def __init__(self):
+        self.vol_sma_fast = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.volume_sma_fast
+        )
+        self.vol_sma_slow = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.volume_sma_slow
+        )
+        self.price_sma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.price_sma_period
+        )
+
+        self.volume_cross = bt.indicators.CrossOver(
+            self.vol_sma_fast, self.vol_sma_slow
+        )
+        self.price_cross = bt.indicators.CrossOver(
+            self.data.close, self.price_sma
+        )
+
+        self.entry_order = None
+        self.close_order = None
+        self.stop_order = None
+        self.take_profit_order = None
+
+    def _cancel_protection(self):
+        for order in (self.stop_order, self.take_profit_order):
+            if order is not None and order.alive():
+                self.cancel(order)
+
+    def _has_active_protection(self):
+        return any(
+            order is not None and order.alive()
+            for order in (self.stop_order, self.take_profit_order)
+        )
+
+    def _position_size(self):
+        stop_distance = self.data.close[0] * self.p.stop_loss_pct
+        if stop_distance <= 0:
+            return 0
+        return int((self.broker.getvalue() * self.p.risk_per_trade) / stop_distance)
+
+    def _place_protection(self, entry_price):
+        if self.position.size > 0:
+            self.stop_order = self.sell(
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 - self.p.stop_loss_pct),
+            )
+            if self.p.take_profit_pct is not None and self.p.take_profit_pct > 0:
+                self.take_profit_order = self.sell(
+                    exectype=bt.Order.Limit,
+                    price=entry_price * (1.0 + self.p.take_profit_pct),
+                    oco=self.stop_order,
+                )
+        elif self.position.size < 0:
+            self.stop_order = self.buy(
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 + self.p.stop_loss_pct),
+            )
+            if self.p.take_profit_pct is not None and self.p.take_profit_pct > 0:
+                self.take_profit_order = self.buy(
+                    exectype=bt.Order.Limit,
+                    price=entry_price * (1.0 - self.p.take_profit_pct),
+                    oco=self.stop_order,
+                )
+
+    def notify_order(self, order):
+        if order.status in (
+            bt.Order.Completed,
+            bt.Order.Canceled,
+            bt.Order.Margin,
+            bt.Order.Rejected,
+        ):
+            if order is self.entry_order:
+                self.entry_order = None
+                if order.status == bt.Order.Completed:
+                    self._place_protection(order.executed.price)
+
+            elif order is self.close_order:
+                self.close_order = None
+                if order.status == bt.Order.Completed:
+                    self._cancel_protection()
+
+            elif order is self.stop_order:
+                self.stop_order = None
+                if order.status == bt.Order.Completed:
+                    self._cancel_protection()
+
+            elif order is self.take_profit_order:
+                self.take_profit_order = None
+                if order.status == bt.Order.Completed:
+                    self._cancel_protection()
+
+    def next(self):
+        if self.entry_order is not None or self.close_order is not None:
+            return
+
+        if self.position.size > 0:
+            if self.volume_cross[0] < 0 or self.price_cross[0] < 0:
+                self._cancel_protection()
+                self.close_order = self.close()
+            return
+
+        if self.position.size < 0:
+            if self.volume_cross[0] > 0 or self.price_cross[0] > 0:
+                self._cancel_protection()
+                self.close_order = self.close()
+            return
+
+        if self._has_active_protection():
+            return
+
+        size = self._position_size()
+        if size <= 0:
+            return
+
+        if self.volume_cross[0] > 0 and self.data.close[0] > self.price_sma[0]:
+            self.entry_order = self.buy(size=size)
+        elif self.volume_cross[0] < 0 and self.data.close[0] < self.price_sma[0]:
+            self.entry_order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"entry execution and sizing","choice":"Entries use Backtrader market orders; risk size is calculated from current equity and the signal bar close times stop_loss_pct.","reason":"The actual market fill price is unavailable until after order execution, while the stop is placed from the actual completed entry price."},{"topic":"optional take-profit","choice":"take_profit_pct values of null or less than or equal to zero disable the take-profit order.","reason":"This provides the specified optional take-profit behavior while retaining the stated 2.0% default."},{"topic":"protective-order interaction","choice":"Stop-loss and take-profit orders are linked with Backtrader OCO handling.","reason":"Only one protective exit should execute for a single position."}]}
+```

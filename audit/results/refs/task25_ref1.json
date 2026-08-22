@@ -1,0 +1,54 @@
+{
+  "task_id": 25,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\n\n\nclass SessionTimeStrategy(bt.Strategy):\n    params = (\n        ('atr_threshold', 0.01),\n        ('capital_fraction', 0.01),\n        ('stop_loss_pct', 0.005),\n        ('take_profit_pct', 0.01),\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=5)\n\n        self.pending_order = None\n        self.stop_order = None\n        self.target_order = None\n        self.entry_window = None\n\n        self.asian_high = None\n        self.asian_low = None\n        self.asian_ready = False\n        self.in_asian_session = False\n\n    def _minute_of_day(self):\n        dt = self.data.datetime.datetime(0)\n        return dt.hour * 60 + dt.minute\n\n    def _cancel_exit_orders(self):\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n            self.stop_order = None\n        if self.target_order is not None:\n            self.cancel(self.target_order)\n            self.target_order = None\n\n    def _size(self):\n        return (self.broker.getvalue() * self.p.capital_fraction) / self.data.close[0]\n\n    def _submit_entry(self, is_long, window):\n        size = self._size()\n        self.entry_window = window\n        self.pending_order = self.buy(size=size) if is_long else self.sell(size=size)\n\n    def next(self):\n        minute = self._minute_of_day()\n\n        # Asian session: 20:00 through 03:00 New York time.\n        asian_session = minute >= 20 * 60 or minute < 3 * 60\n        if asian_session:\n            if not self.in_asian_session:\n                self.asian_high = None\n                self.asian_low = None\n                self.asian_ready = False\n\n            self.asian_high = (\n                self.data.high[0]\n                if self.asian_high is None\n                else max(self.asian_high, self.data.high[0])\n            )\n            self.asian_low = (\n                self.data.low[0]\n                if self.asian_low is None\n                else min(self.asian_low, self.data.low[0])\n            )\n            self.in_asian_session = True\n            return\n\n        if self.in_asian_session:\n            self.asian_ready = self.asian_high is not None and self.asian_low is not None\n            self.in_asian_session = False\n\n        # Close positions in the 30 minutes preceding the NY open.\n        if 9 * 60 <= minute < 9 * 60 + 30 and self.position and self.pending_order is None:\n            self._cancel_exit_orders()\n            self.pending_order = self.close()\n            return\n\n        # Close at the end of the entry window.\n        if self.position and self.pending_order is None:\n            if self.entry_window == 'ny_open' and minute >= 11 * 60 + 30:\n                self._cancel_exit_orders()\n                self.pending_order = self.close()\n                return\n            if self.entry_window == 'power_hour' and minute >= 16 * 60:\n                self._cancel_exit_orders()\n                self.pending_order = self.close()\n                return\n            if self.entry_window == 'london' and minute >= 9 * 60:\n                self._cancel_exit_orders()\n                self.pending_order = self.close()\n                return\n\n        if self.position or self.pending_order is not None:\n            return\n\n        if self.atr[0] < self.p.atr_threshold:\n            return\n\n        ny_open = 9 * 60 + 30 <= minute < 11 * 60 + 30\n        power_hour = 15 * 60 <= minute < 16 * 60\n        london = 3 * 60 <= minute < 9 * 60\n\n        if london and self.asian_ready:\n            # Break of the Asian extreme followed by opposite-direction candle.\n            if self.data.low[0] < self.asian_low and self.data.close[0] > self.data.open[0]:\n                self._submit_entry(True, 'london')\n            elif self.data.high[0] > self.asian_high and self.data.close[0] < self.data.open[0]:\n                self._submit_entry(False, 'london')\n        elif ny_open:\n            self._submit_entry(True, 'ny_open')\n        elif power_hour:\n            self._submit_entry(True, 'power_hour')\n\n    def notify_order(self, order):\n        if order.status in (order.Canceled, order.Margin, order.Rejected):\n            if order is self.pending_order:\n                self.pending_order = None\n            if order is self.stop_order:\n                self.stop_order = None\n            if order is self.target_order:\n                self.target_order = None\n            return\n\n        if order.status != order.Completed:\n            return\n\n        if order is self.pending_order:\n            self.pending_order = None\n\n            if order.isbuy() and self.position.size > 0:\n                entry_price = order.executed.price\n                self.stop_order = self.sell(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Stop,\n                    price=entry_price * (1.0 - self.p.stop_loss_pct),\n                )\n                self.target_order = self.sell(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Limit,\n                    price=entry_price * (1.0 + self.p.take_profit_pct),\n                )\n            elif order.issell() and self.position.size < 0:\n                entry_price = order.executed.price\n                self.stop_order = self.buy(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Stop,\n                    price=entry_price * (1.0 + self.p.stop_loss_pct),\n                )\n                self.target_order = self.buy(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Limit,\n                    price=entry_price * (1.0 - self.p.take_profit_pct),\n                )\n\n        elif order is self.stop_order or order is self.target_order:\n            self._cancel_exit_orders()\n            self.entry_window = None\n\n    def notify_trade(self, trade):\n        if trade.isclosed:\n            self.entry_window = None",
+  "assumptions": [
+    {
+      "topic": "timezone",
+      "choice": "Session times are interpreted in the feed timestamp's New York/Eastern local time.",
+      "reason": "The specification names New York and London sessions but provides no timezone conversion rule."
+    },
+    {
+      "topic": "session_definitions",
+      "choice": "Asian session is 20:00-03:00, London session is 03:00-09:00, NY opening window is 09:30-11:30, and Power Hour is 15:00-16:00.",
+      "reason": "Only the NY opening and closing windows are partially specified; exact Asian and London boundaries are otherwise silent."
+    },
+    {
+      "topic": "atr_threshold",
+      "choice": "ATR(5) must be at least 0.01.",
+      "reason": "The specification requires an ATR(5) threshold but does not state its value."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "Each entry uses shares worth 1% of current broker equity at the signal close.",
+      "reason": "The specification gives 1% of total trading capital as the fixed sizing example but does not provide a fixed share quantity. With a 0.5% stop, this remains below the stated 0.5% capital maximum risk."
+    },
+    {
+      "topic": "ny_direction",
+      "choice": "When both long and short are equally permitted in NY windows without a directional signal, long has deterministic precedence.",
+      "reason": "The stated NY time rules permit both directions but provide no condition for choosing between them; holding at most one position prevents simultaneous long and short entries."
+    },
+    {
+      "topic": "london_reversal",
+      "choice": "A break below the Asian low followed by a bullish candle is long; a break above the Asian high followed by a bearish candle is short.",
+      "reason": "This is the closest OHLCV-only reading of a new Asian-range extreme followed by reversal in the opposite direction."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Asian extremes are accumulated only when Asian-session bars are present in the single supplied feed; otherwise London trades cannot be qualified from unavailable Asian data.",
+      "reason": "The supplied AAPL feed begins at 09:30, so it contains no Asian or London-session bars from which the required extremes and reversals can be observed."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2026-08-11T15:01:00",
+      "side": "BUY",
+      "size": 0.3261259446485607,
+      "price": 306.6199951171875
+    }
+  ]
+}

@@ -1,0 +1,209 @@
+```python
+import backtrader as bt
+import math
+
+
+class ShortVolatilityStrategy(bt.Strategy):
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+
+        self.bandwidth = (self.bb.top - self.bb.bot) / self.bb.mid
+        self.bandwidth_sma100 = bt.indicators.SMA(self.bandwidth, period=100)
+        self.volume_sma20 = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.upper_cross = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.lower_cross = bt.indicators.CrossOver(self.data.close, self.bb.bot)
+
+        self.order = None
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+
+        self.entry_price = None
+        self.entry_bar = None
+        self.entry_direction = None
+        self.pending_sma20 = None
+        self.forced_exit = False
+
+    def _submit_entry(self, direction):
+        entry_proxy = self.data.close[0]
+        atr = self.atr14[0]
+        sma20 = self.sma20[0]
+        equity = self.broker.getvalue()
+
+        if direction == "long":
+            stop_price = entry_proxy - 1.5 * atr
+            target_price = entry_proxy + 0.5 * (sma20 - entry_proxy)
+        else:
+            stop_price = entry_proxy + 1.5 * atr
+            target_price = entry_proxy - 0.5 * (entry_proxy - sma20)
+
+        risk_per_share = abs(entry_proxy - stop_price)
+        target_profit_per_share = abs(target_price - entry_proxy)
+
+        if risk_per_share == 0 or target_profit_per_share == 0:
+            return
+
+        size_risk = math.floor((equity * 0.01) / risk_per_share)
+        size_target = math.floor((equity * 0.005) / target_profit_per_share)
+        size = min(size_risk, size_target)
+
+        if size <= 0:
+            return
+
+        self.entry_direction = direction
+        self.pending_sma20 = sma20
+
+        if direction == "long":
+            self.entry_order = self.buy(size=size)
+        else:
+            self.entry_order = self.sell(size=size)
+
+        self.order = self.entry_order
+
+    def _force_close(self):
+        if self.forced_exit or self.order is not None:
+            return
+
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.target_order is not None:
+            self.cancel(self.target_order)
+
+        self.forced_exit = True
+        self.order = self.close()
+
+    def next(self):
+        if self.position:
+            if self.forced_exit:
+                return
+
+            if len(self) - self.entry_bar >= 45:
+                self._force_close()
+                return
+
+            if self.entry_direction == "long":
+                if self.data.close[0] <= self.entry_price * 0.95:
+                    self._force_close()
+            else:
+                if self.data.close[0] >= self.entry_price * 1.05:
+                    self._force_close()
+            return
+
+        if (
+            self.order is not None
+            or self.stop_order is not None
+            or self.target_order is not None
+        ):
+            return
+
+        bandwidth_ok = (
+            self.bandwidth[0] > self.bandwidth_sma100[0]
+            and self.bandwidth[0] < 1.5 * self.bandwidth_sma100[0]
+        )
+        liquidity_ok = self.data.volume[0] < 1.5 * self.volume_sma20[0]
+
+        if not (bandwidth_ok and liquidity_ok):
+            return
+
+        if self.upper_cross[0] < 0:
+            self._submit_entry("short")
+        elif self.lower_cross[0] > 0:
+            self._submit_entry("long")
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+                size = abs(order.executed.size)
+
+                if self.entry_direction == "long":
+                    target_price = self.entry_price + 0.5 * (
+                        self.pending_sma20 - self.entry_price
+                    )
+                    stop_price = self.entry_price - 1.5 * self.atr14[0]
+                    self.stop_order = self.sell(
+                        size=size, exectype=bt.Order.Stop, price=stop_price
+                    )
+                    self.target_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self.stop_order,
+                    )
+                else:
+                    target_price = self.entry_price - 0.5 * (
+                        self.entry_price - self.pending_sma20
+                    )
+                    stop_price = self.entry_price + 1.5 * self.atr14[0]
+                    self.stop_order = self.buy(
+                        size=size, exectype=bt.Order.Stop, price=stop_price
+                    )
+                    self.target_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self.stop_order,
+                    )
+
+                self.entry_order = None
+                self.order = None
+            elif order.status in [
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.entry_order = None
+                self.order = None
+            return
+
+        if order is self.stop_order:
+            if order.status in [
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.stop_order = None
+                if order.status == order.Completed:
+                    self.forced_exit = False
+            return
+
+        if order is self.target_order:
+            if order.status in [
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.target_order = None
+                if order.status == order.Completed:
+                    self.forced_exit = False
+            return
+
+        if order is self.order and order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+            if order.status == order.Completed:
+                self.forced_exit = False
+                self.entry_price = None
+                self.entry_bar = None
+                self.entry_direction = None
+                self.pending_sma20 = None
+```
+
+```json
+{"assumptions":[{"topic":"entry sizing","choice":"Use the signal bar's close as the entry-price proxy for pre-trade sizing; use the actual next-open fill for stop and target prices.","reason":"A next-open market fill price is unavailable when the order and its required size must be submitted."},{"topic":"SMA20 target reference","choice":"Use the SMA(20) value from the signal bar when creating the post-fill bracket.","reason":"This is the latest SMA value available when the next-open entry order is submitted."},{"topic":"emergency exit price","choice":"Evaluate the ±5% adverse-move condition against the current bar's close and submit a market close.","reason":"The specification does not identify an intrabar trigger price; next() evaluates completed OHLCV bars."},{"topic":"bracket timing","choice":"Submit stop and target orders upon confirmation of the next-open entry fill.","reason":"The actual filled entry price is required for both bracket prices; orders submitted in that callback become active on the following broker cycle."}]}
+```

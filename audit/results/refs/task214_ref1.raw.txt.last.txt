@@ -1,0 +1,167 @@
+```python
+import backtrader as bt
+import math
+
+
+class HybridCoreWheelStrategy(bt.Strategy):
+    params = (
+        ("core_fraction", 0.50),
+        ("overlay_fraction", 0.05),
+        ("max_overlays", 5),
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+
+        self.lower_level = self.sma50 - self.atr14
+        self.upper_level = self.sma50 + self.atr14
+        self.cross_up = bt.indicators.CrossOver(self.data.close, self.lower_level)
+
+        self.order = None
+        self._order_meta = {}
+        self._core_size = 0
+        self._overlays = []
+        self._next_overlay_id = 0
+        self._last_rebalance_month = None
+
+    def _submit(self, order, meta):
+        self.order = order
+        self._order_meta[order.ref] = meta
+
+    def _close_overlays(self, overlays, reason):
+        size = sum(item["size"] for item in overlays)
+        if size > 0:
+            order = self.sell(size=size)
+            self._submit(order, {
+                "kind": "overlay_exit",
+                "ids": [item["id"] for item in overlays],
+                "reason": reason,
+            })
+
+    def notify_order(self, order):
+        if order.status not in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            return
+
+        meta = self._order_meta.pop(order.ref, None)
+
+        if order.status == order.Completed and meta is not None:
+            if meta["kind"] == "core":
+                self._core_size += order.executed.size
+
+            elif meta["kind"] == "overlay_entry":
+                self._overlays.append({
+                    "id": meta["id"],
+                    "size": abs(order.executed.size),
+                    "entry": order.executed.price,
+                    "atr": meta["atr"],
+                    "bar": len(self),
+                })
+
+            elif meta["kind"] == "overlay_exit":
+                exiting = set(meta["ids"])
+                self._overlays = [
+                    item for item in self._overlays
+                    if item["id"] not in exiting
+                ]
+
+        if self.order is not None and order.ref == self.order.ref:
+            self.order = None
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        close = self.data.close[0]
+        sma50 = self.sma50[0]
+        sma200 = self.sma200[0]
+        atr = self.atr14[0]
+        capital = self.broker.getvalue()
+
+        uptrend = sma50 >= sma200
+        emergency = sma50 < sma200 and close < sma200 * 0.90
+
+        if emergency and self._overlays:
+            self._close_overlays(self._overlays, "emergency")
+            return
+
+        if self._overlays and close >= self.upper_level[0]:
+            self._close_overlays(self._overlays, "covered_call_proxy")
+            return
+
+        exits = []
+        for item in self._overlays:
+            take_profit_entry = item["entry"] + 0.5 * item["atr"]
+            take_profit_sma = sma50 + 0.5 * atr
+            stop_loss = min(
+                item["entry"] - 1.5 * item["atr"],
+                item["entry"] * 0.90,
+            )
+            time_stop = len(self) - item["bar"] >= 10
+
+            if (
+                close >= take_profit_entry
+                or close >= take_profit_sma
+                or close <= stop_loss
+                or time_stop
+            ):
+                exits.append(item)
+
+        if exits:
+            self._close_overlays(exits, "overlay_exit")
+            return
+
+        if (
+            uptrend
+            and close <= sma50
+            and close >= 0.90 * sma50
+            and self.cross_up[0] > 0
+            and len(self._overlays) < self.p.max_overlays
+        ):
+            requested_size = int(math.floor(
+                (capital * self.p.overlay_fraction) / close
+            ))
+            core_value = self._core_size * close
+            overlay_value = sum(
+                item["size"] * close for item in self._overlays
+            )
+            requested_value = requested_size * close
+
+            if (
+                requested_size > 0
+                and overlay_value + requested_value <= capital * 0.25
+                and core_value + overlay_value + requested_value <= capital * 0.75
+            ):
+                overlay_id = self._next_overlay_id
+                self._next_overlay_id += 1
+                order = self.buy(size=requested_size)
+                self._submit(order, {
+                    "kind": "overlay_entry",
+                    "id": overlay_id,
+                    "atr": atr,
+                })
+                return
+
+        month = (self.data.datetime.date(0).year, self.data.datetime.date(0).month)
+        if month != self._last_rebalance_month:
+            self._last_rebalance_month = month
+            target_core_size = int(math.floor(
+                (capital * self.p.core_fraction) / close
+            ))
+            difference = target_core_size - self._core_size
+
+            if difference > 0:
+                self._submit(self.buy(size=difference), {"kind": "core"})
+            elif difference < 0:
+                self._submit(self.sell(size=abs(difference)), {"kind": "core"})
+```
+
+```json
+{"assumptions":[{"topic":"core rebalance frequency","choice":"Rebalance the 50% core on the first eligible strategy bar of each calendar month.","reason":"The specification requires periodic rebalancing but does not define a frequency."},{"topic":"covered-call proxy discretion","choice":"Close 100% of active overlays when Close reaches SMA_50 + 1×ATR_14.","reason":"The specification permits closing 50–100% at discretion."},{"topic":"daily-bar trigger pricing","choice":"Evaluate overlay TP, SL, time-stop, emergency, and rally conditions using Close; orders execute according to Backtrader's standard order timing.","reason":"The feed supplies daily OHLCV bars and the specification does not define intrabar execution priority."},{"topic":"share rounding","choice":"Use whole shares, rounded down from each percentage-of-capital allocation.","reason":"The specification gives percentage allocations but does not define fractional-share handling."},{"topic":"overlay lot accounting","choice":"Track each completed overlay entry as an individual virtual lot while submitting aggregate sell orders for selected overlay exits.","reason":"A single Backtrader position does not natively distinguish core shares from multiple overlay lots."}]}
+```

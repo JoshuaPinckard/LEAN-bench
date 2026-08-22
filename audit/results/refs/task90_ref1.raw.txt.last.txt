@@ -1,0 +1,146 @@
+```python
+import backtrader as bt
+import math
+
+
+class PortfolioOptimizationWithTransactionCosts(bt.Strategy):
+    params = (
+        ('risk_coefficient', 2.5),
+        ('transaction_cost_rate', 0.001),
+        ('turnover_limit', 0.20),
+        ('forecast_period', 20),
+        ('rebalance_months', 1),
+    )
+
+    def __init__(self):
+        self.returns = bt.indicators.PercentChange(self.data.close, period=1)
+        self.alpha = bt.indicators.SimpleMovingAverage(
+            self.returns, period=self.p.forecast_period
+        )
+        self.volatility = bt.indicators.StandardDeviation(
+            self.returns, period=self.p.forecast_period
+        )
+
+        self.order = None
+        self.last_rebalance_month = None
+        self.transactions = []
+        self.rebalance_reports = []
+        self.portfolio_values = []
+        self.portfolio_returns = []
+        self.previous_value = None
+
+    def _current_weight(self):
+        value = self.broker.getvalue()
+        if value == 0:
+            return 0.0
+        return (self.position.size * self.data.close[0]) / value
+
+    def _performance_metrics(self):
+        if not self.portfolio_returns:
+            return 0.0, 0.0, 0.0
+
+        average_return = sum(self.portfolio_returns) / len(self.portfolio_returns)
+        variance = sum(
+            (item - average_return) ** 2 for item in self.portfolio_returns
+        ) / len(self.portfolio_returns)
+        volatility = math.sqrt(variance) * math.sqrt(252)
+
+        total_return = (
+            self.portfolio_values[-1] / self.portfolio_values[0] - 1.0
+            if len(self.portfolio_values) > 1 and self.portfolio_values[0] != 0
+            else 0.0
+        )
+        sharpe_ratio = (
+            (average_return * 252) / volatility if volatility != 0 else 0.0
+        )
+        return total_return, volatility, sharpe_ratio
+
+    def next(self):
+        portfolio_value = self.broker.getvalue()
+        self.portfolio_values.append(portfolio_value)
+
+        if self.previous_value is not None and self.previous_value != 0:
+            self.portfolio_returns.append(
+                portfolio_value / self.previous_value - 1.0
+            )
+        self.previous_value = portfolio_value
+
+        if self.order:
+            return
+
+        current_date = self.data.datetime.date(0)
+        month_key = (current_date.year, current_date.month)
+
+        if self.last_rebalance_month == month_key:
+            return
+        self.last_rebalance_month = month_key
+
+        current_weight = self._current_weight()
+        expected_return = float(self.alpha[0])
+        covariance = float(self.volatility[0]) ** 2
+
+        # With one available risky asset, the long-only and sum-to-one
+        # constraints require its target portfolio weight to be 100%.
+        target_weight = 1.0
+        turnover = abs(target_weight - current_weight)
+
+        current_utility = (
+            expected_return * current_weight
+            - self.p.risk_coefficient * covariance * (current_weight ** 2)
+        )
+        target_utility = (
+            expected_return * target_weight
+            - self.p.risk_coefficient * covariance * (target_weight ** 2)
+        )
+        total_transaction_cost = (
+            self.p.transaction_cost_rate * portfolio_value * turnover
+        )
+
+        total_return, performance_volatility, sharpe_ratio = (
+            self._performance_metrics()
+        )
+        portfolio_risk = abs(target_weight) * math.sqrt(covariance)
+        risk_contribution = portfolio_risk
+
+        self.rebalance_reports.append({
+            'date': current_date,
+            'current_portfolio_weights': [current_weight],
+            'target_portfolio_weights': [target_weight],
+            'total_transaction_costs': total_transaction_cost,
+            'portfolio_return': total_return,
+            'portfolio_volatility': performance_volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'risk_budget': [target_weight],
+            'risk_contribution': [risk_contribution],
+        })
+
+        if (
+            turnover <= self.p.turnover_limit
+            and (target_utility - current_utility) >= total_transaction_cost
+        ):
+            if target_weight > current_weight:
+                self.order = self.buy()
+            elif target_weight < current_weight:
+                self.order = self.sell()
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            self.transactions.append({
+                'date': self.data.datetime.date(0),
+                'size': order.executed.size,
+                'price': order.executed.price,
+                'value': order.executed.value,
+                'transaction_cost': order.executed.comm,
+            })
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Treat the sole AAPL feed as the only risky asset.","reason":"The specification requires a portfolio across assets, but the harness supplies only one data feed."},{"topic":"infeasible","choice":"Apply the stated long-only, sum-of-weights-equals-one, and 20% turnover constraints simultaneously without an initial-allocation exception.","reason":"With a single asset, the only valid target weight is 100%; from the initial 0% AAPL weight this exceeds the 20% turnover limit, so no initial rebalance is feasible."},{"topic":"forecast model","choice":"Use the 20-bar simple moving average of daily AAPL percentage returns as alpha and the 20-bar return variance as the one-asset covariance matrix.","reason":"The specification requires forecast outputs and historical covariance but does not specify a forecasting model or lookback."},{"topic":"optimization objective","choice":"Use expected return times weight minus risk_coefficient times variance times squared weight, and require the utility increase to be at least the modeled transaction cost.","reason":"This is a literal one-asset mean-variance utility interpretation of the required return-risk-cost tradeoff."},{"topic":"frequency","choice":"Rebalance on the first strategy-eligible bar of each calendar month.","reason":"The specification requires a fixed frequency and gives monthly as an example without selecting one."},{"topic":"performance metrics","choice":"Calculate portfolio volatility and Sharpe ratio from recorded daily portfolio returns and annualize using 252 trading days with a zero risk-free rate.","reason":"The specification requests these metrics but does not define their calculation."}]}

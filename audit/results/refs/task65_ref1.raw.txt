@@ -1,0 +1,176 @@
+```python
+import backtrader as bt
+import math
+
+
+class NeuralNetworkSignalStrategy(bt.Strategy):
+    params = (
+        ('training_bars', 504),
+        ('epochs', 20),
+        ('learning_rate', 0.01),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.williams_r = bt.indicators.WilliamsR(self.data, period=14)
+        self.order = None
+        self.addminperiod(self.p.training_bars + 1)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+
+    def _softmax(self, values):
+        maximum = max(values)
+        exponentials = [math.exp(value - maximum) for value in values]
+        total = sum(exponentials)
+        return [value / total for value in exponentials]
+
+    def _signal(self):
+        features = []
+        labels = []
+
+        for ago in range(self.p.training_bars, 0, -1):
+            features.append([
+                float(self.data.open[-ago]),
+                float(self.rsi[-ago]),
+                float(self.williams_r[-ago]),
+            ])
+
+            change = (
+                float(self.data.open[-ago + 1]) - float(self.data.open[-ago])
+            ) / float(self.data.open[-ago])
+
+            if change > 0.001:
+                labels.append(0)  # BUY
+            elif change < -0.001:
+                labels.append(1)  # SELL
+            else:
+                labels.append(2)  # HOLD
+
+        means = [
+            sum(row[index] for row in features) / len(features)
+            for index in range(3)
+        ]
+        deviations = [
+            math.sqrt(
+                sum((row[index] - means[index]) ** 2 for row in features)
+                / len(features)
+            )
+            for index in range(3)
+        ]
+        deviations = [value if value != 0.0 else 1.0 for value in deviations]
+
+        normalized = [
+            [
+                (row[index] - means[index]) / deviations[index]
+                for index in range(3)
+            ]
+            for row in features
+        ]
+
+        hidden_size = 4
+        w1 = [
+            [0.01 * (input_index + hidden_index + 1)
+             for hidden_index in range(hidden_size)]
+            for input_index in range(3)
+        ]
+        b1 = [0.0] * hidden_size
+        w2 = [
+            [0.01 * (hidden_index + output_index + 1)
+             for output_index in range(3)]
+            for hidden_index in range(hidden_size)
+        ]
+        b2 = [0.0] * 3
+
+        for _ in range(self.p.epochs):
+            for row, label in zip(normalized, labels):
+                hidden_linear = [
+                    b1[j] + sum(row[i] * w1[i][j] for i in range(3))
+                    for j in range(hidden_size)
+                ]
+                hidden = [max(0.0, value) for value in hidden_linear]
+                probabilities = self._softmax([
+                    b2[k] + sum(hidden[j] * w2[j][k]
+                                for j in range(hidden_size))
+                    for k in range(3)
+                ])
+
+                output_error = [
+                    probabilities[k] - (1.0 if k == label else 0.0)
+                    for k in range(3)
+                ]
+                hidden_error = [
+                    (
+                        sum(output_error[k] * w2[j][k] for k in range(3))
+                        if hidden_linear[j] > 0.0 else 0.0
+                    )
+                    for j in range(hidden_size)
+                ]
+
+                for j in range(hidden_size):
+                    for k in range(3):
+                        w2[j][k] -= self.p.learning_rate * hidden[j] * output_error[k]
+                for k in range(3):
+                    b2[k] -= self.p.learning_rate * output_error[k]
+
+                for i in range(3):
+                    for j in range(hidden_size):
+                        w1[i][j] -= self.p.learning_rate * row[i] * hidden_error[j]
+                for j in range(hidden_size):
+                    b1[j] -= self.p.learning_rate * hidden_error[j]
+
+        current = [
+            (float(self.data.open[0]) - means[0]) / deviations[0],
+            (float(self.rsi[0]) - means[1]) / deviations[1],
+            (float(self.williams_r[0]) - means[2]) / deviations[2],
+        ]
+        hidden = [
+            max(0.0, b1[j] + sum(current[i] * w1[i][j] for i in range(3)))
+            for j in range(hidden_size)
+        ]
+        probabilities = self._softmax([
+            b2[k] + sum(hidden[j] * w2[j][k] for j in range(hidden_size))
+            for k in range(3)
+        ])
+
+        return ('BUY', 'SELL', 'HOLD')[probabilities.index(max(probabilities))]
+
+    def _size(self):
+        price = float(self.data.open[0])
+        commission = self.broker.getcommissioninfo(self.data).p.commission
+        return int(self.broker.getcash() / (price * (1.0 + commission)))
+
+    def next(self):
+        if self.order:
+            return
+
+        signal = self._signal()
+
+        if self.position.size > 0:
+            if signal in ('SELL', 'HOLD'):
+                self.order = self.close()
+            return
+
+        if self.position.size < 0:
+            if signal in ('BUY', 'HOLD'):
+                self.order = self.close()
+            return
+
+        size = self._size()
+        if size <= 0:
+            return
+
+        if signal == 'BUY':
+            self.order = self.buy(size=size)
+        elif signal == 'SELL':
+            self.order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"training window","choice":"Use a rolling 504 prior-bar window as the closest practical representation of two trading years.","reason":"The specification states two years but does not define calendar-versus-trading-day handling."},{"topic":"neural network design","choice":"Use a deterministic feed-forward neural network with three inputs, one four-unit ReLU hidden layer, and three softmax outputs; retrain it each eligible bar.","reason":"The specification requires a neural network but does not define its architecture, initialization, optimizer, or retraining schedule."},{"topic":"training labels","choice":"Label the next-open move as BUY above +0.1%, SELL below -0.1%, and HOLD otherwise.","reason":"The specification requires three output categories but does not supply labeled target definitions."},{"topic":"feature scaling","choice":"Standardize open, RSI, and Williams %R using mean and standard deviation from the training window.","reason":"Neural-network input scaling is unspecified and is needed because the three inputs have materially different numerical ranges."},{"topic":"100 percent capital sizing","choice":"Size orders from current available cash and current open price, including the stated commission; orders retain Backtrader's normal next-bar market execution.","reason":"The actual next-bar execution price is unavailable when the signal is generated."}]}

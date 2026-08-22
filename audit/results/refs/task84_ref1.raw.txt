@@ -1,0 +1,145 @@
+```python
+import backtrader as bt
+import math
+
+
+class SupertrendStrategy(bt.Strategy):
+    params = (
+        ("atr_period", 10),
+        ("multiplier", 3),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.addminperiod(self.p.atr_period + 1)
+
+        self.final_upper = None
+        self.final_lower = None
+        self.supertrend = None
+
+        self.order = None
+        self.stop_order = None
+        self.stop_replacement = None
+        self.entry_stop = None
+        self.closing = False
+
+    def _stop_price(self, supertrend_value, is_long):
+        direction = -math.inf if is_long else math.inf
+        return math.nextafter(supertrend_value, direction)
+
+    def _place_stop(self, price):
+        if self.position.size > 0:
+            return self.sell(exectype=bt.Order.Stop, price=price)
+        return self.buy(exectype=bt.Order.Stop, price=price)
+
+    def next(self):
+        midpoint = (self.data.high[0] + self.data.low[0]) / 2.0
+        basic_upper = midpoint + self.p.multiplier * self.atr[0]
+        basic_lower = midpoint - self.p.multiplier * self.atr[0]
+
+        if self.supertrend is None:
+            self.final_upper = basic_upper
+            self.final_lower = basic_lower
+            self.supertrend = self.final_upper
+            return
+
+        previous_supertrend = self.supertrend
+        previous_upper = self.final_upper
+        previous_lower = self.final_lower
+
+        if self.data.close[-1] <= previous_upper:
+            self.final_upper = min(basic_upper, previous_upper)
+        else:
+            self.final_upper = basic_upper
+
+        if self.data.close[-1] >= previous_lower:
+            self.final_lower = max(basic_lower, previous_lower)
+        else:
+            self.final_lower = basic_lower
+
+        if previous_supertrend == previous_upper:
+            self.supertrend = (
+                self.final_upper
+                if self.data.close[0] <= self.final_upper
+                else self.final_lower
+            )
+        else:
+            self.supertrend = (
+                self.final_lower
+                if self.data.close[0] >= self.final_lower
+                else self.final_upper
+            )
+
+        if self.order:
+            return
+
+        if self.position:
+            exit_long = self.position.size > 0 and self.data.close[0] < previous_supertrend
+            exit_short = self.position.size < 0 and self.data.close[0] > previous_supertrend
+
+            if exit_long or exit_short:
+                self.stop_replacement = None
+                self.closing = True
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+                return
+
+            desired_stop = self._stop_price(
+                self.supertrend, self.position.size > 0
+            )
+
+            if self.stop_order is None:
+                self.stop_order = self._place_stop(desired_stop)
+            elif (
+                self.stop_replacement is None
+                and desired_stop != self.stop_order.created.price
+            ):
+                self.stop_replacement = desired_stop
+                self.cancel(self.stop_order)
+            return
+
+        if self.data.close[0] > previous_supertrend:
+            self.entry_stop = self._stop_price(self.supertrend, True)
+            self.order = self.order_target_percent(target=1.0)
+        elif self.data.close[0] < previous_supertrend:
+            self.entry_stop = self._stop_price(self.supertrend, False)
+            self.order = self.order_target_percent(target=-1.0)
+
+    def notify_order(self, order):
+        final_statuses = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order is self.stop_order:
+            if order.status == order.Completed:
+                self.stop_replacement = None
+
+            if order.status in final_statuses:
+                self.stop_order = None
+
+                if (
+                    order.status == order.Canceled
+                    and self.stop_replacement is not None
+                    and self.position
+                    and not self.closing
+                ):
+                    replacement = self.stop_replacement
+                    self.stop_replacement = None
+                    self.stop_order = self._place_stop(replacement)
+
+        if order is self.order and order.status in final_statuses:
+            if order.status == order.Completed and self.entry_stop is not None and self.position:
+                self.stop_order = self._place_stop(self.entry_stop)
+
+            self.entry_stop = None
+            self.closing = False
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"Supertrend calculation","choice":"Used the conventional final upper/lower band and Supertrend switching formula with ATR(10) and multiplier 3.","reason":"The specification names Supertrend but does not define its band recursion formula."},{"topic":"Initial Supertrend state","choice":"Initialized the first available Supertrend value to the final upper band.","reason":"No initial trend direction is specified."},{"topic":"Slight stop offset","choice":"Used the nearest representable price below or above the Supertrend line via math.nextafter.","reason":"The specification requires stops to be slightly beyond the line but gives no numeric offset."},{"topic":"Position sizing","choice":"Used order_target_percent targets of 100% long and -100% short.","reason":"The specification gives 100% of available capital per trade as its fixed-size example."},{"topic":"Order execution","choice":"Signals submit Backtrader market orders and stop orders under the harness broker's normal timing rules.","reason":"Exact same-candle close execution is not available from standard next() market orders in this environment."}]} 
+```

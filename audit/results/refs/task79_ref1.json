@@ -1,0 +1,54 @@
+{
+  "task_id": 79,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\nfrom collections import deque\n\n\nclass BreakoutMomentumTrendFollowing(bt.Strategy):\n    params = (\n        (\"weekly_lookback\", 52),\n        (\"daily_sma_period\", 200),\n        (\"hourly_resistance_period\", 20),\n        (\"hourly_volume_period\", 20),\n        (\"atr_period\", 14),\n        (\"atr_multiple\", 2.0),\n        (\"percent_stop\", 0.05),\n        (\"take_profit\", 0.05),\n        (\"risk_fraction\", 0.01),\n        (\"near_weekly_high_fraction\", 0.05),\n    )\n\n    def __init__(self):\n        self.order = None\n        self.stop_order = None\n        self.tp_order = None\n\n        self.pending_entry_kind = None\n        self.position_kind = None\n        self.entry_price = None\n        self.selected_stop = None\n        self.replacement_stop_price = None\n\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        self.completed_daily_closes = []\n        self.completed_weekly_highs = []\n\n        self.day_key = None\n        self.week_key = None\n        self.day_close = None\n        self.week_high = None\n\n        self.prior_hourly_highs = deque(maxlen=self.p.hourly_resistance_period)\n        self.prior_hourly_volumes = deque(maxlen=self.p.hourly_volume_period)\n\n    def _stop_price(self, price):\n        atr_value = float(self.atr[0])\n        percentage_stop = price * (1.0 - self.p.percent_stop)\n\n        if math.isfinite(atr_value):\n            atr_stop = price - self.p.atr_multiple * atr_value\n            return max(atr_stop, percentage_stop)\n\n        return percentage_stop\n\n    def _submit_stop(self, price):\n        if self.position.size > 0:\n            self.stop_order = self.sell(\n                exectype=bt.Order.Stop,\n                price=price,\n                size=self.position.size,\n            )\n\n    def _replace_stop(self, price):\n        self.replacement_stop_price = price\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n        else:\n            self._submit_stop(price)\n            self.replacement_stop_price = None\n\n    def _enter(self, kind, stop_price):\n        risk_per_share = self.data.close[0] - stop_price\n        if risk_per_share <= 0:\n            return\n\n        capital_at_risk = self.broker.getvalue() * self.p.risk_fraction\n        size_by_risk = int(capital_at_risk / risk_per_share)\n        size_by_cash = int(\n            self.broker.getcash() / (self.data.close[0] * (1.0 + self.broker.getcommissioninfo(self.data).p.commission))\n        )\n        size = min(size_by_risk, size_by_cash)\n\n        if size > 0:\n            self.pending_entry_kind = kind\n            self.order = self.buy(size=size)\n\n    def _update_higher_timeframes(self):\n        dt = self.data.datetime.datetime(0)\n        current_day = dt.date()\n        iso_year, iso_week, _ = dt.isocalendar()\n        current_week = (iso_year, iso_week)\n\n        if self.day_key is None:\n            self.day_key = current_day\n            self.day_close = self.data.close[0]\n        elif current_day != self.day_key:\n            self.completed_daily_closes.append(self.day_close)\n            self.day_key = current_day\n            self.day_close = self.data.close[0]\n        else:\n            self.day_close = self.data.close[0]\n\n        if self.week_key is None:\n            self.week_key = current_week\n            self.week_high = self.data.high[0]\n        elif current_week != self.week_key:\n            self.completed_weekly_highs.append(self.week_high)\n            self.week_key = current_week\n            self.week_high = self.data.high[0]\n        else:\n            self.week_high = max(self.week_high, self.data.high[0])\n\n    def next(self):\n        self._update_higher_timeframes()\n\n        daily_uptrend = False\n        if len(self.completed_daily_closes) >= self.p.daily_sma_period:\n            daily_sma = (\n                sum(self.completed_daily_closes[-self.p.daily_sma_period:])\n                / self.p.daily_sma_period\n            )\n            daily_uptrend = self.completed_daily_closes[-1] > daily_sma\n\n        weekly_breakout_level = None\n        if len(self.completed_weekly_highs) >= self.p.weekly_lookback:\n            weekly_breakout_level = max(\n                self.completed_weekly_highs[-self.p.weekly_lookback:]\n            )\n\n        if (\n            self.position.size > 0\n            and self.position_kind == \"short_term\"\n            and weekly_breakout_level is not None\n            and self.data.close[0] > weekly_breakout_level\n        ):\n            self.position_kind = \"long_term\"\n            if self.tp_order is not None:\n                self.cancel(self.tp_order)\n            self._replace_stop(self.selected_stop)\n\n        if self.position.size == 0 and self.order is None and daily_uptrend:\n            signal_stop = self._stop_price(self.data.close[0])\n\n            if (\n                weekly_breakout_level is not None\n                and self.data.close[0] > weekly_breakout_level\n            ):\n                self._enter(\"long_term\", signal_stop)\n\n            elif (\n                len(self.prior_hourly_highs) == self.p.hourly_resistance_period\n                and len(self.prior_hourly_volumes) == self.p.hourly_volume_period\n                and self.data.close[0] > max(self.prior_hourly_highs)\n                and self.data.volume[0]\n                > sum(self.prior_hourly_volumes) / self.p.hourly_volume_period\n                and (\n                    weekly_breakout_level is None\n                    or self.data.close[0]\n                    < weekly_breakout_level\n                    * (1.0 - self.p.near_weekly_high_fraction)\n                )\n            ):\n                self._enter(\"short_term\", signal_stop)\n\n        self.prior_hourly_highs.append(self.data.high[0])\n        self.prior_hourly_volumes.append(self.data.volume[0])\n\n    def notify_order(self, order):\n        terminal = (\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        )\n\n        if order.status == order.Completed:\n            if order is self.order:\n                self.order = None\n                self.entry_price = order.executed.price\n                self.selected_stop = self._stop_price(self.entry_price)\n                self.position_kind = self.pending_entry_kind\n                self.pending_entry_kind = None\n\n                self._submit_stop(self.selected_stop)\n\n                if self.position_kind == \"short_term\":\n                    self.tp_order = self.sell(\n                        exectype=bt.Order.Limit,\n                        price=self.entry_price * (1.0 + self.p.take_profit),\n                        size=order.executed.size * 0.5,\n                    )\n\n            elif order is self.tp_order:\n                self.tp_order = None\n                self._replace_stop(self.entry_price)\n\n            elif order is self.stop_order:\n                self.stop_order = None\n                self.position_kind = None\n                self.entry_price = None\n                self.selected_stop = None\n                self.replacement_stop_price = None\n\n        elif order.status in terminal:\n            if order is self.order:\n                self.order = None\n                self.pending_entry_kind = None\n\n            elif order is self.tp_order:\n                self.tp_order = None\n\n            elif order is self.stop_order:\n                self.stop_order = None\n                if (\n                    self.replacement_stop_price is not None\n                    and self.position.size > 0\n                ):\n                    replacement = self.replacement_stop_price\n                    self.replacement_stop_price = None\n                    self._submit_stop(replacement)",
+  "assumptions": [
+    {
+      "topic": "weekly and daily timeframes",
+      "choice": "Build completed calendar-week highs and completed calendar-day closes from the hourly feed; use the latest completed daily close versus its 200-day SMA and the prior 52 completed weekly highs.",
+      "reason": "The harness supplies only one hourly feed, so higher timeframes must be derived without lookahead."
+    },
+    {
+      "topic": "ATR details",
+      "choice": "Use a 14-hour ATR and a stop 2 ATR below the actual entry price.",
+      "reason": "The specification gives the ATR multiplier but not its period or a defined swing-low rule; ATR(14) is the chosen literal ATR alternative."
+    },
+    {
+      "topic": "more conservative stop",
+      "choice": "Use the higher of the ATR stop and the 5% stop, producing the smaller potential loss.",
+      "reason": "A tighter stop is treated as the more conservative of the stated alternatives; 5% is selected from the specified 5-8% range."
+    },
+    {
+      "topic": "risk sizing",
+      "choice": "Risk 1% of current broker equity, calculate whole-share size from signal-close stop distance, and cap size by available cash including commission.",
+      "reason": "The specification gives a 1-2% range but no exact value or rounding rule."
+    },
+    {
+      "topic": "increased volume",
+      "choice": "Require current hourly volume to exceed the mean of the preceding 20 hourly volumes.",
+      "reason": "The specification requires increased volume but supplies no comparison period or threshold."
+    },
+    {
+      "topic": "near historical weekly high",
+      "choice": "Treat within 5% below the 52-week breakout level as near, blocking only short-term entries there.",
+      "reason": "The rule does not quantify near; the 5% threshold provides a concrete implementation while preserving long-term breakout entries."
+    },
+    {
+      "topic": "short-term conversion stop",
+      "choice": "After partial take-profit moves the stop to breakeven, conversion cancels the target and restores the originally selected ATR/percentage stop.",
+      "reason": "The conversion rule explicitly states that the long-term stop remains based on the selected ATR-based or percentage-based method."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2024-07-18T14:30:00",
+      "side": "BUY",
+      "size": 377.0,
+      "price": 8.0
+    }
+  ]
+}

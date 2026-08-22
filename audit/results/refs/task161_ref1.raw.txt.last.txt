@@ -1,0 +1,136 @@
+```python
+import backtrader as bt
+
+
+class WeeklyORBStrategy(bt.Strategy):
+    params = ()
+
+    def __init__(self):
+        self.ema21 = bt.indicators.EMA(self.data.close, period=21)
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.stochastic = bt.indicators.Stochastic(
+            self.data, period=14, period_dfast=3, period_dslow=3
+        )
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+        self.stoch_cross = bt.indicators.CrossOver(
+            self.stochastic.percK, self.stochastic.percD
+        )
+        self.volume_sma20 = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.entry_order = None
+        self.close_order = None
+        self.exit_stop = None
+        self.exit_target = None
+
+        self.week_key = None
+        self.wor_high = None
+        self.wor_low = None
+        self.wor_range = None
+        self.breakout_confirmed = False
+
+        self.pending_wor_low = None
+        self.pending_wor_range = None
+        self.pending_atr = None
+
+    def _cancel_exit_orders(self):
+        for order in (self.exit_stop, self.exit_target):
+            if order is not None and order.alive():
+                self.cancel(order)
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order is self.entry_order:
+                self.entry_order = None
+
+                stop_price = self.pending_wor_low - 0.25 * self.pending_atr
+                target_price = (
+                    order.executed.price + 1.5 * self.pending_wor_range
+                )
+
+                self.exit_stop = self.sell(
+                    size=order.executed.size,
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                )
+                self.exit_target = self.sell(
+                    size=order.executed.size,
+                    exectype=bt.Order.Limit,
+                    price=target_price,
+                    oco=self.exit_stop,
+                )
+            elif order is self.close_order:
+                self.close_order = None
+            elif order is self.exit_stop:
+                self.exit_stop = None
+            elif order is self.exit_target:
+                self.exit_target = None
+
+        elif order.status in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.entry_order:
+                self.entry_order = None
+            elif order is self.close_order:
+                self.close_order = None
+            elif order is self.exit_stop:
+                self.exit_stop = None
+            elif order is self.exit_target:
+                self.exit_target = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        iso_year, iso_week, _ = current_date.isocalendar()
+        current_week = (iso_year, iso_week)
+
+        if current_week != self.week_key:
+            self.week_key = current_week
+            self.wor_high = self.data.high[0]
+            self.wor_low = self.data.low[0]
+            self.wor_range = self.wor_high - self.wor_low
+            self.breakout_confirmed = False
+
+        if self.position:
+            if (
+                self.close_order is None
+                and self.data.close[0] < self.wor_low
+            ):
+                self._cancel_exit_orders()
+                self.close_order = self.close()
+        elif (
+            self.entry_order is None
+            and self.close_order is None
+            and self.exit_stop is None
+            and self.exit_target is None
+        ):
+            golden_low = self.wor_high - 0.618 * self.wor_range
+            golden_high = self.wor_high - 0.382 * self.wor_range
+            pullback = (
+                golden_low <= self.data.low[0] <= golden_high
+                or golden_low <= self.data.close[0] <= golden_high
+            )
+
+            if (
+                self.breakout_confirmed
+                and pullback
+                and self.data.close[0] > self.ema21[0]
+                and self.data.close[0] > self.bbands.mid[0]
+                and self.stoch_cross[0] > 0
+                and self.data.volume[0] > self.volume_sma20[0]
+            ):
+                size = 0.01 * self.broker.getvalue() / self.data.close[0]
+                self.pending_wor_low = self.wor_low
+                self.pending_wor_range = self.wor_range
+                self.pending_atr = self.atr14[0]
+                self.entry_order = self.buy(size=size)
+
+        if self.data.close[0] > self.wor_high:
+            self.breakout_confirmed = True
+```
+
+```json
+{"assumptions":[{"topic":"breakout timing","choice":"A breakout must be confirmed on a prior trading day of the current week before a pullback entry is allowed.","reason":"The specification says there has already been a breakout and describes the pullback as occurring after it."},{"topic":"optional volume confirmation","choice":"Volume greater than its SMA(20) is applied as the optional strengthening condition.","reason":"The specification explicitly supplies this confirmation rule; this implementation elects to use it."},{"topic":"ATR stop timing","choice":"The ATR(14) stop level is fixed using the ATR value on the entry-signal bar.","reason":"The specification does not state that the stop should trail or be recalculated after entry."},{"topic":"infeasible","choice":"Take-profit and ATR stop-loss are submitted as OCO resting orders; the stop is submitted first. A close below WOR_low cancels them and submits self.close().","reason":"Daily OHLCV cannot determine intraday event ordering when both target and stop levels are touched within one bar, nor can a close-based signal execute at that same historical close in Backtrader."}]}
+```

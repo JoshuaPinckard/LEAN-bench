@@ -1,0 +1,171 @@
+```python
+import backtrader as bt
+
+
+class FormerResistanceRetestStrategy(bt.Strategy):
+    def __init__(self):
+        self.sma50 = bt.indicators.SimpleMovingAverage(self.data.close, period=50)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+        self.addminperiod(55)
+
+        self.last_pivot_high = None
+        self.pivot_lows = []
+        self.setup = None
+
+        self.entry_order = None
+        self.entry_eligible_bar = None
+        self.stop_order = None
+        self.tp_orders = []
+        self.stop_price = None
+
+    def next(self):
+        if self.entry_order is not None and len(self) >= self.entry_eligible_bar:
+            self.cancel(self.entry_order)
+
+        if self.data.high[-1] > self.data.high[-2] and self.data.high[-1] > self.data.high[0]:
+            self.last_pivot_high = float(self.data.high[-1])
+
+        if self.data.low[-1] < self.data.low[-2] and self.data.low[-1] < self.data.low[0]:
+            self.pivot_lows.append(float(self.data.low[-1]))
+            self.pivot_lows = self.pivot_lows[-2:]
+
+        if self.position:
+            return
+
+        if self.entry_order is not None:
+            return
+
+        atr = float(self.atr14[0])
+        close = float(self.data.close[0])
+
+        if self.setup is not None:
+            age = len(self) - self.setup["breakout_bar"]
+            if age > 10:
+                self.setup = None
+            elif age >= 1:
+                level = self.setup["level"]
+                open_ = float(self.data.open[0])
+                high = float(self.data.high[0])
+                low = float(self.data.low[0])
+                previous_high = float(self.data.high[-1])
+                previous_close = float(self.data.close[-1])
+
+                body = abs(close - open_)
+                hammer = (
+                    min(open_, close) - low >= 1.5 * body
+                    and close > open_
+                )
+                bullish_engulfing = (
+                    close > previous_high
+                    and open_ <= previous_close
+                )
+                long_lower_wick_at_level = low <= level and close > open_
+
+                retest = abs(low - level) <= 0.25 * atr
+                bullish_signal = (
+                    hammer
+                    or bullish_engulfing
+                    or long_lower_wick_at_level
+                )
+                volatility_ok = (
+                    atr / close <= 0.025
+                    and (high - low) / close <= 0.035
+                )
+
+                if retest and bullish_signal and volatility_ok:
+                    entry_cap = level + 0.5 * atr
+                    stop = level - 0.5 * atr
+                    risk_per_unit = entry_cap - stop
+                    quantity = (0.01 * self.broker.getvalue()) / risk_per_unit
+
+                    self.stop_price = stop
+                    self.entry_order = self.buy(
+                        size=quantity,
+                        exectype=bt.Order.Limit,
+                        price=entry_cap,
+                    )
+                    self.entry_eligible_bar = len(self) + 1
+                    self.setup = None
+                    return
+
+        uptrend = (
+            close > float(self.sma50[0])
+            and float(self.sma50[0]) > float(self.sma50[-5])
+        )
+        rising_pivot_lows = (
+            len(self.pivot_lows) == 2
+            and self.pivot_lows[-1] > self.pivot_lows[-2]
+        )
+
+        if (
+            self.setup is None
+            and self.last_pivot_high is not None
+            and uptrend
+            and rising_pivot_lows
+            and close >= self.last_pivot_high + 0.25 * atr
+        ):
+            self.setup = {
+                "level": self.last_pivot_high,
+                "breakout_bar": len(self),
+            }
+
+    def notify_order(self, order):
+        if order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order is self.entry_order:
+                self.entry_order = None
+                self.entry_eligible_bar = None
+            return
+
+        if order.status != order.Completed:
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+            self.entry_eligible_bar = None
+
+            entry = order.executed.price
+            quantity = order.executed.size
+            r_value = entry - self.stop_price
+
+            self.stop_order = self.sell(
+                size=quantity,
+                exectype=bt.Order.Stop,
+                price=self.stop_price,
+            )
+
+            self.tp_orders = [
+                self.sell(size=quantity * 0.25, exectype=bt.Order.Limit,
+                          price=entry + 2.0 * r_value),
+                self.sell(size=quantity * 0.25, exectype=bt.Order.Limit,
+                          price=entry + 4.0 * r_value),
+                self.sell(size=quantity * 0.25, exectype=bt.Order.Limit,
+                          price=entry + 6.0 * r_value),
+                self.sell(size=quantity * 0.25, exectype=bt.Order.Limit,
+                          price=entry + 8.0 * r_value),
+            ]
+            return
+
+        if order is self.stop_order:
+            self.stop_order = None
+            for tp_order in self.tp_orders:
+                self.cancel(tp_order)
+            self.tp_orders = []
+            return
+
+        if order in self.tp_orders:
+            if self.stop_order is not None:
+                self.cancel(self.stop_order)
+
+            if self.position.size > 0:
+                self.stop_order = self.sell(
+                    size=self.position.size,
+                    exectype=bt.Order.Stop,
+                    price=self.stop_price,
+                )
+            else:
+                self.stop_order = None
+```
+
+```json
+{"assumptions":[{"topic":"pivot-window","choice":"A 3-bar pivot is the middle bar of three consecutive bars, using strict greater-than for pivot highs and strict less-than for pivot lows.","reason":"The specification gives a window size but not tie handling or pivot confirmation mechanics."},{"topic":"retest-tolerance","choice":"A retest requires abs(Low - S) <= 0.25*ATR(14).","reason":"This treats the stated tolerance as a symmetric demand-zone tolerance around S."},{"topic":"ATR-timing","choice":"The ATR used for the signal-day volatility filter, entry cap, and stop is the ATR(14) available on the signal bar.","reason":"The next-day opening price is not known when the order must be created."},{"topic":"entry-open-infeasible","choice":"A one-day buy-limit order at S + 0.5*ATR(14) is submitted on the signal bar and cancelled after the next bar if unfilled.","reason":"Standard Backtrader next() orders execute after signal evaluation; it cannot conditionally submit and fill a market order at the already-observed next-bar open without cheat-on-open. A limit order fills at the next open when that open is at or below the cap, but may also fill later that same daily bar if its low reaches the cap."},{"topic":"risk-sizing","choice":"Quantity is 1% of current equity divided by (entry cap - SL).","reason":"The actual next-day opening fill is unknown at signal time. Because an eligible fill cannot exceed the entry cap, this keeps actual entry-to-stop risk at or below 1% of equity."},{"topic":"multiple-setups","choice":"Only one breakout/retest setup is tracked while flat; a later breakout is considered after the current setup resolves or expires.","reason":"The specification defines one level S and permits only one position, but does not define concurrent setup priority."},{"topic":"same-bar-stop-and-targets","choice":"Backtrader broker order-processing order determines outcomes if a daily bar reaches both the common stop and one or more targets.","reason":"OHLC daily bars do not provide intrabar price sequence."}]}
+```

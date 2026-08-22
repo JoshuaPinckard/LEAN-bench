@@ -1,0 +1,121 @@
+```python
+import backtrader as bt
+import math
+from collections import deque
+
+
+class DQNStrategy(bt.Strategy):
+    params = (
+        ("training_bars", 252),
+        ("epsilon", 0.8),
+        ("epsilon_decay", 0.99),
+        ("gamma", 0.95),
+        ("learning_rate", 0.01),
+        ("max_trade_size", 100),
+    )
+
+    def __init__(self):
+        self.pending_order = None
+        self.epsilon = self.p.epsilon
+        self.previous_value = None
+        self.training_prices = []
+        self.q_values = {}
+        self.training_cash = 1000.0
+        self.training_shares = 0
+        self.training_previous_value = 1000.0
+        self.training_complete = False
+
+    def _state(self, price):
+        return round(float(price), 2)
+
+    def _actions(self):
+        return range(201)  # 0=hold, 1-100=buy shares, 101-200=sell shares
+
+    def _best_action(self, state):
+        values = self.q_values.setdefault(
+            state, {action: 0.0 for action in self._actions()}
+        )
+        return max(values, key=values.get)
+
+    def _action(self, state):
+        if (len(self.training_prices) % 100) < int(self.epsilon * 100):
+            return len(self.training_prices) % 201
+        return self._best_action(state)
+
+    def _train_step(self, price):
+        state = self._state(price)
+        action = self._action(state)
+
+        if 1 <= action <= self.p.max_trade_size:
+            shares = action
+            cost = shares * price
+            if cost <= self.training_cash:
+                self.training_cash -= cost
+                self.training_shares += shares
+        elif action > self.p.max_trade_size:
+            shares = action - self.p.max_trade_size
+            shares = min(shares, self.training_shares)
+            if shares:
+                self.training_cash += shares * price
+                self.training_shares -= shares
+
+        portfolio_value = self.training_cash + self.training_shares * price
+        reward = portfolio_value - self.training_previous_value
+        self.training_previous_value = portfolio_value
+
+        values = self.q_values.setdefault(
+            state, {candidate: 0.0 for candidate in self._actions()}
+        )
+        next_state = self._state(price)
+        next_values = self.q_values.setdefault(
+            next_state, {candidate: 0.0 for candidate in self._actions()}
+        )
+        target = reward + self.p.gamma * max(next_values.values())
+        values[action] += self.p.learning_rate * (target - values[action])
+
+    def next(self):
+        price = float(self.data.close[0])
+
+        if not self.training_complete:
+            self.training_prices.append(price)
+            self._train_step(price)
+
+            if len(self.training_prices) >= self.p.training_bars:
+                self.training_complete = True
+                self.epsilon *= self.p.epsilon_decay
+            return
+
+        if self.pending_order:
+            return
+
+        state = self._state(price)
+        action = self._best_action(state)
+
+        if 1 <= action <= self.p.max_trade_size:
+            requested = action
+            affordable = int(self.broker.getcash() / price)
+            shares = min(requested, affordable)
+            if shares > 0:
+                self.pending_order = self.buy(size=shares)
+
+        elif action > self.p.max_trade_size:
+            requested = action - self.p.max_trade_size
+            shares = min(requested, self.position.size)
+            if shares > 0:
+                self.pending_order = self.sell(size=shares)
+
+        self.previous_value = self.broker.getvalue()
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_order = None
+```
+
+```json
+{"assumptions":[{"topic":"neural-network architecture","choice":"Implemented a tabular Q-learning value function keyed only by the current market price.","reason":"The specification requires a DQN but does not define network architecture, training epochs, replay buffer, optimizer, or supported machine-learning dependencies; only backtrader, math, collections, and statistics are allowed."},{"topic":"action representation","choice":"Used 201 discrete actions: hold, buy 1 through 100 shares, and sell 1 through 100 shares.","reason":"The specified variable share ranges require a concrete action encoding; selling zero shares is equivalent to hold."},{"topic":"training period","choice":"The first 252 daily bars are used as one training year, with simulated initial cash of 1000 and zero shares; live strategy orders begin after that episode.","reason":"The feed is daily and the specification states training on one year of historical data but does not define a separate training dataset or episode count."},{"topic":"epsilon decay","choice":"Epsilon is decayed once after the single available one-year training episode.","reason":"The specification defines decay after each episode but does not specify a number of episodes."},{"topic":"infeasible","choice":"The harness-provided broker cash remains 10000 for executed orders, while the internal training portfolio uses the specified 1000 monetary units.","reason":"The fixed execution environment sets starting cash to 10000, conflicting with the specification's required initial capital of 1000; a strategy cannot safely override the harness broker setup."}]}
+```

@@ -1,0 +1,222 @@
+```python
+import backtrader as bt
+import math
+from collections import deque
+
+
+class SOFIMeanReversionIntradayFlags(bt.Strategy):
+    params = (
+        ("intraday_ema_short", 10),
+        ("intraday_ema_medium", 20),
+        ("yearly_high_bars", 26 * 5 * 5 * 4),  # 26 weeks of 15-minute bars
+        ("vrvp_period", 20),
+        ("vrvp_percentile_period", 100),
+        ("thin_pocket_percentile", 20),
+        ("key_level", 26.0),
+        ("stop_loss_pct", 0.02),
+        ("take_profit_pct", 0.05),
+        ("risk_per_trade_pct", 0.01),
+        ("flag_bars", 3),
+        ("flag_max_range_pct", 0.02),
+    )
+
+    def __init__(self):
+        self.ema10_intraday = bt.indicators.EMA(
+            self.data.close, period=self.p.intraday_ema_short
+        )
+        self.ema20_intraday = bt.indicators.EMA(
+            self.data.close, period=self.p.intraday_ema_medium
+        )
+
+        self.pending_order = None
+        self.pending_kind = None
+
+        self.highs_52_week = deque(maxlen=self.p.yearly_high_bars)
+        self.volatility_volume = deque(maxlen=self.p.vrvp_period)
+        self.vrvp_history = deque(maxlen=self.p.vrvp_percentile_period)
+        self.flag_history = deque(maxlen=self.p.flag_bars)
+
+        self.current_date = None
+        self.session_open = None
+        self.previous_daily_close = None
+        self.daily_closes = []
+        self.daily_ema10 = None
+        self.daily_ema20 = None
+
+        self.stop_price = None
+        self.target_price = None
+
+    def _update_daily_emas(self, close):
+        self.daily_closes.append(close)
+
+        if len(self.daily_closes) == 10:
+            self.daily_ema10 = sum(self.daily_closes[-10:]) / 10.0
+        elif len(self.daily_closes) > 10:
+            self.daily_ema10 = (
+                close * (2.0 / 11.0) + self.daily_ema10 * (1.0 - 2.0 / 11.0)
+            )
+
+        if len(self.daily_closes) == 20:
+            self.daily_ema20 = sum(self.daily_closes[-20:]) / 20.0
+        elif len(self.daily_closes) > 20:
+            self.daily_ema20 = (
+                close * (2.0 / 21.0) + self.daily_ema20 * (1.0 - 2.0 / 21.0)
+            )
+
+        self.previous_daily_close = close
+
+    def _vrvp_is_thin(self):
+        if len(self.volatility_volume) < self.p.vrvp_period:
+            return False
+
+        total_volume = sum(volume for _, volume in self.volatility_volume)
+        if total_volume <= 0:
+            return False
+
+        vrvp = sum(volatility * volume for volatility, volume in self.volatility_volume)
+        vrvp /= total_volume
+
+        self.vrvp_history.append(vrvp)
+        if len(self.vrvp_history) < self.p.vrvp_percentile_period:
+            return False
+
+        sorted_values = sorted(self.vrvp_history)
+        index = int(
+            math.floor(
+                (self.p.thin_pocket_percentile / 100.0) * (len(sorted_values) - 1)
+            )
+        )
+        return vrvp <= sorted_values[index]
+
+    def _entry_size(self, price):
+        risk_amount = self.broker.getvalue() * self.p.risk_per_trade_pct
+        risk_per_share = price * self.p.stop_loss_pct
+        if risk_per_share <= 0:
+            return 0
+        return int(math.floor(risk_amount / risk_per_share))
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        bar_date = dt.date()
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        open_ = self.data.open[0]
+
+        if self.current_date != bar_date:
+            self.current_date = bar_date
+            self.session_open = open_
+            self.flag_history.clear()
+
+        self.highs_52_week.append(high)
+
+        if len(self) > 1 and self.data.close[-1] != 0:
+            volatility = abs(close - self.data.close[-1]) / self.data.close[-1]
+            self.volatility_volume.append((volatility, self.data.volume[0]))
+        thin_pocket = self._vrvp_is_thin()
+
+        # Indicator-based exit is evaluated using the completed daily close.
+        if dt.hour == 15 and dt.minute == 45:
+            prior_ema10 = self.daily_ema10
+            prior_ema20 = self.daily_ema20
+            self._update_daily_emas(close)
+
+            if (
+                self.position
+                and self.pending_order is None
+                and self.daily_ema10 is not None
+                and self.daily_ema20 is not None
+                and (close < self.daily_ema10 or close < self.daily_ema20)
+            ):
+                self.pending_order = self.close()
+                self.pending_kind = "exit"
+            return
+
+        if self.position:
+            if (
+                self.pending_order is None
+                and self.stop_price is not None
+                and (close <= self.stop_price or close >= self.target_price)
+            ):
+                self.pending_order = self.close()
+                self.pending_kind = "exit"
+            return
+
+        if self.pending_order is not None:
+            return
+
+        # The first 15-minute move after the open is skipped.
+        if dt.hour == 9 and dt.minute == 30:
+            return
+
+        if (
+            self.daily_ema10 is None
+            or self.daily_ema20 is None
+            or len(self.highs_52_week) == 0
+            or not (close > self.daily_ema10 and close > self.daily_ema20)
+            or close < 0.99 * max(self.highs_52_week)
+            or close <= self.p.key_level
+            or not thin_pocket
+        ):
+            self.flag_history.append((high, low, close))
+            return
+
+        rising_ema10 = self.ema10_intraday[0] > self.ema10_intraday[-1]
+        rising_ema20 = self.ema20_intraday[0] > self.ema20_intraday[-1]
+        upward_reversal = close > open_
+
+        gap_fill_pullback = (
+            self.previous_daily_close is not None
+            and self.session_open > self.previous_daily_close
+            and low <= self.previous_daily_close
+            and close >= self.previous_daily_close
+            and upward_reversal
+        )
+        ema_pullback = (
+            upward_reversal
+            and (
+                (low <= self.ema10_intraday[0] and rising_ema10)
+                or (low <= self.ema20_intraday[0] and rising_ema20)
+            )
+        )
+        pullback_entry = gap_fill_pullback or ema_pullback
+
+        flag_entry = False
+        if len(self.flag_history) == self.p.flag_bars:
+            flag_high = max(bar[0] for bar in self.flag_history)
+            flag_low = min(bar[1] for bar in self.flag_history)
+            flag_range = (flag_high - flag_low) / flag_low if flag_low > 0 else 0
+            flag_entry = (
+                flag_range <= self.p.flag_max_range_pct and close > flag_high
+            )
+
+        if pullback_entry or flag_entry:
+            size = self._entry_size(close)
+            if size > 0:
+                self.pending_order = self.buy(size=size)
+                self.pending_kind = "entry"
+
+        self.flag_history.append((high, low, close))
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if self.pending_kind == "entry" and order.isbuy():
+                self.stop_price = order.executed.price * (1.0 - self.p.stop_loss_pct)
+                self.target_price = order.executed.price * (
+                    1.0 + self.p.take_profit_pct
+                )
+            elif self.pending_kind == "exit":
+                self.stop_price = None
+                self.target_price = None
+
+            self.pending_order = None
+            self.pending_kind = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            self.pending_order = None
+            self.pending_kind = None
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"A rolling 26-week high uses 15-minute bars available from the supplied feed; before 26 weeks of history are available, the highest observed bar high is used.","reason":"The feed contains less than 52 weeks of data and no earlier historical data is available."},{"topic":"daily EMA","choice":"Daily EMA(10) and EMA(20) are calculated from each session's final 15-minute close, seeded with the corresponding simple moving average and then updated with the standard EMA formula.","reason":"The specification requires daily EMAs while the supplied feed is 15-minute only."},{"topic":"VRVP","choice":"VRVP is the 20-bar volume-weighted mean absolute close-to-close percentage change; a thin pocket is a value at or below its trailing 100-observation 20th percentile.","reason":"The specification names VRVP and a thin pocket but supplies no calculation method, lookback, or percentile threshold."},{"topic":"pullback reversal","choice":"An upward reversal means the current 15-minute close is above its open. A pullback is either a touch and recovery of the prior daily close after a gap-up, or a touch of a rising intraday EMA(10) or EMA(20).","reason":"Gap-fill level, reversal confirmation, and the exact intraday EMA choice are not numerically defined."},{"topic":"flag","choice":"A flag is three preceding 15-minute bars whose high-low range is at most 2%; its upper boundary is their highest high, and a breakout requires the current close above it.","reason":"The specification requires a 15-minute consolidation flag but does not define its duration, range, or boundary calculation."},{"topic":"risk management","choice":"Stop-loss is 2% below executed entry, take-profit is 5% above executed entry, and order size risks 1% of current portfolio value based on the 2% stop distance.","reason":"The specification offers ranges of 1-2% for stops and risk and 3-5% for targets, without selecting exact values."},{"topic":"open rule","choice":"No entry is evaluated on the 09:30 bar.","reason":"This implements skipping the first price move after the open and avoids an opening-range-breakout confirmation."}]}
+```

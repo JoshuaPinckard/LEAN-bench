@@ -1,0 +1,216 @@
+{
+  "task_id": 81,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\nfrom collections import deque\n\n\nclass ContinuousEventPredictiveStrategy(bt.Strategy):\n    params = (\n        (\"model_mode\", \"continuous\"),  # \"continuous\" or \"event_driven\"\n        (\"regression_window\", 120),\n        (\"minimum_samples\", 30),\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=14)\n        self.volume_average = bt.indicators.SimpleMovingAverage(\n            self.data.volume, period=14\n        )\n        self.pending_order = None\n        self.feature_history = deque(maxlen=self.p.regression_window + 5)\n        self.training_samples = deque(maxlen=self.p.regression_window)\n\n    def notify_order(self, order):\n        if order.status in (\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        ):\n            self.pending_order = None\n\n    @staticmethod\n    def _clip(value, lower=-1.0, upper=1.0):\n        return max(lower, min(upper, value))\n\n    def _forecast(self, features, volatility_ratio):\n        if len(self.training_samples) < self.p.minimum_samples:\n            return None\n\n        dimensions = 5  # intercept plus four model features\n        matrix = [[0.0] * dimensions for _ in range(dimensions)]\n        vector = [0.0] * dimensions\n\n        for sample_features, target in self.training_samples:\n            row = [1.0] + list(sample_features)\n            for i in range(dimensions):\n                vector[i] += row[i] * target\n                for j in range(dimensions):\n                    matrix[i][j] += row[i] * row[j]\n\n        for i in range(dimensions):\n            matrix[i][i] += 1e-8\n\n        for column in range(dimensions):\n            pivot = max(\n                range(column, dimensions),\n                key=lambda row: abs(matrix[row][column]),\n            )\n            if abs(matrix[pivot][column]) < 1e-12:\n                return None\n            matrix[column], matrix[pivot] = matrix[pivot], matrix[column]\n            vector[column], vector[pivot] = vector[pivot], vector[column]\n\n            divisor = matrix[column][column]\n            for j in range(column, dimensions):\n                matrix[column][j] /= divisor\n            vector[column] /= divisor\n\n            for row in range(dimensions):\n                if row == column:\n                    continue\n                factor = matrix[row][column]\n                for j in range(column, dimensions):\n                    matrix[row][j] -= factor * matrix[column][j]\n                vector[row] -= factor * vector[column]\n\n        predicted_return = vector[0] + sum(\n            coefficient * feature\n            for coefficient, feature in zip(vector[1:], features)\n        )\n        return self._clip(predicted_return / volatility_ratio)\n\n    def next(self):\n        if self.pending_order:\n            return\n\n        close = float(self.data.close[0])\n        high = float(self.data.high[0])\n        low = float(self.data.low[0])\n        open_price = float(self.data.open[0])\n        volume = float(self.data.volume[0])\n        atr = float(self.atr[0])\n        average_volume = float(self.volume_average[0])\n\n        if (\n            not math.isfinite(atr)\n            or not math.isfinite(average_volume)\n            or close <= 0.0\n            or atr <= 0.0\n            or average_volume <= 0.0\n        ):\n            return\n\n        price_range = high - low\n        order_imbalance = (\n            self._clip((2.0 * close - high - low) / price_range)\n            if price_range > 0.0\n            else 0.0\n        )\n\n        candle_direction = 1.0 if close > open_price else -1.0 if close < open_price else 0.0\n        trade_imbalance = candle_direction * self._clip(volume / average_volume)\n        volume_feature = self._clip((volume - average_volume) / average_volume)\n        volatility_ratio = atr / close\n        volatility_feature = self._clip(volatility_ratio / 0.01)\n\n        features = (\n            order_imbalance,\n            trade_imbalance,\n            volume_feature,\n            volatility_feature,\n        )\n\n        if len(self.feature_history) >= 5:\n            old_close, old_features = self.feature_history[-5]\n            future_return = (close / old_close) - 1.0\n            self.training_samples.append((old_features, future_return))\n\n        self.feature_history.append((close, features))\n        forecast = self._forecast(features, volatility_ratio)\n\n        if forecast is None:\n            return\n\n        event_active = abs(order_imbalance) > 0.6\n        if self.p.model_mode == \"event_driven\" and not event_active:\n            return\n\n        if self.position.size > 0 and forecast < 0.0:\n            self.pending_order = self.close()\n            return\n\n        if self.position.size < 0 and forecast > 0.0:\n            self.pending_order = self.close()\n            return\n\n        minutes = self.data.datetime.time(0).hour * 60 + self.data.datetime.time(0).minute\n        in_trading_window = 10 * 60 <= minutes <= 16 * 60\n        volatility_filter_passes = atr >= 0.001 * close\n\n        if self.position.size or not in_trading_window or not volatility_filter_passes:\n            return\n\n        threshold = 0.2 if self.p.model_mode == \"continuous\" else 0.5\n        size = self.broker.getcash() / (close * 1.001)\n\n        if size <= 0.0:\n            return\n\n        if forecast > threshold:\n            self.pending_order = self.buy(size=size)\n        elif forecast < -threshold:\n            self.pending_order = self.sell(size=size)",
+  "assumptions": [
+    {
+      "topic": "two strategy versions",
+      "choice": "A single strategy class exposes model_mode='continuous' or model_mode='event_driven'.",
+      "reason": "The harness permits one strategy class and one position, so independently trading both versions simultaneously is infeasible."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Order Imbalance is proxied by the bar close-location value; Trade Imbalance is proxied by candle direction weighted by volume relative to its 14-bar average.",
+      "reason": "The supplied OHLCV feed contains neither order-book depth nor buyer/seller-initiated trade data."
+    },
+    {
+      "topic": "forecast model",
+      "choice": "A rolling ordinary least-squares regression uses the four stated features to predict the realized return five bars after each historical feature observation; its prediction is divided by current ATR/price and clipped to [-1,1].",
+      "reason": "This provides a causal linear predictive model with a five-bar future-return target and the required forecast range."
+    },
+    {
+      "topic": "regression history",
+      "choice": "The regression uses up to 120 labeled observations and requires 30 observations before producing a forecast.",
+      "reason": "The specification does not state a training-window length or minimum sample count."
+    },
+    {
+      "topic": "event-driven exits",
+      "choice": "When model_mode is event_driven, both entries and sign-change exits require the Order Imbalance event criterion.",
+      "reason": "The specification states that the event-driven model is active only when absolute Order Imbalance exceeds 0.6."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "Entry size is available cash divided by close multiplied by 1.001.",
+      "reason": "This targets 100% available capital while reserving the stated 0.001 commission; market orders execute on the next bar, whose exact execution price is unavailable at signal time."
+    },
+    {
+      "topic": "trading window",
+      "choice": "The 10:00 through 16:00 window is inclusive of bars timestamped 16:00.",
+      "reason": "The specification gives endpoint times but does not state endpoint exclusivity."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 14,
+  "tape": [
+    {
+      "dt": "2026-08-12T13:48:00",
+      "side": "SELL",
+      "size": -32.952384702833236,
+      "price": 303.1650085449219
+    },
+    {
+      "dt": "2026-08-12T14:04:00",
+      "side": "BUY",
+      "size": 32.952384702833236,
+      "price": 303.80499267578125
+    },
+    {
+      "dt": "2026-08-12T14:11:00",
+      "side": "SELL",
+      "size": -32.84027240773681,
+      "price": 302.9739074707031
+    },
+    {
+      "dt": "2026-08-12T14:23:00",
+      "side": "BUY",
+      "size": 32.84027240773681,
+      "price": 302.5899963378906
+    },
+    {
+      "dt": "2026-08-13T14:25:00",
+      "side": "SELL",
+      "size": -32.635827858160596,
+      "price": 304.6332092285156
+    },
+    {
+      "dt": "2026-08-13T14:26:00",
+      "side": "BUY",
+      "size": 32.635827858160596,
+      "price": 304.94500732421875
+    },
+    {
+      "dt": "2026-08-14T14:04:00",
+      "side": "SELL",
+      "size": -32.3899510019397,
+      "price": 306.00421142578125
+    },
+    {
+      "dt": "2026-08-14T14:07:00",
+      "side": "BUY",
+      "size": 32.3899510019397,
+      "price": 305.9049987792969
+    },
+    {
+      "dt": "2026-08-14T14:09:00",
+      "side": "SELL",
+      "size": -32.341024551615845,
+      "price": 305.9599914550781
+    },
+    {
+      "dt": "2026-08-14T14:10:00",
+      "side": "BUY",
+      "size": 32.341024551615845,
+      "price": 305.94000244140625
+    },
+    {
+      "dt": "2026-08-14T14:23:00",
+      "side": "SELL",
+      "size": -32.348827453542434,
+      "price": 305.2799987792969
+    },
+    {
+      "dt": "2026-08-14T14:24:00",
+      "side": "BUY",
+      "size": 32.348827453542434,
+      "price": 305.2200012207031
+    },
+    {
+      "dt": "2026-08-17T13:35:00",
+      "side": "BUY",
+      "size": 32.24144779817889,
+      "price": 305.760009765625
+    },
+    {
+      "dt": "2026-08-17T13:38:00",
+      "side": "SELL",
+      "size": -32.24144779817889,
+      "price": 305.9599914550781
+    },
+    {
+      "dt": "2026-08-17T13:39:00",
+      "side": "SELL",
+      "size": -32.236559112895186,
+      "price": 305.4100036621094
+    },
+    {
+      "dt": "2026-08-17T13:51:00",
+      "side": "BUY",
+      "size": 32.236559112895186,
+      "price": 305.9599914550781
+    },
+    {
+      "dt": "2026-08-17T14:05:00",
+      "side": "SELL",
+      "size": -32.14626036958251,
+      "price": 305.0899963378906
+    },
+    {
+      "dt": "2026-08-17T14:13:00",
+      "side": "BUY",
+      "size": 32.14626036958251,
+      "price": 304.9200134277344
+    },
+    {
+      "dt": "2026-08-18T13:36:00",
+      "side": "SELL",
+      "size": -31.967957377083565,
+      "price": 306.31500244140625
+    },
+    {
+      "dt": "2026-08-18T13:42:00",
+      "side": "BUY",
+      "size": 31.967957377083565,
+      "price": 306.5899963378906
+    },
+    {
+      "dt": "2026-08-18T13:43:00",
+      "side": "SELL",
+      "size": -31.842030057215492,
+      "price": 306.6400146484375
+    },
+    {
+      "dt": "2026-08-18T13:45:00",
+      "side": "BUY",
+      "size": 31.842030057215492,
+      "price": 306.9649963378906
+    },
+    {
+      "dt": "2026-08-18T13:47:00",
+      "side": "BUY",
+      "size": 31.71261576496833,
+      "price": 306.9700012207031
+    },
+    {
+      "dt": "2026-08-18T13:53:00",
+      "side": "SELL",
+      "size": -31.71261576496833,
+      "price": 306.19000244140625
+    },
+    {
+      "dt": "2026-08-18T13:55:00",
+      "side": "SELL",
+      "size": -31.619311795186025,
+      "price": 306.4700012207031
+    },
+    {
+      "dt": "2026-08-18T13:56:00",
+      "side": "BUY",
+      "size": 31.619311795186025,
+      "price": 306.5199890136719
+    },
+    {
+      "dt": "2026-08-19T13:31:00",
+      "side": "SELL",
+      "size": -31.12321319634273,
+      "price": 310.6300048828125
+    },
+    {
+      "dt": "2026-08-19T13:36:00",
+      "side": "BUY",
+      "size": 31.12321319634273,
+      "price": 311.2699890136719
+    }
+  ]
+}

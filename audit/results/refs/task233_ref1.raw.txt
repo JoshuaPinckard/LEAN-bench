@@ -1,0 +1,189 @@
+```python
+import backtrader as bt
+import math
+
+
+class PseudoProtectivePutATR(bt.Strategy):
+    params = (
+        ("base_price", None),
+        ("main_shares", None),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.pending_order = None
+        self.entry_order = None
+        self.exit_order = None
+        self.stop_order = None
+
+        self.hedge_active = False
+        self.entry_price = None
+        self.entry_atr = None
+        self.entry_bar = None
+        self.entry_term = None
+        self.entry_request = None
+        self.roll_request = None
+        self.exit_requested = False
+
+        self.next_k = 1
+
+    def _can_open(self):
+        return (
+            self.p.base_price is not None
+            and self.p.main_shares is not None
+            and self.p.base_price > 0
+            and self.p.main_shares > 0
+            and self.data.close[0] > 0
+            and self.atr[0] > 0
+            and self.atr[0] / self.data.close[0] <= 0.04
+        )
+
+    def _quantity(self):
+        return math.floor(
+            0.02 * (self.p.main_shares * self.data.close[0]) / self.atr[0]
+        )
+
+    def _request_entry(self, term):
+        qty = self._quantity()
+        if qty > 0:
+            self.entry_request = (self.atr[0], term)
+            self.entry_order = self.sell(size=qty)
+            self.pending_order = self.entry_order
+
+    def _request_exit(self, roll_term=None):
+        if self.exit_requested or self.exit_order is not None:
+            return
+        self.exit_requested = True
+        if roll_term is not None:
+            self.roll_request = roll_term
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+
+    def next(self):
+        if self.p.base_price is None or self.p.main_shares is None:
+            return
+
+        if (
+            self.exit_requested
+            and self.stop_order is None
+            and self.exit_order is None
+            and self.position.size < 0
+        ):
+            self.exit_order = self.close()
+            self.pending_order = self.exit_order
+            return
+
+        if self.pending_order is not None:
+            return
+
+        if (
+            self.roll_request is not None
+            and not self.hedge_active
+            and self.position.size == 0
+        ):
+            term = self.roll_request
+            self.roll_request = None
+            self._request_entry(term)
+            return
+
+        close = self.data.close[0]
+
+        newly_breached = False
+        while close >= self.p.base_price * (1 + 0.10 * self.next_k):
+            newly_breached = True
+            self.next_k += 1
+
+        if self.hedge_active and self.position.size < 0:
+            if len(self) - self.entry_bar >= self.entry_term:
+                self._request_exit()
+                return
+
+            if close <= self.entry_price * 0.85:
+                self._request_exit()
+                return
+
+            if newly_breached and self._can_open():
+                self._request_exit(roll_term=180)
+                return
+
+        elif (
+            not self.hedge_active
+            and self.position.size == 0
+            and close >= 3 * self.p.base_price
+            and self._can_open()
+        ):
+            self._request_entry(term=90)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.stop_order:
+            if order.status == order.Completed:
+                self.stop_order = None
+                self.hedge_active = False
+                self.entry_price = None
+                self.entry_atr = None
+                self.entry_bar = None
+                self.entry_term = None
+                self.exit_requested = False
+                self.roll_request = None
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.stop_order = None
+            return
+
+        if order is self.entry_order:
+            self.pending_order = None
+            self.entry_order = None
+
+            if order.status == order.Completed:
+                self.hedge_active = True
+                self.entry_price = order.executed.price
+                self.entry_atr, self.entry_term = self.entry_request
+                self.entry_bar = len(self)
+                self.entry_request = None
+                self.stop_order = self.buy(
+                    size=abs(self.position.size),
+                    exectype=bt.Order.Stop,
+                    price=self.entry_price + self.entry_atr,
+                )
+            else:
+                self.entry_request = None
+            return
+
+        if order is self.exit_order:
+            self.pending_order = None
+            self.exit_order = None
+
+            if order.status == order.Completed:
+                self.hedge_active = False
+                self.entry_price = None
+                self.entry_atr = None
+                self.entry_bar = None
+                self.entry_term = None
+                self.exit_requested = False
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.exit_requested = False
+            return
+
+        if order is self.pending_order and order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_order = None
+```
+
+```json
+{"assumptions":[{"topic":"required parameters","choice":"base_price and main_shares default to None; no hedge is traded until both are supplied as positive values.","reason":"The specification states these values are passed as parameters but provides no numeric defaults."},{"topic":"separate overlay account","choice":"The strategy's actual Backtrader position represents only the short hedge overlay; no long core position is opened or managed.","reason":"The stated underlying long is assumed to exist outside this strategy, while the fixed harness provides only one broker/account."},{"topic":"entry and stop timing","choice":"Short hedge entries use Backtrader market orders; entry is the executed fill price, while the ATR saved at the qualifying signal bar sets the 1-ATR stop distance.","reason":"A market order's executed entry price is not known until order completion."},{"topic":"threshold gaps","choice":"If one Close exceeds multiple previously unreached 10% thresholds on the same bar, all are marked reached and at most one roll is requested.","reason":"Only one hedge can be open under the canonical single-position rule."},{"topic":"roll eligibility","choice":"A threshold is considered reached when Close first meets or exceeds it, even if volatility prevents a roll on that bar.","reason":"The specification requires the threshold not to have been reached before and separately restricts opening or rolling by the ATR/Close condition."}]}
+```

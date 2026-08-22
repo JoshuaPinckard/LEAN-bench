@@ -1,0 +1,192 @@
+```python
+import backtrader as bt
+
+
+class MultiTimeframeCandlestickPatternAggregationStrategy(bt.Strategy):
+    params = (
+        ("pattern", None),
+        ("opposite_pattern", None),
+        ("risk_per_trade", 0.01),
+        ("profit_atr_multiple", 1.5),
+        ("stop_atr_multiple", 0.5),
+        ("atr_period", 14),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self._pending_entry_atr = None
+        self._session_date = None
+        self._session_bar_number = 0
+        self._bar_index = -1
+        self._candles = {15: [], 30: [], 60: [], 120: []}
+        self._pattern_events = {15: [], 30: [], 60: [], 120: []}
+        self.pattern_counts = []
+
+    def _bullish_engulfing(self, previous, current):
+        return (
+            previous["close"] < previous["open"]
+            and current["close"] > current["open"]
+            and current["open"] <= previous["close"]
+            and current["close"] >= previous["open"]
+        )
+
+    def _bearish_engulfing(self, previous, current):
+        return (
+            previous["close"] > previous["open"]
+            and current["close"] < current["open"]
+            and current["open"] >= previous["close"]
+            and current["close"] <= previous["open"]
+        )
+
+    def _selected_pattern(self, previous, current):
+        if self.p.pattern is None:
+            return self._bullish_engulfing(previous, current)
+        return self.p.pattern(previous, current)
+
+    def _opposite_pattern(self, previous, current):
+        if self.p.opposite_pattern is None:
+            return self._bearish_engulfing(previous, current)
+        return self.p.opposite_pattern(previous, current)
+
+    def _append_candle(self, timeframe, candle):
+        self._candles[timeframe].append(candle)
+        candles = self._candles[timeframe]
+        if len(candles) >= 2 and self._selected_pattern(candles[-2], candles[-1]):
+            self._pattern_events[timeframe].append(candle["end_index"])
+
+    def _aggregate_candle(self, timeframe, component_count):
+        source = self._candles[15][-component_count:]
+        return {
+            "open": source[0]["open"],
+            "high": max(candle["high"] for candle in source),
+            "low": min(candle["low"] for candle in source),
+            "close": source[-1]["close"],
+            "end_index": source[-1]["end_index"],
+            "datetime": source[-1]["datetime"],
+        }
+
+    def _count_patterns_in_window(self, timeframe, start_index, end_index):
+        return sum(
+            start_index <= event_index <= end_index
+            for event_index in self._pattern_events[timeframe]
+        )
+
+    def _atr_value(self):
+        if len(self) < self.atr._minperiod:
+            return None
+        value = float(self.atr[0])
+        if value != value or value <= 0.0:
+            return None
+        return value
+
+    def _evaluate_two_hour_pattern(self, candle):
+        high_count = 1
+        start_index = candle["end_index"] - 7
+        counts = {
+            120: high_count,
+            60: self._count_patterns_in_window(60, start_index, candle["end_index"]),
+            30: self._count_patterns_in_window(30, start_index, candle["end_index"]),
+            15: self._count_patterns_in_window(15, start_index, candle["end_index"]),
+        }
+        self.pattern_counts.append({
+            "datetime": candle["datetime"],
+            "120": counts[120],
+            "60": counts[60],
+            "30": counts[30],
+            "15": counts[15],
+        })
+
+        if (
+            not self.position
+            and self.order is None
+            and counts[60] > counts[120]
+            and counts[30] > counts[60]
+            and counts[15] > counts[30]
+        ):
+            atr_value = self._atr_value()
+            if atr_value is not None:
+                stop_distance = self.p.stop_atr_multiple * atr_value
+                size = (
+                    self.broker.getvalue() * self.p.risk_per_trade
+                ) / stop_distance
+                if size > 0.0:
+                    self._pending_entry_atr = atr_value
+                    self.order = self.buy(size=size, exectype=bt.Order.Close)
+
+    def _process_bar(self):
+        current_dt = self.data.datetime.datetime(0)
+        current_date = current_dt.date()
+
+        if self._session_date != current_date:
+            self._session_date = current_date
+            self._session_bar_number = 0
+
+        self._bar_index += 1
+        self._session_bar_number += 1
+        raw_candle = {
+            "open": float(self.data.open[0]),
+            "high": float(self.data.high[0]),
+            "low": float(self.data.low[0]),
+            "close": float(self.data.close[0]),
+            "end_index": self._bar_index,
+            "datetime": current_dt,
+        }
+        self._append_candle(15, raw_candle)
+
+        if len(self._candles[15]) >= 2 and self._opposite_pattern(
+            self._candles[15][-2], self._candles[15][-1]
+        ):
+            if self.position and self.order is None:
+                self.order = self.close(exectype=bt.Order.Close)
+
+        if self.position and self.order is None and self.entry_price is not None:
+            target = self.entry_price + self.p.profit_atr_multiple * self.entry_atr
+            stop = self.entry_price - self.p.stop_atr_multiple * self.entry_atr
+            if float(self.data.low[0]) <= stop or float(self.data.high[0]) >= target:
+                self.order = self.close(exectype=bt.Order.Close)
+
+        if self._session_bar_number % 2 == 0:
+            self._append_candle(30, self._aggregate_candle(30, 2))
+
+        if self._session_bar_number % 4 == 0:
+            self._append_candle(60, self._aggregate_candle(60, 4))
+
+        if self._session_bar_number % 8 == 0:
+            two_hour_candle = self._aggregate_candle(120, 8)
+            self._append_candle(120, two_hour_candle)
+            if len(self._candles[120]) >= 2 and self._selected_pattern(
+                self._candles[120][-2], self._candles[120][-1]
+            ):
+                self._evaluate_two_hour_pattern(two_hour_candle)
+
+    def prenext(self):
+        self._process_bar()
+
+    def next(self):
+        self._process_bar()
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order.status == order.Completed:
+                if order.isbuy():
+                    self.entry_price = order.executed.price
+                    self.entry_atr = self._pending_entry_atr
+                else:
+                    self.entry_price = None
+                    self.entry_atr = None
+            if order.status != order.Completed or not order.isbuy():
+                self._pending_entry_atr = None
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"timeframe construction","choice":"The supplied 15-minute bars are aggregated into 30-, 60-, and 120-minute candles from the first bar of each trading day; incomplete end-of-day aggregates are not evaluated.","reason":"The harness provides only one 15-minute feed and does not specify higher-timeframe session alignment."},{"topic":"recursive signal","choice":"A 120-minute Bullish Engulfing triggers an entry only when the Bullish Engulfing counts within that same 120-minute window increase strictly at every drill-down step: 60 > 120, 30 > 60, and 15 > 30.","reason":"This applies the required recursive search across all listed consecutive timeframes and places the signal on the lowest specified entry timeframe."},{"topic":"pattern window membership","choice":"A lower-timeframe pattern is counted when its completing candle ends within the triggering 120-minute window, even if its preceding candle began before that window.","reason":"This permits all lower-candle completions in the stated period to be searched and counted."},{"topic":"ATR period","choice":"ATR uses period 14 on the 15-minute entry timeframe.","reason":"The specification requires ATR but does not state a period; 14 is the conventional ATR default."},{"topic":"custom patterns","choice":"The pattern and opposite_pattern parameters may be replaced with callables accepting previous and current candle dictionaries; absent replacements they are Bullish and Bearish Engulfing respectively.","reason":"Backtrader has no universal standard-candlestick-pattern selector, so callable parameters make replacement direct without changing the aggregation logic."},{"topic":"infeasible","choice":"Orders use Backtrader Close orders as the closest available representation of execution at the candle close.","reason":"With the fixed harness and no specified cheat-on-close broker setting, an order submitted after observing a completed candle cannot be guaranteed to fill at that same candle's close."},{"topic":"intrabar target and stop collision","choice":"If both the stop and profit target are reachable in one 15-minute bar, the stop condition is evaluated first.","reason":"OHLCV bars do not provide the intrabar price path needed to determine which level was reached first."}]}
+```

@@ -1,0 +1,57 @@
+{
+  "task_id": 76,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\n\n\nclass EntropyPoolingStrategy(bt.Strategy):\n    params = (\n        (\"lookback\", 60),\n        (\"volume_period\", 20),\n        (\"target_return\", 1.00),\n        (\"target_volatility\", 0.20),\n        (\"entry_shift\", 0.05),\n        (\"exit_shift\", 0.05),\n        (\"strange_spike_multiple\", 2.0),\n    )\n\n    def __init__(self):\n        self.addminperiod(self.p.lookback + 1)\n        self.volume_average = bt.indicators.SMA(\n            self.data.volume, period=self.p.volume_period\n        )\n        self.order = None\n        self.stop_level = None\n        self.take_profit_level = None\n\n    def notify_order(self, order):\n        if order.status in (\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        ):\n            self.order = None\n\n    @staticmethod\n    def _weighted_quantile(values, weights, percentile):\n        pairs = sorted(zip(values, weights), key=lambda item: item[0])\n        cumulative = 0.0\n        for value, weight in pairs:\n            cumulative += weight\n            if cumulative >= percentile:\n                return value\n        return pairs[-1][0]\n\n    @staticmethod\n    def _weights(returns, lam1, lam2):\n        logs = [lam1 * value + lam2 * value * value for value in returns]\n        maximum = max(logs)\n        raw = [math.exp(value - maximum) for value in logs]\n        total = sum(raw)\n        return [value / total for value in raw]\n\n    def _solve_entropy_pool(self, returns, target_mean, target_volatility,\n                            initial_lambda):\n        target_second_moment = target_mean * target_mean + target_volatility ** 2\n        lam1, lam2 = initial_lambda\n\n        for _ in range(100):\n            weights = self._weights(returns, lam1, lam2)\n            mean = sum(weight * value for weight, value in zip(weights, returns))\n            second = sum(\n                weight * value * value for weight, value in zip(weights, returns)\n            )\n            error1 = mean - target_mean\n            error2 = second - target_second_moment\n\n            if max(abs(error1), abs(error2)) < 1e-9:\n                return weights, True\n\n            fourth = sum(\n                weight * value ** 4 for weight, value in zip(weights, returns)\n            )\n            third = sum(\n                weight * value ** 3 for weight, value in zip(weights, returns)\n            )\n            j11 = second - mean * mean\n            j12 = third - mean * second\n            j22 = fourth - second * second\n            determinant = j11 * j22 - j12 * j12\n\n            if abs(determinant) < 1e-18:\n                return None, False\n\n            delta1 = (j22 * error1 - j12 * error2) / determinant\n            delta2 = (-j12 * error1 + j11 * error2) / determinant\n            lam1 -= delta1\n            lam2 -= delta2\n\n            if not (math.isfinite(lam1) and math.isfinite(lam2)):\n                return None, False\n\n        return None, False\n\n    def _is_strange_distribution(self, prices, weights):\n        low, high = min(prices), max(prices)\n        if high <= low:\n            return True\n\n        bins = [0.0] * 10\n        width = (high - low) / 10.0\n        for price, weight in zip(prices, weights):\n            index = min(9, int((price - low) / width))\n            bins[index] += weight\n\n        peaks = 0\n        for index in range(1, len(bins) - 1):\n            if bins[index] > bins[index - 1] and bins[index] > bins[index + 1]:\n                peaks += 1\n\n        abnormal_spike = max(bins) > (\n            self.p.strange_spike_multiple / len(bins)\n        )\n        return peaks >= 2 or abnormal_spike\n\n    def _posterior(self, target_return):\n        closes = list(self.data.close.get(size=self.p.lookback + 1))\n        returns = [\n            closes[index] / closes[index - 1] - 1.0\n            for index in range(1, len(closes))\n        ]\n\n        target_second = target_return * target_return + self.p.target_volatility ** 2\n        feasible_seconds = [value * value for value in returns]\n        if (\n            target_return < min(returns)\n            or target_return > max(returns)\n            or target_second < min(feasible_seconds)\n            or target_second > max(feasible_seconds)\n        ):\n            return None\n\n        first, first_ok = self._solve_entropy_pool(\n            returns, target_return, self.p.target_volatility, (0.0, 0.0)\n        )\n        second, second_ok = self._solve_entropy_pool(\n            returns, target_return, self.p.target_volatility, (0.1, -0.1)\n        )\n        if not first_ok or not second_ok:\n            return None\n\n        if max(abs(a - b) for a, b in zip(first, second)) > 1e-6:\n            return None\n\n        current_price = self.data.close[0]\n        prior_weights = [1.0 / len(returns)] * len(returns)\n        prior_prices = [current_price * (1.0 + value) for value in returns]\n        posterior_prices = prior_prices[:]\n\n        if self._is_strange_distribution(posterior_prices, first):\n            return None\n\n        prior_median = self._weighted_quantile(prior_prices, prior_weights, 0.50)\n        posterior_median = self._weighted_quantile(posterior_prices, first, 0.50)\n        posterior_variance = sum(\n            weight * (value - target_return) ** 2\n            for value, weight in zip(returns, first)\n        )\n        posterior_volatility = math.sqrt(max(0.0, posterior_variance))\n\n        if prior_median == 0.0 or posterior_volatility == 0.0:\n            return None\n\n        return {\n            \"shift\": (posterior_median - prior_median) / prior_median,\n            \"volatility\": posterior_volatility,\n            \"p05\": self._weighted_quantile(posterior_prices, first, 0.05),\n            \"p95\": self._weighted_quantile(posterior_prices, first, 0.95),\n        }\n\n    def next(self):\n        if self.order:\n            return\n\n        if not self.position:\n            if self.data.volume[0] <= self.volume_average[0]:\n                return\n\n            positive = self._posterior(self.p.target_return)\n            negative = self._posterior(-self.p.target_return)\n\n            if positive and positive[\"shift\"] > self.p.entry_shift:\n                self.stop_level = positive[\"p05\"]\n                self.take_profit_level = positive[\"p95\"]\n                self.order = self.buy(size=1.0 / positive[\"volatility\"])\n            elif negative and negative[\"shift\"] < -self.p.entry_shift:\n                self.stop_level = negative[\"p95\"]\n                self.take_profit_level = negative[\"p05\"]\n                self.order = self.sell(size=1.0 / negative[\"volatility\"])\n            return\n\n        price_reached_exit = (\n            (self.position.size > 0 and (\n                self.data.low[0] <= self.stop_level\n                or self.data.high[0] >= self.take_profit_level\n            ))\n            or\n            (self.position.size < 0 and (\n                self.data.high[0] >= self.stop_level\n                or self.data.low[0] <= self.take_profit_level\n            ))\n        )\n\n        if self.position.size > 0:\n            current = self._posterior(self.p.target_return)\n            opposite = self._posterior(-self.p.target_return)\n            distribution_reverted = (\n                current is not None and abs(current[\"shift\"]) < self.p.exit_shift\n            )\n            opposite_stress = (\n                opposite is not None and opposite[\"shift\"] < -self.p.entry_shift\n            )\n        else:\n            current = self._posterior(-self.p.target_return)\n            opposite = self._posterior(self.p.target_return)\n            distribution_reverted = (\n                current is not None and abs(current[\"shift\"]) < self.p.exit_shift\n            )\n            opposite_stress = (\n                opposite is not None and opposite[\"shift\"] > self.p.entry_shift\n            )\n\n        if price_reached_exit or distribution_reverted or opposite_stress:\n            self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "stress parameters",
+      "choice": "Used the specification examples as defaults: target expected return +100%/-100%, target volatility 20%, and entry median shift 5%.",
+      "reason": "The specification supplies examples but no alternative numeric values."
+    },
+    {
+      "topic": "exit threshold",
+      "choice": "Set Z to 5%.",
+      "reason": "Z is unspecified; the stated 5% distribution-shift threshold is the closest supplied threshold."
+    },
+    {
+      "topic": "entropy pooling",
+      "choice": "Used a minimum-relative-entropy posterior over the prior uniform empirical distribution of the prior 60 daily returns, constrained to the target mean and volatility.",
+      "reason": "A rolling historical sample and uniform empirical prior provide a literal executable entropy-pooling formulation from the available closing prices."
+    },
+    {
+      "topic": "posterior price distribution",
+      "choice": "Converted each return scenario to a price scenario using current close times (1 + return).",
+      "reason": "Median and percentile exit levels are stated as price-distribution levels."
+    },
+    {
+      "topic": "optimizer quality filter",
+      "choice": "Rejected infeasible constraints, non-convergence, non-finite solutions, singular Hessians, and solutions differing by more than 1e-6 when started from two initial conditions.",
+      "reason": "These implement the required convergence and initial-condition-sensitivity checks using a manual fminunc-style Newton solver."
+    },
+    {
+      "topic": "strange behavior threshold",
+      "choice": "Rejected posterior distributions with two or more interior histogram peaks or any of 10 equal-width bins containing more than twice the equal-mass level.",
+      "reason": "The specification requires filtering bimodal distributions and abnormal spikes but does not provide a numeric spike threshold."
+    },
+    {
+      "topic": "volume filter",
+      "choice": "Defined high volume as current volume strictly greater than its 20-day simple moving average.",
+      "reason": "The specification requires high-volume trading but does not define high volume or a lookback."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Multi-asset diversification is not implemented beyond the supplied single asset.",
+      "reason": "The fixed harness provides exactly one AAPL data feed."
+    },
+    {
+      "topic": "stop and take-profit execution",
+      "choice": "A level is treated as reached when the bar low/high crosses it; the strategy then issues self.close().",
+      "reason": "Only daily OHLC bars are available, while the canonical convention defines exits as self.close()."
+    }
+  ],
+  "success": false,
+  "error": "Backtest error: min() arg is an empty sequence",
+  "total_trades": 0,
+  "tape": []
+}

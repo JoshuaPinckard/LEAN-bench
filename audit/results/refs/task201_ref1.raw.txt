@@ -1,0 +1,193 @@
+```python
+import backtrader as bt
+import math
+
+
+class CreditSpreadProxyStrategy(bt.Strategy):
+    params = (
+        ("risk_capital", 4000.0),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=20)
+        self.sma_30_bars_ago = self.sma(-30)
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.cross_lower = bt.indicators.CrossOver(
+            self.data.close, self.bbands.bot
+        )
+        self.cross_upper = bt.indicators.CrossOver(
+            self.data.close, self.bbands.top
+        )
+
+        self.order = None
+        self.stop_order = None
+        self.target_order = None
+        self.pending_direction = 0
+        self.trade_direction = 0
+        self.closing_for_session = False
+
+    def _cancel_exit_orders(self):
+        for order in (self.stop_order, self.target_order):
+            if order is not None and order.alive():
+                self.cancel(order)
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        current_time = dt.time()
+
+        market_open_plus_90 = dt.replace(
+            hour=11, minute=0, second=0, microsecond=0
+        ).time()
+        session_exit_time = dt.replace(
+            hour=15, minute=30, second=0, microsecond=0
+        ).time()
+
+        if current_time >= session_exit_time:
+            if self.position:
+                self.closing_for_session = True
+                self._cancel_exit_orders()
+
+                if (
+                    self.stop_order is None
+                    and self.target_order is None
+                    and self.order is None
+                ):
+                    self.order = self.close()
+            return
+
+        if current_time <= market_open_plus_90:
+            return
+
+        if self.position or self.order is not None or self.closing_for_session:
+            return
+
+        close = self.data.close[0]
+        atr = self.atr[0]
+
+        if atr / close > 0.02:
+            return
+
+        bullish = close > self.sma[0] and self.sma[0] > self.sma_30_bars_ago[0]
+        bearish = close < self.sma[0] and self.sma[0] < self.sma_30_bars_ago[0]
+
+        direction = 0
+        if bullish and self.cross_lower[0] > 0:
+            direction = 1
+        elif bearish and self.cross_upper[0] < 0:
+            direction = -1
+        else:
+            return
+
+        opposite_band = self.bbands.top[0] if direction == 1 else self.bbands.bot[0]
+        stop_distance = max(1.25 * atr, abs(close - opposite_band))
+
+        if stop_distance <= 0:
+            return
+
+        risk_budget = 0.01 * self.p.risk_capital
+        size = math.floor(risk_budget / stop_distance)
+
+        if size < 1:
+            return
+
+        self.pending_direction = direction
+        if direction == 1:
+            self.order = self.buy(size=size)
+        else:
+            self.order = self.sell(size=size)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Submitted,
+            order.Accepted,
+            order.Partial,
+        ):
+            return
+
+        if order is self.order:
+            if order.status == order.Completed:
+                completed_direction = self.pending_direction
+                self.order = None
+                self.pending_direction = 0
+
+                if self.closing_for_session:
+                    return
+
+                entry_price = order.executed.price
+                atr = self.atr[0]
+                middle_distance = abs(self.bbands.mid[0] - entry_price)
+                take_distance = min(0.25 * atr, middle_distance)
+
+                if completed_direction == 1:
+                    stop_distance = max(
+                        1.25 * atr, abs(entry_price - self.bbands.top[0])
+                    )
+                    stop_price = entry_price - stop_distance
+                    target_price = entry_price + take_distance
+                    self.stop_order = self.sell(
+                        size=order.executed.size,
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                    )
+                    self.target_order = self.sell(
+                        size=order.executed.size,
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self.stop_order,
+                    )
+                else:
+                    stop_distance = max(
+                        1.25 * atr, abs(entry_price - self.bbands.bot[0])
+                    )
+                    stop_price = entry_price + stop_distance
+                    target_price = entry_price - take_distance
+                    self.stop_order = self.buy(
+                        size=abs(order.executed.size),
+                        exectype=bt.Order.Stop,
+                        price=stop_price,
+                    )
+                    self.target_order = self.buy(
+                        size=abs(order.executed.size),
+                        exectype=bt.Order.Limit,
+                        price=target_price,
+                        oco=self.stop_order,
+                    )
+
+                self.trade_direction = completed_direction
+            else:
+                self.order = None
+                self.pending_direction = 0
+            return
+
+        if order is self.stop_order:
+            if order.status == order.Completed:
+                self.stop_order = None
+                self.target_order = None
+                self.trade_direction = 0
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.stop_order = None
+            return
+
+        if order is self.target_order:
+            if order.status == order.Completed:
+                self.stop_order = None
+                self.target_order = None
+                self.trade_direction = 0
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.target_order = None
+```
+
+```json
+{"assumptions":[{"topic":"session timing","choice":"Entries are allowed strictly after 11:00 and session liquidation begins at 15:30.","reason":"This is the earliest point in the stated 15–30 minute pre-close window; standard Backtrader market orders execute on the following bar, placing the expected liquidation fill 25 minutes before a 16:00 close."},{"topic":"sideways filter","choice":"A sideways market is evaluated on the current intraday bar: if neither stated bullish nor bearish trend condition holds, no signal is traded.","reason":"The specification defines sideways directly as the trend condition not being met and supplies no separate daily-state definition."},{"topic":"risk capital","choice":"The 1% risk budget is calculated from the explicitly stated initial capital of $4,000, producing a $40 maximum price-loss budget.","reason":"The strategy specification explicitly supplies $4,000 even though the harness starts the broker with $10,000."},{"topic":"opposite Bollinger band","choice":"The farther stop distance uses the absolute distance from entry to the band opposite the entry trigger, then places the stop in the loss direction.","reason":"A long stop must be below entry and a short stop above entry for the stated potential-loss calculation; the specification does not otherwise define how an opposite-side band becomes a loss-direction stop."},{"topic":"infeasible","choice":"Position size is calculated from the signal-bar Close, while final stop and target prices use the actual market-order execution price.","reason":"With normal Backtrader market-order execution, the eventual entry price is unknown when the risk-sized order is submitted; a next-bar gap can therefore make realized stop risk differ from the pre-trade estimate."}]}
+```

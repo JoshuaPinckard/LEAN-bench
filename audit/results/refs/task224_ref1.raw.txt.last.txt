@@ -1,0 +1,134 @@
+```python
+import backtrader as bt
+
+
+class SyntheticCoveredCalls(bt.Strategy):
+    params = (
+        ("strike", 150),
+        ("annual_sales_limit", 270000),
+        ("lot", 100),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_pct = 100.0 * self.atr / self.data.close
+        self.atr_pct_ema = bt.indicators.EMA(self.atr_pct, period=50)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.macd = bt.indicators.MACDHisto(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.order = None
+        self.month_key = None
+        self.annual_year = None
+        self.annual_sold_lots = 0
+        self.lots_month = 0
+        self.month_sold_lots = 0
+        self.carried_lots = 0
+        self.skip_month = False
+
+    def _sync_year(self, year):
+        if self.annual_year != year:
+            self.annual_year = year
+            self.annual_sold_lots = 0
+
+    def _start_month(self, date):
+        if self.month_key is not None:
+            self.carried_lots = max(
+                0, self.lots_month - self.month_sold_lots
+            )
+
+        self.month_key = (date.year, date.month)
+        remaining_limit_usd = max(
+            0,
+            self.p.annual_sales_limit
+            - self.annual_sold_lots * self.p.strike * self.p.lot,
+        )
+        limit_lots = int(
+            remaining_limit_usd // (self.p.strike * self.p.lot)
+        )
+        position_lots = int(self.position.size // self.p.lot)
+
+        self.lots_month = min(limit_lots, position_lots)
+        self.month_sold_lots = 0
+        self.skip_month = False
+
+    def _last_bar_of_month(self, date):
+        try:
+            next_date = self.data.datetime.date(1)
+            return (
+                next_date.year != date.year
+                or next_date.month != date.month
+            )
+        except IndexError:
+            return True
+
+    def _submit_sale(self, lots):
+        if lots > 0 and self.order is None:
+            self.order = self.sell(size=lots * self.p.lot)
+
+    def next(self):
+        date = self.data.datetime.date(0)
+        self._sync_year(date.year)
+
+        if self.month_key != (date.year, date.month):
+            self._start_month(date)
+
+        if (
+            self.order is not None
+            or self.skip_month
+            or self.lots_month <= self.month_sold_lots
+            or self.position.size < self.p.lot
+        ):
+            return
+
+        sell_trigger = (
+            (self.data.high[0] >= self.p.strike
+             or self.data.close[0] >= self.bb.top[0])
+            and self.atr_pct[0] > self.atr_pct_ema[0]
+            and self.data.volume[0] >= self.volume_sma[0]
+        )
+
+        strong_bullish_impulse = (
+            self.rsi[0] > 75
+            and self.macd.histo[0] > 0
+            and self.macd.histo[0] > self.macd.histo[-1]
+        )
+
+        if sell_trigger and strong_bullish_impulse:
+            self.skip_month = True
+            return
+
+        remaining_lots = self.lots_month - self.month_sold_lots
+
+        if self._last_bar_of_month(date) and self.data.close[0] >= self.p.strike:
+            self._submit_sale(remaining_lots)
+        elif sell_trigger:
+            self._submit_sale(1)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order.status == order.Completed and order.issell():
+                execution_year = self.data.datetime.date(0).year
+                self._sync_year(execution_year)
+
+                sold_lots = int(
+                    abs(order.executed.size) // self.p.lot
+                )
+                self.annual_sold_lots += sold_lots
+                self.month_sold_lots += sold_lots
+
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"initial_position","choice":"No entry order is created.","reason":"The specification describes staged exits from an existing large position but provides no entry rule; the supplied harness starts with cash only."},{"topic":"staging","choice":"A regular qualifying signal submits one 100-share lot; the month-end exercise submits all remaining monthly lots.","reason":"The lot is specified as 100 shares and the specification limits, rather than otherwise allocates, monthly lots."},{"topic":"bullish_impulse","choice":"When the impulse is present with a sell trigger, all remaining sales for that month are skipped.","reason":"This is the literal operational choice for the stated ability to skip the sale in that month."},{"topic":"annual_accounting","choice":"Each completed 100-share sale consumes strike × lot = $15,000 of the annual limit.","reason":"The monthly availability formula explicitly values lots using strike × 100."},{"topic":"carryover","choice":"Unused lots are recorded and carried conceptually, while each new month's capacity is recalculated using the specified min(remaining annual capacity, current position capacity) formula.","reason":"That formula already includes all unsold annual capacity, so adding carried lots would exceed the stated calculation."}]}

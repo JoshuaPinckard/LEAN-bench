@@ -1,0 +1,181 @@
+```python
+import backtrader as bt
+import math
+
+
+class TDPStrategy(bt.Strategy):
+    class TDP(bt.Indicator):
+        lines = ("tdp",)
+        params = (("period", 100), ("decay", 0.05),)
+
+        def __init__(self):
+            self.addminperiod(self.p.period)
+
+        def next(self):
+            current_close = self.data.close[0]
+            weighted_rank = 0.0
+            total_weight = 0.0
+
+            for k in range(self.p.period):
+                weight = math.exp(-self.p.decay * k)
+                total_weight += weight
+                if self.data.close[-k] <= current_close:
+                    weighted_rank += weight
+
+            self.lines.tdp[0] = 100.0 * weighted_rank / total_weight
+
+    class Divergence(bt.Indicator):
+        lines = ("bullish", "bearish")
+        params = (("period", 20),)
+
+        def __init__(self):
+            self.addminperiod(self.p.period * 2)
+
+        def next(self):
+            recent_closes = [self.data.close[-i] for i in range(self.p.period)]
+            prior_closes = [
+                self.data.close[-i]
+                for i in range(self.p.period, self.p.period * 2)
+            ]
+            recent_tdp = [self.data1[-i] for i in range(self.p.period)]
+            prior_tdp = [
+                self.data1[-i]
+                for i in range(self.p.period, self.p.period * 2)
+            ]
+
+            self.lines.bullish[0] = (
+                min(recent_closes) < min(prior_closes)
+                and min(recent_tdp) > min(prior_tdp)
+            )
+            self.lines.bearish[0] = (
+                max(recent_closes) > max(prior_closes)
+                and max(recent_tdp) < max(prior_tdp)
+            )
+
+    params = (
+        ("N", 100),
+        ("decay", 0.05),
+        ("ema_period", 22),
+        ("long_oversold", 30),
+        ("long_extreme_oversold", 15),
+        ("short_overbought", 70),
+        ("short_extreme_overbought", 85),
+        ("exit_midpoint", 50),
+        ("divergence_window", 20),
+        ("use_divergence", False),
+        ("stop_percent", 0.05),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+        self.exit_pending = False
+
+        self.tdp = self.TDP(
+            self.data.close,
+            period=self.p.N,
+            decay=self.p.decay,
+        )
+        self.tdp_ema = bt.indicators.EMA(self.tdp, period=self.p.ema_period)
+
+        self.long_cross_30 = bt.indicators.CrossUp(
+            self.tdp_ema, self.p.long_oversold
+        )
+        self.long_cross_15 = bt.indicators.CrossUp(
+            self.tdp_ema, self.p.long_extreme_oversold
+        )
+        self.short_cross_70 = bt.indicators.CrossDown(
+            self.tdp_ema, self.p.short_overbought
+        )
+        self.short_cross_85 = bt.indicators.CrossDown(
+            self.tdp_ema, self.p.short_extreme_overbought
+        )
+
+        self.exit_long_50 = bt.indicators.CrossDown(
+            self.tdp_ema, self.p.exit_midpoint
+        )
+        self.exit_long_70 = bt.indicators.CrossUp(
+            self.tdp_ema, self.p.short_overbought
+        )
+        self.exit_short_50 = bt.indicators.CrossUp(
+            self.tdp_ema, self.p.exit_midpoint
+        )
+        self.exit_short_30 = bt.indicators.CrossDown(
+            self.tdp_ema, self.p.long_oversold
+        )
+
+        self.divergence = self.Divergence(
+            self.data.close,
+            self.tdp_ema,
+            period=self.p.divergence_window,
+        )
+
+    def next(self):
+        if self.order or self.exit_pending:
+            return
+
+        if not self.position:
+            bullish_ok = (
+                not self.p.use_divergence or bool(self.divergence.bullish[0])
+            )
+            bearish_ok = (
+                not self.p.use_divergence or bool(self.divergence.bearish[0])
+            )
+
+            if (
+                bool(self.long_cross_30[0]) or bool(self.long_cross_15[0])
+            ) and bullish_ok:
+                self.order = self.buy()
+            elif (
+                bool(self.short_cross_70[0]) or bool(self.short_cross_85[0])
+            ) and bearish_ok:
+                self.order = self.sell()
+            return
+
+        if self.position.size > 0:
+            should_exit = bool(self.exit_long_50[0]) or bool(self.exit_long_70[0])
+        else:
+            should_exit = bool(self.exit_short_50[0]) or bool(self.exit_short_30[0])
+
+        if should_exit:
+            if self.stop_order:
+                self.exit_pending = True
+                self.cancel(self.stop_order)
+            else:
+                self.order = self.close()
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.order:
+                self.order = None
+
+            if order is self.stop_order:
+                self.stop_order = None
+
+                if order.status == order.Canceled and self.exit_pending and self.position:
+                    self.exit_pending = False
+                    self.order = self.close()
+                    return
+
+                self.exit_pending = False
+
+            if order.status == order.Completed:
+                if order.isbuy() and self.position.size > 0 and not self.stop_order:
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=order.executed.price * (1.0 - self.p.stop_percent),
+                    )
+                elif order.issell() and self.position.size < 0 and not self.stop_order:
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop,
+                        price=order.executed.price * (1.0 + self.p.stop_percent),
+                    )
+```
+
+```json
+{"assumptions":[{"topic":"decay default","choice":"0.05","reason":"The specification gives N=100 as an example but does not provide a numerical decay default."},{"topic":"divergence filter","choice":"Disabled by default; when enabled, it gates the corresponding crossover entry.","reason":"The specification calls the divergence filter optional."},{"topic":"divergence definition","choice":"Compare the low/high of the most recent D bars with the low/high of the immediately preceding D bars.","reason":"A lower low or higher high requires a reference interval, which the specification does not define."},{"topic":"stop setting","choice":"Fixed 5% stop from the completed entry price.","reason":"The specification permits choosing a fixed-percent or ATR-based stop and gives 5% as the fixed-percent example."}]}

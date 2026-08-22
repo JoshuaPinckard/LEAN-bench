@@ -1,0 +1,93 @@
+```python
+import backtrader as bt
+import math
+import statistics
+from collections import deque
+
+
+class MonthlySkewUtilityStrategy(bt.Strategy):
+    params = (
+        ('alpha', 2.0),
+        ('beta', 1.0),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.rsi14 = bt.indicators.RSI(self.data.close, period=14)
+        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.vol_sma50 = bt.indicators.SMA(self.data.volume, period=50)
+        self.boll = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+
+        self.order = None
+        self.utility_history = deque(maxlen=252)
+        self.last_rebalance_month = None
+        self.addminperiod(253)
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            self.order = None
+
+    def next(self):
+        if len(self.data) >= 253:
+            log_returns = [
+                math.log(self.data.close[-i] / self.data.close[-i - 1])
+                for i in range(252)
+            ]
+            mu = statistics.mean(log_returns)
+            sigma = self.atr[0] / self.data.close[0]
+
+            lower_count = sum(
+                1 for i in range(252)
+                if self.data.close[-i] < self.boll.bot[-i]
+            )
+            upper_count = sum(
+                1 for i in range(252)
+                if self.data.close[-i] > self.boll.top[-i]
+            )
+            skew_penalty = max(0.0, lower_count / 252.0 - upper_count / 252.0)
+
+            utility = mu - self.p.alpha * sigma - self.p.beta * skew_penalty
+            self.utility_history.append(utility)
+
+        current_month = (self.data.datetime.date(0).year,
+                         self.data.datetime.date(0).month)
+
+        if self.order or current_month == self.last_rebalance_month:
+            return
+
+        self.last_rebalance_month = current_month
+
+        if len(self.utility_history) < 252:
+            threshold = 0.0
+        else:
+            threshold = statistics.median(self.utility_history)
+
+        if len(self.data) < 253:
+            return
+
+        filters_pass = (
+            self.data.close[0] > self.sma50[0]
+            and self.rsi14[0] > 45
+            and self.vol_sma20[0] > self.vol_sma50[0]
+        )
+
+        if utility <= 0.0 or not filters_pass:
+            if self.position:
+                self.order = self.close()
+        elif utility <= threshold:
+            self.order = self.order_target_percent(target=0.50)
+        else:
+            self.order = self.order_target_percent(target=1.00)
+```
+
+```json
+{"assumptions":[{"topic":"monthly rebalance","choice":"The first observed bar for each calendar month is treated as that month's first trading day.","reason":"The feed contains daily trading bars only."},{"topic":"threshold history","choice":"U is computed daily using its stated rolling inputs and the median is taken over the latest 252 daily U values.","reason":"A median U over the last 252 days requires daily U observations, although portfolio actions occur only monthly."},{"topic":"position sizing","choice":"50% and 100% of capital are implemented with order_target_percent targets of 0.50 and 1.00.","reason":"This directly expresses the specified capital allocation at each monthly rebalance."},{"topic":"filters at rebalance","choice":"If entry filters fail at a monthly rebalance, any existing long position is closed and no new position is entered.","reason":"Positions are held only until the next monthly rebalance, and entry is conditional on all stated filters."}]}
+```

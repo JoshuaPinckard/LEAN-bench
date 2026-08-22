@@ -1,136 +1,101 @@
 ```python
-# complete strategy class
 import backtrader as bt
 
 
 class CupAndHandleStrategy(bt.Strategy):
     params = (
-        ('cup_period', 220),           # bars forming the cup
-        ('handle_period', 30),         # bars forming the handle (cup+handle = 250 ~ 1 year)
-        ('vol_period', 50),            # average-volume lookback for breakout confirmation
-        ('rim_frac', 0.20),            # fraction of cup edges used to locate each rim
-        ('rim_tol', 0.10),             # max relative difference between left/right cup rims
-        ('min_cup_depth', 0.10),       # minimum cup depth as a fraction of resistance
-        ('center_lo', 0.25),           # cup bottom must lie within the central band ...
-        ('center_hi', 0.75),           # ... of the cup (U-shape)
-        ('handle_max_retrace', 0.50),  # handle depth <= this fraction of the cup depth
-        ('risk_pct', 0.01),            # risk per trade as fraction of total capital (1-2% -> 1%)
+        ("cup_bars", 250),
+        ("handle_bars", 20),
+        ("volume_period", 50),
+        ("risk_fraction", 0.01),
     )
 
     def __init__(self):
-        # Volume indicator: average volume over the last `vol_period` candles.
-        self.vol_avg = bt.indicators.SimpleMovingAverage(
-            self.data.volume, period=self.p.vol_period)
         self.order = None
-        self.stop_price = None
-        self.min_bars = self.p.cup_period + self.p.handle_period + 1
+        self.handle_stop = None
+        self.volume_average = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.volume_period
+        )
 
     def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
-            return
-        if order.status in (order.Completed, order.Canceled,
-                            order.Margin, order.Rejected):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order.status in (order.Canceled, order.Margin, order.Rejected):
+                self.handle_stop = None
             self.order = None
 
     def next(self):
         if self.order:
             return
 
-        # Manage an open position: exit on a drop below the handle low (stop-loss).
         if self.position:
-            if self.data.close[0] < self.stop_price:
+            if self.handle_stop is not None and self.data.low[0] < self.handle_stop:
                 self.order = self.close()
             return
 
-        # Need a full cup+handle (>= ~1 year) of history plus the prior bar.
-        if len(self.data) < self.min_bars:
+        required_history = self.p.cup_bars + self.p.handle_bars
+        if len(self.data) <= required_history:
             return
 
-        H = self.p.handle_period
-        C = self.p.cup_period
+        highs = [
+            self.data.high[-offset]
+            for offset in range(required_history, 0, -1)
+        ]
+        lows = [
+            self.data.low[-offset]
+            for offset in range(required_history, 0, -1)
+        ]
 
-        # Handle window: the H bars immediately preceding the current (breakout) bar.
-        handle_highs = [self.data.high[-i] for i in range(1, H + 1)]
-        handle_lows = [self.data.low[-i] for i in range(1, H + 1)]
+        cup_highs = highs[:self.p.cup_bars]
+        cup_lows = lows[:self.p.cup_bars]
+        handle_highs = highs[self.p.cup_bars:]
+        handle_lows = lows[self.p.cup_bars:]
 
-        # Cup window: the C bars preceding the handle, in chronological order.
-        cup_highs = [self.data.high[-i] for i in range(H + C, H, -1)]
-        cup_lows = [self.data.low[-i] for i in range(H + C, H, -1)]
-
-        # --- Cup geometry (U-shaped formation) ---------------------------
-        cup_bottom = min(cup_lows)
-        edge = max(1, int(self.p.rim_frac * C))
-        left_rim = max(cup_highs[:edge])
-        right_rim = max(cup_highs[-edge:])
-        resistance = max(left_rim, right_rim)     # upper boundary / neckline
-        cup_depth = resistance - cup_bottom
-        if cup_depth <= 0:
-            return
-
-        # Cup must be a genuine U (meaningful depth).
-        if cup_depth < self.p.min_cup_depth * resistance:
-            return
-
-        # Bottom of the U must sit in the central band of the cup.
-        bottom_idx = cup_lows.index(cup_bottom)
-        if not (self.p.center_lo * C <= bottom_idx <= self.p.center_hi * C):
-            return
-
-        # Left and right rims at similar levels -> symmetric cup.
-        if abs(left_rim - right_rim) > self.p.rim_tol * resistance:
-            return
-
-        # --- Handle geometry (consolidation / small decline) -------------
-        handle_high = max(handle_highs)
+        neckline = max(cup_highs)
+        cup_low = min(cup_lows)
+        cup_bottom_index = cup_lows.index(cup_low)
         handle_low = min(handle_lows)
 
-        # Handle stays below the resistance (it has not broken out yet).
-        if handle_high >= resistance:
-            return
-        # Handle is only a small decline relative to the cup, and above the cup bottom.
-        if handle_low <= cup_bottom:
-            return
-        handle_depth = resistance - handle_low
-        if handle_depth > self.p.handle_max_retrace * cup_depth:
-            return
+        left_rim = max(cup_highs[:20])
+        right_rim = max(cup_highs[-20:])
 
-        # --- Breakout with volume confirmation ---------------------------
-        # Break upward above the resistance; the breakout candle closes above it.
-        broke_out = (self.data.close[0] > resistance and
-                    self.data.close[-1] <= resistance)
-        volume_ok = self.data.volume[0] > self.vol_avg[0]
-        if not (broke_out and volume_ok):
-            return
+        cup_is_u_shaped = (
+            20 <= cup_bottom_index < self.p.cup_bars - 20
+            and left_rim >= neckline * 0.95
+            and right_rim >= neckline * 0.95
+        )
+        handle_is_valid = (
+            handle_low > cup_low
+            and handle_low >= neckline * 0.90
+            and max(handle_highs) <= neckline
+        )
 
-        # --- Risk-based position sizing (stop = handle low) --------------
-        entry_price = self.data.close[0]
-        risk_per_share = entry_price - handle_low
-        if risk_per_share <= 0:
-            return
-        risk_amount = self.p.risk_pct * self.broker.getvalue()
-        size = int(risk_amount / risk_per_share)
+        breakout = (
+            self.data.close[0] > neckline
+            and self.data.volume[0] > self.volume_average[0]
+        )
 
-        # Do not attempt to buy more than the available cash allows.
-        affordable = int(self.broker.getcash() / (entry_price * 1.001))
-        size = min(size, affordable)
-        if size <= 0:
-            return
+        if cup_is_u_shaped and handle_is_valid and breakout:
+            risk_per_share = self.data.close[0] - handle_low
+            if risk_per_share <= 0:
+                return
 
-        self.stop_price = handle_low
-        self.order = self.buy(size=size)
+            risk_capital = self.broker.getvalue() * self.p.risk_fraction
+            size_by_risk = int(risk_capital / risk_per_share)
+            size_by_cash = int(
+                self.broker.getcash() / (self.data.close[0] * (1.0 + 0.001))
+            )
+            size = min(size_by_risk, size_by_cash)
+
+            if size > 0:
+                self.handle_stop = handle_low
+                self.order = self.buy(size=size)
 ```
+
 ```json
-{"assumptions": [
-  {"topic": "pattern-detection window", "choice": "Fixed decomposition of the pattern into a 220-bar cup followed by a 30-bar handle (total 250 bars) evaluated on a rolling basis before the current bar.", "reason": "Spec requires formation >= 1 year (~250 candles) but is silent on the cup/handle split; 250 daily bars satisfies the stated minimum and the fixed split makes the U/handle geometry deterministic."},
-  {"topic": "resistance / neckline definition", "choice": "Resistance = max of the two cup rims, where each rim is the highest high over the outer 20% of the cup window.", "reason": "Spec calls the neckline the 'upper boundary of the cup'; taking rim highs (rather than any mid-cup spike) represents that boundary."},
-  {"topic": "cup U-shape quantification", "choice": "Require cup depth >= 10% of resistance, left/right rims within 10% of each other, and the cup low positioned in the central 25%-75% band of the cup.", "reason": "Spec describes the cup qualitatively as U-shaped; these thresholds enforce a symmetric, meaningfully deep U while adding no indicators the spec does not name."},
-  {"topic": "handle quantification", "choice": "Handle (30 bars before breakout) must stay strictly below resistance, remain above the cup bottom, and retrace at most 50% of the cup depth.", "reason": "Spec defines the handle as a 'consolidation or small decline after the bottom of the cup'; these bounds enforce a shallow pullback in the upper part of the cup."},
-  {"topic": "breakout confirmation (close above)", "choice": "Breakout trigger requires the candle to CLOSE above resistance (with the prior close at/below it).", "reason": "Spec condition 4 'preferably' wants the close above resistance; adopting it as the trigger also satisfies the mandatory 'break upward above the resistance' (condition 2)."},
-  {"topic": "volume indicator", "choice": "SimpleMovingAverage of volume, period 50; breakout requires current-bar volume > this 50-bar average.", "reason": "Spec explicitly states average volume over the last 50 candles as the confirmation; SMA(volume,50) is that average."},
-  {"topic": "risk per trade", "choice": "1% of total capital (broker value) per trade.", "reason": "Spec allows 1-2%; 1% is the conservative end of the stated range."},
-  {"topic": "position sizing feasibility cap", "choice": "size = floor(risk_amount / (entry_close - handle_low)); additionally capped at shares affordable given available cash and 0.001 commission.", "reason": "Spec sizes off the stop-loss distance; the cash cap only prevents margin rejection when the stop is tight, without changing the risk-based rule when cash is sufficient."},
-  {"topic": "exit trigger basis", "choice": "Stop evaluated on the bar CLOSE (close < handle low) and executed via self.close() (market, next open).", "reason": "Spec says 'close the position when price drops below the handle low'; using the confirmed close is a stable literal reading in this bar-based backtrader environment."},
-  {"topic": "warm-up handling", "choice": "Skip all entry logic until at least 251 bars of history are available.", "reason": "The spec's >=250-bar (1-year) formation requirement inherently needs that much history before any pattern can be detected."},
-  {"topic": "timeframe", "choice": "Pattern detected on the provided 1d AAPL feed using a ~250-bar lookback to represent the '1 year or higher' formation.", "reason": "Only a daily feed is supplied; the spec's own example equates 1 year to ~250 daily candles, so the daily feed with a 250-bar window is the closest literal implementation."}
-]}
+{"assumptions":[{"topic":"cup and handle geometry","choice":"A pattern uses 250 completed candles for the cup and 20 completed candles for the handle. The cup low must occur outside the first and last 20 cup candles; the highest highs in each 20-candle rim must be within 5% of the cup neckline. The handle low must remain above the cup low and within 10% of the neckline, and no handle high may exceed the neckline.","reason":"The specification requires a U-shaped cup and a small declining or consolidating handle but does not define their measurable geometry."},{"topic":"formation duration","choice":"The 250-candle cup plus 20-candle handle is treated as a completed 270-candle formation before the breakout candle.","reason":"This satisfies the stated minimum formation time of approximately 250 daily candles."},{"topic":"neckline","choice":"The neckline is the highest High within the 250-candle cup.","reason":"The upper boundary of the cup is specified but no calculation method is given."},{"topic":"breakout price","choice":"A breakout requires the breakout candle Close to be above the neckline.","reason":"This implements the stated preference that the breakout candle close above resistance while providing an unambiguous price-break test."},{"topic":"volume average","choice":"The confirmation average is a 50-candle simple moving average of Volume including the breakout candle, as calculated by the specified 50-period indicator.","reason":"The specification names an average over the last 50 candles but does not state whether the current candle is excluded."},{"topic":"risk percentage","choice":"Risk per trade is 1% of current total account value, with share quantity floored to the smaller of risk-based and cash-affordable quantity.","reason":"The specification permits 1-2% but does not select one value; 1% is within the stated limit."},{"topic":"stop trigger","choice":"The position is closed when the bar Low is below the stored handle low.","reason":"The specification says price drops below the handle low without selecting an OHLC field; Low is the literal intrabar price test available from daily OHLC data."},{"topic":"infeasible","choice":"Risk sizing uses the breakout Close although a standard market buy executes on the following bar and may fill at a different price.","reason":"The actual next-bar execution price is unknowable when the breakout signal is evaluated, so exact post-fill risk cannot be guaranteed using only the supplied daily OHLCV feed."}]}
 ```

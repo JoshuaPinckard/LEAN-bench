@@ -2,123 +2,127 @@
 import backtrader as bt
 
 
-class EMAForecastStrategy(bt.Strategy):
+class EMAForecastingForPositionEntry(bt.Strategy):
     params = (
-        ('ema_period', 21),     # medium-term EMA
-        ('threshold', 0.005),   # 0.5% significance threshold
-        ('stop_pct', 0.02),     # 2% stop-loss
-        ('take_pct', 0.03),     # 3% take-profit
-        ('capital_pct', 0.98),  # ~100% of available capital (buffered)
+        ("ema_period", 21),
+        ("threshold", 0.005),
+        ("stop_loss", 0.02),
+        ("take_profit", 0.03),
     )
 
     def __init__(self):
-        # EMA(21); backtrader's EMA uses k = 2/(period+1) internally,
-        # matching the spec's weighting multiplier (2/22 for period 21).
         self.ema = bt.indicators.ExponentialMovingAverage(
             self.data.close, period=self.p.ema_period
         )
-        self.k = 2.0 / (self.p.ema_period + 1)
+        self.k = 2.0 / (self.p.ema_period + 1.0)
 
-        self.order = None        # pending entry / crossover-close order
-        self.stop_order = None   # protective stop-loss order
-        self.limit_order = None  # protective take-profit order
-        self.entering = False    # True while an entry order is in flight
+        self.previous_forecast = None
+        self.entry_order = None
+        self.exit_order = None
+        self.stop_order = None
+        self.take_profit_order = None
 
-    def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
-            return
+    def _has_pending_entry_or_exit(self):
+        return self.entry_order is not None or self.exit_order is not None
 
-        if order.status == order.Completed:
-            if order is self.order:
-                # Entry order or crossover-close order finished.
-                if self.entering and self.position:
-                    entry_price = order.executed.price
-                    size = abs(self.position.size)
-                    if self.position.size > 0:  # long -> protective SELLs
-                        stop_price = entry_price * (1.0 - self.p.stop_pct)
-                        limit_price = entry_price * (1.0 + self.p.take_pct)
-                        self.stop_order = self.sell(
-                            size=size, exectype=bt.Order.Stop, price=stop_price)
-                        self.limit_order = self.sell(
-                            size=size, exectype=bt.Order.Limit, price=limit_price,
-                            oco=self.stop_order)
-                    else:                        # short -> protective BUYs
-                        stop_price = entry_price * (1.0 + self.p.stop_pct)
-                        limit_price = entry_price * (1.0 - self.p.take_pct)
-                        self.stop_order = self.buy(
-                            size=size, exectype=bt.Order.Stop, price=stop_price)
-                        self.limit_order = self.buy(
-                            size=size, exectype=bt.Order.Limit, price=limit_price,
-                            oco=self.stop_order)
-                self.entering = False
-                self.order = None
-            elif order is self.stop_order or order is self.limit_order:
-                # A protective order filled; OCO cancels the sibling.
-                self.stop_order = None
-                self.limit_order = None
-
-        elif order.status in (order.Canceled, order.Margin, order.Rejected):
-            if order is self.order:
-                self.entering = False
-                self.order = None
-            elif order is self.stop_order:
-                self.stop_order = None
-            elif order is self.limit_order:
-                self.limit_order = None
-
-    def _cancel_protective(self):
+    def _cancel_protective_orders(self):
         if self.stop_order is not None:
             self.cancel(self.stop_order)
-        if self.limit_order is not None:
-            self.cancel(self.limit_order)
-        self.stop_order = None
-        self.limit_order = None
+        if self.take_profit_order is not None:
+            self.cancel(self.take_profit_order)
+
+    def _submit_protective_orders(self, entry_price):
+        size = abs(self.position.size)
+
+        if self.position.size > 0:
+            self.stop_order = self.sell(
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 - self.p.stop_loss),
+                size=size,
+            )
+            self.take_profit_order = self.sell(
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 + self.p.take_profit),
+                size=size,
+            )
+        else:
+            self.stop_order = self.buy(
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 + self.p.stop_loss),
+                size=size,
+            )
+            self.take_profit_order = self.buy(
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 - self.p.take_profit),
+                size=size,
+            )
 
     def next(self):
-        # Do not act while an entry/close order is pending.
-        if self.order is not None:
+        forecast = (
+            self.data.close[0] * self.k
+            + self.ema[0] * (1.0 - self.k)
+        )
+
+        if self._has_pending_entry_or_exit():
+            self.previous_forecast = forecast
             return
 
-        k = self.k
-        close0 = self.data.close[0]                       # Close(N)
-        ema0 = self.ema[0]                                # EMA(N)
-        forecast_next = close0 * k + ema0 * (1.0 - k)     # EMA_forecast(N+1)
+        if self.position:
+            if self.previous_forecast is not None:
+                if (
+                    self.position.size > 0
+                    and self.data.close[-1] > self.previous_forecast
+                    and self.data.close[0] < self.previous_forecast
+                ):
+                    self._cancel_protective_orders()
+                    self.exit_order = self.close()
 
-        if not self.position:
-            # ---------------- Entry logic ----------------
-            long_gap = (forecast_next - close0) / close0   # Close below forecast
-            short_gap = (close0 - forecast_next) / close0  # Close above forecast
-
-            if long_gap >= self.p.threshold:
-                size = int((self.broker.getcash() * self.p.capital_pct) / close0)
-                if size > 0:
-                    self.entering = True
-                    self.order = self.buy(size=size)
-            elif short_gap >= self.p.threshold:
-                size = int((self.broker.getcash() * self.p.capital_pct) / close0)
-                if size > 0:
-                    self.entering = True
-                    self.order = self.sell(size=size)
+                elif (
+                    self.position.size < 0
+                    and self.data.close[-1] < self.previous_forecast
+                    and self.data.close[0] > self.previous_forecast
+                ):
+                    self._cancel_protective_orders()
+                    self.exit_order = self.close()
         else:
-            # ---------------- Exit logic ----------------
-            # Rolling forecast line: value applicable to a given day is the
-            # forecast made from the previous day's Close and EMA.
-            fc_today = self.data.close[-1] * k + self.ema[-1] * (1.0 - k)
-            fc_yest = self.data.close[-2] * k + self.ema[-2] * (1.0 - k)
-            c0 = self.data.close[0]
-            c1 = self.data.close[-1]
+            size = self.broker.getcash() / self.data.close[0]
 
-            if self.position.size > 0:
-                # Close crosses forecast from above to below -> exit long.
-                if c1 > fc_yest and c0 < fc_today:
-                    self._cancel_protective()
-                    self.order = self.close()
-            elif self.position.size < 0:
-                # Close crosses forecast from below to above -> exit short.
-                if c1 < fc_yest and c0 > fc_today:
-                    self._cancel_protective()
-                    self.order = self.close()
+            if self.data.close[0] <= forecast * (1.0 - self.p.threshold):
+                self.entry_order = self.buy(size=size)
+
+            elif self.data.close[0] >= forecast * (1.0 + self.p.threshold):
+                self.entry_order = self.sell(size=size)
+
+        self.previous_forecast = forecast
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.entry_order:
+                self.entry_order = None
+                if order.status == order.Completed:
+                    self._submit_protective_orders(order.executed.price)
+
+            elif order is self.exit_order:
+                self.exit_order = None
+
+            elif order is self.stop_order:
+                self.stop_order = None
+                if order.status == order.Completed:
+                    if self.take_profit_order is not None:
+                        self.cancel(self.take_profit_order)
+
+            elif order is self.take_profit_order:
+                self.take_profit_order = None
+                if order.status == order.Completed:
+                    if self.stop_order is not None:
+                        self.cancel(self.stop_order)
 ```
+
 ```json
-{"assumptions": [{"topic": "threshold-basis", "choice": "The 0.5% entry threshold is evaluated as |Close(N) - EMA_forecast(N+1)| / Close(N) >= 0.005 (long: forecast above close; short: forecast below close).", "reason": "Spec states the threshold as a percentage 'difference between Close(N) and EMA_forecast(N+1)' but does not name the denominator; Close(N), the referenced current price, is the natural base."}, {"topic": "exit-crossover", "choice": "The forecast is recomputed each bar into a rolling line FC[t] = Close[t-1]*k + EMA[t-1]*(1-k); a long is closed when Close crosses this line downward (Close[-1] > FC_prev and Close[0] < FC_now) and a short when it crosses upward.", "reason": "A single static EMA_forecast(N+1) value is inconsistent with the entry rule (a long is opened while Close is already below the forecast, so it could not later 'cross from above to below' that same level). The daily-updated forecast line is the only coherent reading of 'the next day's closing price crosses the forecast EMA'."}, {"topic": "risk-orders", "choice": "Stop-loss and take-profit are placed as real OCO Stop and Limit orders at the actual entry fill price after the entry completes (long: -2%/+3%, short: +2%/-3%), so they can trigger intrabar; the forecast-cross exit uses self.close() after canceling them.", "reason": "Spec defines fixed percentage SL/TP relative to the entry price; native stop/limit orders reproduce intrabar triggering faithfully, whereas close-only checks would miss intraday hits."}, {"topic": "position-size", "choice": "Order size = int(available_cash * 0.98 / Close(N)), i.e. approximately 100% of available capital per trade.", "reason": "Spec specifies '100% of available capital (for example)'. A 2% buffer absorbs the 0.1% commission and next-bar open execution so a full-notional order is not margin-rejected (which would silently drop the trade)."}, {"topic": "trend-filter", "choice": "The optional EMA(50) trend-direction filter is NOT implemented; no EMA(50) indicator is added.", "reason": "Spec lists it under 'Additional rules' as a condition that 'can be added' to filter false signals - explicitly optional and absent from the mandatory 'Conditions for entering a position'. Omitting it avoids imposing a filter the core specification does not require."}]}
+{"assumptions":[{"topic":"threshold basis","choice":"The 0.5% difference is measured relative to the forecast EMA: close <= forecast * 0.995 for long entries and close >= forecast * 1.005 for short entries.","reason":"The specification gives a percentage threshold but does not state its denominator."},{"topic":"exit crossing","choice":"The forecast calculated on day N is retained and evaluated on day N+1; a crossing requires the prior close and current close to be on opposite stated sides of that retained forecast.","reason":"This is the literal implementation of a next-day close crossing the forecast EMA(N+1)."},{"topic":"position sizing","choice":"Order size is available cash divided by the current closing price at signal time.","reason":"This implements the stated example of using 100% of available capital; actual fill remains subject to next-bar execution and commission."},{"topic":"protective prices","choice":"Stop-loss and take-profit orders are submitted after entry completion using the actual executed entry price.","reason":"The specified levels are explicitly relative to the entry price."},{"topic":"EMA(50) trend filter","choice":"Not applied.","reason":"The specification describes it as an optional additional condition ('can be added'), not a mandatory rule."}]}
 ```

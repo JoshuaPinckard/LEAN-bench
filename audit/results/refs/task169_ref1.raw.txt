@@ -1,0 +1,151 @@
+```python
+import backtrader as bt
+
+
+class RegimeVolatilityStrategy(bt.Strategy):
+    params = (("base_risk", 0.01),)
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+        self.trade_kind = None
+        self.entry_atr = None
+        self.entry_price = None
+
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.bb_width = self.bb.top - self.bb.bot
+        self.ema_atr = bt.indicators.EMA(self.atr, period=50)
+        self.ema_bb_width = bt.indicators.EMA(self.bb_width, period=50)
+
+        self.cvi = (
+            0.5 * (self.atr / self.ema_atr)
+            + 0.5 * (self.bb_width / self.ema_bb_width)
+        )
+        self.j = self.atr / self.bb_width
+
+        self.ema10 = bt.indicators.EMA(self.data.close, period=10)
+        self.ema30 = bt.indicators.EMA(self.data.close, period=30)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.macd = bt.indicators.MACDHisto(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+
+        self.ema_cross = bt.indicators.CrossOver(self.ema10, self.ema30)
+        self.cvi_cross = bt.indicators.CrossOver(self.cvi, 1.0)
+        self.hist_cross = bt.indicators.CrossOver(self.macd.histo, 0.0)
+        self.rsi_cross = bt.indicators.CrossOver(self.rsi, 50.0)
+
+    def _size_for_entry(self, stop_multiple):
+        multiplier = 1.0
+        if self.cvi[0] < 0.9:
+            multiplier = 1.3
+        elif self.cvi[0] > 1.1:
+            multiplier = 0.7
+
+        risk_cash = self.broker.getcash() * self.p.base_risk
+        return max(1, int((risk_cash / (stop_multiple * self.atr[0])) * multiplier))
+
+    def _enter_long(self, kind, stop_multiple):
+        self.trade_kind = kind
+        self.entry_atr = self.atr[0]
+        self.order = self.buy(size=self._size_for_entry(stop_multiple))
+
+    def _close_position(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+        self.order = self.close()
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.stop_order:
+                if order.status == order.Completed:
+                    self.trade_kind = None
+                    self.entry_atr = None
+                    self.entry_price = None
+                self.stop_order = None
+                return
+
+            if order is self.order:
+                if order.status == order.Completed and order.isbuy():
+                    self.entry_price = order.executed.price
+                    stop_multiple = 1.5 if self.trade_kind == "low" else 2.5
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=self.entry_price - stop_multiple * self.entry_atr,
+                        size=order.executed.size,
+                    )
+                elif order.status == order.Completed and order.issell():
+                    self.trade_kind = None
+                    self.entry_atr = None
+                    self.entry_price = None
+                elif order.status in (order.Canceled, order.Margin, order.Rejected):
+                    if not self.position:
+                        self.trade_kind = None
+                        self.entry_atr = None
+                        self.entry_price = None
+                self.order = None
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        if self.position:
+            low_regime_exit = (
+                self.trade_kind == "low" and self.cvi_cross[0] > 0
+            )
+            high_regime_exit = (
+                self.trade_kind == "high" and self.cvi_cross[0] < 0
+            )
+            mean_reversion_exit = (
+                self.trade_kind == "high"
+                and (self.data.close[0] >= self.bb.mid[0] or self.rsi[0] > 55)
+            )
+
+            if low_regime_exit or high_regime_exit or mean_reversion_exit:
+                self._close_position()
+            else:
+                self._close_position()
+            return
+
+        low_volatility_long = (
+            self.cvi[0] < 0.9
+            and self.ema_cross[0] > 0
+            and self.data.close[0] > self.sma50[0]
+            and self.rsi[0] > 50
+        )
+
+        high_volatility_long = (
+            self.cvi[0] > 1.1
+            and self.data.low[0] <= self.bb.bot[0]
+            and self.rsi[0] < 35
+        )
+
+        upward_shift_long = (
+            self.cvi_cross[0] > 0
+            and self.hist_cross[0] > 0
+            and self.rsi_cross[0] > 0
+            and self.rsi[0] > 50
+            and self.data.close[0] > self.sma50[0]
+        )
+
+        if low_volatility_long:
+            self._enter_long("low", 1.5)
+        elif high_volatility_long:
+            self._enter_long("high", 2.5)
+        elif upward_shift_long:
+            self._enter_long("shift", 2.5)
+```
+
+```json
+{"assumptions":[{"topic":"shorting","choice":"Long-only implementation.","reason":"Short entries are conditional on being allowed, and no permission to short is stated; the canonical default is long-only."},{"topic":"base risk R","choice":"R is set to 1% of available cash per trade.","reason":"The specification names R% but does not provide its value."},{"topic":"risk sizing","choice":"Base shares equal 1% of cash divided by the applicable ATR stop distance, then multiplied by the specified CVI bucket multiplier and rounded down to whole shares.","reason":"The specification requires risk-based sizing and CVI-dependent multipliers but does not define the base-share formula."},{"topic":"shift ATR stop","choice":"An upward regime-shift long uses the high-volatility 2.5*ATR stop.","reason":"A shift entry is permitted in the intermediate zone, where no ATR-stop multiple is specified; upward crossing is treated as a move toward high volatility."},{"topic":"infeasible","choice":"On daily data, each held position is submitted for closure on the next available bar after entry.","reason":"An end-of-trading-day close cannot be executed within the same daily bar using standard backtrader market-order timing."}]}
+```

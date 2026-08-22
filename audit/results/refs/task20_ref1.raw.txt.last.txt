@@ -1,0 +1,234 @@
+```python
+import backtrader as bt
+from collections import deque
+
+
+class OpeningRangeBreakoutFib(bt.Strategy):
+    def __init__(self):
+        self.or_high = None
+        self.or_low = None
+        self.or_ready = False
+        self.session_date = None
+
+        self.hourly_closes = deque(maxlen=51)
+        self.trend = 0
+
+        self.state = "await_breakout"
+        self.impulse_price = None
+        self.previous_close = None
+
+        self.pending_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.pending_side = None
+        self.pending_or_high = None
+        self.pending_or_low = None
+        self.active_or_high = None
+        self.active_or_low = None
+
+    def _reset_session(self, current_date):
+        self.session_date = current_date
+        self.or_high = None
+        self.or_low = None
+        self.or_ready = False
+        self.state = "await_breakout"
+        self.impulse_price = None
+        self.previous_close = None
+
+    def _update_hourly_trend(self, dt, close):
+        minutes_from_open = (dt.hour * 60 + dt.minute) - (9 * 60 + 30)
+        if 0 <= minutes_from_open < 360 and (minutes_from_open + 1) % 60 == 0:
+            self.hourly_closes.append(close)
+
+            if len(self.hourly_closes) >= 51:
+                values = list(self.hourly_closes)
+                current_sma = sum(values[-50:]) / 50.0
+                prior_sma = sum(values[:-1]) / 50.0
+
+                if current_sma > prior_sma:
+                    self.trend = 1
+                elif current_sma < prior_sma:
+                    self.trend = -1
+                else:
+                    self.trend = 0
+
+    def _process_15_minute_close(self, close):
+        if not self.or_ready:
+            return
+
+        if self.state == "await_breakout":
+            if close > self.or_high and self.trend == 1:
+                self.state = "long_impulse"
+                self.impulse_price = close
+            elif close < self.or_low and self.trend == -1:
+                self.state = "short_impulse"
+                self.impulse_price = close
+
+        elif self.state == "long_impulse":
+            if close > self.impulse_price:
+                self.impulse_price = close
+            if self.impulse_price - self.or_high >= self.or_high - self.or_low:
+                self.state = "long_pullback"
+
+        elif self.state == "short_impulse":
+            if close < self.impulse_price:
+                self.impulse_price = close
+            if self.or_low - self.impulse_price >= self.or_high - self.or_low:
+                self.state = "short_pullback"
+
+    def _submit_entry(self, side):
+        self.pending_side = side
+        self.pending_or_high = self.or_high
+        self.pending_or_low = self.or_low
+
+        if side == "long":
+            self.pending_order = self.buy()
+        else:
+            self.pending_order = self.sell()
+
+    def _check_fibonacci_entry(self, high, low, close):
+        if self.pending_order is not None or self.position:
+            return
+
+        if self.state == "long_pullback" and self.trend == 1:
+            if high > self.impulse_price:
+                self.impulse_price = high
+
+            move = self.impulse_price - self.or_high
+            fib_50 = self.impulse_price - (0.500 * move)
+            fib_618 = self.impulse_price - (0.618 * move)
+            zone_low = min(fib_50, fib_618)
+            zone_high = max(fib_50, fib_618)
+
+            if (
+                low <= zone_high
+                and high >= zone_low
+                and self.previous_close is not None
+                and close > self.previous_close
+            ):
+                self._submit_entry("long")
+                self.state = "entered"
+
+        elif self.state == "short_pullback" and self.trend == -1:
+            if low < self.impulse_price:
+                self.impulse_price = low
+
+            move = self.or_low - self.impulse_price
+            fib_50 = self.impulse_price + (0.500 * move)
+            fib_618 = self.impulse_price + (0.618 * move)
+            zone_low = min(fib_50, fib_618)
+            zone_high = max(fib_50, fib_618)
+
+            if (
+                high >= zone_low
+                and low <= zone_high
+                and self.previous_close is not None
+                and close < self.previous_close
+            ):
+                self._submit_entry("short")
+                self.state = "entered"
+
+    def next(self):
+        dt = bt.num2date(self.data.datetime[0])
+        current_date = dt.date()
+        high = self.data.high[0]
+        low = self.data.low[0]
+        close = self.data.close[0]
+
+        if self.session_date != current_date:
+            self._reset_session(current_date)
+
+        self._update_hourly_trend(dt, close)
+
+        if dt.hour == 9 and dt.minute >= 30 or dt.hour == 10 and dt.minute < 30:
+            if self.or_high is None:
+                self.or_high = high
+                self.or_low = low
+            else:
+                self.or_high = max(self.or_high, high)
+                self.or_low = min(self.or_low, low)
+
+            if dt.hour == 10 and dt.minute == 29:
+                self.or_ready = True
+
+        if self.or_ready and dt.minute % 15 == 14 and not (dt.hour == 10 and dt.minute == 29):
+            self._process_15_minute_close(close)
+
+        if (
+            self.position
+            and self.pending_order is None
+            and self.active_or_low is not None
+            and self.active_or_low <= close <= self.active_or_high
+        ):
+            if self.stop_order is not None:
+                self.cancel(self.stop_order)
+            if self.target_order is not None:
+                self.cancel(self.target_order)
+            self.pending_order = self.close()
+
+        self._check_fibonacci_entry(high, low, close)
+        self.previous_close = close
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order == self.pending_order:
+                if self.pending_side == "long":
+                    risk = order.executed.price - self.pending_or_low
+                    self.active_or_high = self.pending_or_high
+                    self.active_or_low = self.pending_or_low
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=self.active_or_low,
+                    )
+                    self.target_order = self.sell(
+                        exectype=bt.Order.Limit,
+                        price=order.executed.price + (2.0 * risk),
+                    )
+                elif self.pending_side == "short":
+                    risk = self.pending_or_high - order.executed.price
+                    self.active_or_high = self.pending_or_high
+                    self.active_or_low = self.pending_or_low
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop,
+                        price=self.active_or_high,
+                    )
+                    self.target_order = self.buy(
+                        exectype=bt.Order.Limit,
+                        price=order.executed.price - (2.0 * risk),
+                    )
+                else:
+                    if self.stop_order is not None:
+                        self.cancel(self.stop_order)
+                    if self.target_order is not None:
+                        self.cancel(self.target_order)
+                    self.active_or_high = None
+                    self.active_or_low = None
+
+                self.pending_order = None
+                self.pending_side = None
+
+            elif order == self.stop_order or order == self.target_order:
+                sibling = self.target_order if order == self.stop_order else self.stop_order
+                if sibling is not None:
+                    self.cancel(sibling)
+                self.stop_order = None
+                self.target_order = None
+                self.active_or_high = None
+                self.active_or_low = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.pending_order:
+                self.pending_order = None
+                self.pending_side = None
+            if order == self.stop_order:
+                self.stop_order = None
+            if order == self.target_order:
+                self.target_order = None
+```
+
+```json
+{"assumptions":[{"topic":"15-minute construction","choice":"Aggregate the supplied 1-minute bars into session-aligned 15-minute periods; the first four periods from 09:30 through 10:29 define the opening range, and later breakouts use completed 15-minute closes.","reason":"The feed is 1-minute while the specification requires primary opening-range and breakout analysis on 15-minute data."},{"topic":"trend filter","choice":"Use the direction of a 50-period SMA of completed, session-aligned 1-hour closes; upward direction permits longs and downward direction permits shorts.","reason":"The specification names SMA 50 on a higher timeframe and gives 1-hour as the applicable example."},{"topic":"strong impulse","choice":"Treat an impulse as strong once its move from the broken opening-range boundary is at least one complete opening-range width.","reason":"The specification requires a strong impulse but provides no numerical threshold."},{"topic":"fibonacci and reversal","choice":"Measure retracements from the broken range boundary to the post-breakout impulse extreme; enter when a 1-minute bar reaches the inclusive 50%-61.8% zone and its close reverses versus the prior 1-minute close.","reason":"The specification specifies the Fibonacci zone and reversal direction but not swing anchoring or an exact reversal pattern."},{"topic":"position sizing","choice":"Use plain self.buy() and self.sell() without an explicit size.","reason":"Position sizing is unspecified, so the canonical default applies."},{"topic":"take profit","choice":"Place a target two times the actual entry-to-stop risk from the completed entry price.","reason":"The specification explicitly supplies 1:2 risk-to-reward as the reasonable default."}]}
+```

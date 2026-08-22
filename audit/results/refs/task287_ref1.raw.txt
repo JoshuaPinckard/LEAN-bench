@@ -1,0 +1,173 @@
+```python
+import backtrader as bt
+
+
+class SwingTrendStrategy(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200)
+        self.volume_sma20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+        self.atr_sma50 = bt.indicators.SMA(self.atr14, period=50)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma50)
+
+        self.order = None
+        self.stop_order = None
+        self.target_order = None
+        self.replacing_exits = False
+
+        self.pending_stop = None
+        self.pending_target = None
+        self.pending_risk = None
+        self.entry_price = None
+        self.stop_price = None
+        self.target_price = None
+        self.risk_per_share = None
+        self.breakeven_moved = False
+
+    def _submit_exits(self, stop_price, target_price):
+        if self.position.size > 0:
+            self.stop_order = self.sell(
+                exectype=bt.Order.Stop,
+                price=stop_price,
+                size=self.position.size,
+            )
+            self.target_order = self.sell(
+                exectype=bt.Order.Limit,
+                price=target_price,
+                size=self.position.size,
+                oco=self.stop_order,
+            )
+        else:
+            self.stop_order = self.buy(
+                exectype=bt.Order.Stop,
+                price=stop_price,
+                size=abs(self.position.size),
+            )
+            self.target_order = self.buy(
+                exectype=bt.Order.Limit,
+                price=target_price,
+                size=abs(self.position.size),
+                oco=self.stop_order,
+            )
+
+    def next(self):
+        if self.replacing_exits:
+            if self.stop_order is None and self.target_order is None and self.position:
+                self._submit_exits(self.entry_price, self.target_price)
+                self.stop_price = self.entry_price
+                self.breakeven_moved = True
+                self.replacing_exits = False
+            return
+
+        if self.position:
+            if not self.breakeven_moved:
+                if (
+                    self.position.size > 0
+                    and self.data.high[0] >= self.entry_price + 1.5 * self.risk_per_share
+                ) or (
+                    self.position.size < 0
+                    and self.data.low[0] <= self.entry_price - 1.5 * self.risk_per_share
+                ):
+                    self.replacing_exits = True
+                    if self.stop_order is not None:
+                        self.cancel(self.stop_order)
+                    if self.target_order is not None:
+                        self.cancel(self.target_order)
+            return
+
+        if self.order is not None or self.stop_order is not None or self.target_order is not None:
+            return
+
+        volume_confirmed = self.data.volume[0] >= 1.5 * self.volume_sma20[0]
+        volatility_confirmed = self.atr14[0] > self.atr_sma50[0]
+
+        was_below_sma50 = any(
+            self.data.close[-i] < self.sma50[-i] for i in range(10, 21)
+        )
+        was_above_sma50 = any(
+            self.data.close[-i] > self.sma50[-i] for i in range(10, 21)
+        )
+
+        recent_low = min(self.data.low[-i] for i in range(1, 21))
+        recent_high = max(self.data.high[-i] for i in range(1, 21))
+        prior_high = max(self.data.high[-i] for i in range(1, 31))
+        prior_low = min(self.data.low[-i] for i in range(1, 31))
+
+        if (
+            self.data.close[0] > self.sma200[0]
+            and was_below_sma50
+            and self.crossover[0] > 0
+            and volume_confirmed
+            and volatility_confirmed
+        ):
+            stop_distance = self.data.close[0] - recent_low
+            if 0 < stop_distance <= 0.05 * self.data.close[0]:
+                size = (self.broker.getvalue() * self.p.risk_fraction) / stop_distance
+                self.pending_stop = recent_low
+                self.pending_target = prior_high
+                self.pending_risk = stop_distance
+                self.order = self.buy(size=size)
+
+        elif (
+            self.data.close[0] < self.sma200[0]
+            and was_above_sma50
+            and self.crossover[0] < 0
+            and volume_confirmed
+            and volatility_confirmed
+        ):
+            stop_distance = recent_high - self.data.close[0]
+            if 0 < stop_distance <= 0.05 * self.data.close[0]:
+                size = (self.broker.getvalue() * self.p.risk_fraction) / stop_distance
+                self.pending_stop = recent_high
+                self.pending_target = prior_low
+                self.pending_risk = stop_distance
+                self.order = self.sell(size=size)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.order:
+            if order.status == order.Completed:
+                self.entry_price = order.executed.price
+                self.stop_price = self.pending_stop
+                self.target_price = self.pending_target
+                self.risk_per_share = self.pending_risk
+                self.breakeven_moved = False
+                self._submit_exits(self.stop_price, self.target_price)
+
+            if order.status in (
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.order = None
+
+        elif order is self.stop_order:
+            if order.status in (
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.stop_order = None
+
+        elif order is self.target_order:
+            if order.status in (
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.target_order = None
+```
+
+```json
+{"assumptions":[{"topic":"pullback window","choice":"A qualifying pullback is any close below/above SMA(50) from 10 through 20 bars before the crossover.","reason":"This is the literal bounded interpretation of “in the last 10–20 bars.”"},{"topic":"swing target","choice":"The prior 30-bar highest high for longs and lowest low for shorts is used as the swing level, excluding the current bar.","reason":"The specification gives a 20–30 bar range but no swing-pivot algorithm; 30 bars uses the stated range and yields one unambiguous level."},{"topic":"risk percentage","choice":"Allowed risk is 1% of current broker value per trade.","reason":"The specification permits 1–2% without selecting a value."},{"topic":"entry-price constraint","choice":"The 5% stop-distance signal check uses the current close, while position size uses that same signal-time stop distance.","reason":"A market order's future execution price is unknown when the signal must be accepted or skipped."},{"topic":"stop placement","choice":"Stops are submitted at the calculated prior low/high level.","reason":"The feed has no tick-size information with which to place a distinct price increment below or above that level."}]}
+```

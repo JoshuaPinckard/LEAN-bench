@@ -1,0 +1,322 @@
+```python
+import backtrader as bt
+
+
+class TrendlineSwingStrategy(bt.Strategy):
+    params = (
+        ("local_lookback", 5),
+        ("active_lookback", 10),
+        ("atr_period", 10),
+        ("atr_average_period", 50),
+        ("atr_limit_multiplier", 1.5),
+        ("volume_period", 10),
+        ("risk_fraction", 0.01),
+        ("stop_buffer_points", 10.0),
+    )
+
+    def __init__(self):
+        self.bars4h = []
+        self.local_lows = []
+        self.local_highs = []
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_context = None
+        self.pending_stop_price = None
+        self.trade_direction = None
+
+    def _line_value(self, first, second, bar_index):
+        slope = (second["price"] - first["price"]) / (
+            second["index"] - first["index"]
+        )
+        return second["price"] + slope * (bar_index - second["index"])
+
+    def _atr10(self):
+        if len(self.bars4h) < self.p.atr_period + 1:
+            return None
+
+        true_ranges = []
+        start = len(self.bars4h) - self.p.atr_period
+        for index in range(start, len(self.bars4h)):
+            bar = self.bars4h[index]
+            previous_close = self.bars4h[index - 1]["close"]
+            true_ranges.append(
+                max(
+                    bar["high"] - bar["low"],
+                    abs(bar["high"] - previous_close),
+                    abs(bar["low"] - previous_close),
+                )
+            )
+        return sum(true_ranges) / self.p.atr_period
+
+    def _volatility_ok(self):
+        required = (
+            self.p.atr_period + self.p.atr_average_period
+        )
+        if len(self.bars4h) < required:
+            return False
+
+        atr_values = []
+        for end_index in range(
+            len(self.bars4h) - self.p.atr_average_period + 1,
+            len(self.bars4h) + 1,
+        ):
+            true_ranges = []
+            start_index = end_index - self.p.atr_period
+            for index in range(start_index, end_index):
+                bar = self.bars4h[index]
+                previous_close = self.bars4h[index - 1]["close"]
+                true_ranges.append(
+                    max(
+                        bar["high"] - bar["low"],
+                        abs(bar["high"] - previous_close),
+                        abs(bar["low"] - previous_close),
+                    )
+                )
+            atr_values.append(sum(true_ranges) / self.p.atr_period)
+
+        return atr_values[-1] <= (
+            self.p.atr_limit_multiplier
+            * (sum(atr_values) / self.p.atr_average_period)
+        )
+
+    def _volume_ok(self):
+        if len(self.bars4h) < self.p.volume_period + 1:
+            return False
+        prior_volumes = [
+            bar["volume"]
+            for bar in self.bars4h[-self.p.volume_period - 1:-1]
+        ]
+        return self.bars4h[-1]["volume"] > (
+            sum(prior_volumes) / self.p.volume_period
+        )
+
+    def _line_is_active(self, first, second, direction):
+        if len(self.bars4h) < self.p.active_lookback:
+            return False
+
+        start = len(self.bars4h) - self.p.active_lookback
+        for index in range(start, len(self.bars4h)):
+            line_price = self._line_value(first, second, index)
+            close = self.bars4h[index]["close"]
+            if direction == "long" and close < line_price:
+                return False
+            if direction == "short" and close > line_price:
+                return False
+        return True
+
+    def _add_local_extrema(self):
+        index = len(self.bars4h) - 1
+        if len(self.bars4h) < self.p.local_lookback:
+            return
+
+        window = self.bars4h[-self.p.local_lookback:]
+        current = self.bars4h[-1]
+
+        if current["low"] == min(bar["low"] for bar in window):
+            self.local_lows.append({"index": index, "price": current["low"]})
+
+        if current["high"] == max(bar["high"] for bar in window):
+            self.local_highs.append({"index": index, "price": current["high"]})
+
+    def _submit_entry(self, direction, stop_price):
+        breakout_price = self.bars4h[-1]["close"]
+        risk_per_contract = abs(breakout_price - stop_price)
+        if risk_per_contract <= 0:
+            return
+
+        size = int(
+            (self.broker.getvalue() * self.p.risk_fraction)
+            / risk_per_contract
+        )
+        if size < 1:
+            return
+
+        self.entry_context = {
+            "direction": direction,
+            "stop_price": stop_price,
+        }
+
+        if direction == "long":
+            self.entry_order = self.buy(size=size)
+        else:
+            self.entry_order = self.sell(size=size)
+
+    def _trail_stop(self):
+        if not self.position or self.stop_order is not None:
+            return
+
+        if self.pending_stop_price is None:
+            return
+
+        size = abs(self.position.size)
+        if self.position.size > 0:
+            self.stop_order = self.sell(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=self.pending_stop_price,
+            )
+        else:
+            self.stop_order = self.buy(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=self.pending_stop_price,
+            )
+        self.pending_stop_price = None
+
+    def _update_trailing_stop(self):
+        if not self.position or self.stop_order is None:
+            return
+
+        if self.position.size > 0 and self.local_lows:
+            candidate = self.local_lows[-1]["price"]
+            if candidate > self.stop_order.created.price:
+                self.pending_stop_price = candidate
+                self.cancel(self.stop_order)
+
+        if self.position.size < 0 and self.local_highs:
+            candidate = self.local_highs[-1]["price"]
+            if candidate < self.stop_order.created.price:
+                self.pending_stop_price = candidate
+                self.cancel(self.stop_order)
+
+    def next(self):
+        hour = self.data.datetime.datetime(0).hour
+        if hour % 4 != 3:
+            return
+
+        self.bars4h.append(
+            {
+                "open": self.data.open[-3],
+                "high": max(self.data.high[-3], self.data.high[-2],
+                            self.data.high[-1], self.data.high[0]),
+                "low": min(self.data.low[-3], self.data.low[-2],
+                           self.data.low[-1], self.data.low[0]),
+                "close": self.data.close[0],
+                "volume": (
+                    self.data.volume[-3] + self.data.volume[-2]
+                    + self.data.volume[-1] + self.data.volume[0]
+                ),
+            }
+        )
+
+        self._add_local_extrema()
+        self._update_trailing_stop()
+
+        if self.position or self.entry_order is not None:
+            return
+
+        if not self._volatility_ok() or not self._volume_ok():
+            return
+
+        current_index = len(self.bars4h) - 1
+        current_close = self.bars4h[-1]["close"]
+
+        if len(self.local_lows) >= 2:
+            first_low, second_low = self.local_lows[-2:]
+            if second_low["price"] > first_low["price"]:
+                line_price = self._line_value(
+                    first_low, second_low, current_index
+                )
+                if (
+                    self._line_is_active(first_low, second_low, "long")
+                    and current_close > line_price
+                ):
+                    self._submit_entry(
+                        "long",
+                        second_low["price"] - self.p.stop_buffer_points,
+                    )
+                    return
+
+        if len(self.local_highs) >= 2:
+            first_high, second_high = self.local_highs[-2:]
+            if second_high["price"] < first_high["price"]:
+                line_price = self._line_value(
+                    first_high, second_high, current_index
+                )
+                if (
+                    self._line_is_active(first_high, second_high, "short")
+                    and current_close < line_price
+                ):
+                    self._submit_entry(
+                        "short",
+                        second_high["price"] + self.p.stop_buffer_points,
+                    )
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal:
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+
+            if order.status != order.Completed:
+                self.entry_context = None
+                return
+
+            self.trade_direction = self.entry_context["direction"]
+            stop_price = self.entry_context["stop_price"]
+            entry_price = order.executed.price
+            risk = abs(entry_price - stop_price)
+            size = abs(order.executed.size)
+
+            if self.trade_direction == "long":
+                target_price = entry_price + (2.0 * risk)
+                self.stop_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                )
+                self.target_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=target_price,
+                )
+            else:
+                target_price = entry_price - (2.0 * risk)
+                self.stop_order = self.buy(
+                    size=size,
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                )
+                self.target_order = self.buy(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=target_price,
+                )
+
+            self.entry_context = None
+            return
+
+        if order is self.stop_order:
+            self.stop_order = None
+            if order.status == order.Completed:
+                if self.target_order is not None:
+                    self.cancel(self.target_order)
+                self.target_order = None
+                self.pending_stop_price = None
+                self.trade_direction = None
+            elif order.status in (order.Canceled, order.Margin, order.Rejected):
+                self._trail_stop()
+            return
+
+        if order is self.target_order:
+            self.target_order = None
+            if order.status == order.Completed:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.stop_order = None
+                self.pending_stop_price = None
+                self.trade_direction = None
+```
+
+```json
+{"assumptions":[{"topic":"timeframe","choice":"Aggregate the supplied 1-hour bars into consecutive 4-hour candles ending at 03:00, 07:00, 11:00, 15:00, 19:00, and 23:00 exchange-local time.","reason":"The specification requires 4-hour signals, while the fixed harness supplies only 1-hour OHLCV data."},{"topic":"local extrema","choice":"Use N=5 and treat the current 4-hour low or high as local when it equals the lowest or highest value of the trailing five 4-hour candles.","reason":"The specification gives N=5-10 without selecting a value or defining pivot confirmation."},{"topic":"active trendline","choice":"Use M=10 and consider an ascending line broken by a 4-hour close below it and a descending line broken by a 4-hour close above it.","reason":"The specification gives M=10 as an example but does not define the precise break-price field."},{"topic":"stop distance","choice":"Use the trendline's most recent local extremum with a 10-point buffer: 10 points below for longs and 10 points above for shorts.","reason":"The specification permits a few points and gives 10-15 points as its example."},{"topic":"risk sizing","choice":"Risk 1% of current broker value per trade, with one point of price movement treated as one monetary unit per contract; do not trade when this produces fewer than one contract.","reason":"The specification requires X% risk but gives a 1-2% range and provides no futures point-value or margin multiplier."},{"topic":"ATR","choice":"Calculate ATR(10) as the simple average of the last 10 four-hour true ranges; compare it with 1.5 times the simple average of the latest 50 such ATR values.","reason":"The specification specifies the periods and threshold but not Wilder smoothing versus a simple average."},{"topic":"volume filter","choice":"Require breakout-candle volume to exceed the average volume of the preceding 10 completed 4-hour candles.","reason":"The specification requires volume above the last-10 average but does not state whether the breakout candle is included."},{"topic":"trend filter","choice":"Do not apply the optional higher-timeframe daily trend filter.","reason":"It is explicitly optional and the harness provides a single hourly data feed only."},{"topic":"trailing stop","choice":"On each newly identified local extremum, move a long stop upward to the new low or a short stop downward to the new high only when that move is favorable.","reason":"The specification permits trailing behind the last local extremum and requires it only after price moves in favor."}]}
+```

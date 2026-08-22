@@ -1,0 +1,105 @@
+```python
+import backtrader as bt
+
+
+class AntiLossStreakSkipper(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+        ("stop_loss_fraction", 0.02),
+        ("take_profit_fraction", 0.04),
+    )
+
+    def __init__(self):
+        self._pending_order = None
+        self._stop_order = None
+        self._take_order = None
+        self._last_trade_won = None
+        self._skip_waiting_entry = False
+        self._skip_active = False
+        self._skip_entry_price = None
+        self._resume_after_bar = -1
+
+    def next(self):
+        if self._skip_waiting_entry:
+            self._skip_waiting_entry = False
+            self._skip_active = True
+            self._skip_entry_price = self.data.open[0]
+
+        if self._skip_active:
+            stop_price = self._skip_entry_price * (1.0 - self.p.stop_loss_fraction)
+            target_price = self._skip_entry_price * (1.0 + self.p.take_profit_fraction)
+
+            if self.data.low[0] <= stop_price:
+                self._skip_active = False
+                self._skip_entry_price = None
+                self._last_trade_won = False
+            elif self.data.high[0] >= target_price:
+                self._skip_active = False
+                self._skip_entry_price = None
+                self._last_trade_won = True
+                self._resume_after_bar = len(self)
+
+            return
+
+        if self.position or self._pending_order or self._stop_order or self._take_order:
+            return
+
+        if len(self) <= self._resume_after_bar:
+            return
+
+        if self._last_trade_won is False:
+            self._skip_waiting_entry = True
+            return
+
+        price = self.data.close[0]
+        if price > 0:
+            size = (self.broker.getvalue() * self.p.risk_fraction) / price
+            self._pending_order = self.buy(size=size)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self._pending_order:
+            self._pending_order = None
+
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                stop_price = entry_price * (1.0 - self.p.stop_loss_fraction)
+                target_price = entry_price * (1.0 + self.p.take_profit_fraction)
+
+                self._stop_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                )
+                self._take_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=target_price,
+                    oco=self._stop_order,
+                )
+            return
+
+        if order is self._stop_order:
+            if order.status == order.Completed:
+                self._last_trade_won = False
+                self._stop_order = None
+                self._take_order = None
+            elif order.status in (order.Canceled, order.Margin, order.Rejected):
+                self._stop_order = None
+            return
+
+        if order is self._take_order:
+            if order.status == order.Completed:
+                self._last_trade_won = True
+                self._stop_order = None
+                self._take_order = None
+            elif order.status in (order.Canceled, order.Margin, order.Rejected):
+                self._take_order = None
+```
+
+```json
+{"assumptions":[{"topic":"entry conditions","choice":"Every bar while flat is treated as a valid entry signal.","reason":"The specification requires predefined standard entry conditions but supplies none."},{"topic":"position sizing","choice":"Order value is 1% of current broker equity, converted to shares using the signal bar close.","reason":"The specification gives 1% of equity as its fixed-size example but does not provide a share quantity or execution-price sizing rule."},{"topic":"skipped-trade entry","choice":"A skipped opportunity is hypothetically entered at the following bar's open, matching Backtrader market-order timing.","reason":"Normal entries are market orders and Backtrader executes them on the next bar."},{"topic":"intrabar target and stop collision","choice":"The hypothetical skipped trade is classified as a loss when both its stop and target are reachable in the same OHLC bar.","reason":"OHLC data does not provide the intrabar sequence needed to determine which level was hit first."},{"topic":"infeasible","choice":"Protective stop and target orders are submitted after the market entry completes, so they cannot protect the entry bar under standard Backtrader order processing.","reason":"The exact filled market-entry price is unknown until execution, while the stated stop and target must be calculated from that price."},{"topic":"cycle reset conflict","choice":"A winning executed trade enables normal entries; a losing executed trade enables skipping.","reason":"This follows the explicit normal-entry and skip-mechanism rules; the statement that a winning trade returns to the skip-after-loss state conflicts with them."}]}
+```

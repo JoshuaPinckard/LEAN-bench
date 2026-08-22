@@ -1,0 +1,142 @@
+```python
+import backtrader as bt
+import math
+
+
+class FutureReturnDistributionStrategy(bt.Strategy):
+    params = (
+        ("fast_sma_period", 13),
+        ("slow_sma_period", 40),
+        ("rsi_period", 14),
+        ("macd_fast_period", 12),
+        ("macd_slow_period", 26),
+        ("macd_signal_period", 9),
+        ("stop_loss", 0.015),
+        ("take_profit", 0.03),
+        ("holding_periods", 6),
+    )
+
+    def __init__(self):
+        self.fast_sma = bt.indicators.SMA(
+            self.data.close, period=self.p.fast_sma_period
+        )
+        self.slow_sma = bt.indicators.SMA(
+            self.data.close, period=self.p.slow_sma_period
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+
+        self.macd_fast = bt.indicators.EMA(
+            self.data.close, period=self.p.macd_fast_period
+        )
+        self.macd_slow = bt.indicators.EMA(
+            self.data.close, period=self.p.macd_slow_period
+        )
+        self.macd = self.macd_fast - self.macd_slow
+        self.macd_signal = bt.indicators.SMA(
+            self.macd, period=self.p.macd_signal_period
+        )
+
+        self.order = None
+        self.entry_price = None
+        self.entry_period_index = None
+        self.pending_entry_period_index = None
+
+        self.current_30m_key = None
+        self.period_index = -1
+        self.ma_crosses = 0
+        self.rsi_total = 0.0
+        self.rsi_count = 0
+        self.previous_fast_sma = None
+        self.previous_slow_sma = None
+
+    def _thirty_minute_key(self):
+        dt = self.data.datetime.datetime(0)
+        session_minutes = dt.hour * 60 + dt.minute
+        return (dt.date(), session_minutes // 30)
+
+    def _is_thirty_minute_close(self):
+        return self.data.datetime.datetime(0).minute % 30 == 25
+
+    def _entry_size(self):
+        price = self.data.close[0]
+        commission = self.broker.getcommissioninfo(self.data).p.commission
+        return self.broker.getcash() / (price * (1.0 + commission))
+
+    def next(self):
+        key = self._thirty_minute_key()
+
+        if key != self.current_30m_key:
+            self.current_30m_key = key
+            self.period_index += 1
+            self.ma_crosses = 0
+            self.rsi_total = 0.0
+            self.rsi_count = 0
+
+        fast = self.fast_sma[0]
+        slow = self.slow_sma[0]
+        rsi = self.rsi[0]
+
+        if (
+            self.previous_fast_sma is not None
+            and fast > slow
+            and self.previous_fast_sma <= self.previous_slow_sma
+        ):
+            self.ma_crosses += 1
+
+        if not math.isnan(rsi):
+            self.rsi_total += rsi
+            self.rsi_count += 1
+
+        self.previous_fast_sma = fast
+        self.previous_slow_sma = slow
+
+        if self.order is None and self.position and self.entry_price is not None:
+            if (
+                self.data.low[0] <= self.entry_price * (1.0 - self.p.stop_loss)
+                or self.data.high[0] >= self.entry_price * (1.0 + self.p.take_profit)
+            ):
+                self.order = self.close()
+                return
+
+        if (
+            self.order is None
+            and self.position
+            and self._is_thirty_minute_close()
+            and self.period_index - self.entry_period_index >= self.p.holding_periods
+        ):
+            self.order = self.close()
+            return
+
+        if (
+            self.order is None
+            and not self.position
+            and self._is_thirty_minute_close()
+            and self.rsi_count > 0
+        ):
+            avg_rsi = self.rsi_total / self.rsi_count
+
+            if self.ma_crosses == 1 and avg_rsi > 70:
+                self.pending_entry_period_index = self.period_index
+                self.order = self.buy(size=self._entry_size())
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.entry_period_index = self.pending_entry_period_index
+            else:
+                self.entry_price = None
+                self.entry_period_index = None
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"30-minute aggregation","choice":"30-minute periods are formed from consecutive 5-minute bars; SMA crossover counting and RSI averaging use the specified 5-minute indicator values within each period.","reason":"The specification explicitly defines crossover counting from 5-minute data and RSI averaging over each 30-minute period, despite also describing 30-minute aggregation before indicator calculation."},{"topic":"30-minute candle completion","choice":"A 30-minute candle completes on bars timestamped at minutes 25 and 55, treating timestamps as 5-minute bar start times.","reason":"The supplied feed contains 5-minute OHLCV bars and no separate resampled data feed."},{"topic":"position sizing","choice":"Entry size uses all available cash divided by the current close plus the stated 0.001 commission.","reason":"This is the closest executable interpretation of a 100% available-capital position when a market order executes on the next bar."},{"topic":"stop-loss and take-profit execution","choice":"The strategy submits a market close order when a 5-minute bar low reaches the 1.5% stop or its high reaches the 3.0% target.","reason":"OHLCV data cannot establish intrabar trigger order or guarantee execution at an exact stop/target price."},{"topic":"infeasible","choice":"Only AAPL and the supplied 2026 date range are used.","reason":"The harness provides one AAPL 5-minute feed only; testing 30-50 tickers and several years of historical data cannot be implemented in this environment."}]}
+```

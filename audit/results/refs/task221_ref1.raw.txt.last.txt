@@ -1,0 +1,109 @@
+```python
+import backtrader as bt
+
+
+class ShortVolatilityProxy(bt.Strategy):
+    params = (
+        ('risk_fraction', 0.01),
+        ('liquidity_threshold', 0),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.bbw = (self.bb.top - self.bb.bot) / self.bb.mid
+        self.bbw_ema = bt.indicators.EMA(self.bbw, period=100)
+
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_ema = bt.indicators.EMA(self.atr, period=100)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.vol_spike_cross = bt.indicators.CrossOver(
+            self.bbw, self.bbw_ema * 1.5
+        )
+
+        self.order = None
+        self.bars_since_vol_spike = None
+        self.position_bars = 0
+        self.entry_price = None
+        self.entry_atr = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy() or order.issell():
+                if not self.position:
+                    self.entry_price = None
+                    self.entry_atr = None
+                    self.position_bars = 0
+                elif self.entry_price is None:
+                    self.entry_price = order.executed.price
+                    self.entry_atr = float(self.atr[0])
+                    self.position_bars = 0
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+
+    def next(self):
+        if self.vol_spike_cross[0] > 0 and \
+           self.atr[0] > 1.2 * self.atr_ema[0] and \
+           self.data.volume[0] > 1.2 * self.volume_sma[0]:
+            self.bars_since_vol_spike = 0
+        elif self.bars_since_vol_spike is not None:
+            self.bars_since_vol_spike += 1
+
+        if self.order:
+            return
+
+        if self.position:
+            self.position_bars += 1
+
+            event_exit = (
+                abs(self.data.open[0] - self.data.close[-1]) > 1.5 * self.atr[0] and
+                self.data.volume[0] > 1.5 * self.volume_sma[0] and
+                self.atr[0] > 1.3 * self.atr_ema[0]
+            )
+
+            middle_reversion = (
+                (self.position.size > 0 and self.data.close[0] >= self.bb.mid[0]) or
+                (self.position.size < 0 and self.data.close[0] <= self.bb.mid[0])
+            )
+
+            volatility_crash = self.bbw[0] < self.bbw_ema[0]
+
+            stop_hit = (
+                self.position.size > 0 and
+                self.data.close[0] <= self.entry_price - 1.5 * self.entry_atr
+            ) or (
+                self.position.size < 0 and
+                self.data.close[0] >= self.entry_price + 1.5 * self.entry_atr
+            )
+
+            if event_exit or middle_reversion or volatility_crash or \
+               self.position_bars >= 21 or stop_hit:
+                self.order = self.close()
+            return
+
+        if self.bars_since_vol_spike is None or \
+           not 5 <= self.bars_since_vol_spike <= 21:
+            return
+
+        if self.volume_sma[0] <= self.p.liquidity_threshold:
+            return
+
+        risk_dollars = self.broker.getvalue() * self.p.risk_fraction
+        size = risk_dollars / (1.5 * self.atr[0])
+
+        if self.data.close[0] > self.bb.top[0] and self.rsi[0] > 60:
+            self.order = self.sell(size=size)
+        elif self.data.close[0] < self.bb.bot[0] and self.rsi[0] < 40:
+            self.order = self.buy(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"risk percentage","choice":"1% of equity per trade","reason":"The specification gives a 1–2% range without selecting a value."},{"topic":"liquidity threshold","choice":"0","reason":"The specification requires a specified SMA(volume,20) threshold but does not provide one; this retains the stated filter without excluding positive-volume AAPL bars arbitrarily."},{"topic":"volatility-spike counter","choice":"Reset to 0 on every qualifying upward BBW crossing and increment once per subsequent bar","reason":"This is the closest operational reading of maintaining a counter after a qualifying crossing and supports repeated pseudo-events."},{"topic":"stop-loss execution","choice":"Submit a market close order after the closing price breaches the 1.5*ATR stop level","reason":"With daily OHLCV and no intrabar execution rule specified, an exact stop-fill path is not defined; the resulting close order executes at the next open."},{"topic":"ATR trailing","choice":"Not used","reason":"The specification marks ATR trailing as optional."},{"topic":"commissions","choice":"Use the harness-provided 0.001 commission","reason":"A fixed per-share commission cannot be configured by this strategy without altering the harness broker setup; this is infeasible under the fixed execution environment."}]}
+```

@@ -1,0 +1,49 @@
+{
+  "task_id": 72,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\n\n\nclass SwingBreakAndRetestStrategy(bt.Strategy):\n    params = (\n        ('bb_period', 20),\n        ('bb_devfactor', 2.0),\n        ('volume_period', 20),\n        ('atr_period', 14),\n        ('market_sma_period', 200),\n    )\n\n    def __init__(self):\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close,\n            period=self.p.bb_period,\n            devfactor=self.p.bb_devfactor,\n        )\n        self.volume_average = bt.indicators.SimpleMovingAverage(\n            self.data.volume,\n            period=self.p.volume_period,\n        )\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        self.order = None\n        self.stop_order = None\n        self.stop_price = None\n\n        self.breakout_side = None\n        self.breakout_volume = None\n        self.breakout_stop = None\n        self.retest_done = False\n        self.pending_kind = None\n        self.entry_date = None\n        self.trading_days_held = 0\n\n        self.current_day = None\n        self.current_day_close = None\n        self.daily_closes = []\n        self.daily_sma = None\n\n    def prenext(self):\n        self._update_daily_data()\n\n    def next(self):\n        self._update_daily_data()\n\n        if self.order:\n            return\n\n        if not self.position:\n            self._reset_trade_state()\n            self._check_initial_breakout()\n            return\n\n        self._manage_open_position()\n\n    def _update_daily_data(self):\n        bar_date = self.data.datetime.date(0)\n\n        if self.current_day is None:\n            self.current_day = bar_date\n        elif bar_date != self.current_day:\n            self.daily_closes.append(self.current_day_close)\n            if len(self.daily_closes) >= self.p.market_sma_period:\n                self.daily_sma = (\n                    sum(self.daily_closes[-self.p.market_sma_period:])\n                    / self.p.market_sma_period\n                )\n            self.current_day = bar_date\n\n            if self.position:\n                self.trading_days_held += 1\n\n        self.current_day_close = self.data.close[0]\n\n    def _check_initial_breakout(self):\n        if self.daily_sma is None:\n            return\n\n        close = self.data.close[0]\n        volume = self.data.volume[0]\n        required_volume = self.volume_average[0] * 1.20\n\n        if close > self.bb.top[0] and volume >= required_volume and close > self.daily_sma:\n            stop_price = self.data.low[0]\n            risk_per_share = close - stop_price\n            if risk_per_share > 0:\n                size = (self.broker.getvalue() * 0.01) / risk_per_share\n                self.breakout_side = 'long'\n                self.breakout_volume = volume\n                self.breakout_stop = stop_price\n                self.pending_kind = 'initial'\n                self.order = self.buy(size=size)\n\n        elif close < self.bb.bot[0] and volume >= required_volume and close < self.daily_sma:\n            stop_price = self.data.high[0]\n            risk_per_share = stop_price - close\n            if risk_per_share > 0:\n                size = (self.broker.getvalue() * 0.01) / risk_per_share\n                self.breakout_side = 'short'\n                self.breakout_volume = volume\n                self.breakout_stop = stop_price\n                self.pending_kind = 'initial'\n                self.order = self.sell(size=size)\n\n    def _manage_open_position(self):\n        if self.trading_days_held >= 10:\n            self._exit_position()\n            return\n\n        if self.position.size > 0:\n            if self.data.low[0] <= self.bb.mid[0]:\n                self._exit_position()\n                return\n        else:\n            if self.data.high[0] >= self.bb.mid[0]:\n                self._exit_position()\n                return\n\n        self._update_trailing_stop()\n\n        if self.retest_done:\n            return\n\n        if self.position.size > 0:\n            retest = (\n                self.data.low[0] <= self.bb.top[0]\n                or self.data.close[0] <= self.bb.top[0]\n            )\n            if retest and self.data.volume[0] < self.breakout_volume:\n                risk_per_share = self.data.close[0] - self.breakout_stop\n                if risk_per_share > 0:\n                    size = (self.broker.getvalue() * 0.01) / risk_per_share\n                    self.pending_kind = 'retest'\n                    self.order = self.buy(size=size)\n\n        else:\n            retest = (\n                self.data.high[0] >= self.bb.bot[0]\n                or self.data.close[0] >= self.bb.bot[0]\n            )\n            if retest and self.data.volume[0] < self.breakout_volume:\n                risk_per_share = self.breakout_stop - self.data.close[0]\n                if risk_per_share > 0:\n                    size = (self.broker.getvalue() * 0.01) / risk_per_share\n                    self.pending_kind = 'retest'\n                    self.order = self.sell(size=size)\n\n    def _update_trailing_stop(self):\n        entry_price = self.position.price\n\n        if self.position.size > 0 and self.data.close[0] > entry_price:\n            new_stop = entry_price + self.atr[0]\n            if self.stop_price is None or new_stop > self.stop_price:\n                self._place_stop(new_stop)\n\n        elif self.position.size < 0 and self.data.close[0] < entry_price:\n            new_stop = entry_price - self.atr[0]\n            if self.stop_price is None or new_stop < self.stop_price:\n                self._place_stop(new_stop)\n\n    def _place_stop(self, price):\n        if self.stop_order:\n            self.cancel(self.stop_order)\n\n        self.stop_price = price\n        size = abs(self.position.size)\n\n        if self.position.size > 0:\n            self.stop_order = self.sell(\n                size=size,\n                exectype=bt.Order.Stop,\n                price=price,\n            )\n        else:\n            self.stop_order = self.buy(\n                size=size,\n                exectype=bt.Order.Stop,\n                price=price,\n            )\n\n    def _exit_position(self):\n        if self.stop_order:\n            self.cancel(self.stop_order)\n        self.pending_kind = 'exit'\n        self.order = self.close()\n\n    def _reset_trade_state(self):\n        self.breakout_side = None\n        self.breakout_volume = None\n        self.breakout_stop = None\n        self.retest_done = False\n        self.pending_kind = None\n        self.entry_date = None\n        self.trading_days_held = 0\n        self.stop_price = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order is self.stop_order:\n            if order.status == order.Completed:\n                self.stop_order = None\n                self._reset_trade_state()\n            elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n                self.stop_order = None\n            return\n\n        if order is not self.order:\n            return\n\n        if order.status == order.Completed:\n            if self.pending_kind == 'initial':\n                self.entry_date = self.data.datetime.date(0)\n                self.trading_days_held = 0\n                self._place_stop(self.breakout_stop)\n            elif self.pending_kind == 'retest':\n                self.retest_done = True\n                self._place_stop(self.stop_price)\n            elif self.pending_kind == 'exit':\n                self._reset_trade_state()\n\n            self.order = None\n            self.pending_kind = None\n\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n            self.pending_kind = None",
+  "assumptions": [
+    {
+      "topic": "market filter timeframe",
+      "choice": "A completed daily close series is derived from the supplied hourly feed and its 200-period SMA is used; the current hourly close is compared with that SMA.",
+      "reason": "The harness supplies only one hourly feed and no higher-timeframe feed."
+    },
+    {
+      "topic": "position sizing entry price",
+      "choice": "The breakout or retest candle close is used as the entry-price estimate for sizing.",
+      "reason": "The specified market-open execution price is unknown when the order must be submitted."
+    },
+    {
+      "topic": "take-profit reach",
+      "choice": "A long take profit is detected when the bar low reaches or crosses the middle band; a short take profit is detected when the bar high reaches or crosses it.",
+      "reason": "OHLCV bars do not provide intrabar sequencing."
+    },
+    {
+      "topic": "retest additions",
+      "choice": "One retest addition is permitted for each completed initial breakout position.",
+      "reason": "The specification permits an add but does not state that repeated additions are allowed."
+    },
+    {
+      "topic": "trailing stop short direction",
+      "choice": "For shorts, break-even plus one ATR is interpreted directionally as entry price minus one ATR.",
+      "reason": "A protective short stop must move below entry when the short position is profitable."
+    },
+    {
+      "topic": "maximum holding period",
+      "choice": "The position is manually closed after ten subsequent trading-day transitions following entry.",
+      "reason": "The feed is intraday and trading days must be derived from date changes."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2024-06-03T14:30:00",
+      "side": "BUY",
+      "size": 43.3837985979174,
+      "price": 194.83000183105472
+    }
+  ]
+}

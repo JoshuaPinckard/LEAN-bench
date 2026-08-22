@@ -1,0 +1,342 @@
+```python
+import backtrader as bt
+import math
+from collections import deque
+
+
+class MultiStrategyORBIncome(bt.Strategy):
+    params = (
+        ('base_capital', 150000.0),
+        ('risk_per_trade', 0.01),
+        ('orb_bars', 6),          # 30 minutes of 5-minute bars
+        ('timeout_bars', 5),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2.0)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.ema = bt.indicators.EMA(self.data.close, period=20)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.bandwidths = deque(maxlen=252)
+        self.pending_orders = {}
+        self.log_records = []
+
+        self.slots = {
+            's1': {'allocation': 0.40, 'active': False},
+            's2': {'allocation': 0.30, 'active': False},
+            's3': {'allocation': 0.30, 'active': False},
+        }
+
+        self.session_date = None
+        self.or_high = None
+        self.or_low = None
+        self.or_count = 0
+        self.or_ready = False
+        self.broke_or_high = False
+        self.broke_or_low = False
+
+    def _percentile(self, values, percentile):
+        ordered = sorted(values)
+        index = max(0, math.ceil(len(ordered) * percentile) - 1)
+        return ordered[index]
+
+    def _record(self, event, slot, **values):
+        values.update({
+            'event': event,
+            'strategy': slot,
+            'bar': len(self),
+            'bandwidth_percentile': self.bandwidth_percentile,
+        })
+        self.log_records.append(values)
+
+    def _active_count(self):
+        return sum(1 for slot in self.slots.values() if slot['active'])
+
+    def _entry_pending_count(self):
+        return sum(
+            1 for item in self.pending_orders.values()
+            if item['kind'] == 'entry'
+        )
+
+    def _volume_ok(self):
+        return self.data.volume[0] >= self.volume_sma[0]
+
+    def _position_size(self, slot_name, stop_distance):
+        if stop_distance <= 0:
+            return 0
+
+        risk_dollars = self.p.base_capital * self.p.risk_per_trade
+        risk_size = math.floor(risk_dollars / stop_distance)
+        allocation_size = math.floor(
+            (self.p.base_capital * self.slots[slot_name]['allocation']) /
+            self.data.close[0]
+        )
+        return max(0, min(risk_size, allocation_size))
+
+    def _submit_entry(self, slot_name, direction, stop, target=None, midor=None):
+        if (self.slots[slot_name]['active'] or
+                self._active_count() + self._entry_pending_count() >= 3):
+            return
+
+        stop_distance = abs(self.data.close[0] - stop)
+        size = self._position_size(slot_name, stop_distance)
+        if size <= 0:
+            return
+
+        order = self.buy(size=size) if direction == 'long' else self.sell(size=size)
+        self.pending_orders[order.ref] = {
+            'kind': 'entry',
+            'slot': slot_name,
+            'direction': direction,
+            'stop': stop,
+            'target': target,
+            'midor': midor,
+            'size': size,
+            'signal_atr': self.atr[0],
+            'signal_upper': self.bb.top[0],
+            'signal_lower': self.bb.bot[0],
+            'signal_middle': self.bb.mid[0],
+        }
+        self._record('signal', slot_name, direction=direction, size=size,
+                     stop=stop, target=target, midor=midor)
+
+    def _exit_slot(self, slot_name, reason):
+        slot = self.slots[slot_name]
+        if not slot['active'] or slot_name in (
+                item['slot'] for item in self.pending_orders.values()):
+            return
+
+        order = self.close(size=slot['size'])
+        self.pending_orders[order.ref] = {
+            'kind': 'exit',
+            'slot': slot_name,
+            'reason': reason,
+        }
+
+    def notify_order(self, order):
+        if order.ref not in self.pending_orders:
+            return
+
+        details = self.pending_orders[order.ref]
+        slot_name = details['slot']
+
+        if order.status in (order.Canceled, order.Margin, order.Rejected):
+            del self.pending_orders[order.ref]
+            return
+
+        if order.status != order.Completed:
+            return
+
+        del self.pending_orders[order.ref]
+        slot = self.slots[slot_name]
+
+        if details['kind'] == 'entry':
+            entry = order.executed.price
+            stop = details['stop']
+            risk = abs(entry - stop)
+
+            slot.update({
+                'active': True,
+                'direction': details['direction'],
+                'size': abs(order.executed.size),
+                'entry': entry,
+                'stop': stop,
+                'risk': risk,
+                'entry_bar': len(self),
+                'midor': details['midor'],
+                'high_water': entry,
+                'low_water': entry,
+            })
+
+            if slot_name == 's1':
+                if slot['direction'] == 'long':
+                    slot['target'] = min(
+                        details['signal_middle'], entry + 0.5 * risk
+                    )
+                else:
+                    slot['target'] = max(
+                        details['signal_middle'], entry - 0.5 * risk
+                    )
+            elif slot_name == 's2':
+                slot['target'] = details['midor']
+            else:
+                slot['target'] = (
+                    entry + 2.0 * risk if slot['direction'] == 'long'
+                    else entry - 2.0 * risk
+                )
+
+            self._record('entry', slot_name, direction=slot['direction'],
+                         price=entry, stop=slot['stop'],
+                         target=slot['target'], r_multiple=0.0)
+
+        else:
+            entry = slot.get('entry', order.executed.price)
+            risk = slot.get('risk', 0.0)
+            direction = slot.get('direction')
+            pnl_per_share = (
+                order.executed.price - entry if direction == 'long'
+                else entry - order.executed.price
+            )
+            r_multiple = pnl_per_share / risk if risk else 0.0
+            self._record('exit', slot_name, reason=details['reason'],
+                         price=order.executed.price, r_multiple=r_multiple)
+            self.slots[slot_name] = {
+                'allocation': self.slots[slot_name]['allocation'],
+                'active': False,
+            }
+
+    def _manage_s1(self):
+        slot = self.slots['s1']
+        if not slot['active']:
+            return
+
+        if slot['direction'] == 'long':
+            if self.data.low[0] <= slot['stop']:
+                self._exit_slot('s1', 'stop')
+            elif self.data.high[0] >= slot['target']:
+                self._exit_slot('s1', 'take_profit')
+        else:
+            if self.data.high[0] >= slot['stop']:
+                self._exit_slot('s1', 'stop')
+            elif self.data.low[0] <= slot['target']:
+                self._exit_slot('s1', 'take_profit')
+
+        if slot['active'] and len(self) - slot['entry_bar'] >= self.p.timeout_bars:
+            self._exit_slot('s1', 'timeout')
+
+    def _manage_s2(self, eod):
+        slot = self.slots['s2']
+        if not slot['active']:
+            return
+
+        if eod:
+            self._exit_slot('s2', 'eod')
+        elif slot['direction'] == 'long':
+            if self.data.low[0] <= slot['stop']:
+                self._exit_slot('s2', 'stop')
+            elif self.data.high[0] >= slot['target']:
+                self._exit_slot('s2', 'take_profit')
+        else:
+            if self.data.high[0] >= slot['stop']:
+                self._exit_slot('s2', 'stop')
+            elif self.data.low[0] <= slot['target']:
+                self._exit_slot('s2', 'take_profit')
+
+    def _manage_s3(self, eod):
+        slot = self.slots['s3']
+        if not slot['active']:
+            return
+
+        if eod:
+            self._exit_slot('s3', 'eod')
+            return
+
+        if slot['direction'] == 'long':
+            slot['high_water'] = max(slot['high_water'], self.data.high[0])
+            trail = max(self.ema[0], slot['high_water'] - self.atr[0])
+            if self.data.low[0] <= max(slot['stop'], trail):
+                self._exit_slot('s3', 'trailing_stop')
+            elif self.data.high[0] >= slot['target']:
+                self._exit_slot('s3', 'take_profit')
+        else:
+            slot['low_water'] = min(slot['low_water'], self.data.low[0])
+            trail = min(self.ema[0], slot['low_water'] + self.atr[0])
+            if self.data.high[0] >= min(slot['stop'], trail):
+                self._exit_slot('s3', 'trailing_stop')
+            elif self.data.low[0] <= slot['target']:
+                self._exit_slot('s3', 'take_profit')
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        current_date = dt.date()
+        eod = dt.hour == 15 and dt.minute == 55
+
+        if current_date != self.session_date:
+            self.session_date = current_date
+            self.or_high = None
+            self.or_low = None
+            self.or_count = 0
+            self.or_ready = False
+            self.broke_or_high = False
+            self.broke_or_low = False
+
+        if dt.hour == 9 and dt.minute >= 30 and self.or_count < self.p.orb_bars:
+            self.or_high = self.data.high[0] if self.or_high is None else max(
+                self.or_high, self.data.high[0]
+            )
+            self.or_low = self.data.low[0] if self.or_low is None else min(
+                self.or_low, self.data.low[0]
+            )
+            self.or_count += 1
+            self.or_ready = self.or_count == self.p.orb_bars
+
+        self._manage_s1()
+        self._manage_s2(eod)
+        self._manage_s3(eod)
+
+        middle = self.bb.mid[0]
+        bandwidth = ((self.bb.top[0] - self.bb.bot[0]) / middle
+                     if middle else 0.0)
+        self.bandwidths.append(bandwidth)
+
+        if len(self.bandwidths) < 252:
+            return
+
+        p10 = self._percentile(self.bandwidths, 0.10)
+        p30 = self._percentile(self.bandwidths, 0.30)
+        p70 = self._percentile(self.bandwidths, 0.70)
+        p90 = self._percentile(self.bandwidths, 0.90)
+        self.bandwidth_percentile = (
+            sum(1 for value in self.bandwidths if value <= bandwidth) /
+            len(self.bandwidths)
+        )
+
+        if eod or not self.or_ready or bandwidth < p10 or not self._volume_ok():
+            return
+
+        midor = (self.or_high + self.or_low) / 2.0
+
+        if bandwidth <= p30:
+            if self.data.high[0] >= self.bb.top[0] and self.rsi[0] > 60:
+                self._submit_entry(
+                    's1', 'short', self.bb.top[0] + self.atr[0]
+                )
+            elif self.data.low[0] <= self.bb.bot[0] and self.rsi[0] < 40:
+                self._submit_entry(
+                    's1', 'long', self.bb.bot[0] - self.atr[0]
+                )
+
+        if p70 <= bandwidth <= p90:
+            if self.data.high[0] > self.or_high:
+                self.broke_or_high = True
+            if self.data.low[0] < self.or_low:
+                self.broke_or_low = True
+
+            if self.broke_or_high and self.data.close[0] < self.or_high:
+                self._submit_entry(
+                    's2', 'short', self.or_high + 0.5 * self.atr[0],
+                    midor=midor
+                )
+                self.broke_or_high = False
+            elif self.broke_or_low and self.data.close[0] > self.or_low:
+                self._submit_entry(
+                    's2', 'long', self.or_low - 0.5 * self.atr[0],
+                    midor=midor
+                )
+                self.broke_or_low = False
+
+        if self.data.close[0] > self.or_high and self.data.close[-1] > self.or_high:
+            stop = max(self.data.close[0] - self.atr[0], self.or_low)
+            if self.ema[0] > self.ema[-1]:
+                self._submit_entry('s3', 'long', stop)
+        elif self.data.close[0] < self.or_low and self.data.close[-1] < self.or_low:
+            stop = min(self.data.close[0] + self.atr[0], self.or_high)
+            if self.ema[0] < self.ema[-1]:
+                self._submit_entry('s3', 'short', stop)
+```
+
+```json
+{"assumptions":[{"topic":"timeout","choice":"Strategy 1 timeout is 5 bars.","reason":"The specification permits 3-5 bars but does not select one value."},{"topic":"percentiles","choice":"Percentiles use a 252-value rolling window including the current BandWidth, with nearest-rank calculation; lower 30% means <=P30 and high volatility means P70<=BandWidth<=P90.","reason":"The specification defines percentile ranges but not the calculation convention or exact inclusive boundaries."},{"topic":"volume filter","choice":"The optional volume filter is enabled for all entries.","reason":"It is the stated optional entry restriction and is implementable from the supplied OHLCV data."},{"topic":"orb_break","choice":"An ORB break is detected by High>OR_high or Low<OR_low; the reversion signal may occur on that bar or a later bar in the same session.","reason":"OHLCV provides intrabar extrema but not tick sequencing."},{"topic":"intrabar_conflicts","choice":"When both a stop and profit level are reachable in one OHLC bar, the stop is evaluated first.","reason":"OHLCV bars cannot establish which level was reached first."},{"topic":"strategy_3_trail","choice":"For longs, the trail is max(EMA20, highest-high-since-entry minus ATR); for shorts, the directional inverse is min(EMA20, lowest-low-since-entry plus ATR).","reason":"The specification names an ATR trail and EMA trail but does not define the trailing reference point; the stated max rule is naturally applicable to long protective stops, while shorts require the directional inverse."},{"topic":"simultaneous_positions","choice":"Subsystems are tracked independently and submit their own sized orders, but Backtrader's single-data strategy position is netted.","reason":"A single Backtrader strategy cannot maintain separately margined, simultaneously hedged long and short positions in one instrument; the requested independent three-strategy exposure model is therefore not fully representable."},{"topic":"eod_execution","choice":"EOD exit orders are submitted on the 15:55 bar.","reason":"Without broker cheat-on-close configuration supplied by the harness, standard Backtrader market orders cannot be guaranteed to fill on that same bar."}]}
+```

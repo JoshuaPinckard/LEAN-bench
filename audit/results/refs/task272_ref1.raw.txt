@@ -1,0 +1,226 @@
+```python
+import backtrader as bt
+import math
+
+
+class TrendFollowingStrategy(bt.Strategy):
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_sma_50 = bt.indicators.SMA(self.atr, period=50)
+        self.atr_sma_200 = bt.indicators.SMA(self.atr, period=200)
+        self.ema_50 = bt.indicators.EMA(self.data.close, period=50)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=12,
+            period_me2=26,
+            period_signal=9,
+        )
+
+        self.order = None
+        self.order_role = None
+        self.stop_order = None
+        self.target_order = None
+
+        self.stop_price = None
+        self.pending_stop_price = None
+        self.entry_stop = None
+        self.entry_atr = None
+        self.exit_requested = False
+
+    def _submit_stop(self, price):
+        self.stop_price = price
+        self.pending_stop_price = None
+        self.stop_order = self.close(exectype=bt.Order.Stop, price=price)
+
+    def _submit_target(self, price):
+        self.target_order = self.close(exectype=bt.Order.Limit, price=price)
+
+    def _place_protective_orders(self, entry_price):
+        self._submit_stop(self.entry_stop)
+
+        if self.position.size > 0:
+            self._submit_target(entry_price + 2.0 * self.entry_atr)
+        else:
+            self._submit_target(entry_price - 2.0 * self.entry_atr)
+
+    def _cancel_protective_orders(self):
+        if self.stop_order is not None and self.stop_order.alive():
+            self.cancel(self.stop_order)
+        if self.target_order is not None and self.target_order.alive():
+            self.cancel(self.target_order)
+
+    def _maybe_submit_exit(self):
+        if (
+            self.exit_requested
+            and self.order is None
+            and self.stop_order is None
+            and self.target_order is None
+            and self.position
+        ):
+            self.order = self.close()
+            self.order_role = "exit"
+            self.exit_requested = False
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        )
+
+        if order is self.order and order.status in terminal:
+            role = self.order_role
+            self.order = None
+            self.order_role = None
+
+            if role == "entry":
+                if order.status == order.Completed:
+                    self._place_protective_orders(order.executed.price)
+                else:
+                    self.entry_stop = None
+                    self.entry_atr = None
+
+            elif role == "exit":
+                self.stop_price = None
+                self.pending_stop_price = None
+                self.entry_stop = None
+                self.entry_atr = None
+                self._cancel_protective_orders()
+
+            return
+
+        if order is self.stop_order and order.status in terminal:
+            self.stop_order = None
+
+            if order.status == order.Completed:
+                self.pending_stop_price = None
+                self._cancel_protective_orders()
+            elif (
+                self.pending_stop_price is not None
+                and self.position
+                and not self.exit_requested
+            ):
+                self._submit_stop(self.pending_stop_price)
+
+            self._maybe_submit_exit()
+            return
+
+        if order is self.target_order and order.status in terminal:
+            self.target_order = None
+
+            if order.status == order.Completed:
+                self.pending_stop_price = None
+                if self.stop_order is not None and self.stop_order.alive():
+                    self.cancel(self.stop_order)
+
+            self._maybe_submit_exit()
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        if not self.position:
+            if self.stop_order is not None or self.target_order is not None:
+                return
+
+            not_flat = self.atr_sma_50[0] >= 0.75 * self.atr_sma_200[0]
+
+            if not not_flat:
+                return
+
+            if (
+                self.data.close[0] > self.ema_50[0]
+                and self.ema_50[0] > self.ema_50[-1]
+                and self.macd.macd[0] > self.macd.signal[0]
+            ):
+                initial_stop = (
+                    min(self.data.low[0], self.data.close[0]) - 1.5 * self.atr[0]
+                )
+                stop_distance = self.data.close[0] - initial_stop
+                size = math.floor(
+                    (self.broker.getvalue() * 0.01) / stop_distance
+                )
+
+                if size > 0:
+                    self.entry_stop = initial_stop
+                    self.entry_atr = self.atr[0]
+                    self.order = self.buy(size=size)
+                    self.order_role = "entry"
+
+            elif (
+                self.data.close[0] < self.ema_50[0]
+                and self.ema_50[0] < self.ema_50[-1]
+                and self.macd.macd[0] < self.macd.signal[0]
+            ):
+                initial_stop = (
+                    max(self.data.high[0], self.data.close[0]) + 1.5 * self.atr[0]
+                )
+                stop_distance = initial_stop - self.data.close[0]
+                size = math.floor(
+                    (self.broker.getvalue() * 0.01) / stop_distance
+                )
+
+                if size > 0:
+                    self.entry_stop = initial_stop
+                    self.entry_atr = self.atr[0]
+                    self.order = self.sell(size=size)
+                    self.order_role = "entry"
+
+            return
+
+        if self.position.size > 0:
+            weakening = (
+                (
+                    self.macd.macd[0] < self.macd.signal[0]
+                    and self.macd.macd[-1] >= self.macd.signal[-1]
+                )
+                or self.ema_50[0] <= self.ema_50[-1]
+            )
+
+            if weakening:
+                self.exit_requested = True
+                self.pending_stop_price = None
+                self._cancel_protective_orders()
+                self._maybe_submit_exit()
+                return
+
+            new_stop = max(self.stop_price, self.data.close[0] - 1.5 * self.atr[0])
+
+            if new_stop > self.stop_price:
+                self.pending_stop_price = new_stop
+                if self.stop_order is not None and self.stop_order.alive():
+                    self.cancel(self.stop_order)
+                else:
+                    self._submit_stop(new_stop)
+
+        else:
+            weakening = (
+                (
+                    self.macd.macd[0] > self.macd.signal[0]
+                    and self.macd.macd[-1] <= self.macd.signal[-1]
+                )
+                or self.ema_50[0] >= self.ema_50[-1]
+            )
+
+            if weakening:
+                self.exit_requested = True
+                self.pending_stop_price = None
+                self._cancel_protective_orders()
+                self._maybe_submit_exit()
+                return
+
+            new_stop = min(self.stop_price, self.data.close[0] + 1.5 * self.atr[0])
+
+            if new_stop < self.stop_price:
+                self.pending_stop_price = new_stop
+                if self.stop_order is not None and self.stop_order.alive():
+                    self.cancel(self.stop_order)
+                else:
+                    self._submit_stop(new_stop)
+```
+
+```json
+{"assumptions":[{"topic":"entry_bar","choice":"The signal bar is treated as the entry bar for initial-stop calculation and risk sizing.","reason":"Backtrader market orders fill on a subsequent bar, while the specified initial stop is required to determine the order size at submission."},{"topic":"take_profit_atr","choice":"The ATR(14) value from the signal/entry bar is retained for the fixed take-profit distance, while the filled order price is used as the entry price.","reason":"A fixed target requires one ATR value; this preserves the ATR at trade initialization and uses Backtrader's actual execution price."},{"topic":"protective_execution","choice":"Stop-losses and take-profits are submitted as Backtrader Stop and Limit closing orders; a trailing-stop update cancels and replaces the existing stop.","reason":"The specification gives price-based stop and target levels but does not define bar-intrabar fill handling."},{"topic":"capital","choice":"Equity is self.broker.getvalue() at entry signal evaluation.","reason":"This is the Backtrader total account equity corresponding to the specified capital used in the 1% risk calculation."}]}
+```

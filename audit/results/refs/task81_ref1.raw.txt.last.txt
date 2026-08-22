@@ -1,0 +1,168 @@
+```python
+import backtrader as bt
+import math
+from collections import deque
+
+
+class ContinuousEventPredictiveStrategy(bt.Strategy):
+    params = (
+        ("model_mode", "continuous"),  # "continuous" or "event_driven"
+        ("regression_window", 120),
+        ("minimum_samples", 30),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.volume_average = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=14
+        )
+        self.pending_order = None
+        self.feature_history = deque(maxlen=self.p.regression_window + 5)
+        self.training_samples = deque(maxlen=self.p.regression_window)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_order = None
+
+    @staticmethod
+    def _clip(value, lower=-1.0, upper=1.0):
+        return max(lower, min(upper, value))
+
+    def _forecast(self, features, volatility_ratio):
+        if len(self.training_samples) < self.p.minimum_samples:
+            return None
+
+        dimensions = 5  # intercept plus four model features
+        matrix = [[0.0] * dimensions for _ in range(dimensions)]
+        vector = [0.0] * dimensions
+
+        for sample_features, target in self.training_samples:
+            row = [1.0] + list(sample_features)
+            for i in range(dimensions):
+                vector[i] += row[i] * target
+                for j in range(dimensions):
+                    matrix[i][j] += row[i] * row[j]
+
+        for i in range(dimensions):
+            matrix[i][i] += 1e-8
+
+        for column in range(dimensions):
+            pivot = max(
+                range(column, dimensions),
+                key=lambda row: abs(matrix[row][column]),
+            )
+            if abs(matrix[pivot][column]) < 1e-12:
+                return None
+            matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+            vector[column], vector[pivot] = vector[pivot], vector[column]
+
+            divisor = matrix[column][column]
+            for j in range(column, dimensions):
+                matrix[column][j] /= divisor
+            vector[column] /= divisor
+
+            for row in range(dimensions):
+                if row == column:
+                    continue
+                factor = matrix[row][column]
+                for j in range(column, dimensions):
+                    matrix[row][j] -= factor * matrix[column][j]
+                vector[row] -= factor * vector[column]
+
+        predicted_return = vector[0] + sum(
+            coefficient * feature
+            for coefficient, feature in zip(vector[1:], features)
+        )
+        return self._clip(predicted_return / volatility_ratio)
+
+    def next(self):
+        if self.pending_order:
+            return
+
+        close = float(self.data.close[0])
+        high = float(self.data.high[0])
+        low = float(self.data.low[0])
+        open_price = float(self.data.open[0])
+        volume = float(self.data.volume[0])
+        atr = float(self.atr[0])
+        average_volume = float(self.volume_average[0])
+
+        if (
+            not math.isfinite(atr)
+            or not math.isfinite(average_volume)
+            or close <= 0.0
+            or atr <= 0.0
+            or average_volume <= 0.0
+        ):
+            return
+
+        price_range = high - low
+        order_imbalance = (
+            self._clip((2.0 * close - high - low) / price_range)
+            if price_range > 0.0
+            else 0.0
+        )
+
+        candle_direction = 1.0 if close > open_price else -1.0 if close < open_price else 0.0
+        trade_imbalance = candle_direction * self._clip(volume / average_volume)
+        volume_feature = self._clip((volume - average_volume) / average_volume)
+        volatility_ratio = atr / close
+        volatility_feature = self._clip(volatility_ratio / 0.01)
+
+        features = (
+            order_imbalance,
+            trade_imbalance,
+            volume_feature,
+            volatility_feature,
+        )
+
+        if len(self.feature_history) >= 5:
+            old_close, old_features = self.feature_history[-5]
+            future_return = (close / old_close) - 1.0
+            self.training_samples.append((old_features, future_return))
+
+        self.feature_history.append((close, features))
+        forecast = self._forecast(features, volatility_ratio)
+
+        if forecast is None:
+            return
+
+        event_active = abs(order_imbalance) > 0.6
+        if self.p.model_mode == "event_driven" and not event_active:
+            return
+
+        if self.position.size > 0 and forecast < 0.0:
+            self.pending_order = self.close()
+            return
+
+        if self.position.size < 0 and forecast > 0.0:
+            self.pending_order = self.close()
+            return
+
+        minutes = self.data.datetime.time(0).hour * 60 + self.data.datetime.time(0).minute
+        in_trading_window = 10 * 60 <= minutes <= 16 * 60
+        volatility_filter_passes = atr >= 0.001 * close
+
+        if self.position.size or not in_trading_window or not volatility_filter_passes:
+            return
+
+        threshold = 0.2 if self.p.model_mode == "continuous" else 0.5
+        size = self.broker.getcash() / (close * 1.001)
+
+        if size <= 0.0:
+            return
+
+        if forecast > threshold:
+            self.pending_order = self.buy(size=size)
+        elif forecast < -threshold:
+            self.pending_order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"two strategy versions","choice":"A single strategy class exposes model_mode='continuous' or model_mode='event_driven'.","reason":"The harness permits one strategy class and one position, so independently trading both versions simultaneously is infeasible."},{"topic":"infeasible","choice":"Order Imbalance is proxied by the bar close-location value; Trade Imbalance is proxied by candle direction weighted by volume relative to its 14-bar average.","reason":"The supplied OHLCV feed contains neither order-book depth nor buyer/seller-initiated trade data."},{"topic":"forecast model","choice":"A rolling ordinary least-squares regression uses the four stated features to predict the realized return five bars after each historical feature observation; its prediction is divided by current ATR/price and clipped to [-1,1].","reason":"This provides a causal linear predictive model with a five-bar future-return target and the required forecast range."},{"topic":"regression history","choice":"The regression uses up to 120 labeled observations and requires 30 observations before producing a forecast.","reason":"The specification does not state a training-window length or minimum sample count."},{"topic":"event-driven exits","choice":"When model_mode is event_driven, both entries and sign-change exits require the Order Imbalance event criterion.","reason":"The specification states that the event-driven model is active only when absolute Order Imbalance exceeds 0.6."},{"topic":"position sizing","choice":"Entry size is available cash divided by close multiplied by 1.001.","reason":"This targets 100% available capital while reserving the stated 0.001 commission; market orders execute on the next bar, whose exact execution price is unavailable at signal time."},{"topic":"trading window","choice":"The 10:00 through 16:00 window is inclusive of bars timestamped 16:00.","reason":"The specification gives endpoint times but does not state endpoint exclusivity."}]}
+```

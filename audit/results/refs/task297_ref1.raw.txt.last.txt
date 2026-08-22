@@ -1,0 +1,126 @@
+```python
+import backtrader as bt
+
+
+class OptionsProxyComparisonStrategy(bt.Strategy):
+    params = (
+        ("strategy", "csp"),  # "csp" or "cc"
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.bb = bt.indicators.BollingerBands(self.data, period=20, devfactor=2)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.ema20 = bt.indicators.EMA(self.data.close, period=20)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=20)
+        self.cross = bt.indicators.CrossOver(self.ema20, self.sma50)
+
+        self.order = None
+        self.order_kind = None
+        self.entry_price = None
+        self.entry_k = None
+        self.entry_bar = None
+        self.protection_active = False
+        self.pending_k = None
+
+    def _k(self):
+        return max(0.01, min(0.05, self.atr[0] / self.data.close[0]))
+
+    def _size(self, fraction, price):
+        cash = self.broker.getcash()
+        commission = self.broker.getcommissioninfo(self.data).p.commission
+        return int((cash * fraction) / (price * (1.0 + commission)))
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled,
+                            order.Margin, order.Rejected):
+            if order.status == order.Completed:
+                if self.order_kind in ("csp_entry", "cc_entry"):
+                    self.entry_price = order.executed.price
+                    self.entry_k = self.pending_k
+                    self.entry_bar = len(self.data)
+                    self.protection_active = False
+                elif self.order_kind == "exit":
+                    self.entry_price = None
+                    self.entry_k = None
+                    self.entry_bar = None
+                    self.protection_active = False
+
+            if order.status in (order.Canceled, order.Margin, order.Rejected):
+                if self.order_kind in ("csp_entry", "cc_entry"):
+                    self.pending_k = None
+
+            self.order = None
+            self.order_kind = None
+
+    def _exit(self):
+        self.order = self.close()
+        self.order_kind = "exit"
+
+    def next(self):
+        if self.order:
+            return
+
+        liquid = self.data.volume[0] > self.volume_sma[0]
+
+        if self.position:
+            bars_held = len(self.data) - self.entry_bar
+
+            if self.p.strategy == "csp":
+                take_profit = self.entry_price * (1.0 + 0.5 * self.entry_k)
+                middle_reached = self.data.high[0] >= self.bb.mid[0]
+                stop_price = self.entry_price - 1.5 * self.atr[0]
+
+                if self.data.low[0] <= stop_price:
+                    self._exit()
+                elif self.data.high[0] >= take_profit or middle_reached:
+                    self._exit()
+                elif bars_held >= 20:
+                    self._exit()
+
+            elif self.p.strategy == "cc":
+                take_profit = self.entry_price * (1.0 + self.entry_k)
+                half_profit = self.entry_price * (1.0 + 0.5 * self.entry_k)
+
+                if self.data.high[0] >= take_profit or self.data.high[0] >= self.bb.top[0]:
+                    self._exit()
+                else:
+                    if self.data.high[0] >= half_profit:
+                        self.protection_active = True
+
+                    if self.protection_active and self.data.close[0] < self.ema20[0]:
+                        self._exit()
+                    elif (self.data.close[0] < self.ema20[0] - self.atr[0] or
+                          self.cross[0] < 0):
+                        self._exit()
+                    elif bars_held >= 20:
+                        self._exit()
+
+            return
+
+        if self.p.strategy == "csp":
+            k = self._k()
+            limit_price = self.data.close[0] * (1.0 - k)
+
+            if (self.data.close[0] < self.bb.bot[0] and
+                    self.rsi[0] < 35 and liquid):
+                size = self._size(0.20, limit_price)
+                if size > 0:
+                    self.pending_k = k
+                    self.order = self.buy(size=size, exectype=bt.Order.Limit,
+                                          price=limit_price)
+                    self.order_kind = "csp_entry"
+
+        elif self.p.strategy == "cc":
+            if self.cross[0] > 0 and self.data.close[0] > self.ema20[0] and liquid:
+                size = self._size(1.00, self.data.close[0])
+                if size > 0:
+                    self.pending_k = self._k()
+                    self.order = self.buy(size=size)
+                    self.order_kind = "cc_entry"
+```
+
+```json
+{"assumptions":[{"topic":"strategy selection","choice":"The class parameter strategy selects \"csp\" or \"cc\"; the harness runs each separately.","reason":"One module-level strategy class is required while the specification defines two strategies."},{"topic":"position sizing","choice":"Whole-share size uses available cash, reserving stated commission, at 20% for CSP and 100% for CC.","reason":"The specification states capital percentages but not share rounding or commission treatment."},{"topic":"k","choice":"k is calculated when an entry order is submitted and retained for that trade's premium/target calculations.","reason":"Exit rules reference k times Entry, consistent with an entry-time pseudo strike/premium."},{"topic":"OHLC touch handling","choice":"Band and profit targets use High; CSP stop uses Low; close-based rules use Close. If CSP stop and profit both occur in one bar, the stop is prioritized.","reason":"Intrabar event ordering is unavailable in daily OHLC data."},{"topic":"timeout","choice":"A timeout is submitted when 20 completed bars have elapsed since the entry fill bar.","reason":"This is the literal bar-count interpretation of forced close 20 bars after entry."},{"topic":"market exits","choice":"All exit conditions submit a market close order when observed, which Backtrader executes on the following bar under standard order timing.","reason":"The specification requires market closes but does not enable same-bar execution."}]}
+```

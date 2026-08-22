@@ -1,0 +1,159 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionBollingerStrategy(bt.Strategy):
+    params = (
+        ("timeout_bars", 20),
+    )
+
+    def __init__(self):
+        self.bb2 = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2.0)
+        self.bb3 = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=3.0)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.stoch = bt.indicators.StochasticFast(self.data, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.ema5 = bt.indicators.EMA(self.data.close, period=5)
+        self.ema10 = bt.indicators.EMA(self.data.close, period=10)
+        self.ema_cross = bt.indicators.CrossOver(self.ema5, self.ema10)
+        self.volume_sma20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.volume_sma50 = bt.indicators.SMA(self.data.volume, period=50)
+
+        self.order = None
+        self.stop_order = None
+        self.pending_stop_band = None
+        self.pending_stop_atr = None
+        self.entry_bar = None
+        self.deteriorated = False
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal:
+            return
+
+        if order is self.stop_order:
+            self.stop_order = None
+            return
+
+        if order is not self.order:
+            return
+
+        self.order = None
+
+        if order.status != order.Completed:
+            return
+
+        if self.position.size:
+            entry_price = order.executed.price
+            stop_distance = max(
+                abs(entry_price - self.pending_stop_band),
+                self.pending_stop_atr * 1.5,
+            )
+
+            if self.position.size > 0:
+                stop_price = entry_price - stop_distance
+                self.stop_order = self.sell(
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                    size=abs(self.position.size),
+                )
+            else:
+                stop_price = entry_price + stop_distance
+                self.stop_order = self.buy(
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                    size=abs(self.position.size),
+                )
+
+            self.entry_bar = len(self)
+            self.deteriorated = False
+        elif self.stop_order is not None:
+            self.cancel(self.stop_order)
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        if self.position.size:
+            if self.position.size > 0:
+                reached_middle = self.data.high[0] >= self.bb2.mid[0]
+                worsening_now = self.ema_cross[0] < 0 or self.rsi[0] >= 50
+            else:
+                reached_middle = self.data.low[0] <= self.bb2.mid[0]
+                worsening_now = self.ema_cross[0] > 0 or self.rsi[0] <= 50
+
+            if reached_middle:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+                return
+
+            if worsening_now:
+                self.deteriorated = True
+
+            if (
+                self.deteriorated
+                and self.entry_bar is not None
+                and len(self) - self.entry_bar >= self.p.timeout_bars
+            ):
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+            return
+
+        band_width = (self.bb2.top[0] - self.bb2.bot[0]) / self.bb2.mid[0]
+        noise_bar = (self.data.high[0] - self.data.low[0]) > 3.0 * self.atr[0]
+        filters_pass = (
+            0.03 <= band_width <= 0.20
+            and self.volume_sma20[0] > self.volume_sma50[0]
+            and not noise_bar
+        )
+
+        if not filters_pass:
+            return
+
+        deviation_sigma = abs(self.data.close[0] - self.bb2.mid[0]) / (
+            (self.bb2.top[0] - self.bb2.mid[0]) / 2.0
+        )
+        multiplier = min(1.5, max(0.5, deviation_sigma - 1.5))
+
+        if (
+            self.data.close[0] < self.bb2.bot[0]
+            and self.rsi[0] < 35
+            and self.stoch.percK[0] < 20
+        ):
+            stop_distance = max(
+                abs(self.data.close[0] - self.bb3.bot[0]),
+                self.atr[0] * 1.5,
+            )
+            size = (self.broker.getvalue() * 0.02 / stop_distance) * multiplier
+            if size > 0:
+                self.pending_stop_band = self.bb3.bot[0]
+                self.pending_stop_atr = self.atr[0]
+                self.order = self.buy(size=size)
+
+        elif (
+            self.data.close[0] > self.bb2.top[0]
+            and self.rsi[0] > 65
+            and self.stoch.percK[0] > 80
+        ):
+            stop_distance = max(
+                abs(self.bb3.top[0] - self.data.close[0]),
+                self.atr[0] * 1.5,
+            )
+            size = (self.broker.getvalue() * 0.02 / stop_distance) * multiplier
+            if size > 0:
+                self.pending_stop_band = self.bb3.top[0]
+                self.pending_stop_atr = self.atr[0]
+                self.order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"Stochastic %K period","choice":"Used StochasticFast with period=14.","reason":"The specification names Stochastic %K but does not state its lookback; 14 is the conventional default."},{"topic":"Capital for risk sizing","choice":"Used current broker portfolio value.","reason":"The specification says capital without defining cash versus equity; portfolio value is the conventional trading definition."},{"topic":"Deviation-strength multiplier","choice":"Computed clip(abs(close-SMA)/sigma - 1.5, 0.5, 1.5).","reason":"This directly interprets deviation beyond 1.5σ, clipped to the stated 0.5–1.5 range."},{"topic":"Reasonable time","choice":"Used 20 bars after entry.","reason":"The specification does not quantify reasonable time; 20 bars matches the stated Bollinger/SMA fair-price window."},{"topic":"Stop implementation","choice":"Calculated the BB(20,3σ) and ATR(14) stop distance at signal time, then placed a protective stop after the entry fills using the greater distance.","reason":"Entry execution price is unknown at signal time, while sizing requires a stop distance before submitting the entry."},{"topic":"Middle-band touching","choice":"For longs, High >= SMA(20); for shorts, Low <= SMA(20).","reason":"High/Low are the available intrabar evidence that price touched or crossed the middle band."}]}
+```

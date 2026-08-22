@@ -1,67 +1,194 @@
 {
   "task_id": 306,
   "ref_idx": 1,
-  "model": "opus",
-  "code": "import backtrader as bt\nimport math\nimport numpy as np\nfrom hmmlearn.hmm import GaussianHMM\n\n\nclass MacdHmmAtrStrategy(bt.Strategy):\n    # Intraday AAPL 5m strategy: MACD(12,26,9) cross confirmed by a 2-state\n    # Gaussian HMM regime transition, with an ATR(14)-based stop of width\n    # ATR * k, k = base_k * (slow/fast) = 1.0 * (26/12).\n    params = dict(\n        macd_fast=12,\n        macd_slow=26,\n        macd_signal=9,\n        atr_period=14,\n        base_k=1.0,\n        hmm_states=2,\n        train_window=390,      # rolling window of last 390 log returns\n        hmm_n_iter=100,\n        hmm_random_state=42,\n        stake=1,               # fixed 1-share sizing\n    )\n\n    def __init__(self):\n        self.macd = bt.indicators.MACD(\n            self.data,\n            period_me1=self.p.macd_fast,\n            period_me2=self.p.macd_slow,\n            period_signal=self.p.macd_signal,\n        )\n        # +1 when MACD crosses above signal, -1 when it crosses below\n        self.mcross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        # k = base_k * (slow_period / fast_period)\n        self.k = self.p.base_k * (self.p.macd_slow / self.p.macd_fast)\n\n        # HMM / regime state\n        self.returns = []          # close-to-close log returns\n        self.last_date = None      # for session-open (daily) detection\n        self.model = None\n        self.bull_state = None\n        self.bear_state = None\n        self.prev_label = None     # previous bar's semantic label ('bull'/'bear')\n\n        # order tracking\n        self.entry_order = None    # pending market entry / exit order\n        self.stop_order = None     # currently live ATR stop order\n\n    # ---- HMM helpers -----------------------------------------------------\n    def _fit_hmm(self):\n        # Train on the last `train_window` returns STRICTLY before the current\n        # bar (past data only -> no lookahead).\n        w = self.p.train_window\n        train = np.asarray(self.returns[-(w + 1):-1], dtype=float).reshape(-1, 1)\n        try:\n            model = GaussianHMM(\n                n_components=self.p.hmm_states,\n                covariance_type='diag',\n                n_iter=self.p.hmm_n_iter,\n                random_state=self.p.hmm_random_state,\n            )\n            model.fit(train)\n            means = model.means_.flatten()\n            self.model = model\n            # bull = state with the higher mean return, bear = the lower\n            self.bull_state = int(np.argmax(means))\n            self.bear_state = int(np.argmin(means))\n        except Exception:\n            # keep the previously fitted model on failure\n            pass\n\n    def _infer_label(self):\n        if self.model is None:\n            return None\n        w = self.p.train_window\n        if len(self.returns) < w:\n            return None\n        # Viterbi decode over the last `w` returns (incl. current); current\n        # hidden state is the last decoded state.\n        seq = np.asarray(self.returns[-w:], dtype=float).reshape(-1, 1)\n        try:\n            states = self.model.predict(seq)\n        except Exception:\n            return None\n        return 'bull' if int(states[-1]) == self.bull_state else 'bear'\n\n    # ---- stop management -------------------------------------------------\n    def _refresh_stop(self):\n        dist = self.atr[0] * self.k\n        price = self.data.close[0]\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n            self.stop_order = None\n        if self.position.size > 0:\n            self.stop_order = self.sell(\n                size=self.position.size,\n                exectype=bt.Order.Stop,\n                price=price - dist,\n            )\n        elif self.position.size < 0:\n            self.stop_order = self.buy(\n                size=abs(self.position.size),\n                exectype=bt.Order.Stop,\n                price=price + dist,\n            )\n\n    # ---- shared per-bar core --------------------------------------------\n    def _core(self, trading):\n        # 1) accumulate close-to-close log returns (also during warm-up)\n        if len(self) > 1 and self.data.close[-1] > 0:\n            self.returns.append(math.log(self.data.close[0] / self.data.close[-1]))\n\n        # 2) refit HMM once per day, at the session open, on past data only\n        cur_date = self.data.datetime.date(0)\n        new_session = (self.last_date is None) or (cur_date != self.last_date)\n        self.last_date = cur_date\n        if new_session and len(self.returns) >= self.p.train_window + 1:\n            self._fit_hmm()\n\n        # 3) infer current regime label and detect a transition on this bar\n        label = self._infer_label()\n        trans_bull = (label == 'bull') and (self.prev_label is not None) and (self.prev_label != 'bull')\n        trans_bear = (label == 'bear') and (self.prev_label is not None) and (self.prev_label != 'bear')\n        if label is not None:\n            self.prev_label = label\n\n        if not trading:\n            return\n\n        # MACD crossover on this bar\n        cross_up = self.mcross[0] > 0\n        cross_down = self.mcross[0] < 0\n\n        bull_confirm = cross_up and trans_bull      # long entry / short exit\n        bear_confirm = cross_down and trans_bear    # short entry / long exit\n\n        # guard: wait for any pending entry/exit market order to resolve\n        if self.entry_order is not None:\n            return\n\n        # 4) risk management: refresh the ATR stop each bar while in position\n        if self.position:\n            self._refresh_stop()\n\n        if self.position.size > 0:              # long open\n            if bear_confirm:                    # opposite confirmation -> exit\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.entry_order = self.close()\n        elif self.position.size < 0:            # short open\n            if bull_confirm:                    # opposite confirmation -> exit\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.entry_order = self.close()\n        else:                                   # flat\n            if bull_confirm:\n                self.entry_order = self.buy(size=self.p.stake)\n            elif bear_confirm:\n                self.entry_order = self.sell(size=self.p.stake)\n\n    def prenext(self):\n        # accumulate returns / regime state during indicator warm-up (no trading)\n        self._core(trading=False)\n\n    def next(self):\n        self._core(trading=True)\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status == order.Completed:\n            if order is self.entry_order:\n                self.entry_order = None\n            if order is self.stop_order:\n                self.stop_order = None\n            return\n        if order.status in (order.Canceled, order.Margin, order.Rejected):\n            if order is self.entry_order:\n                self.entry_order = None\n            if order is self.stop_order:\n                self.stop_order = None\n            return",
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\n\n\nclass HMMMACDATRStrategy(bt.Strategy):\n    params = (\n        (\"fast_period\", 12),\n        (\"slow_period\", 26),\n        (\"signal_period\", 9),\n        (\"atr_period\", 14),\n        (\"hmm_window\", 390),\n        (\"base_k\", 1.0),\n        (\"hmm_iterations\", 20),\n    )\n\n    def __init__(self):\n        self.macd = bt.indicators.MACD(\n            self.data.close,\n            period_me1=self.p.fast_period,\n            period_me2=self.p.slow_period,\n            period_signal=self.p.signal_period,\n        )\n        self.macd_cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        self.order = None\n        self.stop_order = None\n        self.last_session_date = None\n        self.hmm = None\n        self.previous_state = None\n\n    def _fit_hmm(self, observations):\n        n = len(observations)\n        overall_mean = sum(observations) / n\n        overall_var = sum((x - overall_mean) ** 2 for x in observations) / n\n        overall_var = max(overall_var, 1e-12)\n\n        ordered = sorted(observations)\n        means = [ordered[n // 4], ordered[(3 * n) // 4]]\n        variances = [overall_var, overall_var]\n        startprob = [0.5, 0.5]\n        transmat = [[0.95, 0.05], [0.05, 0.95]]\n\n        for _ in range(self.p.hmm_iterations):\n            emissions = []\n            for x in observations:\n                row = []\n                for state in range(2):\n                    variance = max(variances[state], 1e-12)\n                    density = math.exp(\n                        -((x - means[state]) ** 2) / (2.0 * variance)\n                    ) / math.sqrt(2.0 * math.pi * variance)\n                    row.append(max(density, 1e-300))\n                emissions.append(row)\n\n            alpha = [[0.0, 0.0] for _ in range(n)]\n            scales = [0.0] * n\n            for state in range(2):\n                alpha[0][state] = startprob[state] * emissions[0][state]\n            scales[0] = max(sum(alpha[0]), 1e-300)\n            alpha[0] = [value / scales[0] for value in alpha[0]]\n\n            for t in range(1, n):\n                for state in range(2):\n                    alpha[t][state] = emissions[t][state] * sum(\n                        alpha[t - 1][previous] * transmat[previous][state]\n                        for previous in range(2)\n                    )\n                scales[t] = max(sum(alpha[t]), 1e-300)\n                alpha[t] = [value / scales[t] for value in alpha[t]]\n\n            beta = [[1.0, 1.0] for _ in range(n)]\n            for t in range(n - 2, -1, -1):\n                for state in range(2):\n                    beta[t][state] = sum(\n                        transmat[state][next_state]\n                        * emissions[t + 1][next_state]\n                        * beta[t + 1][next_state]\n                        for next_state in range(2)\n                    ) / scales[t + 1]\n\n            gamma = [[0.0, 0.0] for _ in range(n)]\n            for t in range(n):\n                total = sum(alpha[t][state] * beta[t][state] for state in range(2))\n                total = max(total, 1e-300)\n                for state in range(2):\n                    gamma[t][state] = alpha[t][state] * beta[t][state] / total\n\n            startprob = list(gamma[0])\n\n            for state in range(2):\n                denominator = sum(gamma[t][state] for t in range(n - 1))\n                denominator = max(denominator, 1e-300)\n                for next_state in range(2):\n                    numerator = 0.0\n                    for t in range(n - 1):\n                        numerator += (\n                            alpha[t][state]\n                            * transmat[state][next_state]\n                            * emissions[t + 1][next_state]\n                            * beta[t + 1][next_state]\n                            / scales[t + 1]\n                        )\n                    transmat[state][next_state] = numerator / denominator\n\n            for state in range(2):\n                weight = max(sum(gamma[t][state] for t in range(n)), 1e-300)\n                means[state] = sum(\n                    gamma[t][state] * observations[t] for t in range(n)\n                ) / weight\n                variances[state] = max(\n                    sum(\n                        gamma[t][state] * (observations[t] - means[state]) ** 2\n                        for t in range(n)\n                    ) / weight,\n                    1e-12,\n                )\n\n        # State 1 is bull (higher mean); state 0 is bear (lower mean).\n        if means[0] > means[1]:\n            startprob.reverse()\n            means.reverse()\n            variances.reverse()\n            transmat = [\n                [transmat[1][1], transmat[1][0]],\n                [transmat[0][1], transmat[0][0]],\n            ]\n\n        return startprob, transmat, means, variances\n\n    def _infer_state(self, observations):\n        startprob, transmat, means, variances = self.hmm\n        scores = [\n            math.log(max(startprob[state], 1e-300))\n            + self._log_density(observations[0], means[state], variances[state])\n            for state in range(2)\n        ]\n\n        for value in observations[1:]:\n            next_scores = [0.0, 0.0]\n            for state in range(2):\n                next_scores[state] = self._log_density(\n                    value, means[state], variances[state]\n                ) + max(\n                    scores[previous] + math.log(max(transmat[previous][state], 1e-300))\n                    for previous in range(2)\n                )\n            scores = next_scores\n\n        return 1 if scores[1] > scores[0] else 0\n\n    def _log_density(self, value, mean, variance):\n        variance = max(variance, 1e-12)\n        return (\n            -0.5 * math.log(2.0 * math.pi * variance)\n            - ((value - mean) ** 2) / (2.0 * variance)\n        )\n\n    def _cancel_stop(self):\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n            self.stop_order = None\n\n    def next(self):\n        current_date = self.data.datetime.date(0)\n\n        if current_date != self.last_session_date:\n            self.last_session_date = current_date\n\n            if len(self.data) >= self.p.hmm_window + 2:\n                past_closes = [\n                    self.data.close[-offset]\n                    for offset in range(self.p.hmm_window + 1, 0, -1)\n                ]\n                past_returns = [\n                    math.log(past_closes[i] / past_closes[i - 1])\n                    for i in range(1, len(past_closes))\n                ]\n                self.hmm = self._fit_hmm(past_returns)\n\n        if self.hmm is None or len(self.data) < 2:\n            return\n\n        available_returns = min(self.p.hmm_window, len(self.data) - 1)\n        closes = [\n            self.data.close[-offset]\n            for offset in range(available_returns, -1, -1)\n        ]\n        returns = [\n            math.log(closes[i] / closes[i - 1])\n            for i in range(1, len(closes))\n        ]\n        current_state = self._infer_state(returns)\n\n        transitioned_to_bull = (\n            self.previous_state is not None\n            and self.previous_state != 1\n            and current_state == 1\n        )\n        transitioned_to_bear = (\n            self.previous_state is not None\n            and self.previous_state != 0\n            and current_state == 0\n        )\n\n        cross_up = self.macd_cross[0] > 0\n        cross_down = self.macd_cross[0] < 0\n        opposite_long_confirmation = cross_down and transitioned_to_bear\n        opposite_short_confirmation = cross_up and transitioned_to_bull\n\n        if self.position.size > 0 and opposite_long_confirmation and self.order is None:\n            self._cancel_stop()\n            self.order = self.close()\n        elif self.position.size < 0 and opposite_short_confirmation and self.order is None:\n            self._cancel_stop()\n            self.order = self.close()\n        elif self.position.size == 0 and self.order is None:\n            if cross_up and transitioned_to_bull:\n                self.order = self.buy(size=1)\n            elif cross_down and transitioned_to_bear:\n                self.order = self.sell(size=1)\n\n        if self.position.size != 0 and self.order is None:\n            self._cancel_stop()\n            distance = self.atr[0] * (\n                self.p.base_k * (self.p.slow_period / self.p.fast_period)\n            )\n\n            if self.position.size > 0:\n                self.stop_order = self.sell(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Stop,\n                    price=self.data.close[0] - distance,\n                )\n            else:\n                self.stop_order = self.buy(\n                    size=abs(self.position.size),\n                    exectype=bt.Order.Stop,\n                    price=self.data.close[0] + distance,\n                )\n\n        self.previous_state = current_state\n\n    def notify_order(self, order):\n        if order == self.stop_order:\n            if order.status in [\n                order.Completed,\n                order.Canceled,\n                order.Margin,\n                order.Rejected,\n            ]:\n                self.stop_order = None\n\n        if order == self.order:\n            if order.status in [\n                order.Completed,\n                order.Canceled,\n                order.Margin,\n                order.Rejected,\n            ]:\n                self.order = None",
   "assumptions": [
     {
-      "topic": "dependencies",
-      "choice": "Import numpy and hmmlearn (GaussianHMM) even though they are outside the harness's stated import allowlist (backtrader/math/collections/statistics).",
-      "reason": "The spec explicitly mandates regime detection via a hmmlearn 2-state Gaussian HMM; substituting a hand-rolled HMM would violate fidelity, so the required libraries are imported."
+      "topic": "infeasible",
+      "choice": "Implemented a manual two-state Gaussian HMM with standard Baum-Welch fitting and Viterbi state inference.",
+      "reason": "The required hmmlearn import is incompatible with the explicitly permitted import list, which limits imports to backtrader, math, collections, and statistics."
     },
     {
-      "topic": "hmm_hyperparameters",
-      "choice": "GaussianHMM(n_components=2, covariance_type='diag', n_iter=100, random_state=42).",
-      "reason": "Spec fixes only the 2 Gaussian states; covariance type / iterations / seed are unstated. Chosen for convergence and deterministic, reproducible fits (needed for trace comparison)."
+      "topic": "HMM refit timing",
+      "choice": "A session open is interpreted as the first supplied 5-minute bar of each calendar trading date; fitting uses closes through the immediately preceding bar.",
+      "reason": "The feed provides intraday OHLCV bars but no separate session-open event."
     },
     {
-      "topic": "state_labeling",
-      "choice": "Label the fitted state with the higher mean return 'bull' (argmax of means_) and the lower 'bear'.",
-      "reason": "Directly implements 'Define state 1 as bull and state 0 as bear by comparing each state's mean return'; index assignment follows the mean comparison rather than fixed 0/1."
+      "topic": "HMM inference",
+      "choice": "The current state is the final Viterbi state inferred from the most recent available close-to-close returns, capped at 390 observations.",
+      "reason": "The specification requires current hidden-state inference but does not prescribe a decoding method."
     },
     {
-      "topic": "state_inference",
-      "choice": "Each bar, Viterbi-decode (model.predict) the last 390 returns (including the current bar) and take the final decoded state as the current hidden state.",
-      "reason": "Spec says 'infer the current hidden state' per bar but not the decoding method; Viterbi over the rolling window is the standard hmmlearn inference and matches the 390-bar window."
+      "topic": "position sizing",
+      "choice": "Each entry uses exactly 1 share.",
+      "reason": "The specification permits fixed sizing and does not require a specific share count."
     },
     {
-      "topic": "transition_definition",
-      "choice": "'Transitions into bull/bear' means the semantic regime label changed from the previous bar to the current bar; comparison uses labels (bull/bear), not raw state indices.",
-      "reason": "Spec ties entries to a same-bar state transition; using labels keeps transitions meaningful across daily refits where raw state indices may swap."
-    },
-    {
-      "topic": "training_window",
-      "choice": "At each session's first bar, refit on the 390 log returns strictly preceding that bar (current bar excluded); inference window is the last 390 returns including the current bar.",
-      "reason": "Honors 'refit once per day at the session open using only past data (no lookahead)' by excluding the current session-open bar from training while still inferring the current state."
-    },
-    {
-      "topic": "return_warmup",
-      "choice": "Accumulate close-to-close log returns in prenext() as well as next().",
-      "reason": "Spec asks for the last 390 returns since data start; without prenext accumulation the window would omit all bars consumed by indicator warm-up."
-    },
-    {
-      "topic": "position_sizing",
-      "choice": "Fixed size of 1 share per entry.",
-      "reason": "Spec offers 'position size fixed (e.g., 1 share) or percent-of-equity sizing'; the fixed 1-share option is selected."
-    },
-    {
-      "topic": "stop_reference",
-      "choice": "Measure the ATR stop from the current bar's close each bar (long: close - ATR*k; short: close + ATR*k), and re-issue it via cancel-and-replace every bar while in position.",
-      "reason": "Spec gives the stop distance (ATR*k) and says 'updated each bar' but not the reference price; the current close is used so the distance trails price as ATR changes."
-    },
-    {
-      "topic": "one_position",
-      "choice": "An opposite confirmation only closes the open position (no same-bar reversal); a new position in the opposite direction requires a fresh confirmation while flat.",
-      "reason": "Canonical single-position default (hold at most one position, no re-entry while open); the spec's separate entry/exit clauses are honored while both directions remain reachable over time."
-    },
-    {
-      "topic": "refit_failure",
-      "choice": "If a hmmlearn fit or predict raises, retain the previously fitted model (and skip inference for that bar) rather than trading with no model.",
-      "reason": "Spec is silent on numerical failures; keeping the last valid model avoids spurious signals from a degenerate refit."
+      "topic": "stop update price",
+      "choice": "Each bar, the active stop is cancelled and replaced using that bar's close plus or minus ATR(14) times 26/12.",
+      "reason": "The specification requires stop orders updated each bar but does not state which intrabar reference price determines the recalculated stop."
     }
   ],
-  "success": false,
-  "error": "Traceback (most recent call last):\n  File \"<string>\", line 5, in <module>\nModuleNotFoundError: No module named 'hmmlearn'",
-  "total_trades": 0,
-  "tape": []
+  "success": true,
+  "error": null,
+  "total_trades": 13,
+  "tape": [
+    {
+      "dt": "2026-04-29T13:35:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 268.1199951171875
+    },
+    {
+      "dt": "2026-04-29T16:20:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 269.68435542344116
+    },
+    {
+      "dt": "2026-04-30T14:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 270.6000061035156
+    },
+    {
+      "dt": "2026-04-30T16:55:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 272.0799865722656
+    },
+    {
+      "dt": "2026-05-05T13:35:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 279.1700134277344
+    },
+    {
+      "dt": "2026-05-06T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 281.9150085449219
+    },
+    {
+      "dt": "2026-05-07T13:35:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 289.0
+    },
+    {
+      "dt": "2026-05-08T19:55:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 293.2728301966182
+    },
+    {
+      "dt": "2026-05-15T14:15:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 299.0751037597656
+    },
+    {
+      "dt": "2026-05-18T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 299.25419794518416
+    },
+    {
+      "dt": "2026-05-18T15:15:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 296.6600036621094
+    },
+    {
+      "dt": "2026-05-18T19:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 296.95114478560794
+    },
+    {
+      "dt": "2026-05-18T19:05:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 297.04998779296875
+    },
+    {
+      "dt": "2026-05-19T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 296.7334944490305
+    },
+    {
+      "dt": "2026-05-27T13:35:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 310.625
+    },
+    {
+      "dt": "2026-05-28T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 310.05508391021635
+    },
+    {
+      "dt": "2026-06-03T13:35:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 316.1400146484375
+    },
+    {
+      "dt": "2026-06-03T19:50:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 310.12735664172817
+    },
+    {
+      "dt": "2026-06-16T13:40:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 294.625
+    },
+    {
+      "dt": "2026-06-16T13:50:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 297.3038088854055
+    },
+    {
+      "dt": "2026-06-22T14:35:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 300.4599914550781
+    },
+    {
+      "dt": "2026-06-22T16:15:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 300.7900085449219
+    },
+    {
+      "dt": "2026-06-22T19:35:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 297.67498779296875
+    },
+    {
+      "dt": "2026-06-23T13:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 297.90207994386066
+    },
+    {
+      "dt": "2026-06-26T19:25:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 280.5
+    },
+    {
+      "dt": "2026-06-26T19:50:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 283.35264471580484
+    }
+  ]
 }

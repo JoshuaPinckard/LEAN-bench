@@ -1,0 +1,144 @@
+```python
+import backtrader as bt
+from collections import deque
+
+
+class CheapVolatilityStrategy(bt.Strategy):
+    params = ()
+
+    def __init__(self):
+        self.order = None
+
+        self.bb20 = bt.indicators.BollingerBands(self.data.close, period=20)
+        self.bb100 = bt.indicators.BollingerBands(self.data.close, period=100)
+        self.bb20_width = self.bb20.top - self.bb20.bot
+        self.bb100_width = self.bb100.top - self.bb100.bot
+
+        self.ema20 = bt.indicators.EMA(self.data.close, period=20)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.rsi14 = bt.indicators.RSI(self.data.close, period=14)
+        self.macd = bt.indicators.MACD(self.data.close)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+
+        self.volume_sma20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.volume_sma100 = bt.indicators.SMA(self.data.volume, period=100)
+
+        self.min_bb_width21 = bt.indicators.Lowest(self.bb20_width, period=21)
+        self.reverse_down = bt.indicators.CrossDown(self.ema20, self.sma50)
+        self.reverse_up = bt.indicators.CrossUp(self.ema20, self.sma50)
+
+        self.ratio_history = deque(maxlen=252)
+        self.entry_atr = None
+        self.stop_price = None
+        self.target_price = None
+        self.high_watermark = None
+        self.low_watermark = None
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed, order.Canceled, order.Margin, order.Rejected
+        ]:
+            if order.status == order.Completed and order.info.get("role") == "entry":
+                self.entry_atr = self.atr14[0]
+
+                if order.isbuy():
+                    self.stop_price = order.executed.price - 1.5 * self.entry_atr
+                    self.target_price = order.executed.price + 3.0 * self.entry_atr
+                    self.high_watermark = order.executed.price
+                    self.low_watermark = None
+                else:
+                    self.stop_price = order.executed.price + 1.5 * self.entry_atr
+                    self.target_price = order.executed.price - 3.0 * self.entry_atr
+                    self.low_watermark = order.executed.price
+                    self.high_watermark = None
+
+            if order.info.get("role") == "exit":
+                self.entry_atr = None
+                self.stop_price = None
+                self.target_price = None
+                self.high_watermark = None
+                self.low_watermark = None
+
+            self.order = None
+
+    def next(self):
+        if self.bb100_width[0] != 0:
+            ratio = self.bb20_width[0] / self.bb100_width[0]
+            self.ratio_history.append(ratio)
+        else:
+            ratio = None
+
+        if self.order:
+            return
+
+        if self.position:
+            close = self.data.close[0]
+
+            if self.position.size > 0:
+                self.high_watermark = max(self.high_watermark, self.data.high[0])
+                trailing_stop = self.high_watermark - self.atr14[0]
+
+                if (
+                    close <= self.stop_price
+                    or close >= self.target_price
+                    or close <= trailing_stop
+                    or self.reverse_down[0] != 0
+                ):
+                    self.order = self.close()
+                    self.order.addinfo(role="exit")
+            else:
+                self.low_watermark = min(self.low_watermark, self.data.low[0])
+                trailing_stop = self.low_watermark + self.atr14[0]
+
+                if (
+                    close >= self.stop_price
+                    or close <= self.target_price
+                    or close >= trailing_stop
+                    or self.reverse_up[0] != 0
+                ):
+                    self.order = self.close()
+                    self.order.addinfo(role="exit")
+            return
+
+        if len(self.ratio_history) < 252 or ratio is None:
+            return
+
+        cheap_vol = (
+            sum(value <= ratio for value in self.ratio_history)
+            / len(self.ratio_history)
+            <= 0.20
+        )
+        liquid = self.volume_sma20[0] > self.volume_sma100[0]
+
+        bullish = (
+            self.ema20[0] > self.sma50[0]
+            and self.rsi14[0] > 55
+            and self.macd.macd[0] > 0
+        )
+        bearish = (
+            self.ema20[0] < self.sma50[0]
+            and self.rsi14[0] < 45
+            and self.macd.macd[0] < 0
+        )
+
+        earnings_setup = (
+            self.bb20_width[0] <= self.min_bb_width21[0]
+            and self.data.volume[0] > 1.5 * self.volume_sma20[0]
+        )
+        earnings_long = earnings_setup and self.data.close[0] > self.bb20.top[0]
+        earnings_short = earnings_setup and self.data.close[0] < self.bb20.bot[0]
+
+        if not liquid:
+            return
+
+        if earnings_long or (not earnings_short and cheap_vol and bullish):
+            self.order = self.buy()
+            self.order.addinfo(role="entry")
+        elif earnings_short or (not earnings_long and cheap_vol and bearish):
+            self.order = self.sell()
+            self.order.addinfo(role="entry")
+```
+
+```json
+{"assumptions":[{"topic":"Bollinger Bands","choice":"Used Backtrader BollingerBands with period 20 and 100 and its standard devfactor of 2.0; width is upper band minus lower band.","reason":"The specification gives periods but does not state the deviation multiplier or width formula."},{"topic":"MACD parameters","choice":"Used Backtrader MACD defaults: fast 12, slow 26, signal 9.","reason":"The specification requires MACD direction but gives no parameters."},{"topic":"lowest 20%","choice":"Classified cheap volatility when the current ratio's inclusive empirical rank among the latest 252 valid ratios is at most 20%.","reason":"The specification does not prescribe a percentile interpolation or tie convention."},{"topic":"trailing stop","choice":"Enabled the optional 1*ATR(14) trailing stop, using the highest high since long entry or lowest low since short entry and the current ATR(14).","reason":"The trailing stop is explicitly optional but no selection was supplied."},{"topic":"exit evaluation","choice":"Evaluated stop, target, and trailing-stop thresholds using each bar's close; resulting close orders follow Backtrader's normal execution behavior.","reason":"The specification does not define intrabar fill priority or order type."},{"topic":"signal conflict","choice":"When simultaneous long and short entry signals conflict, earnings-analog breakout signals take precedence over cheap-volatility directional signals.","reason":"Only one position may be held and the specification does not define conflict priority."}]}
+```

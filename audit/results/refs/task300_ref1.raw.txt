@@ -1,0 +1,151 @@
+```python
+import backtrader as bt
+
+
+class ScalpingStrategy(bt.Strategy):
+    params = (
+        ('symbol', 'SNAP'),
+        ('atr_threshold', 0.03),
+        ('liquidity_threshold', 1000),
+        ('position_size', 100),
+        ('enforce_pdt_rule', False),
+    )
+
+    def __init__(self):
+        self.stochastic = bt.indicators.Stochastic(
+            self.data,
+            period=5,
+            period_dfast=3,
+            period_dslow=3,
+        )
+        self.cross = bt.indicators.CrossOver(
+            self.stochastic.percK,
+            self.stochastic.percD,
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=3)
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=20)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.take_profit_order = None
+        self.stop_loss_order = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in (
+            bt.Order.Completed,
+            bt.Order.Canceled,
+            bt.Order.Margin,
+            bt.Order.Rejected,
+        ):
+            if order == self.order:
+                self.order = None
+
+            if order == self.take_profit_order:
+                self.take_profit_order = None
+
+            if order == self.stop_loss_order:
+                self.stop_loss_order = None
+
+        if order.status == bt.Order.Completed and order.isbuy() and self.position.size > 0:
+            if self.entry_bar is None:
+                self.entry_bar = len(self)
+                self._place_protective_orders(order.executed.price, True)
+
+        if order.status == bt.Order.Completed and order.issell() and self.position.size < 0:
+            if self.entry_bar is None:
+                self.entry_bar = len(self)
+                self._place_protective_orders(order.executed.price, False)
+
+        if not self.position:
+            self.entry_bar = None
+
+    def _place_protective_orders(self, entry_price, is_long):
+        if is_long:
+            self.take_profit_order = self.sell(
+                exectype=bt.Order.Limit,
+                price=entry_price + 0.01,
+            )
+            self.stop_loss_order = self.sell(
+                exectype=bt.Order.Stop,
+                price=entry_price - 0.02,
+                oco=self.take_profit_order,
+            )
+        else:
+            self.take_profit_order = self.buy(
+                exectype=bt.Order.Limit,
+                price=entry_price - 0.01,
+            )
+            self.stop_loss_order = self.buy(
+                exectype=bt.Order.Stop,
+                price=entry_price + 0.02,
+                oco=self.take_profit_order,
+            )
+
+    def _cancel_protective_orders(self):
+        if self.take_profit_order is not None:
+            self.cancel(self.take_profit_order)
+        if self.stop_loss_order is not None:
+            self.cancel(self.stop_loss_order)
+
+    def _main_session_after_opening_skip(self):
+        current = self.data.datetime.datetime(0)
+        minute_of_day = current.hour * 60 + current.minute
+        return 9 * 60 + 33 <= minute_of_day < 16 * 60
+
+    def next(self):
+        if self.position:
+            if self.order is not None:
+                return
+
+            if self.position.size > 0:
+                reversal = self.cross[0] < 0 or self.stochastic.percK[0] < 50
+            else:
+                reversal = self.cross[0] > 0 or self.stochastic.percK[0] > 50
+
+            timed_out = (
+                self.entry_bar is not None
+                and len(self) - self.entry_bar >= 3
+            )
+
+            if reversal or timed_out:
+                self._cancel_protective_orders()
+                self.order = self.close()
+            return
+
+        if self.order is not None:
+            return
+
+        if not self._main_session_after_opening_skip():
+            return
+
+        if self.p.enforce_pdt_rule and self.broker.getvalue() <= 25000:
+            return
+
+        if (
+            self.data.volume[0] <= 1.2 * self.volume_sma[0]
+            or self.volume_sma[0] <= self.p.liquidity_threshold
+            or self.atr[0] < self.p.atr_threshold
+        ):
+            return
+
+        size = min(500, max(100, int(self.p.position_size)))
+
+        if (
+            self.cross[0] > 0
+            and self.stochastic.percK[0] > 80
+            and self.rsi[0] > 55
+        ):
+            self.order = self.buy(size=size)
+
+        elif (
+            self.cross[0] < 0
+            and self.stochastic.percK[0] < 20
+            and self.rsi[0] < 45
+        ):
+            self.order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"liquidity threshold default","choice":"liquidity_threshold defaults to 1000 shares.","reason":"The specification requires an adjustable SMA(volume,20) liquidity threshold but does not state its default value."},{"topic":"PDT rule","choice":"enforce_pdt_rule defaults to False; when enabled it requires broker account value to be greater than $25,000 before entries.","reason":"The specification describes the PDT balance condition as optional."},{"topic":"main session","choice":"Main session is interpreted as timestamps from 09:30 through 15:59 local feed time, with the first three minutes skipped so entries begin at 09:33.","reason":"The OHLCV feed supplies timestamps but no exchange-session metadata."},{"topic":"timeout","choice":"A timeout exit is submitted after three completed bars following the entry fill.","reason":"The specification does not define whether the fill bar itself counts as one of the three bars."},{"topic":"protective exits","choice":"Take-profit and stop-loss are submitted as OCO limit and stop orders after the entry fill, using the actual executed entry price.","reason":"This is the closest literal implementation of exits at stated price offsets in Backtrader."}]} 
+```

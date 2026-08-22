@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+import math
+
+
+class DividendPitchforkStrategist(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_devfactor', 2),
+        ('rsi_period', 14),
+        ('atr_period', 14),
+        ('sma_period', 50),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor,
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+
+        self.order = None
+        self.stop_order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.entry_bar = None
+        self.is_core = False
+        self.roll_pending = False
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.entry_atr = self.atr[0]
+                self.entry_bar = len(self)
+                self.is_core = False
+
+                stop_price = self.entry_price - (1.5 * self.entry_atr)
+                self.stop_order = self.sell(
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                    size=order.executed.size,
+                )
+            else:
+                if order == self.stop_order:
+                    self.stop_order = None
+
+                if not self.position:
+                    self.entry_price = None
+                    self.entry_atr = None
+                    self.entry_bar = None
+                    self.is_core = False
+
+                    if self.roll_pending:
+                        self.roll_pending = False
+                        self._enter_position()
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order == self.order:
+                self.order = None
+            if order.status != order.Completed and order == self.stop_order:
+                self.stop_order = None
+
+    def _position_within_half_capital(self):
+        position_value = self.position.size * self.data.close[0]
+        return position_value <= (0.5 * self.broker.getvalue())
+
+    def _enter_position(self):
+        capital = self.broker.getvalue()
+        cash = self.broker.getcash()
+        price = self.data.close[0]
+
+        max_position_value = 0.5 * capital
+        size = int(math.floor(max_position_value / (price * 1.001)))
+
+        if size <= 0:
+            return
+
+        estimated_cost = (size * price) * 1.001
+        if cash - estimated_cost < (0.5 * capital):
+            return
+
+        self.order = self.buy(size=size)
+
+    def _cancel_stop(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        close = self.data.close[0]
+
+        if not self.position:
+            if (
+                close <= self.bb.bot[0]
+                and 25 <= self.rsi[0] <= 45
+            ):
+                self._enter_position()
+            return
+
+        if self.is_core:
+            if close > self.sma50[0] or self.rsi[0] > 60:
+                self.order = self.close()
+            return
+
+        if (
+            close <= (self.bb.bot[0] - self.atr[0])
+            or self.rsi[0] < 25
+        ):
+            if self._position_within_half_capital():
+                self.is_core = True
+                self._cancel_stop()
+                return
+
+        if (
+            close >= self.bb.mid[0]
+            or close >= (self.entry_price + self.entry_atr)
+        ):
+            self._cancel_stop()
+            self.order = self.close()
+            return
+
+        active_bars = len(self) - self.entry_bar
+
+        if 25 <= active_bars <= 27:
+            self._cancel_stop()
+            self.roll_pending = close <= self.bb.bot[0]
+            self.order = self.close()
+            return
+
+        if active_bars >= 30:
+            self._cancel_stop()
+            self.order = self.close()
+```
+
+```json
+{"assumptions":[{"topic":"sizing","choice":"Size is calculated from the signal-bar close, includes the fixed 0.001 commission, and is rounded down to whole shares.","reason":"The next-bar market fill price is unknown when the entry decision is made; including commission implements the stated requirement that cash remain at least 50% of capital after opening."},{"topic":"capital","choice":"Capital means current broker equity; the conversion cap uses current position market value at the bar close divided by current broker equity.","reason":"The specification refers to capital and total position value without defining a separate capital base."},{"topic":"stop","choice":"The protective stop is submitted after the entry fills at fill price minus 1.5 times the entry-bar ATR, and is cancelled when the position becomes core or is otherwise closed.","reason":"A stop requires the actual entry execution price; a core is explicitly a holding without a time stop, and the specification describes it as long-term."},{"topic":"atr_reference","choice":"The 1 ATR profit target uses ATR at entry; the post-entry drawdown conversion test uses the current lower band and current ATR.","reason":"The target and stop are entry-based price levels, while the conversion condition is evaluated after entry against the then-current indicator values."},{"topic":"holding_bars","choice":"Active bars are counted from the bar on which the entry order completes; bar 25 is the first 25–27 management bar.","reason":"A position becomes active only upon execution."},{"topic":"roll_execution","choice":"A roll closes first and submits the replacement entry after the close order completes.","reason":"Backtrader market orders execute on a later bar; this preserves the one-position-at-a-time rule while implementing the requested timer reset."},{"topic":"priority","choice":"Core conversion is evaluated before ordinary profit-taking and time-based exit rules; broker stop orders may execute intrabar before a close-based conversion signal can be evaluated.","reason":"Conversion is an explicit state change triggered by the close, whereas the protective stop is a standing stop order."}]}
+```

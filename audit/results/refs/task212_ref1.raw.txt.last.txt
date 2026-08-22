@@ -1,0 +1,98 @@
+```python
+import backtrader as bt
+
+
+class SingleAssetVolatilityRotation(bt.Strategy):
+    def __init__(self):
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=30)
+
+        self.order = None
+        self.order_role = None
+        self.base_order_submitted = False
+
+        self.cycle_active = False
+        self.anchor_high = None
+        self.sell_price = None
+        self.cooldown_completed_bar = None
+
+    def start(self):
+        self.order = self.buy()
+        self.order_role = "base"
+        self.base_order_submitted = True
+
+    def _five_percent_size(self):
+        price = self.data.close[0]
+        if price <= 0:
+            return 0.0
+        return (self.broker.getvalue() * 0.05) / price
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.cycle_active:
+            mean_reversion = self.data.close[0] <= self.anchor_high * 0.95
+            protection = self.data.close[0] >= self.sell_price * 1.03
+
+            if mean_reversion or protection:
+                size = self._five_percent_size()
+                if size > 0:
+                    self.order = self.buy(size=size)
+                    self.order_role = "cycle_exit"
+            return
+
+        cooldown_observed = (
+            self.cooldown_completed_bar is None
+            or len(self) > self.cooldown_completed_bar + 30
+        )
+        atr_filter = self.atr[0] > 0.5 * self.atr_sma[0]
+        upper_band_touch = self.data.close[0] >= self.bbands.top[0]
+
+        if (
+            self.position.size > 0
+            and cooldown_observed
+            and atr_filter
+            and upper_band_touch
+        ):
+            size = min(self._five_percent_size(), self.position.size)
+            if size > 0:
+                self.anchor_high = self.data.high[0]
+                self.order = self.sell(size=size)
+                self.order_role = "tactical_sell"
+
+    def notify_order(self, order):
+        if order.status not in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            return
+
+        role = self.order_role
+
+        if order.status == order.Completed:
+            if role == "tactical_sell":
+                self.sell_price = order.executed.price
+                self.cycle_active = True
+            elif role == "cycle_exit":
+                self.cycle_active = False
+                self.anchor_high = None
+                self.sell_price = None
+                self.cooldown_completed_bar = len(self)
+
+        elif role == "tactical_sell":
+            self.anchor_high = None
+            self.sell_price = None
+
+        self.order = None
+        self.order_role = None
+```
+
+```json
+{"assumptions":[{"topic":"base position","choice":"Submit one plain self.buy() order at strategy start.","reason":"The specification requires a maintained base long position but does not state its initial entry or size; canonical defaults require plain buy sizing when size is unstated."},{"topic":"exit price evaluation","choice":"Evaluate both exit thresholds using the daily closing price.","reason":"The strategy is evaluated on daily bars and only the entry condition explicitly identifies the close; using the completed bar close provides a single deterministic price for each daily decision."},{"topic":"cooldown","choice":"Block new tactical sells for the 30 trading bars following the completed buyback, allowing a new entry on the next bar.","reason":"This treats the stated 30-trading-day cooldown as 30 full post-completion trading days."}]}
+```

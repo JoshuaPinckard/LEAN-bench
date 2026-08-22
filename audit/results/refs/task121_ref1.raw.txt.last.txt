@@ -1,0 +1,225 @@
+```python
+import backtrader as bt
+import math
+
+
+class PullbackTradingUsingFibonacciLevelsAndEMA(bt.Strategy):
+    params = (
+        ("ema_period", 20),
+        ("risk_fraction", 0.01),
+        ("price_increment", 0.01),
+    )
+
+    def __init__(self):
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+
+        self.last_significant_low = None
+        self.last_significant_high = None
+
+        self.entry_order = None
+        self.stop_order = None
+        self.tp1_order = None
+        self.tp2_order = None
+
+        self.entry_stop = None
+        self.entry_tp1 = None
+        self.entry_tp2 = None
+        self.move_stop_to_breakeven = False
+
+    def _fibonacci_levels(self):
+        low = self.last_significant_low
+        high = self.last_significant_high
+        distance = high - low
+
+        return [
+            (0.618, high - distance * 0.618),
+            (0.500, high - distance * 0.500),
+            (0.382, high - distance * 0.382),
+            (0.236, high - distance * 0.236),
+        ]
+
+    def _orders_pending(self):
+        return any(
+            order is not None
+            for order in (
+                self.entry_order,
+                self.stop_order,
+                self.tp1_order,
+                self.tp2_order,
+            )
+        )
+
+    def _cancel_exit_orders(self):
+        for order in (self.stop_order, self.tp1_order, self.tp2_order):
+            if order is not None:
+                self.cancel(order)
+
+    def next(self):
+        if (
+            self.data.low[-1] < self.data.low[-2]
+            and self.data.low[-1] < self.data.low[0]
+        ):
+            self.last_significant_low = self.data.low[-1]
+            self.last_significant_high = None
+
+        if (
+            self.last_significant_low is not None
+            and self.data.high[-1] > self.data.high[-2]
+            and self.data.high[-1] > self.data.high[0]
+            and self.data.high[-1] > self.last_significant_low
+        ):
+            self.last_significant_high = self.data.high[-1]
+
+        if self.position or self._orders_pending():
+            return
+
+        if (
+            self.last_significant_low is None
+            or self.last_significant_high is None
+            or self.data.close[0] <= self.ema[0]
+        ):
+            return
+
+        bullish_reversal = (
+            self.data.close[0] > self.data.open[0]
+            and self.data.close[0] > self.data.close[-1]
+        )
+        if not bullish_reversal:
+            return
+
+        fib_levels = self._fibonacci_levels()
+        entry_level = None
+        entry_index = None
+
+        for index, (_, level) in enumerate(fib_levels):
+            if self.data.low[0] <= level <= self.data.high[0]:
+                entry_level = level
+                entry_index = index
+                break
+
+        if entry_level is None:
+            return
+
+        stop_price = self.last_significant_low - self.p.price_increment
+        estimated_entry = self.data.close[0]
+        risk_per_share = estimated_entry - stop_price
+
+        if risk_per_share <= 0:
+            return
+
+        higher_targets = [level for _, level in fib_levels[entry_index + 1:]]
+        higher_targets.append(self.last_significant_high)
+
+        if higher_targets:
+            tp1_price = higher_targets[0]
+        else:
+            return
+
+        if len(higher_targets) >= 2:
+            tp2_price = higher_targets[1]
+        else:
+            tp2_price = estimated_entry + (9.0 * risk_per_share)
+
+        if tp2_price - estimated_entry < 9.0 * risk_per_share:
+            return
+
+        risk_cash = self.broker.getvalue() * self.p.risk_fraction
+        risk_size = math.floor(risk_cash / risk_per_share)
+        affordable_size = math.floor(
+            self.broker.getcash()
+            / (estimated_entry * (1.0 + self.broker.getcommissioninfo(self.data).p.commission))
+        )
+        size = min(risk_size, affordable_size)
+
+        if size <= 0:
+            return
+
+        self.entry_stop = stop_price
+        self.entry_tp1 = tp1_price
+        self.entry_tp2 = tp2_price
+        self.entry_order = self.buy(size=size)
+
+    def notify_order(self, order):
+        terminal_statuses = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal_statuses:
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+
+            if order.status == order.Completed:
+                size = order.executed.size
+                self.stop_order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Stop,
+                    price=self.entry_stop,
+                )
+                self.tp1_order = self.sell(
+                    size=size / 2.0,
+                    exectype=bt.Order.Limit,
+                    price=self.entry_tp1,
+                )
+            return
+
+        if order is self.tp1_order:
+            self.tp1_order = None
+
+            if order.status == order.Completed and self.position:
+                self.move_stop_to_breakeven = True
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                else:
+                    remaining = self.position.size
+                    self.stop_order = self.sell(
+                        size=remaining,
+                        exectype=bt.Order.Stop,
+                        price=self.position.price,
+                    )
+                    self.tp2_order = self.sell(
+                        size=remaining,
+                        exectype=bt.Order.Limit,
+                        price=self.entry_tp2,
+                    )
+            return
+
+        if order is self.stop_order:
+            self.stop_order = None
+
+            if (
+                order.status == order.Canceled
+                and self.move_stop_to_breakeven
+                and self.position
+            ):
+                self.move_stop_to_breakeven = False
+                remaining = self.position.size
+                self.stop_order = self.sell(
+                    size=remaining,
+                    exectype=bt.Order.Stop,
+                    price=self.position.price,
+                )
+                self.tp2_order = self.sell(
+                    size=remaining,
+                    exectype=bt.Order.Limit,
+                    price=self.entry_tp2,
+                )
+            elif order.status == order.Completed:
+                self.move_stop_to_breakeven = False
+                self._cancel_exit_orders()
+            return
+
+        if order is self.tp2_order:
+            self.tp2_order = None
+
+            if order.status == order.Completed:
+                self._cancel_exit_orders()
+```
+
+```json
+{"assumptions":[{"topic":"significant swings","choice":"A significant low/high is a confirmed one-bar local pivot: the prior bar's low/high is lower/higher than both adjacent bars. A new low begins a new Fibonacci swing, and the next confirmed high defines its upper endpoint.","reason":"The specification requires significant lows and highs but does not define their detection method."},{"topic":"pullback reversal confirmation","choice":"A Fibonacci level is reached when it lies within the current bar's low-high range; reversal confirmation requires a bullish candle (close above open) and an upswing (close above the previous close).","reason":"The specification gives bullish candlestick formation or start of an upswing as examples but provides no exact pattern definition."},{"topic":"multiple reached levels","choice":"When one bar reaches multiple levels, the deepest reached level is selected first: 61.8%, then 50.0%, 38.2%, and 23.6%.","reason":"The specification does not establish priority among simultaneously reached Fibonacci levels."},{"topic":"stop placement","choice":"The long stop is one cent below the last significant low.","reason":"The specification requires a stop beyond the last local low and as close as possible, but does not specify an offset or tick size; $0.01 is used as the smallest assumed price increment."},{"topic":"risk sizing","choice":"Risk is set to 1% of current broker equity, within the stated 1-2% range. Share quantity is floor(1% equity divided by estimated entry-to-stop risk), capped by available cash including commission.","reason":"The specification requires stop-based sizing and gives a 1-2% risk range but does not select a precise percentage."},{"topic":"profit targets","choice":"TP1 and TP2 are the next and subsequent higher Fibonacci levels toward the swing high. If only the swing high remains after a 23.6% entry, TP1 is that high and TP2 is projected at 9R above estimated entry as the required higher-price-high target.","reason":"A higher future Dow Theory high is unknowable from completed OHLCV bars; the 9R projection is the closest literal executable target satisfying the stated minimum RR goal."},{"topic":"minimum RR","choice":"An entry is allowed only when TP2 is at least nine times the estimated entry-to-stop risk above the estimated entry.","reason":"The specification states the goal is RR of at least 1:9."},{"topic":"partial exit","choice":"Half the position is sold at TP1; after TP1 fills, the stop for the remaining position is moved to breakeven and TP2 is placed.","reason":"The specification permits partial closure at TP1 and moving the stop to breakeven but does not specify the partial percentage."},{"topic":"infeasible","choice":"Actual market-order fill price and risk cannot be known until the following bar in standard Backtrader execution, so sizing and the 9R test use the signal bar close; gaps can change realized risk and reward.","reason":"The environment uses normal Backtrader market-order execution rather than guaranteed signal-close fills."}]}
+```

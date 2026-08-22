@@ -1,0 +1,179 @@
+```python
+import backtrader as bt
+import math
+from collections import deque
+
+
+class FVGOrderBlockStrategy(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+    )
+
+    def __init__(self):
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+
+        self.hour_bucket = None
+        self.hour_ohlcv = None
+        self.hour_bars = deque(maxlen=3)
+        self.fvgs = []
+
+        self.last_order_block_high = None
+        self.fvg_touched = False
+        self.entry_stop_price = None
+
+    def _complete_hour(self):
+        if self.hour_ohlcv is None:
+            return
+
+        hour_bar = self.hour_ohlcv
+        self.hour_bars.append(hour_bar)
+
+        if len(self.hour_bars) == 3:
+            first, middle, third = self.hour_bars
+
+            if first["high"] < third["low"]:
+                self.fvgs.append({
+                    "low": first["high"],
+                    "high": third["low"],
+                    "direction": "up",
+                })
+            elif first["low"] > third["high"]:
+                self.fvgs.append({
+                    "low": third["high"],
+                    "high": first["low"],
+                    "direction": "down",
+                })
+
+    def _update_hourly_data(self):
+        dt = self.data.datetime.datetime(0)
+        bucket = dt.replace(minute=0, second=0, microsecond=0)
+
+        current = {
+            "open": float(self.data.open[0]),
+            "high": float(self.data.high[0]),
+            "low": float(self.data.low[0]),
+            "close": float(self.data.close[0]),
+        }
+
+        if self.hour_bucket is None:
+            self.hour_bucket = bucket
+            self.hour_ohlcv = current
+            return
+
+        if bucket != self.hour_bucket:
+            self._complete_hour()
+            self.hour_bucket = bucket
+            self.hour_ohlcv = current
+            return
+
+        self.hour_ohlcv["high"] = max(self.hour_ohlcv["high"], current["high"])
+        self.hour_ohlcv["low"] = min(self.hour_ohlcv["low"], current["low"])
+        self.hour_ohlcv["close"] = current["close"]
+
+    def _clear_closed_trade_state(self):
+        self.fvg_touched = False
+        self.entry_stop_price = None
+
+    def _next_fvg_above(self, price):
+        candidates = [fvg["low"] for fvg in self.fvgs if fvg["low"] > price]
+        return min(candidates) if candidates else None
+
+    def _place_target_if_available(self):
+        if not self.position or self.target_order is not None:
+            return
+
+        target = self._next_fvg_above(self.position.price)
+        if target is not None:
+            self.target_order = self.sell(
+                size=self.position.size,
+                exectype=bt.Order.Limit,
+                price=target,
+                oco=self.stop_order,
+            )
+
+    def next(self):
+        self._update_hourly_data()
+
+        if self.position:
+            self._place_target_if_available()
+            return
+
+        if self.entry_order is not None or self.stop_order is not None or self.target_order is not None:
+            return
+
+        high = float(self.data.high[0])
+        low = float(self.data.low[0])
+        close = float(self.data.close[0])
+        open_ = float(self.data.open[0])
+
+        touched = any(low <= fvg["high"] and high >= fvg["low"] for fvg in self.fvgs)
+        if touched:
+            self.fvg_touched = True
+
+        clear_uptrend = (
+            len(self.hour_bars) == 3
+            and self.hour_bars[0]["close"] < self.hour_bars[1]["close"] < self.hour_bars[2]["close"]
+        )
+
+        breaks_order_block = (
+            self.last_order_block_high is not None
+            and close > self.last_order_block_high
+        )
+
+        if self.fvg_touched and clear_uptrend and breaks_order_block:
+            stop_price = math.nextafter(low, -math.inf)
+            risk_per_unit = close - stop_price
+
+            if risk_per_unit > 0:
+                risk_amount = self.broker.getvalue() * self.p.risk_fraction
+                cash_limited_size = self.broker.getcash() / (close * (1.0 + self.broker.getcommissioninfo(self.data).p.commission))
+                size = min(risk_amount / risk_per_unit, cash_limited_size)
+
+                if size > 0:
+                    self.entry_stop_price = stop_price
+                    self.entry_order = self.buy(size=size)
+
+        candle_range = high - low
+        candle_body = abs(close - open_)
+        if candle_range > 0 and candle_body >= 0.70 * candle_range:
+            self.last_order_block_high = high
+
+    def notify_order(self, order):
+        final_statuses = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in final_statuses:
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+
+            if order.status == order.Completed:
+                self.stop_order = self.sell(
+                    size=self.position.size,
+                    exectype=bt.Order.Stop,
+                    price=self.entry_stop_price,
+                )
+                self._place_target_if_available()
+            else:
+                self.entry_stop_price = None
+
+        elif order is self.stop_order:
+            self.stop_order = None
+
+        elif order is self.target_order:
+            self.target_order = None
+
+        if order.status == order.Completed and not self.position:
+            self._clear_closed_trade_state()
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Construct 1-hour candles internally by aggregating the supplied 1-minute OHLC bars.","reason":"The harness supplies only one 1-minute data feed and does not provide a separate 1-hour feed."},{"topic":"FVG interpretation","choice":"A bullish FVG is recorded when the first candle high is below the third candle low; a bearish FVG is recorded when the first candle low is above the third candle high. The zone is bounded by those non-overlapping outer-candle extremes.","reason":"This is the literal three-consecutive-candle non-overlap implementation of the stated FVG definition."},{"topic":"trend and sideways filter","choice":"A clear upward main trend requires the last three completed 1-hour closes to be strictly increasing.","reason":"The specification requires a main trend and excludes strong sideways movement but supplies no numerical trend definition."},{"topic":"Order Block","choice":"The last 1-minute candle whose body is at least 70% of its high-low range supplies the significant Order Block high; an upward close above that high is the strong upward continuation and break confirmation.","reason":"The 70% body criterion is stated, while 'strong price move' has no separate threshold."},{"topic":"FVG touch sequencing","choice":"Once any recorded 1-hour FVG is touched or entered by a 1-minute bar, the touch remains valid until a trade closes or an entry attempt is rejected.","reason":"The specification requires retracement to an FVG before the Order Block break but does not give an expiry interval."},{"topic":"take-profit level","choice":"Use the lower boundary of the nearest recorded 1-hour FVG whose entire zone begins above the filled entry price.","reason":"A FVG is a zone rather than one price; its lower boundary is the first level reached from below."},{"topic":"risk sizing","choice":"Risk 1% of current account value per trade, using entry-price-to-stop distance and limiting size to available cash.","reason":"The specification directs a fixed 1-2% capital risk while leaving the exact percentage and cash constraint unspecified."},{"topic":"stop placement","choice":"Use the floating-point value immediately below the Order Block break candle low.","reason":"No instrument tick size is supplied, while the stop is explicitly required below that low."},{"topic":"missing target","choice":"Enter after a valid signal even if no FVG is currently above entry; submit the take-profit when a later recorded FVG above the filled entry becomes available.","reason":"The specification requires entry on the Order Block break and does not authorize rejecting otherwise valid entries when the next target FVG has not yet formed."}]}
+```

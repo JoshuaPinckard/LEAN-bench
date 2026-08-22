@@ -1,0 +1,123 @@
+```python
+import backtrader as bt
+import math
+
+
+class LiquidityShockStrategy(bt.Strategy):
+    params = (
+        ('max_lots', 3),
+    )
+
+    def __init__(self):
+        self.s = (self.data.high - self.data.low) / self.data.close
+        self.sma_s = bt.indicators.SMA(self.s, period=20)
+        self.sma_volume_10 = bt.indicators.SMA(self.data.volume, period=10)
+        self.sma_volume_20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.atr_10 = bt.indicators.ATR(self.data, period=10)
+        self.sma_atr_50 = bt.indicators.SMA(self.atr_10, period=50)
+        self.s_cross = bt.indicators.CrossOver(self.s, self.sma_s)
+
+        self.order = None
+        self._pending_role = None
+        self.lots = []
+
+    def _size(self):
+        price = self.data.close[0]
+        return int(math.floor((self.broker.getvalue() * 0.01) / price))
+
+    def _submit_entry(self, is_long):
+        size = self._size()
+        if size <= 0:
+            return
+        self._pending_role = 'entry'
+        self.order = self.buy(size=size) if is_long else self.sell(size=size)
+
+    def _submit_exit(self):
+        self._pending_role = 'exit'
+        self.order = self.close()
+
+    def next(self):
+        if self.order:
+            return
+
+        s = self.s[0]
+        normal_s = self.sma_s[0]
+        volume_shock = self.sma_volume_10[0] > 1.5 * self.sma_volume_20[0]
+        low_volatility = self.atr_10[0] < self.sma_atr_50[0]
+        unchanged_close = (
+            abs(self.data.close[0] - self.data.close[-1]) / self.data.close[-1]
+            <= 0.001
+        )
+
+        if self.position:
+            if self.position.size > 0:
+                hit_exit = self.s_cross[0] > 0
+                hit_risk = any(
+                    self.data.close[0] >= lot * 1.005 or
+                    self.data.close[0] <= lot * 0.997
+                    for lot in self.lots
+                )
+                if hit_exit or hit_risk:
+                    self._submit_exit()
+                    return
+
+                if (
+                    len(self.lots) < self.p.max_lots and
+                    s < 0.8 * normal_s and
+                    volume_shock and
+                    low_volatility and
+                    unchanged_close
+                ):
+                    self._submit_entry(True)
+
+            else:
+                hit_exit = self.s_cross[0] < 0
+                hit_risk = any(
+                    self.data.close[0] <= lot * 0.995 or
+                    self.data.close[0] >= lot * 1.003
+                    for lot in self.lots
+                )
+                if hit_exit or hit_risk:
+                    self._submit_exit()
+                    return
+
+                if (
+                    len(self.lots) < self.p.max_lots and
+                    s > 1.2 * normal_s and
+                    volume_shock and
+                    low_volatility and
+                    unchanged_close
+                ):
+                    self._submit_entry(False)
+            return
+
+        if (
+            s < 0.8 * normal_s and
+            volume_shock and
+            low_volatility and
+            unchanged_close
+        ):
+            self._submit_entry(True)
+        elif (
+            s > 1.2 * normal_s and
+            volume_shock and
+            low_volatility and
+            unchanged_close
+        ):
+            self._submit_entry(False)
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order.status == order.Completed:
+                if self._pending_role == 'entry':
+                    self.lots.append(order.executed.price)
+                elif self._pending_role == 'exit':
+                    self.lots = []
+
+            self.order = None
+            self._pending_role = None
+```
+
+```json
+{"assumptions":[{"topic":"position sizing","choice":"Each entry uses floor(1% of current broker value / current close) shares.","reason":"The specification caps each order at 1% of capital but does not prescribe share rounding or a capital valuation method."},{"topic":"additions","choice":"Entries meeting the same directional signal add lots while in that direction, capped at three total open lots.","reason":"The specification permits additions and explicitly limits simultaneously open lots to three; this explicit cap governs the initial position plus additions."},{"topic":"take-profit and stop-loss evaluation","choice":"Exit signals are evaluated against each completed bar's close relative to every recorded lot entry price.","reason":"The specification gives price percentages but does not prescribe stop-order types or intrabar execution precedence."},{"topic":"shorting","choice":"Short entries use self.sell(size=...) and short exits use self.close().","reason":"The specification explicitly defines a short-position condition."}]}
+```

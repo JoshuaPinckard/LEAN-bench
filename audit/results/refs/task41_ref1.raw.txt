@@ -1,0 +1,156 @@
+```python
+import backtrader as bt
+
+
+class LeveragedETFLongTermInvestmentStrategy(bt.Strategy):
+    params = (
+        ("sma_period", 200),
+        ("annual_return_rate", 0.10),
+        ("interest_rate", 0.067),
+        ("inflation_rate", 0.03),
+        ("tax_rate", 0.25),
+        ("leverage_ratio", 2.0),
+        ("stop_loss_fraction", 0.80),
+        ("holding_years", 5),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+
+        self.net_annual_return = (
+            (self.p.annual_return_rate - self.p.interest_rate)
+            * (1.0 - self.p.tax_rate)
+            - self.p.inflation_rate
+        )
+
+        self.order = None
+        self.borrowed_funds = 0.0
+        self.initial_investment_value = None
+        self.entry_date = None
+        self.last_rebalance_date = None
+        self.pending_borrowed_funds = None
+        self.repayment_wait = 0
+
+    def _anniversary(self, date_value, years):
+        return date_value.replace(year=date_value.year + years)
+
+    def _commission_reserve(self, size, price):
+        commission_info = self.broker.getcommissioninfo(self.data)
+        return commission_info.getcommission(size, price)
+
+    def _submit_rebalance(self, target_size, target_debt):
+        current_size = self.position.size
+        difference = target_size - current_size
+        price = self.data.close[0]
+
+        if difference > 0:
+            commission_reserve = self._commission_reserve(difference, price)
+            self.broker.add_cash(
+                (target_debt - self.borrowed_funds) + commission_reserve
+            )
+            self.pending_borrowed_funds = target_debt
+            self.order = self.buy(size=difference)
+            self.order.addinfo(action="rebalance")
+        elif difference < 0:
+            self.broker.add_cash(target_debt - self.borrowed_funds)
+            self.pending_borrowed_funds = target_debt
+            self.order = self.sell(size=-difference)
+            self.order.addinfo(action="rebalance")
+        else:
+            self.broker.add_cash(target_debt - self.borrowed_funds)
+            self.borrowed_funds = target_debt
+            self.last_rebalance_date = self.data.datetime.date(0)
+
+    def next(self):
+        if self.repayment_wait:
+            self.repayment_wait -= 1
+            return
+
+        if self.order:
+            return
+
+        current_date = self.data.datetime.date(0)
+        price = self.data.close[0]
+
+        if not self.position:
+            if price > self.sma[0]:
+                equity_capital = self.broker.getvalue()
+                total_position_value = equity_capital * self.p.leverage_ratio
+                borrowed_funds = total_position_value * 0.50
+                size = int(total_position_value / price)
+
+                if size > 0:
+                    commission_reserve = self._commission_reserve(size, price)
+                    self.borrowed_funds = borrowed_funds
+                    self.pending_borrowed_funds = borrowed_funds
+                    self.broker.add_cash(borrowed_funds + commission_reserve)
+                    self.order = self.buy(size=size)
+                    self.order.addinfo(action="entry")
+            return
+
+        portfolio_value_including_borrowed_funds = self.broker.getvalue()
+
+        if (
+            portfolio_value_including_borrowed_funds
+            < self.initial_investment_value * self.p.stop_loss_fraction
+            or price < self.sma[0]
+            or current_date >= self._anniversary(
+                self.entry_date, self.p.holding_years
+            )
+        ):
+            self.order = self.close()
+            self.order.addinfo(action="exit")
+            return
+
+        if current_date >= self._anniversary(self.last_rebalance_date, 1):
+            equity_capital = self.broker.getvalue() - self.borrowed_funds
+            target_position_value = equity_capital * self.p.leverage_ratio
+            target_size = int(target_position_value / price)
+            target_debt = (target_size * price) * 0.50
+            self._submit_rebalance(target_size, target_debt)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Submitted,
+            order.Accepted,
+        ):
+            return
+
+        if order.status == order.Completed:
+            action = order.info.get("action")
+
+            if action == "entry":
+                self.borrowed_funds = self.pending_borrowed_funds
+                self.initial_investment_value = (
+                    self.position.size * order.executed.price
+                )
+                self.entry_date = self.data.datetime.date(0)
+                self.last_rebalance_date = self.entry_date
+
+            elif action == "rebalance":
+                self.borrowed_funds = self.pending_borrowed_funds
+                self.last_rebalance_date = self.data.datetime.date(0)
+
+            elif action == "exit":
+                self.broker.add_cash(-self.borrowed_funds)
+                self.borrowed_funds = 0.0
+                self.initial_investment_value = None
+                self.entry_date = None
+                self.last_rebalance_date = None
+                self.repayment_wait = 1
+
+            self.pending_borrowed_funds = None
+            self.order = None
+
+        elif order.status in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_borrowed_funds = None
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"borrowing","choice":"Simulate borrowed capital by adding cash to the Backtrader broker and maintain borrowed funds in a separate debt ledger.","reason":"The fixed single-feed Backtrader environment has no native margin-loan account."},{"topic":"commissions","choice":"Reserve enough additional broker cash for commissions when increasing exposure, while the debt ledger remains the specified 50% of position value.","reason":"A 2:1 position sized at its full market value would otherwise be rejected because the harness deducts commission."},{"topic":"initial investment value","choice":"Use the executed entry position market value as the initial investment value for the 80% stop-loss threshold.","reason":"This is the literal total position value controlled by the leveraged entry."},{"topic":"annual and five-year timing","choice":"Apply rebalancing and the holding-period exit on the first available daily bar on or after each calendar anniversary.","reason":"The feed contains daily trading bars and may not contain a bar on an exact calendar anniversary."},{"topic":"integer shares","choice":"Round position sizes down to whole shares.","reason":"Backtrader stock orders require a practical discrete share quantity when no fractional-share convention is specified."},{"topic":"backtest duration","choice":"Use the complete feed supplied by the harness.","reason":"The supplied data spans less than the specified minimum ten-year evaluation period, so extending it is infeasible without external data."}]}
+```

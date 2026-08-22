@@ -1,0 +1,135 @@
+```python
+import backtrader as bt
+import math
+
+
+class WalkForwardMeanReversion(bt.Strategy):
+    params = (
+        ('k', 2),
+        ('m', 3),
+        ('risk_fraction', 0.01),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=252)
+        self.bbands = bt.indicators.BollingerBands(self.data.close, period=252)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=50)
+        self.ema200 = bt.indicators.EMA(self.data.close, period=200)
+
+        self.order = None
+        self.theta = None
+        self.sigma = None
+        self.exit_cross = None
+        self.window_start = None
+        self.insample_end = None
+        self.gap_end = None
+        self.trading_end = None
+
+    def _add_months(self, value, months):
+        month_index = value.month - 1 + months
+        year = value.year + month_index // 12
+        month = month_index % 12 + 1
+        return value.replace(year=year, month=month)
+
+    def _set_window(self, start):
+        self.window_start = start
+        self.insample_end = self._add_months(start, 12)
+        self.gap_end = self._add_months(self.insample_end, 1)
+        self.trading_end = self._add_months(self.gap_end, 6)
+
+    def prenext(self):
+        if self.window_start is None:
+            self._set_window(self.data.datetime.date(0))
+
+    def _calibrate(self):
+        self.theta = self.sma[-1]
+        self.sigma = (self.bbands.top[-1] - self.bbands.mid[-1]) / 2.0
+        self.exit_cross = bt.indicators.CrossOver(self.data.close, self.theta)
+
+    def _submit_entry(self, is_long):
+        atr_value = self.atr[0]
+        close = self.data.close[0]
+
+        if not (math.isfinite(atr_value) and atr_value > 0):
+            return
+
+        if is_long:
+            stop_price = self.theta - self.p.m * self.sigma
+        else:
+            stop_price = self.theta + self.p.m * self.sigma
+
+        distance_to_stop = abs(close - stop_price)
+        risk_per_unit = max(distance_to_stop, 1.5 * atr_value)
+        size = (self.broker.getvalue() * self.p.risk_fraction) / risk_per_unit
+
+        if size > 0:
+            self.order = self.buy(size=size) if is_long else self.sell(size=size)
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+
+        if self.window_start is None:
+            self._set_window(current_date)
+
+        if current_date >= self.trading_end:
+            if self.position and self.order is None:
+                self.order = self.close()
+            self._set_window(self.trading_end)
+            self.theta = None
+            self.sigma = None
+            self.exit_cross = None
+            return
+
+        if current_date >= self.insample_end and self.theta is None:
+            self._calibrate()
+
+        if current_date < self.gap_end or self.theta is None:
+            return
+
+        if self.order is not None:
+            return
+
+        close = self.data.close[0]
+        atr_value = self.atr[0]
+
+        if self.position:
+            if self.position.size > 0:
+                take_profit = self.exit_cross is not None and self.exit_cross[0] > 0
+                regime_stop = close <= self.theta - self.p.m * self.sigma
+                atr_stop = close <= self.position.price - 2.0 * atr_value
+                if take_profit or regime_stop or atr_stop:
+                    self.order = self.close()
+            else:
+                take_profit = self.exit_cross is not None and self.exit_cross[0] < 0
+                regime_stop = close >= self.theta + self.p.m * self.sigma
+                atr_stop = close >= self.position.price + 2.0 * atr_value
+                if take_profit or regime_stop or atr_stop:
+                    self.order = self.close()
+            return
+
+        downtrend = self.ema50[0] < self.ema200[0]
+
+        if (close < self.theta - self.p.k * self.sigma and
+                self.rsi[0] < 40 and
+                not downtrend):
+            self._submit_entry(is_long=True)
+        elif (close > self.theta + self.p.k * self.sigma and
+                self.rsi[0] > 60 and
+                downtrend):
+            self._submit_entry(is_long=False)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"walk-forward shift","choice":"Windows are sequential and non-overlapping: 12 calendar months in-sample, followed by one calendar-month no-trade gap and six calendar months out-of-sample, then a new window begins.","reason":"The specification does not state the shift increment."},{"topic":"calibration boundary","choice":"Calibration occurs on the first available bar at or after the gap begins, using the prior bar's SMA(252) and Bollinger-derived standard deviation, which is the last available in-sample bar.","reason":"The feed can omit calendar boundary dates such as weekends and holidays."},{"topic":"end of trading period","choice":"An open position is closed when its six-month out-of-sample trading period ends.","reason":"Fixed calibration values apply only to their stated next trading period."},{"topic":"trend filter interpretation","choice":"Longs are skipped when EMA(50) < EMA(200); shorts are skipped when that condition is violated, so shorts require EMA(50) < EMA(200).","reason":"This follows the stated, though asymmetric, wording literally."},{"topic":"ATR protective stop","choice":"The protective stop compares the current Close with the filled position price using the current ATR(14).","reason":"The specification does not state that ATR should be frozen at entry."}]}
+```

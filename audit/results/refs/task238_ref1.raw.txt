@@ -1,0 +1,290 @@
+```python
+import backtrader as bt
+import math
+
+
+class ModularScalpingStrategy(bt.Strategy):
+    params = (
+        ("use_module_a", True),
+        ("use_module_b", True),
+        ("use_rsi_filter", True),
+        ("use_macd_filter", True),
+        ("use_atr_vol_filter", True),
+        ("use_bbands_squeeze", True),
+        ("risk_R", 100.0),
+    )
+
+    def __init__(self):
+        self.ema5 = bt.indicators.EMA(self.data.close, period=5)
+        self.ema8 = bt.indicators.EMA(self.data.close, period=8)
+        self.ema13 = bt.indicators.EMA(self.data.close, period=13)
+        self.ema9 = bt.indicators.EMA(self.data.close, period=9)
+        self.ema21 = bt.indicators.EMA(self.data.close, period=21)
+
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=12,
+            period_me2=26,
+            period_signal=9,
+        )
+        self.macd_hist = self.macd.macd - self.macd.signal
+
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close,
+            period=20,
+            devfactor=2,
+        )
+        self.bb_width = self.bbands.top - self.bbands.bot
+        self.bb_width_sma = bt.indicators.SMA(self.bb_width, period=20)
+
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=50)
+
+        self.order = None
+        self.entry_order = None
+
+        self.a_long_setup = None
+        self.a_short_setup = None
+        self.b_long_setup = None
+        self.b_short_setup = None
+
+        self.entry_price = None
+        self.initial_stop = None
+        self.take_profit = None
+        self.entry_bar = None
+        self.local_high = None
+        self.local_low = None
+        self.trailing_stop = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order is self.entry_order:
+                self.entry_price = order.executed.price
+                risk_distance = 1.5 * float(self.atr[0])
+                self.entry_bar = len(self)
+
+                if order.isbuy():
+                    self.initial_stop = self.entry_price - risk_distance
+                    self.take_profit = self.entry_price + (2.0 * risk_distance)
+                    self.local_high = self.entry_price
+                    self.local_low = None
+                    self.trailing_stop = self.initial_stop
+                else:
+                    self.initial_stop = self.entry_price + risk_distance
+                    self.take_profit = self.entry_price - (2.0 * risk_distance)
+                    self.local_low = self.entry_price
+                    self.local_high = None
+                    self.trailing_stop = self.initial_stop
+
+                self.entry_order = None
+
+            elif not self.position:
+                self.entry_price = None
+                self.initial_stop = None
+                self.take_profit = None
+                self.entry_bar = None
+                self.local_high = None
+                self.local_low = None
+                self.trailing_stop = None
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.entry_order:
+                self.entry_order = None
+            if order is self.order:
+                self.order = None
+
+    def _filters_pass(self, direction, rsi_low, rsi_high):
+        if self.p.use_rsi_filter:
+            if direction > 0:
+                if not (self.rsi[0] > rsi_low and self.rsi[0] < rsi_high):
+                    return False
+            else:
+                if not (self.rsi[0] > rsi_low and self.rsi[0] < rsi_high):
+                    return False
+
+        if self.p.use_macd_filter:
+            if direction > 0 and not self.macd_hist[0] > 0:
+                return False
+            if direction < 0 and not self.macd_hist[0] < 0:
+                return False
+
+        if self.p.use_atr_vol_filter and not self.atr[0] > self.atr_sma[0]:
+            return False
+
+        if self.p.use_bbands_squeeze and not self.bb_width[0] < self.bb_width_sma[0]:
+            return False
+
+        return True
+
+    def _submit_entry(self, direction):
+        risk_distance = 1.5 * float(self.atr[0])
+        if risk_distance <= 0:
+            return
+
+        size = math.floor(float(self.p.risk_R) / risk_distance)
+        if size < 1:
+            return
+
+        if direction > 0:
+            self.order = self.buy(size=size)
+        else:
+            self.order = self.sell(size=size)
+
+        self.entry_order = self.order
+
+    def next(self):
+        if self.order:
+            return
+
+        a_spread_1 = self.ema5[0] - self.ema8[0]
+        a_spread_2 = self.ema8[0] - self.ema13[0]
+        a_spread_1_prev = self.ema5[-1] - self.ema8[-1]
+        a_spread_2_prev = self.ema8[-1] - self.ema13[-1]
+
+        a_bullish = (
+            self.ema5[0] > self.ema8[0] > self.ema13[0]
+            and a_spread_1 > a_spread_1_prev
+            and a_spread_2 > a_spread_2_prev
+        )
+        a_bearish = (
+            self.ema5[0] < self.ema8[0] < self.ema13[0]
+            and a_spread_1 < a_spread_1_prev
+            and a_spread_2 < a_spread_2_prev
+        )
+
+        b_spread = self.ema9[0] - self.ema21[0]
+        b_spread_1 = self.ema9[-1] - self.ema21[-1]
+        b_spread_2 = self.ema9[-2] - self.ema21[-2]
+        b_squeeze = self.bb_width[0] < self.bb_width_sma[0]
+
+        b_bullish = (
+            self.ema9[0] > self.ema21[0]
+            and b_spread > b_spread_1 > b_spread_2
+        )
+        b_bearish = (
+            self.ema9[0] < self.ema21[0]
+            and b_spread < b_spread_1 < b_spread_2
+        )
+
+        a_long_breakout = (
+            self.a_long_setup is not None
+            and self.data.high[0] > self.a_long_setup
+        )
+        a_short_breakout = (
+            self.a_short_setup is not None
+            and self.data.low[0] < self.a_short_setup
+        )
+        b_long_breakout = (
+            self.b_long_setup is not None
+            and self.data.high[0] > self.b_long_setup
+        )
+        b_short_breakout = (
+            self.b_short_setup is not None
+            and self.data.low[0] < self.b_short_setup
+        )
+
+        if a_long_breakout:
+            self.a_long_setup = None
+        if a_short_breakout:
+            self.a_short_setup = None
+        if b_long_breakout:
+            self.b_long_setup = None
+        if b_short_breakout:
+            self.b_short_setup = None
+
+        a_long_signal = (
+            self.p.use_module_a
+            and a_long_breakout
+            and self._filters_pass(1, -math.inf, 70)
+        )
+        a_short_signal = (
+            self.p.use_module_a
+            and a_short_breakout
+            and self._filters_pass(-1, 30, math.inf)
+        )
+        b_long_signal = (
+            self.p.use_module_b
+            and b_long_breakout
+            and b_squeeze
+            and self._filters_pass(1, 40, 65)
+        )
+        b_short_signal = (
+            self.p.use_module_b
+            and b_short_breakout
+            and b_squeeze
+            and self._filters_pass(-1, 35, 60)
+        )
+
+        long_signal = a_long_signal or b_long_signal
+        short_signal = a_short_signal or b_short_signal
+
+        if self.position.size > 0:
+            self.local_high = max(self.local_high, float(self.data.high[0]))
+            candidate_stop = max(
+                float(self.ema21[0]),
+                self.local_high - float(self.atr[0]),
+            )
+            self.trailing_stop = max(self.trailing_stop, candidate_stop)
+
+            exit_signal = (
+                self.data.low[0] <= self.trailing_stop
+                or self.data.high[0] >= self.take_profit
+                or short_signal
+                or self.data.close[0] < self.ema13[0]
+                or len(self) - self.entry_bar >= 10
+            )
+            if exit_signal:
+                self.order = self.close()
+            return
+
+        if self.position.size < 0:
+            self.local_low = min(self.local_low, float(self.data.low[0]))
+            candidate_stop = min(
+                float(self.ema21[0]),
+                self.local_low + float(self.atr[0]),
+            )
+            self.trailing_stop = min(self.trailing_stop, candidate_stop)
+
+            exit_signal = (
+                self.data.high[0] >= self.trailing_stop
+                or self.data.low[0] <= self.take_profit
+                or long_signal
+                or self.data.close[0] > self.ema13[0]
+                or len(self) - self.entry_bar >= 10
+            )
+            if exit_signal:
+                self.order = self.close()
+            return
+
+        if long_signal:
+            self._submit_entry(1)
+        elif short_signal:
+            self._submit_entry(-1)
+
+        if a_bullish and self.data.low[0] <= self.ema5[0]:
+            self.a_long_setup = float(self.data.high[0])
+        if a_bearish and self.data.high[0] >= self.ema5[0]:
+            self.a_short_setup = float(self.data.low[0])
+
+        ema_touch = (
+            self.data.low[0] <= self.ema9[0] <= self.data.high[0]
+            or self.data.low[0] <= self.ema21[0] <= self.data.high[0]
+        )
+        if b_bullish and b_squeeze and ema_touch:
+            self.b_long_setup = float(self.data.high[0])
+        if b_bearish and b_squeeze and ema_touch:
+            self.b_short_setup = float(self.data.low[0])
+```
+
+```json
+{"assumptions":[{"topic":"fixed risk R","choice":"risk_R is an optimizable fixed dollar-risk parameter defaulting to 100.0; entry size is floor(R / (1.5*ATR(14))).","reason":"The specification requires fixed-R ATR-based sizing but does not state a numerical R value or rounding method."},{"topic":"pullback and touch setup lifetime","choice":"The latest qualifying pullback/touch bar is retained until its first breakout; that breakout consumes the setup whether or not other filters pass.","reason":"No setup expiry or replacement rule is specified; this gives a literal breakout event and prevents entering after the breakout bar has passed."},{"topic":"trailing-stop ratchet","choice":"Long trailing stops only rise and short trailing stops only fall; each is based on the stated EMA(21) and one-ATR-from-local-extremum values, while never becoming less protective than the initial stop.","reason":"The specification calls it a trailing stop but does not state whether it may loosen."},{"topic":"intrabar exit triggers","choice":"Stop and take-profit conditions are detected from Low/High respectively, with the stop condition evaluated first when both occur on one bar; exits are submitted with self.close().","reason":"Only OHLCV bars are available and no stop-order execution priority is specified."},{"topic":"opposite signal","choice":"An opposite signal means a fully qualified enabled-module breakout signal after its enabled filters.","reason":"The specification does not define whether an opposite signal is a trend condition, setup, or completed entry signal."},{"topic":"time stop","choice":"The position is exited when 10 bars have elapsed since the completed entry bar.","reason":"The specification does not define whether the entry bar itself counts as one of the 10 bars."}]}
+```

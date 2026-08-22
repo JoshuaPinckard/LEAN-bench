@@ -1,0 +1,57 @@
+{
+  "task_id": 35,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\n\n\nclass TrendChannelBreakout(bt.Strategy):\n    params = (\n        (\"risk_fraction\", 0.01),\n        (\"stop_loss_pct\", 0.005),\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data.close, period=14)\n        self.sma20 = bt.indicators.SMA(self.data.close, period=20)\n        self.sma50 = bt.indicators.SMA(self.data.close, period=50)\n\n        self.channel_high = None\n        self.channel_low = None\n        self.current_day = None\n\n        self.cumulative_volume = 0.0\n        self.cumulative_vwap_value = 0.0\n        self.vwap = None\n        self.pvt = 0.0\n\n        self.tsi_ema1 = None\n        self.tsi_ema2 = None\n        self.tsi_abs_ema1 = None\n        self.tsi_abs_ema2 = None\n        self.tsi = None\n\n        self.pending_order = None\n        self.stop_order = None\n        self.entry_order = None\n        self.exit_order = None\n\n        self.entry_price = None\n        self.entry_channel_high = None\n        self.entry_channel_low = None\n        self.stop_price = None\n        self.completed_5m_bars_after_entry = 0\n\n    def _is_5m_close(self):\n        current_time = self.data.datetime.time(0)\n        return current_time.minute % 5 == 4\n\n    def _request_exit(self):\n        if self.pending_order is None and self.position:\n            if self.stop_order is not None:\n                self.cancel(self.stop_order)\n            self.exit_order = self.close()\n            self.pending_order = self.exit_order\n\n    def next(self):\n        current_date = self.data.datetime.date(0)\n        current_time = self.data.datetime.time(0)\n        close = self.data.close[0]\n        volume = self.data.volume[0]\n\n        if self.current_day != current_date:\n            self.current_day = current_date\n            self.channel_high = None\n            self.channel_low = None\n            self.cumulative_volume = 0.0\n            self.cumulative_vwap_value = 0.0\n\n        self.cumulative_volume += volume\n        self.cumulative_vwap_value += close * volume\n        if self.cumulative_volume:\n            self.vwap = self.cumulative_vwap_value / self.cumulative_volume\n\n        if len(self) > 1 and self.data.close[-1] != 0:\n            self.pvt += volume * (close - self.data.close[-1]) / self.data.close[-1]\n\n        if len(self) > 1:\n            momentum = close - self.data.close[-1]\n            alpha_25 = 2.0 / 26.0\n            alpha_13 = 2.0 / 14.0\n\n            if self.tsi_ema1 is None:\n                self.tsi_ema1 = momentum\n                self.tsi_abs_ema1 = abs(momentum)\n                self.tsi_ema2 = momentum\n                self.tsi_abs_ema2 = abs(momentum)\n            else:\n                self.tsi_ema1 += alpha_25 * (momentum - self.tsi_ema1)\n                self.tsi_abs_ema1 += alpha_25 * (abs(momentum) - self.tsi_abs_ema1)\n                self.tsi_ema2 += alpha_13 * (self.tsi_ema1 - self.tsi_ema2)\n                self.tsi_abs_ema2 += alpha_13 * (self.tsi_abs_ema1 - self.tsi_abs_ema2)\n\n            if self.tsi_abs_ema2:\n                self.tsi = 100.0 * self.tsi_ema2 / self.tsi_abs_ema2\n\n        if current_time.hour == 9 and current_time.minute == 55:\n            self.channel_high = self.data.high[0]\n\n        if current_time.hour == 10 and current_time.minute == 0:\n            self.channel_low = self.data.low[0]\n\n        if not self._is_5m_close():\n            return\n\n        if self.position:\n            self.completed_5m_bars_after_entry += 1\n\n            if self.sma20[0] is not None and self.data.low[0] <= self.sma20[0]:\n                self._request_exit()\n                return\n\n            inside_original_channel = (\n                self.entry_channel_low is not None\n                and self.entry_channel_high is not None\n                and self.entry_channel_low <= close <= self.entry_channel_high\n            )\n            if inside_original_channel:\n                self._request_exit()\n                return\n\n        if (\n            not self.position\n            and self.pending_order is None\n            and self.channel_high is not None\n            and self.channel_low is not None\n            and current_time.hour < 15\n            and close > self.channel_high\n            and self.sma20[0] > self.sma50[0]\n            and self.rsi[0] > 50\n            and self.tsi is not None\n            and self.tsi > 0\n        ):\n            provisional_stop = min(\n                close * (1.0 - self.p.stop_loss_pct),\n                self.channel_low,\n            )\n            risk_per_share = close - provisional_stop\n            if risk_per_share > 0:\n                risk_budget = self.broker.getvalue() * self.p.risk_fraction\n                risk_size = int(risk_budget / risk_per_share)\n                affordable_size = int(self.broker.getcash() / close)\n                size = min(risk_size, affordable_size)\n\n                if size > 0:\n                    self.entry_order = self.buy(size=size)\n                    self.pending_order = self.entry_order\n\n    def notify_order(self, order):\n        if order.status in (\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        ):\n            if order == self.pending_order:\n                self.pending_order = None\n\n            if order == self.entry_order:\n                if order.status == order.Completed:\n                    self.entry_price = order.executed.price\n                    self.entry_channel_high = self.channel_high\n                    self.entry_channel_low = self.channel_low\n                    self.completed_5m_bars_after_entry = 0\n                    self.stop_price = min(\n                        self.entry_price * (1.0 - self.p.stop_loss_pct),\n                        self.entry_channel_low,\n                    )\n                    self.stop_order = self.sell(\n                        exectype=bt.Order.Stop,\n                        price=self.stop_price,\n                        size=order.executed.size,\n                    )\n                self.entry_order = None\n\n            if order == self.stop_order:\n                self.stop_order = None\n                if order.status == order.Completed:\n                    self.entry_price = None\n                    self.entry_channel_high = None\n                    self.entry_channel_low = None\n                    self.stop_price = None\n\n            if order == self.exit_order:\n                self.exit_order = None\n                if order.status == order.Completed:\n                    self.entry_price = None\n                    self.entry_channel_high = None\n                    self.entry_channel_low = None\n                    self.stop_price = None",
+  "assumptions": [
+    {
+      "topic": "5m execution signals",
+      "choice": "Use each completed five-minute interval ending at minutes 04, 09, 14, ..., 59 from the supplied one-minute feed.",
+      "reason": "The environment supplies only one-minute data, so five-minute closes are formed from its clock-aligned bars."
+    },
+    {
+      "topic": "lower white trend line",
+      "choice": "Use the 20-period SMA as the dynamic lower trend-following line.",
+      "reason": "The specification permits a trend-line proxy and explicitly names the 20-period SMA."
+    },
+    {
+      "topic": "momentum confirmation",
+      "choice": "Require both RSI above 50 and positive TSI.",
+      "reason": "Momentum confirmation is optional; both named confirmations are used for the stated added confirmation."
+    },
+    {
+      "topic": "TSI",
+      "choice": "Calculate TSI as double-smoothed one-minute close momentum using EMA periods 25 then 13.",
+      "reason": "This implements the stated default TSI parameters."
+    },
+    {
+      "topic": "optional volatility and volume filters",
+      "choice": "Do not apply either filter.",
+      "reason": "Neither provides a quantitative threshold required for a deterministic skip decision."
+    },
+    {
+      "topic": "stop loss",
+      "choice": "Use 0.5% below entry, constrained to the lower of that value and the original lower channel line.",
+      "reason": "0.5% is the first stated example and the constraint places the stop at or below the lower channel level."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "Risk 1% of current account value per trade, capped by available cash.",
+      "reason": "1% is the first stated risk example; the cash cap prevents an unaffordable order."
+    },
+    {
+      "topic": "PVT and VWAP",
+      "choice": "Calculate PVT cumulatively from one-minute closes and VWAP cumulatively within each trading day.",
+      "reason": "The specification names both indicators but does not define alternate calculation windows."
+    },
+    {
+      "topic": "whipsaw protection",
+      "choice": "Close whenever a completed five-minute close returns inside the original channel, including the first one after entry.",
+      "reason": "This directly implements immediate breakout failure and also satisfies the stated trend-reversal exit."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

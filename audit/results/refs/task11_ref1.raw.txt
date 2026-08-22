@@ -1,0 +1,130 @@
+```python
+import backtrader as bt
+
+
+class IntradayPreviousCloseCrossStrategy(bt.Strategy):
+    params = (("capital_fraction", 1.0),)
+
+    def __init__(self):
+        self.addminperiod(2)
+        self.pending_order = None
+        self.entry_order = None
+        self.exit_order = None
+        self.stop_order = None
+        self.limit_order = None
+
+    def _in_trading_window(self):
+        current_dt = self.data.datetime.datetime(0)
+        minute_of_day = current_dt.hour * 60 + current_dt.minute
+        after_first_five_minutes = minute_of_day >= (9 * 60 + 35)
+        high_liquidity_period = (10 * 60) <= minute_of_day <= (16 * 60)
+        return after_first_five_minutes and high_liquidity_period
+
+    def _cancel_protection_orders(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.limit_order is not None:
+            self.cancel(self.limit_order)
+
+    def _entry_size(self, price):
+        commission = self.broker.getcommissioninfo(self.data).p.commission
+        cash = self.broker.getcash() * self.p.capital_fraction
+        return cash / (price * (1.0 + commission))
+
+    def next(self):
+        if not self._in_trading_window():
+            return
+
+        if self.pending_order is not None:
+            return
+
+        if self.stop_order is not None or self.limit_order is not None:
+            return
+
+        current_price = self.data.close[0]
+        previous_close = self.data.close[-1]
+        crosses_above = current_price > previous_close
+        crosses_below = current_price < previous_close
+
+        if not self.position:
+            size = self._entry_size(current_price)
+
+            if crosses_above:
+                self.entry_order = self.buy(size=size)
+                self.pending_order = self.entry_order
+            elif crosses_below:
+                self.entry_order = self.sell(size=size)
+                self.pending_order = self.entry_order
+        elif self.position.size > 0 and crosses_below:
+            self._cancel_protection_orders()
+            self.exit_order = self.close()
+            self.pending_order = self.exit_order
+        elif self.position.size < 0 and crosses_above:
+            self._cancel_protection_orders()
+            self.exit_order = self.close()
+            self.pending_order = self.exit_order
+
+    def notify_order(self, order):
+        final_statuses = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in final_statuses:
+            return
+
+        if order is self.pending_order:
+            self.pending_order = None
+
+        if order is self.entry_order:
+            self.entry_order = None
+
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if order.isbuy():
+                    self.stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price * 0.99,
+                    )
+                    self.limit_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price * 1.02,
+                        oco=self.stop_order,
+                    )
+                else:
+                    self.stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price * 1.01,
+                    )
+                    self.limit_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price * 0.98,
+                        oco=self.stop_order,
+                    )
+
+        if order is self.exit_order:
+            self.exit_order = None
+            self._cancel_protection_orders()
+
+        if order is self.stop_order:
+            self.stop_order = None
+            if self.limit_order is not None:
+                self.cancel(self.limit_order)
+
+        if order is self.limit_order:
+            self.limit_order = None
+            if self.stop_order is not None:
+                self.cancel(self.stop_order)
+```
+
+```json
+{"assumptions":[{"topic":"current price","choice":"Use self.data.close[0] as the current market price.","reason":"The supplied OHLCV M1 feed provides one price value per bar to strategy logic; intrabar tick prices are unavailable."},{"topic":"infeasible","choice":"Submit standard Backtrader market orders when a signal is evaluated.","reason":"With one OHLCV bar per minute and harness-controlled execution settings, true before-close intrabar execution cannot be reproduced; Backtrader fills market orders at its configured next available execution point."},{"topic":"position sizing","choice":"Use 100% of available cash per entry, reserving the configured commission, with fractional-share sizing.","reason":"The specification requires fixed sizing and gives 100% of available capital as its stated example, but does not provide a share quantity."},{"topic":"trading hours","choice":"Treat 10:00 through 16:00 local time as inclusive and evaluate signal-based entries/exits only in that interval.","reason":"This is the literal inclusive reading of 'from 10:00 to 16:00'; the separate first-five-minutes rule is implemented although it is redundant with the 10:00 start."},{"topic":"protective exits","choice":"Keep stop-loss and take-profit orders active after entry, including outside the signal-trading window.","reason":"They are required risk-management orders and no instruction authorizes cancelling them at the end of the high-liquidity period."}]}
+```

@@ -1,0 +1,132 @@
+```python
+import backtrader as bt
+import math
+
+
+class WeeklyORBStrategy(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+    )
+
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(self.data.close, period=20)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+
+        self.order = None
+        self.orders = []
+
+        self.week_key = None
+        self.range_high = None
+        self.range_low = None
+        self.midpoint = None
+        self.breakout_bar = None
+        self.returned_to_midpoint = False
+
+    def _set_weekly_range_if_needed(self):
+        current_date = self.data.datetime.date(0)
+        iso = current_date.isocalendar()
+        key = (iso.year, iso.week)
+
+        if key != self.week_key:
+            self.week_key = key
+            self.range_high = self.data.high[0]
+            self.range_low = self.data.low[0]
+            self.midpoint = (self.range_high + self.range_low) / 2.0
+            self.breakout_bar = None
+            self.returned_to_midpoint = False
+
+    def prenext(self):
+        self._set_weekly_range_if_needed()
+
+    def _orders_pending(self):
+        return any(order.alive() for order in self.orders)
+
+    def next(self):
+        self._set_weekly_range_if_needed()
+
+        if not self._orders_pending():
+            self.orders = []
+
+        if self.position or self.order is not None or self._orders_pending():
+            return
+
+        if self.breakout_bar is None:
+            if self.data.close[0] < self.range_low:
+                self.breakout_bar = len(self)
+            return
+
+        days_after_breakout = len(self) - self.breakout_bar
+
+        if days_after_breakout > 2:
+            return
+
+        if days_after_breakout < 1:
+            return
+
+        if self.data.low[0] <= self.midpoint <= self.data.high[0]:
+            self.returned_to_midpoint = True
+
+        trend_down = (
+            self.data.close[0] < self.ema20[0]
+            and self.data.close[0] < self.sma50[0]
+            and self.ema20[0] < self.sma50[0]
+            and self.ema20[0] < self.ema20[-1]
+        )
+
+        crossed_down = (
+            self.data.close[-1] > self.midpoint
+            and self.data.close[0] <= self.midpoint
+        )
+
+        if not (self.returned_to_midpoint and crossed_down and trend_down):
+            return
+
+        stop_risk_per_share = self.range_high - self.data.close[0]
+        if stop_risk_per_share <= 0:
+            return
+
+        risk_budget = self.broker.getvalue() * self.p.risk_fraction
+        size = int(math.floor(risk_budget / stop_risk_per_share))
+        if size <= 0:
+            return
+
+        parent = self.sell(
+            size=size,
+            exectype=bt.Order.Market,
+            transmit=False,
+        )
+        stop = self.buy(
+            size=size,
+            exectype=bt.Order.Stop,
+            price=self.range_high,
+            parent=parent,
+            transmit=False,
+        )
+        target = self.buy(
+            size=size,
+            exectype=bt.Order.Limit,
+            price=self.range_low,
+            parent=parent,
+            transmit=True,
+        )
+
+        self.order = parent
+        self.orders = [parent, stop, target]
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.order:
+                self.order = None
+
+            if not self._orders_pending():
+                self.orders = []
+```
+
+```json
+{"assumptions":[{"topic":"risk sizing","choice":"Use 1% of current broker equity as the stop-risk budget, with whole-share sizing rounded down.","reason":"The specification permits 1–2% of capital but does not select a specific percentage or rounding method."},{"topic":"entry and return price interpretation","choice":"Use daily OHLC: a return to 0.5 occurs when the day's Low-to-High range contains 0.5; the from-above-to-below entry trigger is prior Close above 0.5 and current Close at or below 0.5.","reason":"The D1 feed has no intraday sequence, so Close is used for the directional cross while OHLC determines whether the level was reached."},{"topic":"infeasible","choice":"Stop-risk sizing is calculated from the signal-day Close, while the market entry fills on Backtrader's next executable bar.","reason":"The actual future market-entry price is unavailable when the order size must be submitted."}]}
+```

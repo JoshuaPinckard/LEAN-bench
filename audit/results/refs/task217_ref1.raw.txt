@@ -1,0 +1,160 @@
+```python
+import backtrader as bt
+
+
+class MomentumStrategy(bt.Strategy):
+    params = (("risk_fraction", 0.01),)
+
+    def __init__(self):
+        self.ema9 = bt.ind.EMA(self.data.close, period=9)
+        self.ema21 = bt.ind.EMA(self.data.close, period=21)
+        self.ema50 = bt.ind.EMA(self.data.close, period=50)
+        self.ema200 = bt.ind.EMA(self.data.close, period=200)
+
+        self.bb = bt.ind.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.macd = bt.ind.MACD(self.data.close, period_me1=12,
+                                period_me2=26, period_signal=9)
+        self.atr = bt.ind.ATR(self.data, period=14)
+        self.volume_sma = bt.ind.SMA(self.data.volume, period=20)
+
+        self.close_upper_cross = bt.ind.CrossOver(self.data.close, self.bb.top)
+        self.macd_bull_cross = bt.ind.CrossOver(self.macd.macd, self.macd.signal)
+        self.close_ema9_cross = bt.ind.CrossOver(self.data.close, self.ema9)
+        self.ema21_bear_cross = bt.ind.CrossOver(self.ema21, self.data.close)
+        self.macd_bear_cross = bt.ind.CrossOver(self.macd.signal, self.macd.macd)
+
+        self.entry_order = None
+        self.stop_order = None
+        self.tp_order = None
+        self.exit_order = None
+        self.exit_requested = False
+        self.rebuild_protection = False
+
+        self.entry_atr = None
+        self.entry_ema21 = None
+        self.stop_price = None
+        self.tp_price = None
+        self.breakeven_moved = False
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled,
+                            order.Margin, order.Rejected):
+            if order is self.entry_order:
+                self.entry_order = None
+
+                if order.status == order.Completed:
+                    entry = order.executed.price
+                    atr_value = self.entry_atr
+                    self.stop_price = min(
+                        self.entry_ema21,
+                        entry - max(0.02, atr_value)
+                    )
+                    self.tp_price = entry + min(max(atr_value, 0.10), 0.20)
+                    self.breakeven_moved = False
+                    self.rebuild_protection = True
+
+            elif order is self.stop_order:
+                self.stop_order = None
+            elif order is self.tp_order:
+                self.tp_order = None
+            elif order is self.exit_order:
+                self.exit_order = None
+                self.exit_requested = False
+
+    def _cancel_protection(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.tp_order is not None:
+            self.cancel(self.tp_order)
+
+    def _place_protection(self):
+        if not self.position or self.stop_price is None or self.tp_price is None:
+            return
+
+        self.stop_order = self.sell(
+            exectype=bt.Order.Stop,
+            price=self.stop_price
+        )
+        self.tp_order = self.sell(
+            exectype=bt.Order.Limit,
+            price=self.tp_price,
+            oco=self.stop_order
+        )
+        self.rebuild_protection = False
+
+    def next(self):
+        if self.entry_order is not None or self.exit_order is not None:
+            return
+
+        if self.position:
+            if self.exit_requested:
+                if self.stop_order is None and self.tp_order is None:
+                    self.exit_order = self.close()
+                return
+
+            if self.rebuild_protection:
+                if self.stop_order is None and self.tp_order is None:
+                    self._place_protection()
+                return
+
+            entry_price = self.position.price
+            unrealized_profit = self.data.close[0] - entry_price
+
+            if (not self.breakeven_moved and unrealized_profit >= 0.10):
+                self.stop_price = max(entry_price, self.ema9[0])
+                self.breakeven_moved = True
+                self.rebuild_protection = True
+                self._cancel_protection()
+                return
+
+            if (self.ema21_bear_cross[0] > 0 or
+                    self.macd_bear_cross[0] > 0 or
+                    (self.breakeven_moved and self.data.close[0] < self.ema9[0])):
+                self.exit_requested = True
+                self._cancel_protection()
+            return
+
+        if self.stop_order is not None or self.tp_order is not None:
+            return
+
+        rvol = self.data.volume[0] / self.volume_sma[0]
+        price_filter = 0.75 <= self.data.close[0] <= 10.00
+        volume_filter = rvol >= 1.5
+        trend_filter = (
+            self.data.close[0] > self.ema9[0] > self.ema21[0] > self.ema50[0]
+            and self.data.close[0] > self.ema200[0]
+        )
+
+        macd_confirmation = any(self.macd_bull_cross[-offset] > 0
+                                for offset in range(3))
+        breakout = self.close_upper_cross[0] > 0 and macd_confirmation
+
+        recent_pullback = any(
+            self.data.low[-offset] <= self.ema21[-offset]
+            or self.data.close[-offset] <= self.bb.mid[-offset]
+            for offset in range(3)
+        )
+        sniper_bounce = (
+            recent_pullback
+            and self.close_ema9_cross[0] > 0
+            and abs(self.bb.top[0] - self.data.close[0]) <= 0.5 * self.atr[0]
+        )
+
+        if (price_filter and volume_filter and trend_filter
+                and (breakout or sniper_bounce)):
+            prospective_stop = min(
+                self.ema21[0],
+                self.data.close[0] - max(0.02, self.atr[0])
+            )
+            risk_per_share = self.data.close[0] - prospective_stop
+
+            if risk_per_share > 0:
+                risk_amount = self.broker.getvalue() * self.p.risk_fraction
+                self.entry_atr = self.atr[0]
+                self.entry_ema21 = self.ema21[0]
+                self.entry_order = self.buy(size=risk_amount / risk_per_share)
+```
+
+```json
+{"assumptions":[{"topic":"risk R per trade","choice":"R is 1% of current broker portfolio value.","reason":"The specification gives 1% of capital as its example but does not fix a different risk percentage."},{"topic":"entry-price sizing","choice":"The current close is used as the prospective entry price for sizing; stop-loss and take-profit are recalculated from the actual market-fill price.","reason":"A market order's next-bar fill is unknown at signal time, while the stated sizing formula requires an entry price."},{"topic":"unrealized profit","choice":"The 0.10 threshold is interpreted as a per-share price gain from the filled entry price.","reason":"The threshold is stated in the same price units as the stop and take-profit distances."},{"topic":"last 3 bars","choice":"The current bar and two immediately preceding bars are included.","reason":"This is the literal rolling three-bar window available when evaluating the current-bar entry signal."},{"topic":"distance to upper Bollinger band","choice":"Distance is calculated as the absolute price difference between close and the upper band.","reason":"Distance conventionally denotes a non-negative separation."},{"topic":"protective orders","choice":"Initial stop-loss and take-profit are submitted as linked stop and limit orders after the entry fills; changing the stop cancels and rebuilds both protective orders.","reason":"This implements the stated SL and TP as executable price orders while preserving one-position behavior."}]}
+```

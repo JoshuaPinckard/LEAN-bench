@@ -1,0 +1,243 @@
+```python
+import backtrader as bt
+import math
+
+
+class SupplyDemandSwingStrategy(bt.Strategy):
+    params = ()
+
+    def __init__(self):
+        self.order = None
+        self._pending_kind = None
+        self._pending_context = None
+        self.active_trade = None
+
+        self._four_hour = None
+        self._daily = None
+        self._four_hour_history = []
+        self._daily_history = []
+        self.demand_zones = []
+        self.supply_zones = []
+        self.daily_trend = None
+        self.previous_close = None
+
+    def _new_bar(self, dt):
+        return {
+            "open": float(self.data.open[0]),
+            "high": float(self.data.high[0]),
+            "low": float(self.data.low[0]),
+            "close": float(self.data.close[0]),
+            "volume": float(self.data.volume[0]),
+            "dt": dt,
+        }
+
+    def _update_bar(self, bar):
+        bar["high"] = max(bar["high"], float(self.data.high[0]))
+        bar["low"] = min(bar["low"], float(self.data.low[0]))
+        bar["close"] = float(self.data.close[0])
+        bar["volume"] += float(self.data.volume[0])
+
+    def _add_zones(self, history, timeframe):
+        if len(history) < 4:
+            return
+
+        consolidation = history[-4:-1]
+        impulse = history[-1]
+        zone_low = min(bar["low"] for bar in consolidation)
+        zone_high = max(bar["high"] for bar in consolidation)
+        zone_height = zone_high - zone_low
+
+        if zone_height < 0.005 * impulse["close"]:
+            return
+
+        if (impulse["close"] > zone_high and
+                impulse["close"] - impulse["open"] >= zone_height):
+            self.demand_zones.append({
+                "lower": zone_low,
+                "upper": zone_high,
+                "timeframe": timeframe,
+                "created": impulse["dt"],
+            })
+
+        if (impulse["close"] < zone_low and
+                impulse["open"] - impulse["close"] >= zone_height):
+            self.supply_zones.append({
+                "lower": zone_low,
+                "upper": zone_high,
+                "timeframe": timeframe,
+                "created": impulse["dt"],
+            })
+
+    def _complete_four_hour(self):
+        self._four_hour_history.append(self._four_hour)
+        self._add_zones(self._four_hour_history, "4H")
+
+    def _complete_daily(self):
+        self._daily_history.append(self._daily)
+        self._add_zones(self._daily_history, "1D")
+
+        if len(self._daily_history) >= 2:
+            if self._daily_history[-1]["close"] > self._daily_history[-2]["close"]:
+                self.daily_trend = "up"
+            elif self._daily_history[-1]["close"] < self._daily_history[-2]["close"]:
+                self.daily_trend = "down"
+            else:
+                self.daily_trend = None
+
+    def _update_timeframes(self, dt):
+        four_hour_key = (dt.date(), dt.hour // 4)
+        daily_key = dt.date()
+
+        if self._four_hour is None:
+            self._four_hour = self._new_bar(dt)
+            self._four_hour_key = four_hour_key
+        elif four_hour_key != self._four_hour_key:
+            self._complete_four_hour()
+            self._four_hour = self._new_bar(dt)
+            self._four_hour_key = four_hour_key
+        else:
+            self._update_bar(self._four_hour)
+
+        if self._daily is None:
+            self._daily = self._new_bar(dt)
+            self._daily_key = daily_key
+        elif daily_key != self._daily_key:
+            self._complete_daily()
+            self._daily = self._new_bar(dt)
+            self._daily_key = daily_key
+        else:
+            self._update_bar(self._daily)
+
+    def _nearest_higher_supply(self, price):
+        candidates = [z for z in self.supply_zones if z["lower"] > price]
+        return min(candidates, key=lambda z: z["lower"]) if candidates else None
+
+    def _nearest_lower_demand(self, price):
+        candidates = [z for z in self.demand_zones if z["upper"] < price]
+        return max(candidates, key=lambda z: z["upper"]) if candidates else None
+
+    def _enter(self, side, zone):
+        price = float(self.data.close[0])
+        stop = zone["lower"] * 0.995 if side == "long" else zone["upper"] * 1.005
+        per_unit_risk = abs(price - stop)
+
+        if per_unit_risk <= 0:
+            return
+
+        size = math.floor((self.broker.getvalue() * 0.01) / per_unit_risk)
+        if size <= 0:
+            return
+
+        target_zone = (
+            self._nearest_higher_supply(price)
+            if side == "long"
+            else self._nearest_lower_demand(price)
+        )
+
+        self._pending_kind = "entry"
+        self._pending_context = {
+            "side": side,
+            "zone": zone,
+            "stop": stop,
+            "target_zone": target_zone,
+        }
+        self.order = self.buy(size=size) if side == "long" else self.sell(size=size)
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        self._update_timeframes(dt)
+
+        close = float(self.data.close[0])
+        high = float(self.data.high[0])
+        low = float(self.data.low[0])
+
+        if self.position and self.order is None and self.active_trade is not None:
+            trade = self.active_trade
+
+            if self.position.size > 0:
+                if low <= trade["stop"] or high >= trade["target"]:
+                    self._pending_kind = "exit"
+                    self._pending_context = None
+                    self.order = self.close()
+            else:
+                if high >= trade["stop"] or low <= trade["target"]:
+                    self._pending_kind = "exit"
+                    self._pending_context = None
+                    self.order = self.close()
+
+        if self.position or self.order is not None or self.previous_close is None:
+            self.previous_close = close
+            return
+
+        if self.daily_trend == "up":
+            candidates = [
+                zone for zone in self.demand_zones
+                if zone["lower"] <= close <= zone["upper"]
+                and low <= (zone["lower"] + zone["upper"]) / 2.0
+            ]
+            if candidates and close > self.previous_close:
+                zone = max(candidates, key=lambda z: z["lower"])
+                self._enter("long", zone)
+
+        elif self.daily_trend == "down":
+            candidates = [
+                zone for zone in self.supply_zones
+                if zone["lower"] <= close <= zone["upper"]
+                and high >= (zone["lower"] + zone["upper"]) / 2.0
+            ]
+            if candidates and close < self.previous_close:
+                zone = min(candidates, key=lambda z: z["upper"])
+                self._enter("short", zone)
+
+        self.previous_close = close
+
+    def notify_order(self, order):
+        if order.status in (bt.Order.Submitted, bt.Order.Accepted):
+            return
+
+        kind = self._pending_kind
+        context = self._pending_context
+
+        if order.status == bt.Order.Completed:
+            self.order = None
+            self._pending_kind = None
+            self._pending_context = None
+
+            if kind == "entry":
+                entry = order.executed.price
+                if context["target_zone"] is not None:
+                    target = (
+                        context["target_zone"]["lower"]
+                        if context["side"] == "long"
+                        else context["target_zone"]["upper"]
+                    )
+                else:
+                    risk = abs(entry - context["stop"])
+                    target = (
+                        entry + 2.0 * risk
+                        if context["side"] == "long"
+                        else entry - 2.0 * risk
+                    )
+
+                self.active_trade = {
+                    "side": context["side"],
+                    "stop": context["stop"],
+                    "target": target,
+                }
+            elif kind == "exit":
+                self.active_trade = None
+
+        elif order.status in (
+            bt.Order.Canceled,
+            bt.Order.Margin,
+            bt.Order.Rejected,
+            bt.Order.Expired,
+        ):
+            self.order = None
+            if kind == "entry":
+                self._pending_context = None
+            self._pending_kind = None
+```
+
+```json
+{"assumptions":[{"topic":"zone algorithm","choice":"A zone is created from three completed consolidation bars followed by one completed directional impulse bar. The impulse must close beyond the consolidation range and have a directional body at least as large as the zone height.","reason":"The specification requires consolidation and a sharp move but does not define their bar counts or numerical definition."},{"topic":"timeframe construction","choice":"4H bars are aggregated from the supplied 1H bars in local calendar buckets beginning at 00:00, 04:00, 08:00, 12:00, 16:00, and 20:00; daily bars use local calendar days.","reason":"Only one 1H feed is supplied, so 4H and 1D values must be constructed from it."},{"topic":"trend direction","choice":"The daily trend is up when the latest completed daily close exceeds the preceding completed daily close, down when it is lower, and neutral when equal.","reason":"The required daily trend filter does not define a trend calculation."},{"topic":"bounce definition","choice":"A long bounce requires the current 1H candle to close above the prior close while its low reaches the demand-zone midpoint or lower; a short bounce requires the current close below the prior close while its high reaches the supply-zone midpoint or higher.","reason":"The specification names lower/upper boundary or central-part bounces without a mechanical candle definition."},{"topic":"RSI","choice":"RSI is omitted.","reason":"The RSI confirmation is explicitly optional."},{"topic":"zone targets","choice":"For longs, the target is the lower boundary of the nearest supply zone entirely above entry; for shorts, it is the upper boundary of the nearest demand zone entirely below entry.","reason":"These are the first boundaries reached when price moves from the entry toward the opposing zone."},{"topic":"risk sizing","choice":"Risk per trade is fixed at 1% of current broker value, with whole-unit size rounded down from the entry-close-to-stop distance.","reason":"The specification permits 1-2% but does not select a percentage or fractional sizing convention."},{"topic":"execution and intrabar ambiguity","choice":"Entries are submitted after the signal candle and execute as Backtrader market orders on the next bar open. Stop/target touches are detected from each 1H bar high/low and submitted as self.close() market exits; if both are touched in one bar, stop-loss takes priority.","reason":"The OHLC feed cannot reveal intrabar ordering, and the stated entry timing permits next-open execution while the canonical exit convention is self.close()."},{"topic":"zone lifetime","choice":"All identified zones remain available for later entries and targets.","reason":"The specification gives no zone invalidation, expiration, or one-use rule."}]}

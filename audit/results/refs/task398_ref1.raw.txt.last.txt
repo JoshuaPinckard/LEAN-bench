@@ -1,0 +1,109 @@
+```python
+import backtrader as bt
+import math
+
+
+class Strategy(bt.Strategy):
+    params = (
+        ("train_bars", 200),
+        ("n_trees", 100),
+        ("seed", 0),
+    )
+
+    def __init__(self):
+        self.rsi2 = bt.indicators.RSI(self.data.close, period=2)
+        self.order = None
+
+    def notify_order(self, order):
+        if order.status in (
+            bt.Order.Completed,
+            bt.Order.Canceled,
+            bt.Order.Margin,
+            bt.Order.Rejected,
+        ):
+            self.order = None
+
+    def _next_random(self, state):
+        return (1664525 * state + 1013904223) & 0xFFFFFFFF
+
+    def _majority(self, labels, default=0):
+        if not labels:
+            return default
+        return 1 if sum(labels) > (len(labels) - sum(labels)) else 0
+
+    def _predict_random_forest(self, rows):
+        labels = [row[2] for row in rows]
+        overall = self._majority(labels)
+        votes = 0
+        state = self.p.seed
+
+        for _ in range(self.p.n_trees):
+            sample = []
+            for _ in range(len(rows)):
+                state = self._next_random(state)
+                sample.append(rows[state % len(rows)])
+
+            state = self._next_random(state)
+            feature = state % 2
+            state = self._next_random(state)
+            threshold = sample[state % len(sample)][feature]
+
+            left = [row[2] for row in sample if row[feature] <= threshold]
+            right = [row[2] for row in sample if row[feature] > threshold]
+
+            latest_rsi = float(self.rsi2[0])
+            latest_return = float(self.data.close[0] / self.data.close[-1] - 1.0)
+            latest_value = (latest_rsi, latest_return)[feature]
+
+            if latest_value <= threshold:
+                votes += self._majority(left, overall)
+            else:
+                votes += self._majority(right, overall)
+
+        return 1 if votes > (self.p.n_trees - votes) else 0
+
+    def _set_target(self, target):
+        if self.order is not None:
+            return
+
+        if target == 1.0 and self.position.size == 0:
+            self.order = self.order_target_percent(target=1.0)
+        elif target == 0.0 and self.position.size != 0:
+            self.order = self.order_target_percent(target=0.0)
+
+    def next(self):
+        rsi_value = float(self.rsi2[0])
+
+        if len(self.data) < 50:
+            if rsi_value < 30:
+                self._set_target(1.0)
+            elif rsi_value > 70:
+                self._set_target(0.0)
+            return
+
+        rows = []
+        earliest = max(-(self.p.train_bars), -len(self.data) + 2)
+
+        for offset in range(earliest, 0):
+            rsi = float(self.rsi2[offset])
+            previous_close = float(self.data.close[offset - 1])
+            close = float(self.data.close[offset])
+            next_close = float(self.data.close[offset + 1])
+
+            if (
+                previous_close != 0
+                and math.isfinite(rsi)
+                and math.isfinite(close)
+                and math.isfinite(next_close)
+            ):
+                rows.append((rsi, close / previous_close - 1.0,
+                             1 if next_close > close else 0))
+
+        if rows:
+            prediction = self._predict_random_forest(rows)
+            self._set_target(1.0 if prediction == 1 else 0.0)
+```
+
+```json
+{"assumptions":[{"topic":"training window","choice":"N=200 bars, capped by available valid historical rows","reason":"The specification gives N=200 as its example but does not otherwise set N."},{"topic":"refit schedule","choice":"Refit on every eligible next() call","reason":"The specification permits daily refitting."},{"topic":"features","choice":"Use RSI(2) and one-day close return only","reason":"These are the two explicitly enumerated feature examples; no additional features are added."},{"topic":"random forest settings","choice":"Use 100 deterministic bootstrapped randomized decision stumps with seed 0","reason":"RandomForestClassifier hyperparameters and random-state are unspecified; deterministic behavior is required for execution-trace auditing."},{"topic":"infeasible","choice":"Implement an in-class random-forest-style classifier rather than scikit-learn RandomForestClassifier","reason":"The fixed environment permits imports only from backtrader, math, collections, and statistics, so scikit-learn cannot be imported."}]} 
+```

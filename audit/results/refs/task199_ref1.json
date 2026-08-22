@@ -1,0 +1,69 @@
+{
+  "task_id": 199,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\n\n\nclass SpotWheelProxy(bt.Strategy):\n    params = (\n        ('sma_len', 200),\n        ('bb_len', 20),\n        ('bb_dev', 2),\n        ('atr_len', 14),\n        ('volp_lookback', 500),\n        ('volp_thresh', 70),\n        ('risk_per_trade', 0.015),\n        ('max_alloc', 0.15),\n        ('cc_timeout', 35),\n        ('cc_overrun', 0.10),\n    )\n\n    class WidthPercentile(bt.Indicator):\n        lines = ('percentile',)\n        params = (('period', 500),)\n\n        def __init__(self):\n            self.addminperiod(self.p.period)\n\n        def next(self):\n            values = list(self.data.get(size=self.p.period))\n            current = values[-1]\n            self.lines.percentile[0] = (\n                100.0 * sum(value <= current for value in values) / self.p.period\n            )\n\n    def __init__(self):\n        self.sma = bt.indicators.SimpleMovingAverage(\n            self.data.close, period=self.p.sma_len\n        )\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close,\n            period=self.p.bb_len,\n            devfactor=self.p.bb_dev,\n            movav=bt.indicators.SimpleMovingAverage,\n        )\n        self.width = (self.bb.top - self.bb.bot) / self.bb.mid\n        self.width_percentile = self.WidthPercentile(\n            self.width, period=self.p.volp_lookback\n        )\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_len)\n        self.cross = bt.indicators.CrossOver(self.data.close, self.bb.bot)\n        self.avg_dollar_volume = bt.indicators.SimpleMovingAverage(\n            self.data.volume * self.data.close, period=20\n        )\n\n        self.order = None\n        self.order_kind = None\n        self.phase = 'flat'\n        self.entry_price = None\n        self.stop_price = None\n        self.partial_bar = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        if order.status == order.Completed:\n            if self.order_kind == 'entry':\n                self.entry_price = order.executed.price\n                self.stop_price = min(\n                    self.entry_price * 0.90,\n                    self.entry_price - 1.5 * self.atr[0],\n                )\n                self.phase = 'csp'\n\n            elif self.order_kind == 'partial':\n                self.stop_price = self.entry_price\n                self.partial_bar = len(self)\n                self.phase = 'cc'\n\n            elif self.order_kind == 'exit':\n                self.phase = 'flat'\n                self.entry_price = None\n                self.stop_price = None\n                self.partial_bar = None\n\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            if self.order_kind == 'entry':\n                self.phase = 'flat'\n\n        if order.status in (\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        ):\n            self.order = None\n            self.order_kind = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if not self.position:\n            filters_met = (\n                self.data.close[0] > self.sma[0]\n                and self.width_percentile[0] > self.p.volp_thresh\n                and 50 <= self.data.close[0] <= 500\n                and self.avg_dollar_volume[0] > 50000000\n            )\n\n            if self.cross[0] == 1 and filters_met:\n                assumed_entry = self.data.close[0]\n                stop = min(\n                    assumed_entry * 0.90,\n                    assumed_entry - 1.5 * self.atr[0],\n                )\n                equity = self.broker.getvalue()\n                risk_dollars = self.p.risk_per_trade * equity\n                size = min(\n                    self.p.max_alloc * equity / assumed_entry,\n                    risk_dollars / (assumed_entry - stop),\n                )\n\n                if size > 0:\n                    self.order = self.buy(size=size)\n                    self.order_kind = 'entry'\n            return\n\n        if self.data.low[0] <= self.stop_price:\n            self.order = self.close()\n            self.order_kind = 'exit'\n            return\n\n        if self.phase == 'csp':\n            if self.data.high[0] >= self.bb.mid[0]:\n                self.order = self.sell(size=self.position.size * 0.5)\n                self.order_kind = 'partial'\n            return\n\n        if self.phase == 'cc':\n            target_reached = (\n                self.data.high[0] >= self.bb.top[0]\n                or self.data.high[0] >= self.entry_price * (1.0 + self.p.cc_overrun)\n            )\n            timed_out = len(self) - self.partial_bar >= self.p.cc_timeout\n\n            if target_reached or timed_out:\n                self.order = self.close()\n                self.order_kind = 'exit'",
+  "assumptions": [
+    {
+      "topic": "entry execution",
+      "choice": "Use a market buy order when the signal occurs; Backtrader executes it on the next available bar under the fixed harness.",
+      "reason": "The specification explicitly permits market entry on the signal bar, while normal Backtrader execution cannot fill a newly submitted market order on that same bar without a harness setting not specified."
+    },
+    {
+      "topic": "Bollinger-width percentile",
+      "choice": "Use the inclusive percentile rank of the current width among the most recent 500 width values, expressed from 0 to 100.",
+      "reason": "The specification gives a percentile threshold of 70 but does not define the rank convention."
+    },
+    {
+      "topic": "price-reaching tests",
+      "choice": "Use bar High to detect profit targets and bar Low to detect stops; submit a market exit after a trigger. If both occur in one bar, evaluate the stop first.",
+      "reason": "OHLCV data does not provide the intrabar sequence or executable path needed to determine which threshold occurred first."
+    },
+    {
+      "topic": "partial-profit timing",
+      "choice": "Start the 35-bar CC timeout when the 50% partial-profit order is completed.",
+      "reason": "This is the literal available interpretation of 'after partial profit-taking' in next-bar order execution."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 2,
+  "tape": [
+    {
+      "dt": "2024-08-08T04:00:00",
+      "side": "BUY",
+      "size": 7.210912138134035,
+      "price": 211.27982425167653
+    },
+    {
+      "dt": "2024-08-13T04:00:00",
+      "side": "SELL",
+      "size": -3.6054560690670177,
+      "price": 217.38043273085663
+    },
+    {
+      "dt": "2024-09-23T04:00:00",
+      "side": "SELL",
+      "size": -3.6054560690670177,
+      "price": 225.6484798300337
+    },
+    {
+      "dt": "2025-01-15T05:00:00",
+      "side": "BUY",
+      "size": 6.5168605410420986,
+      "price": 233.1503884256181
+    },
+    {
+      "dt": "2025-01-29T05:00:00",
+      "side": "SELL",
+      "size": -3.2584302705210493,
+      "price": 232.6336842670617
+    },
+    {
+      "dt": "2025-01-30T05:00:00",
+      "side": "SELL",
+      "size": -3.2584302705210493,
+      "price": 237.15482584661257
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "task_id": 62,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\n\n\nclass MarketSegmentationByVolatilityAndTrend(bt.Strategy):\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=14)\n        self.atr_average = bt.indicators.SimpleMovingAverage(self.atr, period=50)\n\n        self.ema_fast = bt.indicators.ExponentialMovingAverage(self.data.close, period=20)\n        self.ema_slow = bt.indicators.ExponentialMovingAverage(self.data.close, period=50)\n        self.ema_global = bt.indicators.ExponentialMovingAverage(self.data.close, period=200)\n\n        self.entry_order = None\n        self.close_order = None\n        self.stop_order = None\n        self.limit_order = None\n        self.entry_atr = None\n\n        self.current_segment = None\n        self.segment_bars = 0\n\n    def _segment(self):\n        high_volatility = self.atr[0] > 1.5 * self.atr_average[0]\n        fast_up = self.ema_fast[0] > self.ema_fast[-1]\n        slow_up = self.ema_slow[0] > self.ema_slow[-1]\n        fast_down = self.ema_fast[0] < self.ema_fast[-1]\n        slow_down = self.ema_slow[0] < self.ema_slow[-1]\n\n        if high_volatility and self.ema_fast[0] > self.ema_slow[0] and fast_up and slow_up:\n            return 3\n        if high_volatility and self.ema_fast[0] < self.ema_slow[0] and fast_down and slow_down:\n            return 2\n        if high_volatility:\n            return \"high_volatility_neutral\"\n        return 1\n\n    def _in_ema_zone(self):\n        lower = min(self.ema_fast[0], self.ema_slow[0])\n        upper = max(self.ema_fast[0], self.ema_slow[0])\n        return self.data.low[0] <= upper and self.data.high[0] >= lower\n\n    def _bullish_pin_bar(self):\n        body = abs(self.data.close[0] - self.data.open[0])\n        if body == 0:\n            return False\n\n        lower_wick = min(self.data.open[0], self.data.close[0]) - self.data.low[0]\n        upper_wick = self.data.high[0] - max(self.data.open[0], self.data.close[0])\n        return (\n            self.data.close[0] > self.data.open[0]\n            and lower_wick >= 2 * body\n            and upper_wick <= body\n        )\n\n    def _bearish_pin_bar(self):\n        body = abs(self.data.close[0] - self.data.open[0])\n        if body == 0:\n            return False\n\n        upper_wick = self.data.high[0] - max(self.data.open[0], self.data.close[0])\n        lower_wick = min(self.data.open[0], self.data.close[0]) - self.data.low[0]\n        return (\n            self.data.close[0] < self.data.open[0]\n            and upper_wick >= 2 * body\n            and lower_wick <= body\n        )\n\n    def _cancel_protection(self):\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n        if self.limit_order is not None:\n            self.cancel(self.limit_order)\n\n    def next(self):\n        segment = self._segment()\n        if segment == self.current_segment:\n            self.segment_bars += 1\n        else:\n            self.current_segment = segment\n            self.segment_bars = 1\n\n        if self.close_order is not None:\n            return\n\n        if self.position:\n            opposite_segment = (\n                (self.position.size > 0 and segment == 2)\n                or (self.position.size < 0 and segment == 3)\n            )\n            if opposite_segment:\n                self._cancel_protection()\n                self.close_order = self.close()\n            return\n\n        if self.entry_order is not None or self.segment_bars < 5:\n            return\n\n        risk_per_share = 2 * self.atr[0]\n        if risk_per_share <= 0:\n            return\n\n        size = math.floor((self.broker.getvalue() * 0.01) / risk_per_share)\n        if size <= 0:\n            return\n\n        global_up = self.ema_global[0] > self.ema_global[-1]\n        global_down = self.ema_global[0] < self.ema_global[-1]\n\n        long_pullback = self._in_ema_zone() and self.data.close[0] < self.data.close[-1]\n        short_pullback = self._in_ema_zone() and self.data.close[0] > self.data.close[-1]\n\n        if segment == 3 and global_up and (long_pullback or self._bullish_pin_bar()):\n            self.entry_atr = self.atr[0]\n            self.entry_order = self.buy(size=size)\n        elif segment == 2 and global_down and (short_pullback or self._bearish_pin_bar()):\n            self.entry_atr = self.atr[0]\n            self.entry_order = self.sell(size=size)\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        if order.status == order.Completed:\n            if order == self.entry_order:\n                entry_price = order.executed.price\n                distance = self.entry_atr\n\n                if order.isbuy():\n                    self.stop_order = self.sell(\n                        size=order.executed.size,\n                        exectype=bt.Order.Stop,\n                        price=entry_price - 2 * distance,\n                    )\n                    self.limit_order = self.sell(\n                        size=order.executed.size,\n                        exectype=bt.Order.Limit,\n                        price=entry_price + 4 * distance,\n                        oco=self.stop_order,\n                    )\n                else:\n                    self.stop_order = self.buy(\n                        size=abs(order.executed.size),\n                        exectype=bt.Order.Stop,\n                        price=entry_price + 2 * distance,\n                    )\n                    self.limit_order = self.buy(\n                        size=abs(order.executed.size),\n                        exectype=bt.Order.Limit,\n                        price=entry_price - 4 * distance,\n                        oco=self.stop_order,\n                    )\n\n                self.entry_order = None\n                self.entry_atr = None\n                return\n\n            if order == self.close_order:\n                self.close_order = None\n                return\n\n            if order == self.stop_order:\n                self.stop_order = None\n                return\n\n            if order == self.limit_order:\n                self.limit_order = None\n                return\n\n        if order.status in (order.Canceled, order.Margin, order.Rejected):\n            if order == self.entry_order:\n                self.entry_order = None\n                self.entry_atr = None\n            elif order == self.close_order:\n                self.close_order = None\n            elif order == self.stop_order:\n                self.stop_order = None\n            elif order == self.limit_order:\n                self.limit_order = None",
+  "assumptions": [
+    {
+      "topic": "ATR averaging",
+      "choice": "The average ATR over 50 bars is a 50-period simple moving average of ATR(14).",
+      "reason": "The specification says average ATR value but does not name a smoothing method."
+    },
+    {
+      "topic": "EMA slope",
+      "choice": "An EMA is sloping up when its current value exceeds its prior-bar value, and sloping down when it is below its prior-bar value.",
+      "reason": "No numerical angle or slope lookback is specified."
+    },
+    {
+      "topic": "Non-trending regimes",
+      "choice": "Only high-volatility conditions satisfying both EMA direction and relative-position requirements are Segment 2 or Segment 3; all other high-volatility states are non-tradable neutral states.",
+      "reason": "The detailed Segment 2 and Segment 3 definitions require both EMA relationships and matching slopes."
+    },
+    {
+      "topic": "Pullback into EMA zone",
+      "choice": "The bar enters the EMA zone when its high-low range overlaps the interval between EMA(20) and EMA(50); a long pullback requires a lower close than the prior bar and a short pullback requires a higher close.",
+      "reason": "The specification does not define an intrabar touch rule or a pullback direction measurement."
+    },
+    {
+      "topic": "Pin bars",
+      "choice": "A bullish pin bar has a positive body, lower wick at least twice the body, and upper wick no larger than the body; bearish is the mirrored condition.",
+      "reason": "No pin-bar geometry is specified."
+    },
+    {
+      "topic": "Global trend filter",
+      "choice": "Longs require EMA(200) to slope up and shorts require EMA(200) to slope down.",
+      "reason": "This applies the stated prohibition against trading against the EMA(200) global trend."
+    },
+    {
+      "topic": "Risk sizing",
+      "choice": "Position size is floor(1% of current broker equity divided by 2 ATR), excluding commissions from the stop-loss risk calculation.",
+      "reason": "The specification defines maximum loss by stop distance but does not state whether commissions are included or how fractional shares are handled."
+    },
+    {
+      "topic": "Protective order timing",
+      "choice": "Stop-loss and take-profit orders are submitted after the entry order completes, using its actual execution price and ATR captured when the entry was signaled.",
+      "reason": "The actual entry price is not known until order execution in Backtrader."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2025-04-15T04:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 200.7990028314966
+    },
+    {
+      "dt": "2025-08-08T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 223.88247952614364
+    }
+  ]
+}

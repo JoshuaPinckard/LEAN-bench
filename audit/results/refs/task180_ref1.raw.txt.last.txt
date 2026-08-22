@@ -1,0 +1,359 @@
+```python
+import backtrader as bt
+
+
+class ORBIntradayMomentum(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.macd = bt.indicators.MACD(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+
+        self.current_day = None
+        self.day_high = None
+        self.day_low = None
+        self.yesterday_high = None
+        self.yesterday_low = None
+
+        self.or_high = None
+        self.or_low = None
+        self.or_width = None
+        self.or_ready = False
+        self.day_eligible = False
+        self.initial_submitted = False
+        self.daily_trades = 0
+        self.initial_size = 0.0
+        self.direction = None
+        self.inside_or_closes = 0
+        self.exit_pending = False
+
+        self.order_info = {}
+        self.stop_order = None
+        self.target_orders = []
+
+    def _date(self):
+        return self.data.datetime.date(0)
+
+    def _momentum_long(self):
+        return self.macd.macd[0] > 0 or self.rsi[0] > 55
+
+    def _momentum_short(self):
+        return self.macd.macd[0] < 0 or self.rsi[0] < 45
+
+    def _cancel_exit_orders(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        for order in self.target_orders:
+            self.cancel(order)
+        self.stop_order = None
+        self.target_orders = []
+
+    def _submit_stop(self):
+        if not self.position or self.direction is None:
+            return
+
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+
+        atr = self.atr[0]
+        offset = 0.05 * atr
+        if self.direction == "long":
+            stop_price = self.or_low - 0.1 * atr
+            order = self.sell(
+                size=self.position.size,
+                exectype=bt.Order.StopLimit,
+                price=stop_price,
+                plimit=stop_price - offset,
+            )
+        else:
+            stop_price = self.or_high + 0.1 * atr
+            order = self.buy(
+                size=abs(self.position.size),
+                exectype=bt.Order.StopLimit,
+                price=stop_price,
+                plimit=stop_price + offset,
+            )
+
+        self.stop_order = order
+        self.order_info[order.ref] = {"role": "stop"}
+
+    def _submit_target(self, size, entry_price, is_initial):
+        if self.direction == "long":
+            if is_initial:
+                target = entry_price + 0.85 * self.or_width
+            else:
+                target = entry_price + 0.7 * (self.bb.top[0] - entry_price)
+            order = self.sell(
+                size=size,
+                exectype=bt.Order.StopLimit,
+                price=target,
+                plimit=target - 0.05 * self.atr[0],
+            )
+        else:
+            if is_initial:
+                target = entry_price - 0.85 * self.or_width
+            else:
+                target = entry_price - 0.7 * (entry_price - self.bb.bot[0])
+            order = self.buy(
+                size=size,
+                exectype=bt.Order.StopLimit,
+                price=target,
+                plimit=target + 0.05 * self.atr[0],
+            )
+
+        self.target_orders.append(order)
+        self.order_info[order.ref] = {"role": "target"}
+
+    def _exit_all(self):
+        if not self.position or self.exit_pending:
+            return
+
+        self.exit_pending = True
+        self._cancel_exit_orders()
+        offset = 0.05 * self.atr[0]
+        price = self.data.close[0]
+
+        if self.position.size > 0:
+            order = self.sell(
+                size=self.position.size,
+                exectype=bt.Order.StopLimit,
+                price=price,
+                plimit=price - offset,
+            )
+        else:
+            order = self.buy(
+                size=abs(self.position.size),
+                exectype=bt.Order.StopLimit,
+                price=price,
+                plimit=price + offset,
+            )
+
+        self.order_info[order.ref] = {"role": "exit"}
+
+    def _new_day(self):
+        if self.current_day is not None:
+            self.yesterday_high = self.day_high
+            self.yesterday_low = self.day_low
+
+        self.current_day = self._date()
+        self.day_high = self.data.high[0]
+        self.day_low = self.data.low[0]
+        self.or_high = self.data.high[0]
+        self.or_low = self.data.low[0]
+        self.or_width = self.or_high - self.or_low
+        self.or_ready = True
+        self.day_eligible = (
+            self.atr[0] / self.data.close[0] >= 0.008
+            and self.or_width >= 0.3 * self.atr[0]
+        )
+        self.initial_submitted = False
+        self.daily_trades = 0
+        self.initial_size = 0.0
+        self.direction = None
+        self.inside_or_closes = 0
+        self.exit_pending = False
+
+    def _submit_initial_orders(self):
+        if not self.day_eligible or self.initial_submitted:
+            return
+
+        atr = self.atr[0]
+        offset = 0.05 * atr
+        stop_distance = self.or_width + 0.2 * atr
+        size = (self.broker.getvalue() * self.p.risk_fraction) / stop_distance
+
+        long_ok = self.sma20[0] > self.sma50[0] and self._momentum_long()
+        short_ok = self.sma20[0] < self.sma50[0] and self._momentum_short()
+
+        if long_ok:
+            entry = self.or_high + 0.1 * atr
+            order = self.buy(
+                size=size,
+                exectype=bt.Order.StopLimit,
+                price=entry,
+                plimit=entry + offset,
+            )
+            self.order_info[order.ref] = {
+                "role": "initial",
+                "direction": "long",
+                "size": size,
+            }
+            self.initial_submitted = True
+
+        elif short_ok:
+            entry = self.or_low - 0.1 * atr
+            order = self.sell(
+                size=size,
+                exectype=bt.Order.StopLimit,
+                price=entry,
+                plimit=entry - offset,
+            )
+            self.order_info[order.ref] = {
+                "role": "initial",
+                "direction": "short",
+                "size": size,
+            }
+            self.initial_submitted = True
+
+    def _submit_addon(self):
+        if (
+            not self.position
+            or self.direction is None
+            or self.exit_pending
+            or self.daily_trades >= 4
+            or self.initial_size <= 0
+        ):
+            return
+
+        atr = self.atr[0]
+        offset = 0.05 * atr
+        add_size = 0.5 * self.initial_size
+
+        if self.direction == "long":
+            retest = (
+                self.data.low[0] <= self.or_high + 0.1 * atr
+                and self.data.high[0] >= self.or_high - 0.1 * atr
+            )
+            yesterday_breakout = (
+                self.yesterday_high is not None
+                and self.data.high[0] > self.yesterday_high
+                and self.data.high[-1] <= self.yesterday_high
+            )
+            if (retest or yesterday_breakout) and self._momentum_long():
+                price = self.data.close[0]
+                order = self.buy(
+                    size=add_size,
+                    exectype=bt.Order.StopLimit,
+                    price=price,
+                    plimit=price + offset,
+                )
+                self.order_info[order.ref] = {
+                    "role": "addon",
+                    "direction": "long",
+                    "size": add_size,
+                }
+
+        else:
+            retest = (
+                self.data.low[0] <= self.or_low + 0.1 * atr
+                and self.data.high[0] >= self.or_low - 0.1 * atr
+            )
+            yesterday_breakout = (
+                self.yesterday_low is not None
+                and self.data.low[0] < self.yesterday_low
+                and self.data.low[-1] >= self.yesterday_low
+            )
+            if (retest or yesterday_breakout) and self._momentum_short():
+                price = self.data.close[0]
+                order = self.sell(
+                    size=add_size,
+                    exectype=bt.Order.StopLimit,
+                    price=price,
+                    plimit=price - offset,
+                )
+                self.order_info[order.ref] = {
+                    "role": "addon",
+                    "direction": "short",
+                    "size": add_size,
+                }
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        info = self.order_info.pop(order.ref, {})
+        role = info.get("role")
+
+        if order.status == order.Completed:
+            if role == "initial":
+                self.direction = info["direction"]
+                self.initial_size = abs(order.executed.size)
+                self.daily_trades += 1
+                self._submit_stop()
+                self._submit_target(
+                    abs(order.executed.size),
+                    order.executed.price,
+                    is_initial=True,
+                )
+
+            elif role == "addon":
+                self.daily_trades += 1
+                self._submit_stop()
+                self._submit_target(
+                    abs(order.executed.size),
+                    order.executed.price,
+                    is_initial=False,
+                )
+
+            elif role == "stop":
+                self._cancel_exit_orders()
+                self.direction = None
+                self.exit_pending = False
+
+            elif role == "exit":
+                self.direction = None
+                self.exit_pending = False
+
+            elif role == "target":
+                self.target_orders = [
+                    target for target in self.target_orders if target.ref != order.ref
+                ]
+                if not self.position:
+                    self._cancel_exit_orders()
+                    self.direction = None
+
+        elif order.status in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        ):
+            if order is self.stop_order:
+                self.stop_order = None
+            self.target_orders = [
+                target for target in self.target_orders if target.ref != order.ref
+            ]
+            if role == "exit":
+                self.exit_pending = False
+
+    def next(self):
+        if self._date() != self.current_day:
+            self._new_day()
+        else:
+            self.day_high = max(self.day_high, self.data.high[0])
+            self.day_low = min(self.day_low, self.data.low[0])
+
+        now = self.data.datetime.time(0)
+        if (now.hour, now.minute) >= (15, 45):
+            self._exit_all()
+            return
+
+        if not self.position:
+            self._submit_initial_orders()
+            return
+
+        if self.or_low <= self.data.close[0] <= self.or_high:
+            self.inside_or_closes += 1
+        else:
+            self.inside_or_closes = 0
+
+        if self.inside_or_closes >= 2:
+            self._exit_all()
+            return
+
+        self._submit_addon()
+```
+
+```json
+{"assumptions":[{"topic":"risk_fraction","choice":"1.0% of current broker value for the initial trade","reason":"The specification permits 0.5–1.0% but does not select a value."},{"topic":"momentum_indicator","choice":"Use both MACD(12,26,9) and RSI(14), applying the stated OR conditions","reason":"The rules express confirmation as MACD or RSI and provide thresholds for both."},{"topic":"opening_range","choice":"Treat the first supplied 15-minute bar of each calendar session as the opening-range candle","reason":"The feed is fixed at 15-minute bars and contains one instrument/session stream."},{"topic":"oco_entries","choice":"Submit only the direction-filter-qualified stop-limit entry","reason":"SMA(20)>SMA(50) and SMA(20)<SMA(50) are mutually exclusive, so both directional OCO legs cannot qualify on one bar."},{"topic":"add_on_trigger_frequency","choice":"A qualifying retest may produce an add-on on each eligible bar until the four-trade daily limit; yesterday-high/low breakouts require a crossing from the prior bar","reason":"The specification defines retest proximity but no one-shot retest state, while 'breakout' is interpreted as a crossing event."},{"topic":"trailing_stop","choice":"Use the specified profit targets and do not enable the alternative 1.5*ATR trailing stop","reason":"The specification presents the trailing stop as an alternative without a selection rule."},{"topic":"eod_exit","choice":"Submit a stop-limit order at 15:45 using the required 0.05*ATR limit offset","reason":"A time exit must be attempted before the regular-session end while preserving the requirement that exits use stop-limit orders."},{"topic":"truncated_final_session","choice":"No special forced liquidation is possible for the feed's final 12:15 bar","reason":"The strategy cannot know that a supplied intraday bar is the final bar of a truncated session before the data feed ends."}]} 
+```

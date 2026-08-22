@@ -1,0 +1,42 @@
+{
+  "task_id": 17,
+  "ref_idx": 1,
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\n\n\nclass ORBMeanReversionStrategy(bt.Strategy):\n    params = (\n        (\"risk_percent\", 0.01),\n    )\n\n    def __init__(self):\n        self.orb_high = None\n        self.orb_low = None\n        self.midpoint = None\n        self.orb_bars = 0\n        self.session_date = None\n\n        self.below_lower = False\n        self.above_upper = False\n\n        self.entry_order = None\n        self.exit_orders = []\n        self.eod_order = None\n        self.eod_cancel_requested = False\n\n    def _reset_session(self, session_date):\n        self.session_date = session_date\n        self.orb_high = None\n        self.orb_low = None\n        self.midpoint = None\n        self.orb_bars = 0\n        self.below_lower = False\n        self.above_upper = False\n        self.eod_cancel_requested = False\n\n    def _submit_bracket(self, is_long):\n        stop_price = self.orb_low if is_long else self.orb_high\n        entry_reference = self.data.close[0]\n        risk_per_unit = abs(entry_reference - stop_price)\n\n        if risk_per_unit <= 0:\n            return\n\n        capital_at_risk = self.broker.getvalue() * self.p.risk_percent\n        size = capital_at_risk / risk_per_unit\n\n        if is_long:\n            orders = self.buy_bracket(\n                size=size,\n                exectype=bt.Order.Market,\n                stopprice=stop_price,\n                limitprice=self.midpoint,\n            )\n        else:\n            orders = self.sell_bracket(\n                size=size,\n                exectype=bt.Order.Market,\n                stopprice=stop_price,\n                limitprice=self.midpoint,\n            )\n\n        self.entry_order = orders[0]\n        self.exit_orders = list(orders[1:])\n\n    def next(self):\n        dt = self.data.datetime.datetime(0)\n        current_date = dt.date()\n        current_time = (dt.hour, dt.minute)\n\n        if self.session_date != current_date:\n            self._reset_session(current_date)\n\n        # Backtrader normalizes the supplied +01:00 timestamps to UTC.\n        # New York is on EDT throughout the supplied date range:\n        # 09:30-10:30 New York = 13:30-14:30 UTC.\n        if (13, 30) <= current_time < (14, 30):\n            if self.orb_high is None:\n                self.orb_high = self.data.high[0]\n                self.orb_low = self.data.low[0]\n            else:\n                self.orb_high = max(self.orb_high, self.data.high[0])\n                self.orb_low = min(self.orb_low, self.data.low[0])\n\n            self.orb_bars += 1\n            if self.orb_bars == 4:\n                self.midpoint = (self.orb_high + self.orb_low) / 2.0\n            return\n\n        # Cancel protective orders early enough to submit a market close\n        # which executes at the 16:00 New York session close (19:00 UTC).\n        if current_time >= (18, 30) and self.position and not self.eod_cancel_requested:\n            self.eod_cancel_requested = True\n            for order in self.exit_orders:\n                if order.alive():\n                    self.cancel(order)\n\n        if current_time >= (18, 45) and self.position and self.eod_cancel_requested:\n            if not any(order.alive() for order in self.exit_orders) and self.eod_order is None:\n                self.eod_order = self.close()\n\n        if self.midpoint is None or self.position or self.entry_order or self.eod_order:\n            return\n\n        # A signal must leave a full next candle before the first three\n        # New York-session hours end at 16:30 UTC.\n        if not ((14, 30) <= current_time < (16, 15)):\n            return\n\n        close = self.data.close[0]\n\n        if close < self.orb_low:\n            self.below_lower = True\n        elif self.below_lower and close > self.orb_low:\n            self.below_lower = False\n            self._submit_bracket(is_long=True)\n\n        if close > self.orb_high:\n            self.above_upper = True\n        elif self.above_upper and close < self.orb_high:\n            self.above_upper = False\n            self._submit_bracket(is_long=False)\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        terminal = (\n            order.Completed,\n            order.Canceled,\n            order.Margin,\n            order.Rejected,\n        )\n\n        if order.status not in terminal:\n            return\n\n        if order is self.entry_order:\n            self.entry_order = None\n\n        if order is self.eod_order:\n            self.eod_order = None\n\n        if order in self.exit_orders and order.status == order.Completed:\n            for sibling in self.exit_orders:\n                if sibling is not order and sibling.alive():\n                    self.cancel(sibling)\n\n        if all(not exit_order.alive() for exit_order in self.exit_orders):\n            self.exit_orders = []",
+  "assumptions": [
+    {
+      "topic": "risk percentage",
+      "choice": "1% of current broker equity is risked per trade.",
+      "reason": "The specification gives a 1-2% example but no exact percentage."
+    },
+    {
+      "topic": "entry and breach price",
+      "choice": "ORB breaches and re-entries are evaluated using candle Close; market bracket entry is submitted on the re-entry candle and executes on the next candle.",
+      "reason": "The specification does not identify an OHLC field for the crossing condition and explicitly requires entry on the next candle."
+    },
+    {
+      "topic": "stop and take-profit execution",
+      "choice": "A native stop order is placed at the relevant ORB boundary and a native limit order is placed at the ORB midpoint.",
+      "reason": "This implements exit when the price reaches the stated levels using available OHLC execution semantics."
+    },
+    {
+      "topic": "risk-reward conflict",
+      "choice": "The stated midpoint take-profit and stated ORB-boundary stop are used as controlling exit levels.",
+      "reason": "For a re-entry price, a fixed midpoint target and fixed ORB stop do not generally produce an exact 1:2 reward-to-risk ratio; changing either level or filtering entries would contradict the explicit level rules."
+    },
+    {
+      "topic": "New York session time",
+      "choice": "New York regular-session open is treated as 09:30 EDT and close as 16:00 EDT; with the supplied aware timestamps normalized by Backtrader, this is 13:30-20:00 UTC.",
+      "reason": "All supplied dates are during U.S. daylight saving time, and no timezone-conversion import is permitted."
+    },
+    {
+      "topic": "end of trading day",
+      "choice": "Open positions are flattened at the 16:00 New York regular-session close.",
+      "reason": "The specification requires all trades closed by the end of the trading day but does not define a different daily cutoff."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

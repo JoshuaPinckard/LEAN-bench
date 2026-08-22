@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+import math
+
+
+class DMAMultiStrategy(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_dev', 2),
+        ('ema_fast', 10),
+        ('ema_slow', 30),
+        ('atr_period', 14),
+        ('breakout_k', 1.5),
+        ('tp_k', 2.0),
+        ('sl_k', 1.0),
+        ('risk_pct', 0.01),
+        ('nominal_cap', 10000.0),
+        ('min_price', 0.0),
+        ('max_price', float('inf')),
+        ('cooldown_bars', 5),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_dev,
+        )
+        self.ema_fast = bt.indicators.EMA(self.data.close, period=self.p.ema_fast)
+        self.ema_slow = bt.indicators.EMA(self.data.close, period=self.p.ema_slow)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema_cross = bt.indicators.CrossOver(self.ema_fast, self.ema_slow)
+        self.bb_cross = bt.indicators.CrossOver(self.data.close, self.bb.mid)
+
+        self.order = None
+        self.last_order_bar = -self.p.cooldown_bars
+        self.entry_price = None
+        self.entry_system = None
+        self.pending_system = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            self.last_order_bar = len(self)
+
+            if order.isbuy() or order.issell():
+                if not self.position:
+                    self.entry_price = None
+                    self.entry_system = None
+                elif self.entry_system is None and self.pending_system is not None:
+                    self.entry_price = order.executed.price
+                    self.entry_system = self.pending_system
+
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+            self.pending_system = None
+
+    def _signals(self):
+        bb_signal = 0
+        if self.data.close[0] < self.bb.bot[0]:
+            bb_signal = 1
+        elif self.data.close[0] > self.bb.top[0]:
+            bb_signal = -1
+
+        ema_signal = 0
+        if self.ema_cross[0] > 0:
+            ema_signal = 1
+        elif self.ema_cross[0] < 0:
+            ema_signal = -1
+
+        atr_signal = 0
+        if self.data.close[0] > self.data.high[-1] + self.p.breakout_k * self.atr[0]:
+            atr_signal = 1
+        elif self.data.close[0] < self.data.low[-1] - self.p.breakout_k * self.atr[0]:
+            atr_signal = -1
+
+        return bb_signal, ema_signal, atr_signal
+
+    def _specific_exit(self):
+        if self.entry_system == 'bb':
+            return (
+                (self.position.size > 0 and self.bb_cross[0] > 0) or
+                (self.position.size < 0 and self.bb_cross[0] < 0)
+            )
+
+        if self.entry_system == 'ema':
+            return (
+                (self.position.size > 0 and self.ema_cross[0] < 0) or
+                (self.position.size < 0 and self.ema_cross[0] > 0)
+            )
+
+        if self.entry_system == 'atr' and self.entry_price is not None:
+            if self.position.size > 0:
+                return (
+                    self.data.close[0] >= self.entry_price + self.p.tp_k * self.atr[0] or
+                    self.data.close[0] <= self.entry_price - self.p.sl_k * self.atr[0]
+                )
+            return (
+                self.data.close[0] <= self.entry_price - self.p.tp_k * self.atr[0] or
+                self.data.close[0] >= self.entry_price + self.p.sl_k * self.atr[0]
+            )
+
+        return False
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        bb_signal, ema_signal, atr_signal = self._signals()
+        signal_sum = bb_signal + ema_signal + atr_signal
+
+        if self.position:
+            opposite = (
+                (self.position.size > 0 and signal_sum <= -2) or
+                (self.position.size < 0 and signal_sum >= 2)
+            )
+            if opposite or self._specific_exit():
+                self.order = self.close()
+            return
+
+        if len(self) - self.last_order_bar < self.p.cooldown_bars:
+            return
+
+        close = self.data.close[0]
+        if not self.p.min_price <= close <= self.p.max_price:
+            return
+
+        if signal_sum < 2 and signal_sum > -2:
+            return
+
+        risk_size = math.floor(self.p.risk_pct * self.broker.getvalue() / self.atr[0])
+        cap_size = math.floor(self.p.nominal_cap / close)
+        size = max(1, min(risk_size, cap_size))
+
+        if signal_sum >= 2:
+            self.pending_system = (
+                'bb' if bb_signal > 0 else
+                'ema' if ema_signal > 0 else
+                'atr'
+            )
+            self.order = self.buy(size=size)
+        else:
+            self.pending_system = (
+                'bb' if bb_signal < 0 else
+                'ema' if ema_signal < 0 else
+                'atr'
+            )
+            self.order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"nominal_cap","choice":"10000.0","reason":"The specification requires a value but does not provide one; this matches starting cash."},{"topic":"min_price/max_price","choice":"0.0 and positive infinity","reason":"The specification requires values but does not provide them; these retain all positive-price trades."},{"topic":"entry subsystem","choice":"When multiple subsystems support a majority entry, record the first applicable subsystem in BB, EMA, ATR order.","reason":"The specification refers to a singular subsystem that generated the entry but does not define a tie rule."},{"topic":"reversal execution","choice":"Submit self.close() for an opposite final signal; permit the opposite entry only after the close completes and cooldown permits.","reason":"This follows the canonical close convention and pending-order guard."},{"topic":"ATR exit reference","choice":"Evaluate ATR take-profit and stop-loss using the current ATR14 value on each bar.","reason":"The specification states ATR14 but does not state that ATR is frozen at entry."}]}
+```

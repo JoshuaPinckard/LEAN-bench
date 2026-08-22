@@ -1,0 +1,82 @@
+```python
+import backtrader as bt
+
+
+class MarketMakerGridStrategy(bt.Strategy):
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=20)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.pending_orders = {}
+        self.skip_next_cycle = False
+
+    def _cancel_all_orders(self):
+        for order in list(self.pending_orders.values()):
+            if order.status in (order.Created, order.Submitted, order.Accepted):
+                self.cancel(order)
+
+    def _submit_limit_orders(self, is_buy, total_size):
+        fair_price = float(self.sma[0])
+        deviations = (0.0005, 0.0010, 0.0015)
+        allocations = (0.20, 0.30, 0.50)
+
+        for deviation, allocation in zip(deviations, allocations):
+            price = fair_price * (1.0 - deviation if is_buy else 1.0 + deviation)
+            size = total_size * allocation
+            if is_buy:
+                order = self.buy(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=price,
+                )
+            else:
+                order = self.sell(
+                    size=size,
+                    exectype=bt.Order.Limit,
+                    price=price,
+                )
+            self.pending_orders[order.ref] = order
+
+    def next(self):
+        if self.skip_next_cycle:
+            self._cancel_all_orders()
+            self.skip_next_cycle = False
+            return
+
+        if self.atr[0] / self.data.close[0] > 0.002:
+            self._cancel_all_orders()
+            return
+
+        # All outstanding grid orders have a one-bar TTL.
+        self._cancel_all_orders()
+
+        capital = self.broker.getvalue()
+        side_budget = capital * 0.10 / 2.0
+        minimum_side_size = 0.1
+        quoted_side_size = max(side_budget / float(self.sma[0]), minimum_side_size)
+
+        if self.position.size <= 0:
+            self._submit_limit_orders(True, quoted_side_size)
+        else:
+            exit_size = min(self.position.size, quoted_side_size)
+            self._submit_limit_orders(False, exit_size)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        ):
+            self.pending_orders.pop(order.ref, None)
+
+        if order.status == order.Completed:
+            limit_price = order.created.price
+            if limit_price and abs(order.executed.price - limit_price) / limit_price > 0.001:
+                self._cancel_all_orders()
+                self.skip_next_cycle = True
+```
+
+```json
+{"assumptions":[{"topic":"capital","choice":"Capital is current broker equity via self.broker.getvalue().","reason":"The specification does not define whether capital means starting cash or current account value."},{"topic":"budget split","choice":"The 10% open-order budget is split equally between buy and sell sides, allocating 5% of capital per side.","reason":"The specification gives a combined cap but does not state a side split."},{"topic":"long-only pairing","choice":"Buy grid orders are placed while flat; after a buy fill, sell grid orders are placed to exit the existing long position. No sell orders are submitted while flat.","reason":"Sell orders are described as opposite-order exits, and the canonical long-only/no-pyramiding convention prevents opening short positions."},{"topic":"level replenishment","choice":"Replenishment retains the same percentage-offset level and uses the current SMA(20) when the next bar's grid is submitted.","reason":"Levels are defined as deviations from SMA(20), while the specification does not state that an old absolute limit price must be retained."},{"topic":"minimum side volume","choice":"The 0.1-unit minimum applies to newly quoted side volume; an exit grid never sells more than the current long position.","reason":"Selling a minimum quantity larger than available inventory would create a short position."}]}
+```

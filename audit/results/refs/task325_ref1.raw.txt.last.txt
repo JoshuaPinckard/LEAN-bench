@@ -1,0 +1,130 @@
+```python
+# complete strategy class
+class OpeningRangeRelativeVolumeStrategy(bt.Strategy):
+    params = (
+        ("volume_period", 20),
+        ("atr_period", 14),
+        ("rsi_period", 14),
+    )
+
+    def __init__(self):
+        self.volume_sma = bt.indicators.SMA(
+            self.data.volume, period=self.p.volume_period
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.rsi_cross_down = bt.indicators.CrossDown(self.rsi, 50.0)
+        self.rsi_cross_up = bt.indicators.CrossUp(self.rsi, 50.0)
+
+        self.order = None
+        self.stop_order = None
+        self.pending_exit = False
+
+        self.current_day = None
+        self.opening_range_bars = 0
+        self.opening_range_high = None
+        self.opening_range_low = None
+
+    def _is_regular_market_hours(self):
+        dt = self.data.datetime.datetime(0)
+        minutes = dt.hour * 60 + dt.minute
+        return 570 <= minutes < 960
+
+    def _update_opening_range(self):
+        dt = self.data.datetime.datetime(0)
+        bar_day = dt.date()
+
+        if bar_day != self.current_day:
+            self.current_day = bar_day
+            self.opening_range_bars = 0
+            self.opening_range_high = None
+            self.opening_range_low = None
+
+        if self._is_regular_market_hours() and self.opening_range_bars < 4:
+            if self.opening_range_high is None:
+                self.opening_range_high = self.data.high[0]
+                self.opening_range_low = self.data.low[0]
+            else:
+                self.opening_range_high = max(
+                    self.opening_range_high, self.data.high[0]
+                )
+                self.opening_range_low = min(
+                    self.opening_range_low, self.data.low[0]
+                )
+            self.opening_range_bars += 1
+
+    def prenext(self):
+        self._update_opening_range()
+
+    def next(self):
+        self._update_opening_range()
+
+        if not self._is_regular_market_hours():
+            return
+
+        if self.opening_range_bars < 4:
+            return
+
+        relative_volume = self.data.volume[0] / self.volume_sma[0]
+        high_relative_volume = relative_volume > 1.5
+        long_breakout = self.data.close[0] > self.opening_range_high
+        short_breakout = self.data.close[0] < self.opening_range_low
+
+        if self.position:
+            if self.order is not None or self.pending_exit:
+                return
+
+            if (
+                (self.position.size > 0 and (self.rsi_cross_down[0] or short_breakout))
+                or (self.position.size < 0 and (self.rsi_cross_up[0] or long_breakout))
+            ):
+                if self.stop_order is not None:
+                    self.pending_exit = True
+                    self.cancel(self.stop_order)
+                else:
+                    self.order = self.close()
+            return
+
+        if self.order is not None or self.stop_order is not None:
+            return
+
+        if high_relative_volume and long_breakout:
+            self.order = self.buy()
+        elif high_relative_volume and short_breakout:
+            self.order = self.sell()
+
+    def notify_order(self, order):
+        if order is self.stop_order:
+            if order.status in (
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.stop_order = None
+
+                if self.pending_exit:
+                    self.pending_exit = False
+                    if self.position and self.order is None:
+                        self.order = self.close()
+            return
+
+        if order is self.order:
+            if order.status == order.Completed:
+                self.order = None
+
+                if self.position and self.stop_order is None:
+                    self.stop_order = self.close(
+                        exectype=bt.Order.StopTrail,
+                        trailamount=1.5 * self.atr[0],
+                    )
+            elif order.status in (
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ):
+                self.order = None
+```
+
+```json
+{"assumptions":[{"topic":"regular market hours","choice":"Treat regular market hours as bar timestamps from 09:30 inclusive through 16:00 exclusive, using the feed timestamp.","reason":"The specification requires ignoring signals outside regular market hours but does not state explicit session boundaries."},{"topic":"opening-range construction","choice":"Build the opening range from the first four regular-market-hours bars of each calendar trading day; signals begin on the following bar.","reason":"The stated first 60 minutes corresponds to the first four 15-minute regular-session bars, and a breakout cannot be evaluated until the range is complete."},{"topic":"trailing-stop timing","choice":"Submit the StopTrail order when the entry order completes, using 1.5 times ATR(14) at that execution bar.","reason":"The specification gives the trail formula but does not specify whether ATR is sampled at signal or fill time."},{"topic":"manual exits with active StopTrail","choice":"Cancel the active StopTrail before submitting a market close order for RSI-stall or opposite-breakout exits.","reason":"This prevents simultaneous protective-stop and close orders from producing an unintended reversal."}]}

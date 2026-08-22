@@ -1,0 +1,153 @@
+```python
+import backtrader as bt
+
+
+class ORBMeanReversionStrategy(bt.Strategy):
+    params = (
+        ("risk_percent", 0.01),
+    )
+
+    def __init__(self):
+        self.orb_high = None
+        self.orb_low = None
+        self.midpoint = None
+        self.orb_bars = 0
+        self.session_date = None
+
+        self.below_lower = False
+        self.above_upper = False
+
+        self.entry_order = None
+        self.exit_orders = []
+        self.eod_order = None
+        self.eod_cancel_requested = False
+
+    def _reset_session(self, session_date):
+        self.session_date = session_date
+        self.orb_high = None
+        self.orb_low = None
+        self.midpoint = None
+        self.orb_bars = 0
+        self.below_lower = False
+        self.above_upper = False
+        self.eod_cancel_requested = False
+
+    def _submit_bracket(self, is_long):
+        stop_price = self.orb_low if is_long else self.orb_high
+        entry_reference = self.data.close[0]
+        risk_per_unit = abs(entry_reference - stop_price)
+
+        if risk_per_unit <= 0:
+            return
+
+        capital_at_risk = self.broker.getvalue() * self.p.risk_percent
+        size = capital_at_risk / risk_per_unit
+
+        if is_long:
+            orders = self.buy_bracket(
+                size=size,
+                exectype=bt.Order.Market,
+                stopprice=stop_price,
+                limitprice=self.midpoint,
+            )
+        else:
+            orders = self.sell_bracket(
+                size=size,
+                exectype=bt.Order.Market,
+                stopprice=stop_price,
+                limitprice=self.midpoint,
+            )
+
+        self.entry_order = orders[0]
+        self.exit_orders = list(orders[1:])
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        current_date = dt.date()
+        current_time = (dt.hour, dt.minute)
+
+        if self.session_date != current_date:
+            self._reset_session(current_date)
+
+        # Backtrader normalizes the supplied +01:00 timestamps to UTC.
+        # New York is on EDT throughout the supplied date range:
+        # 09:30-10:30 New York = 13:30-14:30 UTC.
+        if (13, 30) <= current_time < (14, 30):
+            if self.orb_high is None:
+                self.orb_high = self.data.high[0]
+                self.orb_low = self.data.low[0]
+            else:
+                self.orb_high = max(self.orb_high, self.data.high[0])
+                self.orb_low = min(self.orb_low, self.data.low[0])
+
+            self.orb_bars += 1
+            if self.orb_bars == 4:
+                self.midpoint = (self.orb_high + self.orb_low) / 2.0
+            return
+
+        # Cancel protective orders early enough to submit a market close
+        # which executes at the 16:00 New York session close (19:00 UTC).
+        if current_time >= (18, 30) and self.position and not self.eod_cancel_requested:
+            self.eod_cancel_requested = True
+            for order in self.exit_orders:
+                if order.alive():
+                    self.cancel(order)
+
+        if current_time >= (18, 45) and self.position and self.eod_cancel_requested:
+            if not any(order.alive() for order in self.exit_orders) and self.eod_order is None:
+                self.eod_order = self.close()
+
+        if self.midpoint is None or self.position or self.entry_order or self.eod_order:
+            return
+
+        # A signal must leave a full next candle before the first three
+        # New York-session hours end at 16:30 UTC.
+        if not ((14, 30) <= current_time < (16, 15)):
+            return
+
+        close = self.data.close[0]
+
+        if close < self.orb_low:
+            self.below_lower = True
+        elif self.below_lower and close > self.orb_low:
+            self.below_lower = False
+            self._submit_bracket(is_long=True)
+
+        if close > self.orb_high:
+            self.above_upper = True
+        elif self.above_upper and close < self.orb_high:
+            self.above_upper = False
+            self._submit_bracket(is_long=False)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal:
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+
+        if order is self.eod_order:
+            self.eod_order = None
+
+        if order in self.exit_orders and order.status == order.Completed:
+            for sibling in self.exit_orders:
+                if sibling is not order and sibling.alive():
+                    self.cancel(sibling)
+
+        if all(not exit_order.alive() for exit_order in self.exit_orders):
+            self.exit_orders = []
+```
+
+```json
+{"assumptions":[{"topic":"risk percentage","choice":"1% of current broker equity is risked per trade.","reason":"The specification gives a 1-2% example but no exact percentage."},{"topic":"entry and breach price","choice":"ORB breaches and re-entries are evaluated using candle Close; market bracket entry is submitted on the re-entry candle and executes on the next candle.","reason":"The specification does not identify an OHLC field for the crossing condition and explicitly requires entry on the next candle."},{"topic":"stop and take-profit execution","choice":"A native stop order is placed at the relevant ORB boundary and a native limit order is placed at the ORB midpoint.","reason":"This implements exit when the price reaches the stated levels using available OHLC execution semantics."},{"topic":"risk-reward conflict","choice":"The stated midpoint take-profit and stated ORB-boundary stop are used as controlling exit levels.","reason":"For a re-entry price, a fixed midpoint target and fixed ORB stop do not generally produce an exact 1:2 reward-to-risk ratio; changing either level or filtering entries would contradict the explicit level rules."},{"topic":"New York session time","choice":"New York regular-session open is treated as 09:30 EDT and close as 16:00 EDT; with the supplied aware timestamps normalized by Backtrader, this is 13:30-20:00 UTC.","reason":"All supplied dates are during U.S. daylight saving time, and no timezone-conversion import is permitted."},{"topic":"end of trading day","choice":"Open positions are flattened at the 16:00 New York regular-session close.","reason":"The specification requires all trades closed by the end of the trading day but does not define a different daily cutoff."}]}
+```

@@ -1,0 +1,172 @@
+```python
+# complete strategy class
+import backtrader as bt
+import math
+from collections import deque
+
+
+class ZonalStrategy(bt.Strategy):
+    def __init__(self):
+        self.support = bt.indicators.Lowest(self.data.low, period=20)
+        self.resistance = bt.indicators.Highest(self.data.high, period=20)
+        self.sma = bt.indicators.SMA(self.data.close, period=50)
+        self.sma_5_bars_ago = self.sma(-5)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.entry_order = None
+        self.flatten_order = None
+        self.units = []
+        self.trade_results = deque(maxlen=100)
+
+    def _cancel_unit_exits(self):
+        for unit in self.units:
+            for order in (unit.get("target"), unit.get("stop")):
+                if order is not None and order.alive():
+                    self.cancel(order)
+
+    def _add_protective_orders(self, entry_order):
+        side = entry_order.info.side
+        atr_value = self.atr[0]
+        size = entry_order.executed.size
+        entry_price = entry_order.executed.price
+
+        unit = {
+            "entry_ref": entry_order.ref,
+            "side": side,
+            "target": None,
+            "stop": None,
+        }
+
+        if side == "long":
+            unit["target"] = self.sell(
+                size=size,
+                exectype=bt.Order.Limit,
+                price=entry_price + atr_value,
+            )
+            unit["stop"] = self.sell(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=entry_price - 2.5 * atr_value,
+            )
+        else:
+            unit["target"] = self.buy(
+                size=size,
+                exectype=bt.Order.Limit,
+                price=entry_price - atr_value,
+            )
+            unit["stop"] = self.buy(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=entry_price + 2.5 * atr_value,
+            )
+
+        unit["target"].addinfo(kind="protective", entry_ref=entry_order.ref)
+        unit["stop"].addinfo(kind="protective", entry_ref=entry_order.ref)
+        self.units.append(unit)
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order.status not in terminal:
+            return
+
+        kind = getattr(order.info, "kind", None)
+
+        if order is self.entry_order:
+            self.entry_order = None
+            if order.status == order.Completed:
+                self._add_protective_orders(order)
+            return
+
+        if order is self.flatten_order:
+            self.flatten_order = None
+            if order.status == order.Completed:
+                self.units = []
+            return
+
+        if kind == "protective" and order.status == order.Completed:
+            entry_ref = order.info.entry_ref
+            for unit in list(self.units):
+                if unit["entry_ref"] == entry_ref:
+                    sibling = (
+                        unit["stop"]
+                        if order is unit["target"]
+                        else unit["target"]
+                    )
+                    if sibling is not None and sibling.alive():
+                        self.cancel(sibling)
+                    self.units.remove(unit)
+                    break
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.trade_results.append(trade.pnlcomm > 0)
+
+    def next(self):
+        if self.flatten_order is not None:
+            return
+
+        close = self.data.close[0]
+        support_lower = self.support[0] - 0.01 * close
+        support_upper = self.support[0] + 0.01 * close
+        resistance_lower = self.resistance[0] - 0.01 * close
+        resistance_upper = self.resistance[0] + 0.01 * close
+
+        if self.position.size > 0 and close > resistance_upper:
+            self._cancel_unit_exits()
+            self.flatten_order = self.close()
+            return
+
+        if self.position.size < 0 and close < support_lower:
+            self._cancel_unit_exits()
+            self.flatten_order = self.close()
+            return
+
+        if self.entry_order is not None or len(self.units) >= 3:
+            return
+
+        if len(self.trade_results) < 100:
+            return
+
+        win_rate = sum(self.trade_results) / 100.0
+        if win_rate < 0.60 or self.atr[0] / close <= 0.015:
+            return
+
+        size = math.floor(0.01 * self.broker.getvalue() / close)
+        if size <= 0:
+            return
+
+        touches_support = (
+            self.data.high[0] >= support_lower
+            and self.data.low[0] <= support_upper
+        )
+        touches_resistance = (
+            self.data.high[0] >= resistance_lower
+            and self.data.low[0] <= resistance_upper
+        )
+
+        if (
+            touches_support
+            and close > support_upper
+            and self.sma[0] > self.sma_5_bars_ago[0]
+        ):
+            self.entry_order = self.buy(size=size)
+            self.entry_order.addinfo(kind="entry", side="long")
+
+        elif (
+            touches_resistance
+            and close < resistance_lower
+            and self.sma[0] < self.sma_5_bars_ago[0]
+        ):
+            self.entry_order = self.sell(size=size)
+            self.entry_order.addinfo(kind="entry", side="short")
+```
+
+```json
+{"assumptions":[{"topic":"zone levels","choice":"Support is the 20-bar minimum Low and resistance is the 20-bar maximum High.","reason":"The specification does not identify which OHLC field defines the 20-bar minimum and maximum."},{"topic":"win rate","choice":"Win rate uses the last 100 closed Backtrader trades and counts a trade as a win when net PnL after commission is positive; entries are disabled until 100 closed trades exist.","reason":"The specification does not define win/loss accounting or behavior before 100 trades are available."},{"topic":"units","choice":"Each completed entry order is one unit; up to three units may be open concurrently, each with its own ATR-derived target and stop.","reason":"The specification explicitly permits up to three open units while separately defining an entry size."},{"topic":"protective exits","choice":"Take-profit and stop-loss are native limit and stop orders placed after entry fills, using the actual fill price and ATR value at that fill.","reason":"The specification gives price levels but does not state whether they trigger intrabar, at close, or from signal-bar values."}]}
+```

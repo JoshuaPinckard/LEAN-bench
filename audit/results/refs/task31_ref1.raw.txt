@@ -1,0 +1,158 @@
+```python
+import backtrader as bt
+import math
+
+
+class Trading0DTEOpeningRangeStrategy(bt.Strategy):
+    params = (
+        ("risk_fraction", 0.01),
+        ("stop_offset_fraction", 0.001),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.order = None
+        self.stop_order = None
+        self.current_date = None
+        self.upper_channel = None
+        self.lower_channel = None
+        self.range_complete = False
+
+    def prenext(self):
+        self._process_bar()
+
+    def next(self):
+        self._process_bar()
+
+    def _reset_day(self, bar_date):
+        self.current_date = bar_date
+        self.upper_channel = None
+        self.lower_channel = None
+        self.range_complete = False
+
+    def _process_bar(self):
+        bar_date = self.data.datetime.date(0)
+        bar_time = self.data.datetime.time(0)
+
+        if bar_date != self.current_date:
+            self._reset_day(bar_date)
+
+        hour = bar_time.hour
+        minute = bar_time.minute
+        minutes = hour * 60 + minute
+
+        range_start = 9 * 60 + 30
+        range_end = 10 * 60 + 10
+        final_entry_time = 15 * 60 + 50
+
+        if range_start <= minutes < range_end:
+            high = float(self.data.high[0])
+            low = float(self.data.low[0])
+
+            if self.upper_channel is None or high > self.upper_channel:
+                self.upper_channel = high
+            if self.lower_channel is None or low < self.lower_channel:
+                self.lower_channel = low
+            return
+
+        if self.upper_channel is None or self.lower_channel is None:
+            return
+
+        if minutes >= range_end:
+            self.range_complete = True
+
+        if not self.range_complete:
+            return
+
+        if self.position and minutes == final_entry_time and self.order is None:
+            self._cancel_stop()
+            self.order = self.close(exectype=bt.Order.Close)
+            return
+
+        if self.position and self.order is None:
+            close = float(self.data.close[0])
+
+            if ((self.position.size > 0 and close <= self.upper_channel) or
+                    (self.position.size < 0 and close >= self.lower_channel)):
+                self._cancel_stop()
+                self.order = self.close()
+            return
+
+        if self.position or self.order is not None or minutes >= final_entry_time:
+            return
+
+        if len(self.data) < 2:
+            return
+
+        close = float(self.data.close[0])
+        rsi = float(self.rsi[0])
+        volume_increasing = self.data.volume[0] > self.data.volume[-1]
+
+        if math.isnan(rsi):
+            return
+
+        if (close > self.upper_channel and
+                (volume_increasing or rsi > 50) and
+                rsi <= 70):
+            stop_price = self.lower_channel * (1 - self.p.stop_offset_fraction)
+            size = self._risk_size(close, stop_price)
+            if size > 0:
+                self.order = self.buy(size=size)
+
+        elif (close < self.lower_channel and
+                (volume_increasing or rsi < 50) and
+                rsi >= 30):
+            stop_price = self.upper_channel * (1 + self.p.stop_offset_fraction)
+            size = self._risk_size(close, stop_price)
+            if size > 0:
+                self.order = self.sell(size=size)
+
+    def _risk_size(self, entry_price, stop_price):
+        risk_per_share = abs(entry_price - stop_price)
+        if risk_per_share <= 0:
+            return 0
+
+        risk_capital = self.broker.getvalue() * self.p.risk_fraction
+        return int(risk_capital / risk_per_share)
+
+    def _cancel_stop(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.order:
+                self.order = None
+
+            if order is self.stop_order:
+                self.stop_order = None
+
+        if order.status != order.Completed:
+            return
+
+        if order.isbuy() and self.position.size > 0 and self.stop_order is None:
+            stop_price = self.lower_channel * (1 - self.p.stop_offset_fraction)
+            self.stop_order = self.sell(
+                size=abs(self.position.size),
+                exectype=bt.Order.Stop,
+                price=stop_price,
+            )
+
+        elif order.issell() and self.position.size < 0 and self.stop_order is None:
+            stop_price = self.upper_channel * (1 + self.p.stop_offset_fraction)
+            self.stop_order = self.buy(
+                size=abs(self.position.size),
+                exectype=bt.Order.Stop,
+                price=stop_price,
+            )
+```
+
+```json
+{"assumptions":[{"topic":"opening-range timing","choice":"Use 5-minute bars timestamped 09:30 through 10:05 to form the range, and evaluate breakouts beginning at 10:10.","reason":"The feed uses 5-minute bars; this is the literal 09:30-to-10:10 opening interval without including the first bar after it ends."},{"topic":"high/low channels","choice":"Use the opening-range maximum high as the upper channel and minimum low as the lower channel.","reason":"No separate channel lookback period is specified, while the opening-range boundaries are the stated price channel levels."},{"topic":"volume confirmation","choice":"Treat increasing volume as current-bar volume greater than the immediately preceding bar's volume; permit either increasing volume or the directional RSI condition.","reason":"The specification says increasing volume and/or RSI trend strength but does not define a comparison period or require both."},{"topic":"stop-loss offset","choice":"Place long stops 0.1% below the lower boundary and short stops 0.1% above the upper boundary.","reason":"The required 'slightly' offset has no numeric value; 0.1% supplies a fixed, symmetric implementation."},{"topic":"position sizing","choice":"Risk 1% of current portfolio value, with whole-share size equal to risk capital divided by entry-to-stop distance.","reason":"The specification recommends a fixed 1–2% capital risk and requires sizing from the stop distance; 1% is selected within that stated range."},{"topic":"return-to-range exit","choice":"Detect a return to the range using the bar close.","reason":"The entry breakout is explicitly defined by a close outside the range, so close is used consistently for the inverse condition."},{"topic":"end-of-day exit","choice":"At 15:50, submit a Backtrader Close order so it executes at the 15:55 session-close bar.","reason":"The supplied 5-minute feed's final bar is 15:55; Backtrader Close orders execute on the next bar's close."},{"topic":"late entries","choice":"Do not open new positions at or after 15:50.","reason":"A new market entry then cannot be reliably closed at the same day's 15:55 close using the supplied bar-based execution model."}]}
+```

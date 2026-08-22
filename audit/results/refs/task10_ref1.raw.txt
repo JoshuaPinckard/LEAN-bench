@@ -1,0 +1,159 @@
+```python
+import backtrader as bt
+import math
+
+
+class SessionRangeBreakoutStrategy(bt.Strategy):
+    params = (
+        ("session", "New York"),
+        ("session_starts", {
+            "London": (8, 0),
+            "New York": (9, 30),
+            "Tokyo": (0, 0),
+        }),
+        ("range_minutes", 120),
+        ("risk_fraction", 0.01),
+        ("take_profit_multiple", 1.5),
+        ("volatility_threshold", 0.002),
+    )
+
+    def __init__(self):
+        self.pending_orders = set()
+        self.session_date = None
+        self.zone_high = None
+        self.zone_low = None
+        self.zone_formed = False
+        self.entry_stop = None
+        self.entry_target = None
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.pending_orders.discard(order.ref)
+
+        if order.status == order.Completed:
+            if order.isbuy() and self.position.size > 0 and self.entry_stop is not None:
+                stop_order = self.sell(
+                    exectype=bt.Order.Stop,
+                    price=self.entry_stop,
+                    transmit=False,
+                )
+                target_order = self.sell(
+                    exectype=bt.Order.Limit,
+                    price=self.entry_target,
+                    oco=stop_order,
+                    transmit=True,
+                )
+                self.pending_orders.add(stop_order.ref)
+                self.pending_orders.add(target_order.ref)
+                self.entry_stop = None
+                self.entry_target = None
+
+            elif order.issell() and self.position.size < 0 and self.entry_stop is not None:
+                stop_order = self.buy(
+                    exectype=bt.Order.Stop,
+                    price=self.entry_stop,
+                    transmit=False,
+                )
+                target_order = self.buy(
+                    exectype=bt.Order.Limit,
+                    price=self.entry_target,
+                    oco=stop_order,
+                    transmit=True,
+                )
+                self.pending_orders.add(stop_order.ref)
+                self.pending_orders.add(target_order.ref)
+                self.entry_stop = None
+                self.entry_target = None
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        current_date = dt.date()
+        start_hour, start_minute = self.p.session_starts[self.p.session]
+        session_start = dt.replace(
+            hour=start_hour,
+            minute=start_minute,
+            second=0,
+            microsecond=0,
+        )
+        elapsed_minutes = (dt - session_start).total_seconds() / 60.0
+
+        if current_date != self.session_date:
+            self.session_date = current_date
+            self.zone_high = None
+            self.zone_low = None
+            self.zone_formed = False
+
+        if 0 <= elapsed_minutes < self.p.range_minutes:
+            if self.zone_high is None:
+                self.zone_high = self.data.high[0]
+                self.zone_low = self.data.low[0]
+            else:
+                self.zone_high = max(self.zone_high, self.data.high[0])
+                self.zone_low = min(self.zone_low, self.data.low[0])
+            return
+
+        if (
+            elapsed_minutes >= self.p.range_minutes
+            and self.zone_high is not None
+            and not self.zone_formed
+        ):
+            self.zone_formed = True
+
+        if (
+            not self.zone_formed
+            or self.position
+            or self.pending_orders
+        ):
+            return
+
+        current_price = self.data.close[0]
+        zone_range = self.zone_high - self.zone_low
+
+        if zone_range < current_price * self.p.volatility_threshold:
+            return
+
+        if current_price > self.zone_high:
+            risk_per_unit = current_price - self.zone_low
+            if risk_per_unit <= 0:
+                return
+
+            size = math.floor(
+                (self.broker.getvalue() * self.p.risk_fraction) / risk_per_unit
+            )
+            if size <= 0:
+                return
+
+            self.entry_stop = self.zone_low
+            self.entry_target = self.zone_high + (
+                self.p.take_profit_multiple * zone_range
+            )
+            order = self.buy(size=size)
+            self.pending_orders.add(order.ref)
+
+        elif current_price < self.zone_low:
+            risk_per_unit = self.zone_high - current_price
+            if risk_per_unit <= 0:
+                return
+
+            size = math.floor(
+                (self.broker.getvalue() * self.p.risk_fraction) / risk_per_unit
+            )
+            if size <= 0:
+                return
+
+            self.entry_stop = self.zone_high
+            self.entry_target = self.zone_low - (
+                self.p.take_profit_multiple * zone_range
+            )
+            order = self.sell(size=size)
+            self.pending_orders.add(order.ref)
+```
+
+```json
+{"assumptions":[{"topic":"session","choice":"Default session is New York at 09:30; selectable London and Tokyo start times are 08:00 and 00:00 respectively, interpreted in the feed clock.","reason":"The specification requires selectable sessions but does not provide a default session or complete session-time table; the supplied data begins at the New York regular-session open."},{"topic":"range bars","choice":"The opening range includes exactly the 120 one-minute bars whose timestamps are from the session start through 119 minutes after it.","reason":"This is the literal implementation of the stated first 120 minutes after the session opens."},{"topic":"position size rounding","choice":"Risk-based size is rounded down to a whole share.","reason":"AAPL equity trading convention requires whole-share sizing, and rounding down ensures potential stop-loss loss does not exceed 1% of capital."},{"topic":"entry and exits","choice":"Breakout is detected from the bar close; the market entry is submitted then stop-loss and take-profit orders are placed after the entry fills, with OCO linkage.","reason":"The specification requires close-based breakouts and states that stop-loss and take-profit levels are placed, while the actual market fill is determined by backtrader's order execution model."}]}
+```

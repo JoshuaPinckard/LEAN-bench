@@ -1,0 +1,175 @@
+```python
+import backtrader as bt
+import math
+
+
+class MarketMakingMeanReversion(bt.Strategy):
+    params = (
+        ("bb_period", 20),
+        ("bb_devfactor", 2.0),
+        ("atr_period", 14),
+        ("volume_period", 20),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor,
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.volume_sma = bt.indicators.SMA(
+            self.data.volume,
+            period=self.p.volume_period,
+        )
+
+        self.buy_quote = None
+        self.sell_quote = None
+        self.take_profit_order = None
+        self.close_order = None
+        self.entry_bar = None
+
+    def _minute_session_allowed(self):
+        if self.data._timeframe == bt.TimeFrame.Days:
+            return True
+
+        if self.data._timeframe != bt.TimeFrame.Minutes:
+            return True
+
+        bar_time = self.data.datetime.datetime(0)
+        minute_of_day = bar_time.hour * 60 + bar_time.minute
+        return 10 * 60 <= minute_of_day < 15 * 60 + 30
+
+    def _capital(self):
+        return self.broker.getvalue()
+
+    def _open_exposure_value(self):
+        exposure = abs(self.position.size) * self.data.close[0]
+
+        for order in self.broker.get_orders_open():
+            if order.exectype == bt.Order.Limit:
+                exposure += abs(order.created.size) * order.created.price
+
+        return exposure
+
+    def _cancel(self, order):
+        if order is not None and order.alive():
+            self.cancel(order)
+
+    def _submit_market_close(self):
+        if self.position.size and self.close_order is None:
+            self.close_order = self.close()
+
+    def _clear_reference(self, order):
+        if order is self.buy_quote:
+            self.buy_quote = None
+        if order is self.sell_quote:
+            self.sell_quote = None
+        if order is self.take_profit_order:
+            self.take_profit_order = None
+        if order is self.close_order:
+            self.close_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted, order.Partial):
+            return
+
+        if order.status == order.Completed:
+            if order is self.buy_quote:
+                self.buy_quote = None
+                self._cancel(self.sell_quote)
+                self.entry_bar = len(self)
+                self.take_profit_order = self.sell(
+                    size=abs(order.executed.size),
+                    exectype=bt.Order.Limit,
+                    price=order.executed.price + 0.30 * self.atr[0],
+                )
+                return
+
+            if order is self.sell_quote:
+                self.sell_quote = None
+                self._cancel(self.buy_quote)
+                self.entry_bar = len(self)
+                self.take_profit_order = self.buy(
+                    size=abs(order.executed.size),
+                    exectype=bt.Order.Limit,
+                    price=order.executed.price - 0.30 * self.atr[0],
+                )
+                return
+
+            if order is self.take_profit_order:
+                self.take_profit_order = None
+                self.entry_bar = None
+                return
+
+            if order is self.close_order:
+                self.close_order = None
+                self.entry_bar = None
+                return
+
+        if order.status in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        ):
+            self._clear_reference(order)
+
+    def next(self):
+        if self.position.size:
+            if self.position.size > 0 and self.data.close[0] < self.bb.bot[0]:
+                self._cancel(self.take_profit_order)
+                self._submit_market_close()
+                return
+
+            if self.position.size < 0 and self.data.close[0] > self.bb.top[0]:
+                self._cancel(self.take_profit_order)
+                self._submit_market_close()
+                return
+
+            if self.entry_bar is not None and len(self) >= self.entry_bar + 1:
+                self._cancel(self.take_profit_order)
+                self._submit_market_close()
+            return
+
+        if self.close_order is not None:
+            return
+
+        if self.buy_quote is not None or self.sell_quote is not None:
+            return
+
+        if not self._minute_session_allowed():
+            return
+
+        capital = self._capital()
+        if self._open_exposure_value() >= 0.05 * capital:
+            return
+
+        if (self.bb.top[0] - self.bb.bot[0]) / self.bb.mid[0] > 0.003:
+            return
+
+        if self.atr[0] / self.data.close[0] > 0.004:
+            return
+
+        if self.data.volume[0] < self.volume_sma[0]:
+            return
+
+        size = math.floor(0.01 * capital / self.data.close[0])
+        if size < 1:
+            return
+
+        self.buy_quote = self.buy(
+            size=size,
+            exectype=bt.Order.Limit,
+            price=self.bb.mid[0] - 0.15 * self.atr[0],
+        )
+        self.sell_quote = self.sell(
+            size=size,
+            exectype=bt.Order.Limit,
+            price=self.bb.mid[0] + 0.15 * self.atr[0],
+        )
+```
+
+```json
+{"assumptions":[{"topic":"capital","choice":"Use current broker portfolio value from broker.getvalue() as capital.","reason":"The specification uses capital but does not define whether it is starting cash, cash, or current equity."},{"topic":"current price","choice":"Use the current bar Close for order-size calculation.","reason":"The specification does not identify a different current price from OHLCV data."},{"topic":"risk valuation","choice":"Value positions at current Close and active limit orders at their limit prices.","reason":"The specification requires total value of open limit orders and positions but does not define valuation prices."},{"topic":"stop price","choice":"Evaluate Bollinger-band stop protection using the current bar Close.","reason":"The specification says price moves beyond the band without selecting Open, High, Low, or Close."},{"topic":"timeout","choice":"Allow the take-profit order one subsequent bar to fill; if it has not filled, cancel it and submit the market close, which Backtrader executes on the following bar.","reason":"This is the closest literal implementation of cancellation after one bar and a market close on the next bar under Backtrader order timing."},{"topic":"session time","choice":"Treat feed timestamps as regular-session local bar times and permit minute-bar entries from 10:00 through 15:29.","reason":"This excludes the first 30 minutes beginning at 09:30 and the last 30 minutes beginning at 15:30."},{"topic":"zero size","choice":"Do not submit quotes when floor(1% of capital / current Close) is zero.","reason":"Backtrader cannot submit a meaningful zero-size order."}]}
+```

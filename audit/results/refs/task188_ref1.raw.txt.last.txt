@@ -1,0 +1,237 @@
+```python
+import backtrader as bt
+
+
+class OnePercentPlaybook(bt.Strategy):
+    params = (
+        ('ema_period', 20),
+    )
+
+    def __init__(self):
+        self.session_date = None
+        self.previous_day_close = None
+        self.day_open = None
+        self.orh = None
+        self.orl = None
+
+        self.ema_values = []
+        self.session_ema = None
+        self.ema_alpha = 2.0 / (self.p.ema_period + 1.0)
+
+        self.orh_sign = None
+        self.orl_sign = None
+        self.ema_sign = None
+        self.pclose_sign = None
+        self.seen_below_ema = False
+        self.seen_above_ema = False
+
+        self.daily_pnl = 0.0
+        self.daily_losing_trades = 0
+        self.initial_capital = self.broker.getvalue()
+        self.eod_processed = False
+
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.eod_close_order = None
+        self.entry_side = None
+
+    def _minute_of_day(self):
+        dt = self.data.datetime.datetime(0)
+        return dt.hour * 60 + dt.minute
+
+    def _start_session(self):
+        self.session_date = self.data.datetime.date(0)
+        self.day_open = self.data.open[0]
+        self.orh = None
+        self.orl = None
+        self.ema_values = []
+        self.session_ema = None
+        self.orh_sign = None
+        self.orl_sign = None
+        self.ema_sign = None
+        self.pclose_sign = None
+        self.seen_below_ema = False
+        self.seen_above_ema = False
+        self.daily_pnl = 0.0
+        self.daily_losing_trades = 0
+        self.eod_processed = False
+
+    def _crossed_above(self, value, level, sign_name):
+        diff = value - level
+        current_sign = 1 if diff > 0 else (-1 if diff < 0 else 0)
+        prior_sign = getattr(self, sign_name)
+        crossed = current_sign > 0 and prior_sign is not None and prior_sign < 0
+        if current_sign:
+            setattr(self, sign_name, current_sign)
+        return crossed
+
+    def _crossed_below(self, value, level, sign_name):
+        diff = value - level
+        current_sign = 1 if diff > 0 else (-1 if diff < 0 else 0)
+        prior_sign = getattr(self, sign_name)
+        crossed = current_sign < 0 and prior_sign is not None and prior_sign > 0
+        if current_sign:
+            setattr(self, sign_name, current_sign)
+        return crossed
+
+    def _orders_pending(self):
+        return any(order is not None for order in (
+            self.entry_order,
+            self.stop_order,
+            self.target_order,
+            self.eod_close_order,
+        ))
+
+    def _enter_long(self):
+        self.entry_side = 'long'
+        self.entry_order = self.buy()
+
+    def _enter_short(self):
+        self.entry_side = 'short'
+        self.entry_order = self.sell()
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        if self.session_date != current_date:
+            if self.session_date is not None:
+                self.previous_day_close = self.data.close[-1]
+            self._start_session()
+
+        minute = self._minute_of_day()
+
+        if 570 <= minute < 575:
+            self.orh = self.data.high[0] if self.orh is None else max(self.orh, self.data.high[0])
+            self.orl = self.data.low[0] if self.orl is None else min(self.orl, self.data.low[0])
+
+        self.ema_values.append(self.data.close[0])
+        if len(self.ema_values) == self.p.ema_period:
+            self.session_ema = sum(self.ema_values) / self.p.ema_period
+        elif len(self.ema_values) > self.p.ema_period:
+            self.session_ema = (
+                (self.data.close[0] - self.session_ema) * self.ema_alpha
+                + self.session_ema
+            )
+
+        if minute >= 955:
+            if not self.eod_processed:
+                self.eod_processed = True
+                for order in (self.entry_order, self.stop_order, self.target_order):
+                    if order is not None and order.alive():
+                        self.cancel(order)
+                if self.position and self.eod_close_order is None:
+                    self.eod_close_order = self.close()
+            return
+
+        if self.position or self._orders_pending():
+            return
+
+        if self.daily_pnl <= -0.005 * self.initial_capital:
+            return
+        if self.daily_losing_trades >= 2:
+            return
+
+        orb_long = False
+        orb_short = False
+        if self.orh is not None and self.orl is not None and minute >= 575:
+            orb_long = self._crossed_above(self.data.close[0], self.orh, 'orh_sign')
+            orb_short = self._crossed_below(self.data.close[0], self.orl, 'orl_sign')
+
+        ema_long = False
+        ema_short = False
+        if self.session_ema is not None:
+            ema_long = (
+                self.seen_below_ema
+                and self._crossed_above(self.data.close[0], self.session_ema, 'ema_sign')
+                and self.data.close[0] > self.session_ema
+            )
+            ema_short = (
+                self.seen_above_ema
+                and self._crossed_below(self.data.close[0], self.session_ema, 'ema_sign')
+                and self.data.close[0] < self.session_ema
+            )
+            if self.data.close[0] < self.session_ema:
+                self.seen_below_ema = True
+            elif self.data.close[0] > self.session_ema:
+                self.seen_above_ema = True
+
+        gap_long = False
+        gap_short = False
+        if self.previous_day_close is not None:
+            if self.day_open > self.previous_day_close:
+                gap_long = self._crossed_above(
+                    self.data.close[0], self.previous_day_close, 'pclose_sign'
+                )
+            elif self.day_open < self.previous_day_close:
+                gap_short = self._crossed_below(
+                    self.data.close[0], self.previous_day_close, 'pclose_sign'
+                )
+
+        if orb_long or ema_long or gap_long:
+            self._enter_long()
+        elif orb_short or ema_short or gap_short:
+            self._enter_short()
+
+    def notify_order(self, order):
+        terminal = (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        )
+
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if self.entry_side == 'long':
+                    self.stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price * 0.99,
+                    )
+                    self.target_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price * 1.02,
+                        oco=self.stop_order,
+                    )
+                else:
+                    self.stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price * 1.01,
+                    )
+                    self.target_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price * 0.98,
+                        oco=self.stop_order,
+                    )
+
+            if order.status in terminal:
+                self.entry_order = None
+                if order.status != order.Completed:
+                    self.entry_side = None
+
+        elif order is self.stop_order and order.status in terminal:
+            self.stop_order = None
+
+        elif order is self.target_order and order.status in terminal:
+            self.target_order = None
+
+        elif order is self.eod_close_order and order.status in terminal:
+            self.eod_close_order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.daily_pnl += trade.pnlcomm
+            if trade.pnlcomm < 0:
+                self.daily_losing_trades += 1
+            self.entry_side = None
+```
+
+```json
+{"assumptions":[{"topic":"opening-range boundary","choice":"The opening range uses bars timestamped 09:30 through 09:34 ET; ORB crossover state begins at 09:35 and entries are allowed from 09:35 onward.","reason":"This treats 09:30-09:35 as the first five one-minute bars and implements the stated post-range condition."},{"topic":"timezone","choice":"Feed timestamps are treated as ET.","reason":"The supplied feed is specified in ET and no timezone conversion is available or required."},{"topic":"daily-loss accounting","choice":"Cumulative daily loss uses closed-trade net P&L including commission, compared with 0.5% of the strategy's initial broker value.","reason":"The specification does not define whether unrealized P&L, commissions, or a changing capital base are included."},{"topic":"simultaneous signals","choice":"When both long and short signals occur on one bar, long has precedence; otherwise signals are evaluated in stated order without requiring confirmation from another signal.","reason":"The signals are specified as independent, but no conflict-resolution rule is given."},{"topic":"bracket pricing","choice":"Stop and target orders are submitted immediately after the market entry fills, using its actual executed price and paired with OCO behavior.","reason":"A Backtrader market order's fill price is unavailable at signal time; this is the closest literal implementation of levels exactly 1% and 2% from entry price."}]} 
+```

@@ -1,0 +1,133 @@
+```python
+import backtrader as bt
+from collections import deque
+
+
+class IntradayEntryExitTimingStrategy(bt.Strategy):
+    params = (
+        ('ema_period', 20),
+        ('sma_period', 50),
+        ('rsi_period', 14),
+    )
+
+    def __init__(self):
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+
+        self.pending_order = None
+        self.stop_order = None
+        self.target_order = None
+
+        self.current_date = None
+        self.current_day_volume = 0.0
+        self.completed_daily_volumes = deque(maxlen=20)
+
+    def _minutes(self):
+        current_time = self.data.datetime.time(0)
+        return current_time.hour * 60 + current_time.minute
+
+    def _update_daily_volume(self):
+        bar_date = self.data.datetime.date(0)
+
+        if self.current_date is None:
+            self.current_date = bar_date
+        elif bar_date != self.current_date:
+            self.completed_daily_volumes.append(self.current_day_volume)
+            self.current_day_volume = 0.0
+            self.current_date = bar_date
+
+        self.current_day_volume += self.data.volume[0]
+
+    def _cancel_protective_orders(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.target_order is not None:
+            self.cancel(self.target_order)
+
+    def next(self):
+        self._update_daily_volume()
+
+        minutes = self._minutes()
+        volume_confirmed = (
+            len(self.completed_daily_volumes) == 20
+            and self.current_day_volume >=
+            1.20 * (sum(self.completed_daily_volumes) / 20.0)
+        )
+
+        if self.position:
+            exit_signal = (
+                (self.ema[0] < self.sma[0] and self.ema[-1] >= self.sma[-1])
+                or self.rsi[0] > 70
+                or minutes > (15 * 60 + 30)
+            )
+
+            if exit_signal and self.pending_order is None:
+                self._cancel_protective_orders()
+                self.pending_order = self.close()
+            return
+
+        if self.pending_order is not None:
+            return
+
+        entry_time = (10 * 60) < minutes <= (14 * 60 + 30)
+        entry_signal = (
+            self.ema[0] > self.sma[0]
+            and self.ema[-1] <= self.sma[-1]
+            and 40 <= self.rsi[0] <= 60
+            and entry_time
+            and volume_confirmed
+        )
+
+        if entry_signal:
+            size = (0.02 * self.broker.getvalue()) / self.data.close[0]
+            if size > 0:
+                self.pending_order = self.buy(size=size)
+
+    def notify_order(self, order):
+        if order.status in (
+            order.Submitted,
+            order.Accepted,
+        ):
+            return
+
+        if order.status == order.Completed:
+            if order is self.pending_order:
+                if order.isbuy():
+                    entry_price = order.executed.price
+                    self.stop_order = self.sell(
+                        size=order.executed.size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price * 0.99,
+                    )
+                    self.target_order = self.sell(
+                        size=order.executed.size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price * 1.02,
+                        oco=self.stop_order,
+                    )
+                self.pending_order = None
+
+            if order is self.stop_order:
+                self.stop_order = None
+                self.target_order = None
+            elif order is self.target_order:
+                self.stop_order = None
+                self.target_order = None
+
+        elif order.status in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.pending_order:
+                self.pending_order = None
+            if order is self.stop_order:
+                self.stop_order = None
+            elif order is self.target_order:
+                self.target_order = None
+```
+
+```json
+{"assumptions":[{"topic":"daily volume","choice":"Daily volume is cumulative 5-minute-bar volume for the current trading day; the 20-day average uses the preceding 20 completed trading days.","reason":"The feed is intraday-only, so final current-day volume is unavailable at entry time."},{"topic":"time interpretation","choice":"Feed timestamps are interpreted directly as EST/EDT market-local times.","reason":"No timezone-conversion information is provided by the fixed feed setup."},{"topic":"entry time boundaries","choice":"Entries are allowed strictly after 10:00 AM through 2:30 PM inclusive.","reason":"This applies the stated exclusion of the 9:30–10:00 AM first 30 minutes together with the stated 9:30 AM–2:30 PM entry window."},{"topic":"infeasible","choice":"Stop-loss and take-profit orders are placed after the market entry fills, using its actual executed price.","reason":"A market order's exact entry price is unavailable before execution; therefore same-bar protective coverage cannot be guaranteed in this environment."}]}
+```

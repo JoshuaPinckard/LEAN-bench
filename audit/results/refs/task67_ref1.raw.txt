@@ -1,0 +1,215 @@
+```python
+import backtrader as bt
+import math
+
+
+class ClassicPatternStrategy(bt.Strategy):
+    params = (
+        ('risk_fraction', 0.01),
+    )
+
+    def __init__(self):
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.volume = self.data.volume
+        self.entry_order = None
+        self.exit_orders = []
+        self.entry_plan = None
+
+    def _size_for_risk(self, breakout_price, stop_price):
+        risk_per_share = abs(breakout_price - stop_price)
+        if risk_per_share <= 0:
+            return 0
+        return math.floor(
+            (self.broker.getvalue() * self.p.risk_fraction) / risk_per_share
+        )
+
+    def _submit_entry(self, direction, stop_price, target_price, breakout_price):
+        size = self._size_for_risk(breakout_price, stop_price)
+        if size <= 0:
+            return
+
+        self.entry_plan = {
+            'direction': direction,
+            'stop': stop_price,
+            'target': target_price,
+        }
+        if direction == 'long':
+            self.entry_order = self.buy(size=size)
+        else:
+            self.entry_order = self.sell(size=size)
+
+    def _pivot_highs(self, prices):
+        return [
+            i for i in range(1, len(prices) - 1)
+            if prices[i] > prices[i - 1] and prices[i] >= prices[i + 1]
+        ]
+
+    def _h_and_s_signal(self, prices):
+        highs = self._pivot_highs(prices)
+        if len(highs) < 3 or self.data.close[0] <= self.sma20[0]:
+            return None
+
+        left, head, right = highs[-3:]
+        left_price, head_price, right_price = (
+            prices[left], prices[head], prices[right]
+        )
+        if not (head_price > left_price and head_price > right_price):
+            return None
+        if right_price > head_price:
+            return None
+
+        low1 = min(prices[left:head + 1])
+        low2 = min(prices[head:right + 1])
+        neckline = (low1 + low2) / 2.0
+        if self.data.close[0] >= neckline:
+            return None
+
+        return right_price, self.data.close[0] - (head_price - neckline)
+
+    def _double_top_signal(self, prices):
+        highs = self._pivot_highs(prices)
+        if len(highs) < 2 or self.data.close[0] <= self.sma20[0]:
+            return None
+
+        first, second = highs[-2:]
+        first_price, second_price = prices[first], prices[second]
+        resistance = (first_price + second_price) / 2.0
+        if abs(first_price - second_price) / resistance > 0.02:
+            return None
+
+        neckline = min(prices[first:second + 1])
+        if neckline >= resistance * 0.99 or self.data.close[0] >= neckline:
+            return None
+
+        return max(first_price, second_price), self.data.close[0] - (resistance - neckline)
+
+    def _volume_confirms_breakout(self, volumes):
+        formation_average = sum(volumes) / len(volumes)
+        return (
+            volumes[-1] < volumes[0]
+            and self.volume[0] >= formation_average * 1.5
+        )
+
+    def _flag_signal(self, prices, volumes):
+        pole_start, consolidation = prices[:5], prices[5:]
+        pole_gain = (pole_start[-1] - pole_start[0]) / pole_start[0]
+        upper, lower = max(consolidation), min(consolidation)
+        height = upper - lower
+
+        if (
+            pole_gain < 0.05
+            or height / upper > 0.05
+            or consolidation[-1] >= consolidation[0]
+            or not self._volume_confirms_breakout(volumes)
+            or self.data.close[0] <= upper
+        ):
+            return None
+
+        return lower, self.data.close[0] + height
+
+    def _pennant_signal(self, prices, volumes):
+        pole_start, consolidation = prices[:5], prices[5:]
+        pole_gain = (pole_start[-1] - pole_start[0]) / pole_start[0]
+        first_half, second_half = consolidation[:3], consolidation[2:]
+        first_range = max(first_half) - min(first_half)
+        second_range = max(second_half) - min(second_half)
+        upper, lower = max(consolidation), min(consolidation)
+        height = upper - lower
+
+        if (
+            pole_gain < 0.05
+            or first_range <= 0
+            or second_range > first_range * 0.5
+            or max(second_half) >= max(first_half)
+            or min(second_half) <= min(first_half)
+            or not self._volume_confirms_breakout(volumes)
+            or self.data.close[0] <= upper
+        ):
+            return None
+
+        return lower, self.data.close[0] + height
+
+    def next(self):
+        if self.entry_order or self.exit_orders or self.position:
+            return
+
+        prices = [self.data.close[i] for i in range(-12, 0)]
+        volumes = [self.volume[i] for i in range(-5, 0)]
+
+        signal = self._h_and_s_signal(prices)
+        if signal:
+            stop, target = signal
+            self._submit_entry('short', stop, target, self.data.close[0])
+            return
+
+        signal = self._double_top_signal(prices)
+        if signal:
+            stop, target = signal
+            self._submit_entry('short', stop, target, self.data.close[0])
+            return
+
+        signal = self._flag_signal(prices[-10:], volumes)
+        if signal:
+            stop, target = signal
+            self._submit_entry('long', stop, target, self.data.close[0])
+            return
+
+        signal = self._pennant_signal(prices[-10:], volumes)
+        if signal:
+            stop, target = signal
+            self._submit_entry('long', stop, target, self.data.close[0])
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.entry_order:
+            if order.status == order.Completed and self.entry_plan:
+                size = abs(order.executed.size)
+                if self.entry_plan['direction'] == 'long':
+                    stop = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=self.entry_plan['stop'],
+                    )
+                    target = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=self.entry_plan['target'],
+                        oco=stop,
+                    )
+                else:
+                    stop = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=self.entry_plan['stop'],
+                    )
+                    target = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=self.entry_plan['target'],
+                        oco=stop,
+                    )
+                self.exit_orders = [stop, target]
+
+            if order.status in (
+                order.Completed, order.Canceled, order.Margin, order.Rejected
+            ):
+                self.entry_order = None
+                self.entry_plan = None
+
+        if order in self.exit_orders and order.status in (
+            order.Completed, order.Canceled, order.Margin, order.Rejected
+        ):
+            if all(
+                item.status in (
+                    item.Completed, item.Canceled, item.Margin, item.Rejected
+                )
+                for item in self.exit_orders
+            ):
+                self.exit_orders = []
+```
+
+```json
+{"assumptions":[{"topic":"risk percentage","choice":"Use 1% of total broker equity as maximum loss per trade.","reason":"The specification permits 1-2% but does not select a value."},{"topic":"pattern observation window","choice":"Evaluate Head and Shoulders and Double Top from the preceding 12 completed closes; evaluate Flag and Pennant from a 5-bar pole followed by a 5-bar consolidation.","reason":"No formation lengths are specified."},{"topic":"local peaks and troughs","choice":"A peak is a close greater than its preceding close and at least its following close; necklines are the lowest closes between relevant peaks.","reason":"The specification requires peaks and a neckline but does not define pivot mechanics or whether High/Low versus Close is used."},{"topic":"double-top equality and pullback","choice":"Treat tops within 2% as the same resistance level and require the intervening neckline to be at least 1% below resistance.","reason":"The terms 'same' and 'small pullback' are qualitative."},{"topic":"flag and pennant thresholds","choice":"A strong move is at least 5%; a flag range is at most 5%; breakout volume is at least 150% of formation average; a pennant must contract to at most half its initial range.","reason":"The specification supplies qualitative requirements but no numerical thresholds."},{"topic":"volume decrease","choice":"Require the last consolidation volume to be below the first consolidation volume.","reason":"The specification requires decreasing volume without defining a trend calculation."},{"topic":"order exits","choice":"After entry fills, submit stop and limit exit orders as an OCO pair using the stated pattern-derived levels.","reason":"This implements the instruction to place stop-loss and take-profit orders while preventing both exits from filling."},{"topic":"infeasible","choice":"The final risk-management bullet is truncated after 'St', so no additional rule from that incomplete text is implemented.","reason":"Its full requirement is unavailable in the supplied specification."}]}
+```

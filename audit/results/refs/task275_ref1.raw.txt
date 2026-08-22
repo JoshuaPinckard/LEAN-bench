@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+import math
+
+
+class SyntheticStraddleOpenGapVolatility(bt.Strategy):
+    def __init__(self):
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.bandwidth = self.bbands.top - self.bbands.bot
+        self.bandwidth_ema = bt.indicators.EMA(self.bandwidth, period=50)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.entry_orders = []
+        self.protective_stop = None
+        self.exit_order = None
+        self.pending_orders = []
+        self.pending_order = None
+
+        self.entry_price = None
+        self.entry_atr = None
+        self.peak_high = None
+        self.peak_low = None
+
+    def _track(self, order):
+        self.pending_orders.append(order)
+        self.pending_order = order
+        return order
+
+    def _untrack(self, order):
+        self.pending_orders = [o for o in self.pending_orders if o is not order]
+        self.pending_order = self.pending_orders[-1] if self.pending_orders else None
+
+    def _clear_position_state(self):
+        self.protective_stop = None
+        self.exit_order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.peak_high = None
+        self.peak_low = None
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+            order.Expired,
+        ]:
+            self._untrack(order)
+
+        if order.status == order.Completed:
+            if any(order is entry for entry in self.entry_orders):
+                self.entry_orders = []
+                self.entry_price = order.executed.price
+                self.entry_atr = float(self.atr[0])
+                self.peak_high = self.data.high[0]
+                self.peak_low = self.data.low[0]
+
+                if order.isbuy():
+                    self.protective_stop = self._track(
+                        self.sell(
+                            exectype=bt.Order.Stop,
+                            price=self.entry_price - 1.5 * self.entry_atr,
+                            size=order.executed.size,
+                        )
+                    )
+                else:
+                    self.protective_stop = self._track(
+                        self.buy(
+                            exectype=bt.Order.Stop,
+                            price=self.entry_price + 1.5 * self.entry_atr,
+                            size=abs(order.executed.size),
+                        )
+                    )
+
+            elif order is self.protective_stop:
+                self._clear_position_state()
+
+            elif order is self.exit_order:
+                self._clear_position_state()
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected, order.Expired]:
+            self.entry_orders = [entry for entry in self.entry_orders if entry is not order]
+
+            if order is self.protective_stop:
+                self.protective_stop = None
+            elif order is self.exit_order:
+                self.exit_order = None
+
+    def next(self):
+        if self.position:
+            if self.position.size > 0:
+                self.peak_high = max(self.peak_high, self.data.high[0])
+                giveback_price = self.entry_price + 0.6 * (
+                    self.peak_high - self.entry_price
+                )
+                giveback_hit = self.data.low[0] <= giveback_price
+            else:
+                self.peak_low = min(self.peak_low, self.data.low[0])
+                giveback_price = self.entry_price - 0.6 * (
+                    self.entry_price - self.peak_low
+                )
+                giveback_hit = self.data.high[0] >= giveback_price
+
+            if self.exit_order is None:
+                if self.protective_stop is not None:
+                    self.cancel(self.protective_stop)
+                    self.protective_stop = None
+
+                self.exit_order = self._track(self.close())
+            return
+
+        if self.entry_orders or self.pending_order is not None:
+            return
+
+        volatility_ok = (
+            self.bandwidth_ema[0] != 0
+            and self.bandwidth[0] / self.bandwidth_ema[0] > 1.2
+        )
+        gap_ok = (
+            abs(self.data.open[0] - self.data.close[-1]) / self.data.close[-1] >= 0.01
+        )
+
+        if volatility_ok and gap_ok:
+            atr_value = float(self.atr[0])
+            equity = self.broker.getvalue()
+            size = math.floor(0.02 * equity / (1.5 * atr_value))
+
+            if size > 0:
+                buy_stop = self._track(
+                    self.buy(
+                        exectype=bt.Order.Stop,
+                        price=self.data.open[0] + 0.8 * atr_value,
+                        size=size,
+                    )
+                )
+                sell_stop = self._track(
+                    self.sell(
+                        exectype=bt.Order.Stop,
+                        price=self.data.open[0] - 0.8 * atr_value,
+                        size=size,
+                        oco=buy_stop,
+                    )
+                )
+                self.entry_orders = [buy_stop, sell_stop]
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Entry stop orders are submitted during next() after observing the day's Open and become eligible on the following daily bar; end-of-session close orders similarly execute on the next available daily bar.","reason":"With the fixed daily OHLC feed and no stated cheat-on-open/session callback configuration, Backtrader cannot submit and fill orders within the already-observed opening session or close a position at that same session's end."},{"topic":"daily OHLC price path","choice":"PeakHigh/PeakLow and give-back tests use each bar's High/Low.","reason":"The specification explicitly names PeakHigh and PeakLow; High/Low are the closest observable daily-bar prices for those rules."},{"topic":"capital","choice":"Equity is broker.getvalue() when the entry orders are submitted.","reason":"The specification says capital/equity but does not define a separate capital measure."}]} 
+```

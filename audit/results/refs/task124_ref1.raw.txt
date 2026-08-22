@@ -1,0 +1,251 @@
+```python
+import backtrader as bt
+
+
+class SwingForexMultiTimeframeStrategy(bt.Strategy):
+    params = ()
+
+    def __init__(self):
+        self._pending_entry = None
+        self._exit_order = None
+        self._stop_order = None
+        self._take_order = None
+
+        self._day = None
+        self._day_open = self._day_high = self._day_low = self._day_close = None
+        self._h4_key = None
+        self._h4_open = self._h4_high = self._h4_low = self._h4_close = None
+
+        self._daily_highs = []
+        self._daily_lows = []
+        self._daily_closes = []
+        self._daily_long = False
+        self._daily_short = False
+        self._daily_support = None
+        self._daily_resistance = None
+
+        self._h4_highs = []
+        self._h4_lows = []
+        self._h4_closes = []
+        self._raw_k_values = []
+        self._slow_k_values = []
+        self._previous_slow_k = None
+
+        self._rsi_seed_changes = []
+        self._rsi_avg_gain = None
+        self._rsi_avg_loss = None
+
+        self._entry_level = None
+        self._entry_direction = None
+
+    def _update_rsi(self, close):
+        if not self._h4_closes:
+            return None
+
+        change = close - self._h4_closes[-1]
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+
+        if self._rsi_avg_gain is None:
+            self._rsi_seed_changes.append((gain, loss))
+            if len(self._rsi_seed_changes) < 14:
+                return None
+            self._rsi_avg_gain = sum(x[0] for x in self._rsi_seed_changes) / 14.0
+            self._rsi_avg_loss = sum(x[1] for x in self._rsi_seed_changes) / 14.0
+        else:
+            self._rsi_avg_gain = ((self._rsi_avg_gain * 13.0) + gain) / 14.0
+            self._rsi_avg_loss = ((self._rsi_avg_loss * 13.0) + loss) / 14.0
+
+        if self._rsi_avg_loss == 0.0:
+            return 100.0 if self._rsi_avg_gain > 0.0 else 50.0
+        return 100.0 - (100.0 / (1.0 + self._rsi_avg_gain / self._rsi_avg_loss))
+
+    def _finalize_day(self):
+        close = self._day_close
+        support = min(self._daily_lows[-50:]) if len(self._daily_lows) >= 50 else None
+        resistance = max(self._daily_highs[-50:]) if len(self._daily_highs) >= 50 else None
+
+        sma = None
+        if len(self._daily_closes) >= 199:
+            sma = (sum(self._daily_closes[-199:]) + close) / 200.0
+
+        self._daily_support = support
+        self._daily_resistance = resistance
+        self._daily_long = (
+            sma is not None and support is not None and
+            close > sma and self._day_low <= support and close > support
+        )
+        self._daily_short = (
+            sma is not None and resistance is not None and
+            close < sma and self._day_high >= resistance and close < resistance
+        )
+
+        self._daily_highs.append(self._day_high)
+        self._daily_lows.append(self._day_low)
+        self._daily_closes.append(close)
+
+    def _submit_entry(self, direction, level):
+        estimate = self._h4_close
+        if direction == "long":
+            stop = max(level * 0.99, estimate * 0.98)
+        else:
+            stop = min(level * 1.01, estimate * 1.02)
+
+        risk_per_unit = abs(estimate - stop)
+        if risk_per_unit <= 0.0:
+            return
+
+        size = int((self.broker.getvalue() * 0.01) / risk_per_unit)
+        if size <= 0:
+            return
+
+        self._entry_level = level
+        self._entry_direction = direction
+        self._pending_entry = (
+            self.buy(size=size) if direction == "long" else self.sell(size=size)
+        )
+
+    def _finalize_h4(self):
+        rsi = self._update_rsi(self._h4_close)
+
+        self._h4_highs.append(self._h4_high)
+        self._h4_lows.append(self._h4_low)
+
+        slow_k = None
+        if len(self._h4_highs) >= 14:
+            highest = max(self._h4_highs[-14:])
+            lowest = min(self._h4_lows[-14:])
+            raw_k = (
+                0.0 if highest == lowest
+                else 100.0 * (self._h4_close - lowest) / (highest - lowest)
+            )
+            self._raw_k_values.append(raw_k)
+            if len(self._raw_k_values) > 3:
+                self._raw_k_values.pop(0)
+            if len(self._raw_k_values) == 3:
+                slow_k = sum(self._raw_k_values) / 3.0
+                self._slow_k_values.append(slow_k)
+                if len(self._slow_k_values) > 3:
+                    self._slow_k_values.pop(0)
+                if len(self._slow_k_values) == 3:
+                    _slow_d = sum(self._slow_k_values) / 3.0
+
+        crossed_up_20 = (
+            slow_k is not None and self._previous_slow_k is not None and
+            self._previous_slow_k < 20.0 and slow_k > 20.0
+        )
+        crossed_down_80 = (
+            slow_k is not None and self._previous_slow_k is not None and
+            self._previous_slow_k > 80.0 and slow_k < 80.0
+        )
+        if slow_k is not None:
+            self._previous_slow_k = slow_k
+
+        self._h4_closes.append(self._h4_close)
+
+        if self.position and self._exit_order is None:
+            exit_signal = (
+                (self.position.size > 0 and crossed_down_80) or
+                (self.position.size < 0 and crossed_up_20)
+            )
+            if exit_signal:
+                if self._stop_order is not None:
+                    self.cancel(self._stop_order)
+                if self._take_order is not None:
+                    self.cancel(self._take_order)
+                self._exit_order = self.close()
+            return
+
+        if self.position or self._pending_entry is not None or self._exit_order is not None:
+            return
+
+        if self._daily_long and crossed_up_20 and rsi is not None and rsi > 50.0:
+            self._submit_entry("long", self._daily_support)
+        elif self._daily_short and crossed_down_80 and rsi is not None and rsi < 50.0:
+            self._submit_entry("short", self._daily_resistance)
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        h4_key = (dt.date(), dt.hour // 4)
+        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]
+
+        if self._day is None:
+            self._day = dt.date()
+            self._day_open, self._day_high, self._day_low, self._day_close = o, h, l, c
+            self._h4_key = h4_key
+            self._h4_open, self._h4_high, self._h4_low, self._h4_close = o, h, l, c
+            return
+
+        if dt.date() != self._day:
+            self._finalize_day()
+            self._finalize_h4()
+
+            self._day = dt.date()
+            self._day_open, self._day_high, self._day_low, self._day_close = o, h, l, c
+            self._h4_key = h4_key
+            self._h4_open, self._h4_high, self._h4_low, self._h4_close = o, h, l, c
+        elif h4_key != self._h4_key:
+            self._finalize_h4()
+
+            self._h4_key = h4_key
+            self._h4_open, self._h4_high, self._h4_low, self._h4_close = o, h, l, c
+            self._day_high = max(self._day_high, h)
+            self._day_low = min(self._day_low, l)
+            self._day_close = c
+        else:
+            self._day_high = max(self._day_high, h)
+            self._day_low = min(self._day_low, l)
+            self._day_close = c
+            self._h4_high = max(self._h4_high, h)
+            self._h4_low = min(self._h4_low, l)
+            self._h4_close = c
+
+    def notify_order(self, order):
+        terminal = [order.Completed, order.Canceled, order.Margin, order.Rejected]
+        if order.status not in terminal:
+            return
+
+        if order == self._pending_entry:
+            self._pending_entry = None
+            if order.status == order.Completed:
+                entry = order.executed.price
+                size = abs(order.executed.size)
+
+                if self._entry_direction == "long":
+                    stop = max(self._entry_level * 0.99, entry * 0.98)
+                    take = entry * 1.02
+                    self._stop_order = self.sell(
+                        size=size, exectype=bt.Order.Stop, price=stop
+                    )
+                    self._take_order = self.sell(
+                        size=size, exectype=bt.Order.Limit, price=take
+                    )
+                else:
+                    stop = min(self._entry_level * 1.01, entry * 1.02)
+                    take = entry * 0.98
+                    self._stop_order = self.buy(
+                        size=size, exectype=bt.Order.Stop, price=stop
+                    )
+                    self._take_order = self.buy(
+                        size=size, exectype=bt.Order.Limit, price=take
+                    )
+
+        if order == self._stop_order:
+            self._stop_order = None
+            if order.status == order.Completed and self._take_order is not None:
+                self.cancel(self._take_order)
+
+        if order == self._take_order:
+            self._take_order = None
+            if order.status == order.Completed and self._stop_order is not None:
+                self.cancel(self._stop_order)
+
+        if order == self._exit_order:
+            self._exit_order = None
+            self._entry_level = None
+            self._entry_direction = None
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Daily and H4 values are aggregated internally from the sole 1-hour feed; H4 buckets are clock-aligned four-hour periods.","reason":"The harness supplies no separate Daily or H4 feeds."},{"topic":"support_resistance","choice":"Support is the lowest low and resistance is the highest high of the preceding 50 completed Daily candles; a bounce is a touch or breach followed by a close back beyond that level.","reason":"The specification does not define an exact local-high/local-low algorithm or bounce rule."},{"topic":"stop_loss_or","choice":"The stop price is the closer-to-entry of the support/resistance-based 1% stop and the 2%-from-entry stop.","reason":"The specification gives the two stop formulations with 'or' but does not state precedence."},{"topic":"risk_sizing","choice":"Position size is the whole-unit floor of 1% of current broker value divided by estimated per-unit loss at the stop, using the completed H4 close as the next-open estimate.","reason":"The next candle's opening fill price is unknown when the order is sized."}]} 
+```

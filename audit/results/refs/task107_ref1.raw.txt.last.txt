@@ -1,0 +1,149 @@
+```python
+import backtrader as bt
+
+
+class CombinedMomentumStrategy(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('momentum_ma_period', 14),
+        ('atr_period', 14),
+        ('stop_loss_pct', 0.01),
+        ('take_profit_pct', 0.02),
+        ('capital_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+        self.take_profit_order = None
+
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.momentum_ma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.momentum_ma_period
+        )
+        self.momentum = self.data.close - self.momentum_ma
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+    def _open_position_count(self):
+        return sum(
+            1 for position in self.broker.positions.values()
+            if position.size != 0
+        )
+
+    def _cancel_risk_orders(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.take_profit_order is not None:
+            self.cancel(self.take_profit_order)
+
+    def _place_risk_orders(self, entry_price, is_long):
+        size = abs(self.position.size)
+
+        if is_long:
+            self.stop_order = self.sell(
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 - self.p.stop_loss_pct),
+                size=size,
+            )
+            self.take_profit_order = self.sell(
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 + self.p.take_profit_pct),
+                size=size,
+                oco=self.stop_order,
+            )
+        else:
+            self.stop_order = self.buy(
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 + self.p.stop_loss_pct),
+                size=size,
+            )
+            self.take_profit_order = self.buy(
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 - self.p.take_profit_pct),
+                size=size,
+                oco=self.stop_order,
+            )
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order == self.order:
+                self.order = None
+                if self.position.size != 0:
+                    self._place_risk_orders(
+                        order.executed.price,
+                        self.position.size > 0,
+                    )
+            elif order == self.stop_order or order == self.take_profit_order:
+                self.stop_order = None
+                self.take_profit_order = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.order:
+                self.order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+            elif order == self.take_profit_order:
+                self.take_profit_order = None
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        macd_cross_up = (
+            self.macd.macd[-1] <= self.macd.signal[-1]
+            and self.macd.macd[0] > self.macd.signal[0]
+        )
+        macd_cross_down = (
+            self.macd.macd[-1] >= self.macd.signal[-1]
+            and self.macd.macd[0] < self.macd.signal[0]
+        )
+
+        if self.position.size > 0:
+            if self.rsi[0] > 70 or macd_cross_down:
+                self._cancel_risk_orders()
+                self.order = self.close()
+            return
+
+        if self.position.size < 0:
+            if self.rsi[0] < 30 or macd_cross_up:
+                self._cancel_risk_orders()
+                self.order = self.close()
+            return
+
+        high_volatility = self.atr[0] > (0.02 * self.data.close[0])
+        neutral_rsi = 40 <= self.rsi[0] <= 60
+        position_size = (
+            self.broker.getvalue() * self.p.capital_pct / self.data.close[0]
+        )
+
+        if (
+            not high_volatility
+            and self._open_position_count() < 3
+            and neutral_rsi
+            and macd_cross_up
+            and self.momentum[0] > 0
+        ):
+            self.order = self.buy(size=position_size)
+
+        elif (
+            not high_volatility
+            and self._open_position_count() < 3
+            and neutral_rsi
+            and macd_cross_down
+            and self.momentum[0] < 0
+        ):
+            self.order = self.sell(size=position_size)
+```
+
+```json
+{"assumptions":[{"topic":"momentum indicator","choice":"Momentum is calculated as the current close minus a 14-period simple moving average of close.","reason":"The specification gives this calculation as its example but does not specify the moving-average period."},{"topic":"ATR period","choice":"ATR uses period 14.","reason":"The volatility threshold is specified, but the ATR period is not."},{"topic":"position-size calculation","choice":"Order quantity is 1% of current broker total value divided by the current close.","reason":"The specification requires 1% of total capital per trade but does not define share rounding or the valuation point."},{"topic":"maximum open positions","choice":"The strategy counts nonzero broker positions and requires fewer than 3; with the single supplied feed and the canonical one-position rule, at most one position can be open.","reason":"The execution environment provides one data feed and the canonical defaults prohibit pyramiding unless explicitly requested."}]} 
+```

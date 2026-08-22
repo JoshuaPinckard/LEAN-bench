@@ -1,0 +1,298 @@
+```python
+import backtrader as bt
+import math
+import collections
+import statistics
+
+
+class MultifunctionalAITradingStrategy(bt.Strategy):
+    params = (
+        ("atr_period", 14),
+        ("risk_reward_ratio", 2.0),
+        ("risk_per_trade", 0.01),
+        ("maximum_daily_risk", 0.02),
+        ("maximum_drawdown", 0.05),
+        ("deposit", 10000.0),
+        ("close_before_major_events", False),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.pending_order = None
+        self.stop_order = None
+        self.take_profit_order = None
+        self.position_stop = None
+        self.position_take_profit = None
+
+        self.trade_log = []
+        self.features = []
+        self.feature_history = collections.deque(maxlen=64)
+        self.signal_history = collections.deque(maxlen=64)
+
+        self.close_history = collections.deque(maxlen=64)
+        self.volume_history = collections.deque(maxlen=64)
+        self.range_history = collections.deque(maxlen=64)
+
+        self.current_day = None
+        self.daily_loss = 0.0
+        self.daily_high_equity = None
+        self.daily_trading_stopped = False
+
+    def _mean(self, values):
+        return sum(values) / len(values) if values else 0.0
+
+    def _std(self, values):
+        return statistics.pstdev(values) if len(values) > 1 else 0.0
+
+    def _recent(self, history, period):
+        return list(history)[-period:] if len(history) >= period else list(history)
+
+    def _change(self, period):
+        if len(self.close_history) <= period:
+            return 0.0
+        previous = list(self.close_history)[-period - 1]
+        return (self.close_history[-1] / previous - 1.0) if previous else 0.0
+
+    def _signal_imbalance(self):
+        recent = list(self.signal_history)[-24:]
+        if not recent:
+            return (0.0, 0.0, 0.0)
+        total = float(len(recent))
+        return (
+            recent.count("BUY") / total,
+            recent.count("SELL") / total,
+            recent.count("HOLD") / total,
+        )
+
+    def _build_62_features(self):
+        close = float(self.data.close[0])
+        open_ = float(self.data.open[0])
+        high = float(self.data.high[0])
+        low = float(self.data.low[0])
+        volume = float(self.data.volume[0])
+        atr = float(self.atr[0])
+
+        self.close_history.append(close)
+        self.volume_history.append(volume)
+        self.range_history.append(high - low)
+
+        denominator = close if close else 1.0
+        atr_denominator = atr if atr else 1.0
+
+        features = [close, open_, high, low, volume]
+        features.extend([
+            close / open_ - 1.0 if open_ else 0.0,
+            high / low - 1.0 if low else 0.0,
+            (high - close) / denominator,
+            (close - low) / denominator,
+            atr / denominator,
+        ])
+
+        for period in (1, 2, 3, 4, 6, 8, 12, 24, 48):
+            features.append(self._change(period))
+
+        for period in (1, 2, 3, 6, 12, 24, 48):
+            if len(self.close_history) > period:
+                features.append(close - list(self.close_history)[-period - 1])
+            else:
+                features.append(0.0)
+
+        for period in (3, 6, 12, 24, 48):
+            average = self._mean(self._recent(self.close_history, period))
+            features.append(close / average - 1.0 if average else 0.0)
+
+        for period in (3, 6, 12, 24, 48):
+            features.append(self._std(self._recent(self.close_history, period)) / denominator)
+
+        for period in (3, 6, 12, 24, 48):
+            average = self._mean(self._recent(self.volume_history, period))
+            features.append(volume / average - 1.0 if average else 0.0)
+
+        features.extend([
+            (close - open_) / atr_denominator,
+            (high - low) / atr_denominator,
+            (high - max(open_, close)) / atr_denominator,
+            (min(open_, close) - low) / atr_denominator,
+        ])
+
+        features.extend(self._signal_imbalance())
+
+        for period in (3, 6, 12, 24, 48):
+            window = self._recent(self.close_history, period)
+            features.append(close / max(window) - 1.0 if window else 0.0)
+            features.append(close / min(window) - 1.0 if window and min(window) else 0.0)
+
+        for period in (3, 6, 12, 24):
+            features.append(self._mean(self._recent(self.range_history, period)) / atr_denominator)
+
+        return features[:62]
+
+    def _lstm_prediction(self, sequence):
+        # A trained LSTM model and its weights are not supplied by the environment.
+        return "HOLD"
+
+    def _reset_daily_risks_if_needed(self):
+        day = self.data.datetime.datetime(0).date()
+        equity = self.broker.getvalue()
+
+        if day != self.current_day:
+            self.current_day = day
+            self.daily_loss = 0.0
+            self.daily_high_equity = equity
+            self.daily_trading_stopped = False
+
+        if equity > self.daily_high_equity:
+            self.daily_high_equity = equity
+
+        drawdown = self.daily_high_equity - equity
+        if drawdown >= self.p.deposit * self.p.maximum_drawdown:
+            self.daily_trading_stopped = True
+
+        if self.daily_loss >= self.p.deposit * self.p.maximum_daily_risk:
+            self.daily_trading_stopped = True
+
+    def _risk_size(self, stop_distance):
+        if stop_distance <= 0.0:
+            return 0.0
+        risk_cash = self.broker.getvalue() * self.p.risk_per_trade
+        return math.floor(risk_cash / stop_distance)
+
+    def _cancel_exit_orders(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+        if self.take_profit_order is not None:
+            self.cancel(self.take_profit_order)
+            self.take_profit_order = None
+
+    def _place_protective_orders(self):
+        size = abs(self.position.size)
+        if not size or self.position_stop is None or self.position_take_profit is None:
+            return
+
+        if self.position.size > 0:
+            self.stop_order = self.sell(
+                size=size, exectype=bt.Order.Stop, price=self.position_stop
+            )
+            self.take_profit_order = self.sell(
+                size=size, exectype=bt.Order.Limit, price=self.position_take_profit
+            )
+        else:
+            self.stop_order = self.buy(
+                size=size, exectype=bt.Order.Stop, price=self.position_stop
+            )
+            self.take_profit_order = self.buy(
+                size=size, exectype=bt.Order.Limit, price=self.position_take_profit
+            )
+
+    def _close_position(self, decision):
+        self._cancel_exit_orders()
+        if self.pending_order is None:
+            self.pending_order = self.close()
+        self.trade_log.append({
+            "decision": decision,
+            "expected_risk": 0.0,
+            "equity": self.broker.getvalue(),
+        })
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order is self.pending_order:
+                self.pending_order = None
+
+            if order.status == order.Completed and order is self.stop_order:
+                if self.take_profit_order is not None:
+                    self.cancel(self.take_profit_order)
+                self.stop_order = None
+                self.take_profit_order = None
+
+            if order.status == order.Completed and order is self.take_profit_order:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.stop_order = None
+                self.take_profit_order = None
+
+            if order.status in (order.Canceled, order.Margin, order.Rejected):
+                if order is self.stop_order:
+                    self.stop_order = None
+                if order is self.take_profit_order:
+                    self.take_profit_order = None
+
+            if order.status == order.Completed and order.isbuy() and not self.position:
+                self.position_stop = None
+                self.position_take_profit = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            if trade.pnlcomm < 0.0:
+                self.daily_loss += abs(trade.pnlcomm)
+            self.position_stop = None
+            self.position_take_profit = None
+            self.stop_order = None
+            self.take_profit_order = None
+
+    def next(self):
+        self._reset_daily_risks_if_needed()
+
+        self.features = self._build_62_features()
+        self.feature_history.append(self.features)
+        signal = self._lstm_prediction(list(self.feature_history))
+        self.signal_history.append(signal)
+
+        volatility = float(self.atr[0])
+        expected_size = self._risk_size(volatility)
+        expected_risk = volatility * expected_size
+
+        self.trade_log.append({
+            "decision": signal,
+            "expected_risk": expected_risk,
+            "equity": self.broker.getvalue(),
+        })
+
+        if self.position:
+            if self.p.close_before_major_events:
+                # No economic-news calendar is available in the OHLCV-only environment.
+                pass
+
+            if self.position.size > 0:
+                if signal == "SELL":
+                    self._close_position(signal)
+                    return
+                if signal == "BUY" and volatility > 0.0:
+                    self.position_stop = max(
+                        self.position_stop, float(self.data.close[0]) - volatility
+                    )
+                    self._cancel_exit_orders()
+                    self._place_protective_orders()
+            else:
+                if signal == "BUY":
+                    self._close_position(signal)
+                    return
+                if signal == "SELL" and volatility > 0.0:
+                    self.position_stop = min(
+                        self.position_stop, float(self.data.close[0]) + volatility
+                    )
+                    self._cancel_exit_orders()
+                    self._place_protective_orders()
+            return
+
+        if self.pending_order is not None or self.daily_trading_stopped or volatility <= 0.0:
+            return
+
+        if expected_size <= 0.0:
+            return
+
+        entry = float(self.data.close[0])
+        if signal == "BUY":
+            self.position_stop = entry - volatility
+            self.position_take_profit = entry + volatility * self.p.risk_reward_ratio
+            self.pending_order = self.buy(size=expected_size)
+        elif signal == "SELL":
+            self.position_stop = entry + volatility
+            self.position_take_profit = entry - volatility * self.p.risk_reward_ratio
+            self.pending_order = self.sell(size=expected_size)
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"The LSTM prediction returns HOLD for every sequence.","reason":"No trained LSTM architecture, weights, labels, or permitted machine-learning library is supplied in the fixed OHLCV-only environment; fabricating a predictive model would not be faithful to the specification."},{"topic":"62 features","choice":"A 62-value OHLCV-derived feature vector is retained as a rolling sequence and includes BUY, SELL, and HOLD signal imbalance values.","reason":"The specification requires 62 features but does not define them individually."},{"topic":"volatility stop","choice":"Volatility is ATR with period 14 and stop distance is one ATR.","reason":"The specification requires volatility-based stops but gives no volatility measure, period, or multiplier."},{"topic":"risk-reward","choice":"Take profit is set at 1:2 risk/reward.","reason":"The specification gives 1:2 and 1:3 as examples without selecting one."},{"topic":"risk thresholds","choice":"Risk per trade is 1% of current equity, maximum daily risk is 2% of the $10,000 deposit, and maximum drawdown is 5% of the $10,000 deposit.","reason":"The specification supplies ranges/examples rather than fixed values."},{"topic":"daily reset","choice":"Daily loss, drawdown high-water mark, and trading suspension reset when the feed date changes.","reason":"With hourly bars, this is the closest deterministic implementation of reset every 24 hours."},{"topic":"economic news","choice":"The closing-before-major-events option is present but cannot identify events or their start times.","reason":"The environment supplies only one OHLCV feed and no economic-calendar data."},{"topic":"expected risk display","choice":"Expected risk is recorded in the in-memory trade log.","reason":"The required module must not print, and no external display or logging sink is provided."},{"topic":"contract value","choice":"Risk sizing uses price-point distance multiplied by position units, without a futures contract multiplier.","reason":"No GC contract multiplier or broker point-value configuration is specified."}]}

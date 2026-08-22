@@ -1,0 +1,152 @@
+```python
+import backtrader as bt
+import math
+
+
+class RenkoTrendStrategy(bt.Strategy):
+    params = (
+        ("brick_size", 50.0),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_order = None
+        self.stop_order = None
+        self.take_profit_order = None
+
+        self.renko_close = None
+        self.brick_directions = []
+
+    def _add_renko_price(self, price):
+        formed = False
+
+        while price >= self.renko_close + self.p.brick_size:
+            self.renko_close += self.p.brick_size
+            self.brick_directions.append(1)
+            formed = True
+
+        while price <= self.renko_close - self.p.brick_size:
+            self.renko_close -= self.p.brick_size
+            self.brick_directions.append(-1)
+            formed = True
+
+        return formed
+
+    def _size(self):
+        price = self.data.close[0]
+        commission = self.broker.getcommissioninfo(self.data).p.commission
+        return int(math.floor(self.broker.getcash() / (price * (1.0 + commission))))
+
+    def _cancel_protection(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.take_profit_order is not None:
+            self.cancel(self.take_profit_order)
+
+    def next(self):
+        if self.renko_close is None:
+            self.renko_close = self.data.open[0]
+
+        new_brick = False
+        for price in (self.data.open[0], self.data.high[0],
+                      self.data.low[0], self.data.close[0]):
+            if self._add_renko_price(price):
+                new_brick = True
+
+        if not new_brick or self.order is not None:
+            return
+
+        if len(self.brick_directions) < 2:
+            return
+
+        direction = self.brick_directions[-1]
+        if direction != self.brick_directions[-2]:
+            return
+
+        if self.position.size > 0 and direction < 0:
+            self._cancel_protection()
+            self.order = self.close()
+            return
+
+        if self.position.size < 0 and direction > 0:
+            self._cancel_protection()
+            self.order = self.close()
+            return
+
+        if self.position.size != 0:
+            return
+
+        size = self._size()
+        if size <= 0:
+            return
+
+        if direction > 0:
+            self.entry_order = self.buy(size=size)
+        else:
+            self.entry_order = self.sell(size=size)
+
+        self.order = self.entry_order
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+
+                if order.isbuy():
+                    self.stop_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price - self.p.brick_size,
+                    )
+                    self.take_profit_order = self.sell(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price + (2.0 * self.p.brick_size),
+                        oco=self.stop_order,
+                    )
+                else:
+                    self.stop_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Stop,
+                        price=entry_price + self.p.brick_size,
+                    )
+                    self.take_profit_order = self.buy(
+                        size=size,
+                        exectype=bt.Order.Limit,
+                        price=entry_price - (2.0 * self.p.brick_size),
+                        oco=self.stop_order,
+                    )
+
+            if order.status in (order.Completed, order.Canceled,
+                                order.Margin, order.Rejected):
+                self.entry_order = None
+                self.order = None
+            return
+
+        if order is self.order and order.status in (
+            order.Completed, order.Canceled, order.Margin, order.Rejected
+        ):
+            self.order = None
+
+        if order is self.stop_order:
+            if order.status == order.Completed and self.take_profit_order is not None:
+                self.cancel(self.take_profit_order)
+            if order.status in (order.Completed, order.Canceled,
+                                order.Margin, order.Rejected):
+                self.stop_order = None
+
+        if order is self.take_profit_order:
+            if order.status == order.Completed and self.stop_order is not None:
+                self.cancel(self.stop_order)
+            if order.status in (order.Completed, order.Canceled,
+                                order.Margin, order.Rejected):
+                self.take_profit_order = None
+```
+
+```json
+{"assumptions":[{"topic":"OHLC Renko construction","choice":"Each daily bar is processed in Open, High, Low, Close order; the first bar's Open initializes the Renko reference price.","reason":"The specification requires OHLC-based Renko construction but does not specify intrabar ordering or an initial Renko price."},{"topic":"Renko reversal construction","choice":"A brick is formed for every full 50-point move from the latest Renko close, including a one-brick move in the opposite direction.","reason":"The specification sets brick size but does not define a separate multi-brick reversal threshold."},{"topic":"Fixed position size","choice":"Use the largest whole-share position whose notional value, including commission for a long entry, fits available cash at the signal bar's Close.","reason":"The specification requires a fixed size and gives 100% of available capital as its example, without defining a share quantity."},{"topic":"Stop-loss and take-profit reference","choice":"Protective orders are placed from the market order's actual execution price: one 50-point brick for the stop-loss and two 50-point bricks for take-profit.","reason":"The specification says these distances are from the entry point; in backtrader a market entry's exact price is known on completion."}]}
+```

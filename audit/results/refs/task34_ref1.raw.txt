@@ -1,0 +1,179 @@
+```python
+import backtrader as bt
+
+
+class WyckoffRangeBreakoutStrategy(bt.Strategy):
+    params = (
+        ("range_period", 20),
+        ("touch_tolerance", 0.005),
+    )
+
+    def __init__(self):
+        self.sma20 = bt.indicators.SMA(self.data.close, period=20)
+        self.avg_volume20 = bt.indicators.SMA(self.data.volume(-1), period=20)
+        self.addminperiod(self.p.range_period + 1)
+
+        self.entry_order = None
+        self.stop_order = None
+        self.target_order = None
+        self.close_order = None
+
+        self.last_entry_bar = -1000000
+        self.entry_support = None
+        self.entry_resistance = None
+        self.entry_is_long = None
+
+    def _range_levels(self):
+        highs = [float(self.data.high[-i]) for i in range(1, self.p.range_period + 1)]
+        lows = [float(self.data.low[-i]) for i in range(1, self.p.range_period + 1)]
+
+        resistance = max(highs)
+        support = min(lows)
+        tolerance = float(self.data.close[0]) * self.p.touch_tolerance
+
+        resistance_touches = sum(high >= resistance - tolerance for high in highs)
+        support_touches = sum(low <= support + tolerance for low in lows)
+
+        if resistance_touches < 2 or support_touches < 2:
+            return None
+
+        if resistance - support < float(self.data.close[0]) * 0.02:
+            return None
+
+        return support, resistance
+
+    def _submit_exit_orders(self, size):
+        range_height = self.entry_resistance - self.entry_support
+
+        if self.entry_is_long:
+            stop_price = self.entry_support * (1.0 - 0.005)
+            target_price = self.entry_resistance + range_height
+            self.stop_order = self.sell(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=stop_price,
+            )
+            self.target_order = self.sell(
+                size=size,
+                exectype=bt.Order.Limit,
+                price=target_price,
+                oco=self.stop_order,
+            )
+        else:
+            stop_price = self.entry_resistance * (1.0 + 0.005)
+            target_price = self.entry_support - range_height
+            self.stop_order = self.buy(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=stop_price,
+            )
+            self.target_order = self.buy(
+                size=size,
+                exectype=bt.Order.Limit,
+                price=target_price,
+                oco=self.stop_order,
+            )
+
+    def notify_order(self, order):
+        if order.status not in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+
+            if order.status == order.Completed:
+                self.last_entry_bar = len(self)
+                self._submit_exit_orders(order.executed.size)
+
+        elif order is self.stop_order:
+            self.stop_order = None
+            if order.status == order.Completed and self.target_order is not None:
+                self.cancel(self.target_order)
+
+        elif order is self.target_order:
+            self.target_order = None
+            if order.status == order.Completed and self.stop_order is not None:
+                self.cancel(self.stop_order)
+
+        elif order is self.close_order:
+            self.close_order = None
+
+    def next(self):
+        if self.position:
+            if (
+                self.close_order is None
+                and self.entry_support < float(self.data.close[0]) < self.entry_resistance
+            ):
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                if self.target_order is not None:
+                    self.cancel(self.target_order)
+                self.close_order = self.close()
+            return
+
+        if any(
+            order is not None
+            for order in (
+                self.entry_order,
+                self.stop_order,
+                self.target_order,
+                self.close_order,
+            )
+        ):
+            return
+
+        if len(self) - self.last_entry_bar < 5:
+            return
+
+        if float(self.data.close[0]) <= float(self.sma20[0]):
+            return
+
+        levels = self._range_levels()
+        if levels is None:
+            return
+
+        support, resistance = levels
+        close = float(self.data.close[0])
+        volume = float(self.data.volume[0])
+
+        if volume < float(self.avg_volume20[0]) * 1.20:
+            return
+
+        is_long = close > resistance
+        is_short = close < support
+
+        if not (is_long or is_short):
+            return
+
+        stop_price = (
+            support * (1.0 - 0.005)
+            if is_long
+            else resistance * (1.0 + 0.005)
+        )
+        potential_loss_per_unit = abs(close - stop_price)
+
+        if potential_loss_per_unit <= 0:
+            return
+
+        size = (self.broker.getvalue() * 0.01) / potential_loss_per_unit
+        if size <= 0:
+            return
+
+        self.entry_support = support
+        self.entry_resistance = resistance
+        self.entry_is_long = is_long
+
+        if is_long:
+            self.entry_order = self.buy(size=size)
+        else:
+            self.entry_order = self.sell(size=size)
+```
+
+```json
+{"assumptions":[{"topic":"range lookback","choice":"A sideways range is evaluated from the 20 completed candles preceding the breakout candle.","reason":"The specification requires support and resistance with at least two touches but does not specify a lookback period; 20 periods is used consistently with the stated SMA and volume periods."},{"topic":"price touches","choice":"A support or resistance touch is a low or high within 0.5% of the respective range extreme; at least two such touches are required.","reason":"The specification requires two touches but does not define an equality tolerance for market prices."},{"topic":"breakout volume average","choice":"The 20-period average volume uses the 20 completed candles preceding the breakout candle.","reason":"This measures breakout volume against prior volume rather than including the breakout candle itself."},{"topic":"entry timing","choice":"Market entry orders are submitted on the breakout candle and execute at the next candle open under standard backtrader behavior.","reason":"The specification permits entry at the open of the next candle."},{"topic":"risk sizing","choice":"Position size may be fractional and equals 1% of current broker value divided by the distance from breakout close to stop-loss.","reason":"The next opening price is unknown when the market order is submitted; the breakout close is the available entry-price estimate."}]}
+```

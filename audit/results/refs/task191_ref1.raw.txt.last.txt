@@ -1,0 +1,236 @@
+```python
+import backtrader as bt
+import collections
+import statistics
+
+
+class ReferenceScalpingStrategy(bt.Strategy):
+    params = (
+        ("session_median_period", 20),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.ema9 = bt.indicators.EMA(self.data.close, period=9)
+        self.ema21 = bt.indicators.EMA(self.data.close, period=21)
+        self.ema_cross = bt.indicators.CrossOver(self.ema9, self.ema21)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.signal_kind = None
+        self.entry_price = None
+        self.entry_atr = None
+
+        self.gamma_history = collections.deque(maxlen=self.p.session_median_period)
+        self.spotvol_history = collections.deque(maxlen=self.p.session_median_period)
+
+        self.current_day = None
+        self.day_bar_count = 0
+        self.day_widths = []
+        self.day_open = None
+        self.day_first_six_close = None
+        self.day_return = None
+        self.day_gap = None
+        self.previous_session_close = None
+        self.regime = None
+
+    def notify_order(self, order):
+        if order.status in [
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ]:
+            if order.status == order.Completed:
+                if order.isbuy() and not self.position:
+                    self.entry_price = order.executed.price
+                    self.entry_atr = float(self.atr[0])
+                elif order.issell() and not self.position:
+                    self.entry_price = order.executed.price
+                    self.entry_atr = float(self.atr[0])
+            self.order = None
+
+    def _finish_session(self):
+        if len(self.day_widths) == 6:
+            self.gamma_history.append(sum(self.day_widths) / 6.0)
+        if self.day_gap is not None:
+            self.spotvol_history.append(self.day_gap)
+
+    def _start_session(self):
+        self.day_bar_count = 0
+        self.day_widths = []
+        self.day_open = float(self.data.open[0])
+        self.day_first_six_close = None
+        self.day_return = None
+        self.day_gap = None
+        self.regime = None
+
+        if self.previous_session_close not in (None, 0.0):
+            self.day_gap = abs(
+                self.day_open - self.previous_session_close
+            ) / self.previous_session_close
+
+        if (
+            len(self.gamma_history) == self.p.session_median_period
+            and len(self.spotvol_history) == self.p.session_median_period
+            and self.day_gap is not None
+        ):
+            gamma_median = statistics.median(self.gamma_history)
+            spotvol_median = statistics.median(self.spotvol_history)
+            gamma_high = False
+            spotvol_high = self.day_gap > spotvol_median
+            self._pending_gamma_median = gamma_median
+            self._pending_spotvol_high = spotvol_high
+        else:
+            self._pending_gamma_median = None
+            self._pending_spotvol_high = None
+
+    def _set_regime_after_six_bars(self):
+        if (
+            self._pending_gamma_median is None
+            or len(self.day_widths) != 6
+        ):
+            return
+
+        gamma_value = sum(self.day_widths) / 6.0
+        gamma_high = gamma_value < self._pending_gamma_median
+        spotvol_high = self._pending_spotvol_high
+
+        self.regime = (
+            ("H" if gamma_high else "L")
+            + ("H" if spotvol_high else "L")
+        )
+
+    def _submit_entry(self, is_long, kind):
+        self.signal_kind = kind
+        self.entry_price = None
+        self.entry_atr = None
+        self.order = self.buy() if is_long else self.sell()
+
+    def _exit_required(self):
+        if self.entry_price is None or self.entry_atr is None:
+            return False
+
+        is_long = self.position.size > 0
+        close = float(self.data.close[0])
+        high = float(self.data.high[0])
+        low = float(self.data.low[0])
+
+        if self.signal_kind == "mr":
+            stop = self.entry_price - self.entry_atr if is_long else self.entry_price + self.entry_atr
+            target_mult = 0.75 if self.regime == "HH" else 1.0
+            target = (
+                self.entry_price + target_mult * self.entry_atr
+                if is_long
+                else self.entry_price - target_mult * self.entry_atr
+            )
+
+            if is_long:
+                return (
+                    low <= stop
+                    or high >= target
+                    or close >= float(self.bb.mid[0])
+                    or float(self.rsi[0]) > 70.0
+                )
+            return (
+                high >= stop
+                or low <= target
+                or close <= float(self.bb.mid[0])
+                or float(self.rsi[0]) < 30.0
+            )
+
+        stop = (
+            self.entry_price - 1.5 * self.entry_atr
+            if is_long
+            else self.entry_price + 1.5 * self.entry_atr
+        )
+        target = (
+            self.entry_price + 2.0 * self.entry_atr
+            if is_long
+            else self.entry_price - 2.0 * self.entry_atr
+        )
+
+        if is_long:
+            return low <= stop or high >= target or self.ema_cross[0] < 0
+        return high >= stop or low <= target or self.ema_cross[0] > 0
+
+    def next(self):
+        bar_day = self.data.datetime.date(0)
+
+        if self.current_day != bar_day:
+            if self.current_day is not None:
+                self._finish_session()
+            self.current_day = bar_day
+            self._start_session()
+
+        self.day_bar_count += 1
+
+        if self.day_bar_count <= 6:
+            self.day_widths.append(float(self.bb.top[0] - self.bb.bot[0]))
+            if self.day_bar_count == 6:
+                self.day_first_six_close = float(self.data.close[0])
+                self.day_return = (
+                    self.day_first_six_close - self.day_open
+                ) / self.day_open
+                self._set_regime_after_six_bars()
+
+        self.previous_session_close = float(self.data.close[0])
+
+        if self.order:
+            return
+
+        if self.position:
+            if self._exit_required():
+                self.order = self.close()
+            return
+
+        if self.regime is None:
+            return
+
+        rsi_cross_up = self.rsi[-1] <= 30.0 and self.rsi[0] > 30.0
+        rsi_cross_down = self.rsi[-1] >= 70.0 and self.rsi[0] < 70.0
+        ema_cross_up = self.ema_cross[0] > 0
+        ema_cross_down = self.ema_cross[0] < 0
+
+        lower_touch = float(self.data.low[0]) <= float(self.bb.bot[0])
+        upper_touch = float(self.data.high[0]) >= float(self.bb.top[0])
+
+        gamma_high = self.regime[0] == "H"
+        spotvol_high = self.regime[1] == "H"
+
+        mr_long = rsi_cross_up and (gamma_high or lower_touch)
+        mr_short = rsi_cross_down and (gamma_high or upper_touch)
+
+        if self.regime == "LL":
+            mr_long = mr_long and ema_cross_up
+            mr_short = mr_short and ema_cross_down
+
+        if mr_long:
+            self._submit_entry(True, "mr")
+            return
+        if mr_short:
+            self._submit_entry(False, "mr")
+            return
+
+        if self.regime == "HL":
+            return
+
+        trend_long = ema_cross_up and spotvol_high
+        trend_short = ema_cross_down and spotvol_high
+
+        if self.regime == "LH":
+            trend_long = trend_long and self.day_return > 0.0
+            trend_short = trend_short and self.day_return <= 0.0
+
+        if trend_long:
+            self._submit_entry(True, "trend")
+        elif trend_short:
+            self._submit_entry(False, "trend")
+```
+
+```json
+{"assumptions":[{"topic":"infeasible","choice":"Indicators and the first-six-bars calculations use the supplied 1-minute feed directly.","reason":"The harness supplies only one 1-minute data feed and strategy code cannot add or resample data feeds through Cerebro; therefore an actual 5-minute Backtrader feed is unavailable."},{"topic":"session","choice":"A session is identified by each calendar date in the feed.","reason":"No exchange-calendar or explicit regular-session boundary rule is supplied."},{"topic":"median availability","choice":"Regimes are unavailable until 20 completed prior sessions exist for both proxies.","reason":"A median over the previous 20 sessions cannot be calculated before then."},{"topic":"ties","choice":"Values equal to their historical median are classified Low.","reason":"The specification defines High/Low by relative magnitude but does not specify equality handling."},{"topic":"outer-band touch","choice":"Long signals use Low touching the lower band and short signals use High touching the upper band.","reason":"This is the directional literal interpretation of touching the outer Bollinger Band for mean reversion."},{"topic":"optional take-profit","choice":"ATR take-profit is enabled.","reason":"The specification supplies explicit ATR take-profit multipliers but does not state that it should be disabled."},{"topic":"stop and target execution","choice":"Stops and ATR targets are evaluated against each bar's High/Low and exited with self.close().","reason":"The specification provides price thresholds but no order type, fill model, or bracket-order instruction."}]}
+```

@@ -1,163 +1,39 @@
 {
   "task_id": 136,
   "ref_idx": 1,
-  "model": "opus",
-  "code": "import backtrader as bt\n\n\nclass NvdaResistanceBreakoutStrategy(bt.Strategy):\n    params = dict(\n        ema_period=8,\n        entry_level=179.33,\n        tp1_level=184.89,\n        tp2_level=192.95,\n        risk_per_trade=0.02,\n    )\n\n    def __init__(self):\n        # Indicator: 8-period Exponential Moving Average.\n        self.ema = bt.indicators.ExponentialMovingAverage(\n            self.data.close, period=self.p.ema_period\n        )\n        self.order = None        # guards pending orders\n        self.trail_stop = None   # current trailing-stop price level\n        self.tp1_done = False     # first (50%) take-profit already taken\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status in (order.Completed, order.Canceled,\n                             order.Margin, order.Rejected):\n            self.order = None\n\n    def next(self):\n        # Only one working order at a time.\n        if self.order:\n            return\n\n        # Flat: look for a breakout entry above the resistance level.\n        if not self.position:\n            self.trail_stop = None\n            self.tp1_done = False\n\n            # Entry: closing price of the current bar exceeds 179.33.\n            if self.data.close[0] > self.p.entry_level:\n                # The trailing-stop distance equals the EMA value, so the\n                # potential loss per share (entry - initial stop) == EMA.\n                risk_per_share = self.ema[0]\n                if risk_per_share > 0:\n                    cash_risk = self.p.risk_per_trade * self.broker.getvalue()\n                    size = int(cash_risk / risk_per_share)\n                    if size >= 1:\n                        self.order = self.buy(size=size)\n            return\n\n        # In a position: maintain the trailing stop (ratchets upward only,\n        # lagging the close by a distance equal to the 8-period EMA value).\n        candidate = self.data.close[0] - self.ema[0]\n        if self.trail_stop is None:\n            self.trail_stop = candidate\n        else:\n            self.trail_stop = max(self.trail_stop, candidate)\n\n        # Trailing stop hit -> exit the whole position (risk management first).\n        if self.data.low[0] <= self.trail_stop:\n            self.order = self.close()\n            return\n\n        # Final take-profit: close the remaining part upon reaching 192.95.\n        if self.tp1_done:\n            if self.data.high[0] >= self.p.tp2_level:\n                self.order = self.close()\n            return\n\n        # First take-profit: close 50% of the position upon reaching 184.89.\n        if self.data.high[0] >= self.p.tp1_level:\n            half = abs(self.position.size) / 2.0\n            if half > 0:\n                self.order = self.sell(size=half)\n                self.tp1_done = True",
+  "model": "gpt-5.6-terra(medium)",
+  "code": "import backtrader as bt\nimport math\n\n\nclass NVDAResistanceEMAStrategy(bt.Strategy):\n    params = ((\"ema_period\", 8),)\n\n    def __init__(self):\n        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)\n        self.order = None\n        self.stop_order = None\n        self.order_role = None\n        self.stop_level = None\n        self.first_take_profit_taken = False\n        self.entry_stop_level = None\n\n    def _place_stop(self):\n        if not self.position or self.stop_level is None:\n            return\n\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n\n        self.stop_order = self.sell(\n            size=self.position.size,\n            exectype=bt.Order.Stop,\n            price=self.stop_level,\n        )\n\n    def _cancel_stop(self):\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n\n    def next(self):\n        if self.order is not None:\n            return\n\n        if not self.position:\n            if self.data.close[0] > 179.33:\n                initial_stop = self.data.close[0] - self.ema[0]\n                potential_loss_per_share = self.data.close[0] - initial_stop\n\n                if potential_loss_per_share > 0:\n                    size = (self.broker.getvalue() * 0.02) / potential_loss_per_share\n                    if size > 0:\n                        self.entry_stop_level = initial_stop\n                        self.order_role = \"entry\"\n                        self.order = self.buy(size=size)\n            return\n\n        if self.data.high[0] >= 192.95:\n            self._cancel_stop()\n            self.order_role = \"final_take_profit\"\n            self.order = self.close()\n            return\n\n        if not self.first_take_profit_taken and self.data.high[0] >= 184.89:\n            self._cancel_stop()\n            self.order_role = \"partial_take_profit\"\n            self.order = self.sell(size=self.position.size * 0.5)\n            return\n\n        candidate_stop = self.data.high[0] - self.ema[0]\n        if self.stop_level is None or candidate_stop > self.stop_level:\n            self.stop_level = candidate_stop\n            self._place_stop()\n\n    def notify_order(self, order):\n        if order is self.stop_order:\n            if order.status in [\n                order.Completed,\n                order.Canceled,\n                order.Margin,\n                order.Rejected,\n            ]:\n                self.stop_order = None\n            return\n\n        if order is not self.order:\n            return\n\n        if order.status in [order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n            self.order_role = None\n            return\n\n        if order.status != order.Completed:\n            return\n\n        role = self.order_role\n        self.order = None\n        self.order_role = None\n\n        if role == \"entry\":\n            self.stop_level = self.entry_stop_level\n            self.entry_stop_level = None\n            self.first_take_profit_taken = False\n            self._place_stop()\n        elif role == \"partial_take_profit\":\n            self.first_take_profit_taken = True\n            if self.position:\n                self._place_stop()\n        elif role == \"final_take_profit\":\n            self.first_take_profit_taken = False\n            self.stop_level = None",
   "assumptions": [
     {
-      "topic": "trailing-stop distance",
-      "choice": "Read literally: the stop lags the price by a distance equal to the current 8-period EMA value, i.e. stop_level = close - EMA(8), ratcheted so it only moves up (max of previous and new candidate).",
-      "reason": "The spec explicitly says 'lagging by a distance equal to the value of the 8-period EMA', so the trail distance is the EMA value itself, not the price-minus-EMA difference."
+      "topic": "trailing-stop calculation",
+      "choice": "The trailing-stop candidate is High minus the 8-period EMA, ratcheted upward only.",
+      "reason": "The specification defines the EMA as the trailing distance and says the stop follows rising price; High represents the daily price reached."
+    },
+    {
+      "topic": "target-price detection",
+      "choice": "Take-profit levels are detected when the bar High reaches or exceeds the stated price.",
+      "reason": "\u201cUpon reaching the price\u201d is interpreted as an intraday price touch on daily OHLC bars."
+    },
+    {
+      "topic": "same-bar target overlap",
+      "choice": "If High reaches 192.95, the final take-profit closes the entire remaining position instead of submitting a separate 50% exit first.",
+      "reason": "Both thresholds are satisfied, and the final rule requires the remaining position to be closed."
     },
     {
       "topic": "position sizing",
-      "choice": "risk_per_share = EMA(8) at the signal bar (since entry - initial stop = EMA), size = floor(0.02 * broker.getvalue() / EMA); require size >= 1 else no trade.",
-      "reason": "Spec: 'potential loss from the stop-loss does not exceed 2% of total trading capital.' The initial stop distance equals the EMA value, and 'total trading capital' is taken as the broker's current account value."
-    },
-    {
-      "topic": "trailing-stop reference price / trigger",
-      "choice": "The stop follows the bar close (close - EMA, ratcheted up); it is triggered when the bar low <= stop level, exiting the full remaining position at market.",
-      "reason": "Spec says the stop 'follows the price' and 'will not fall below its previous value' but does not name a specific price; close is used for tracking and low for the intrabar breach test."
-    },
-    {
-      "topic": "take-profit trigger / execution",
-      "choice": "'Upon reaching price P' is detected when the bar high >= P; TP1 sells 50% of the current position, TP2 closes the remainder. Exits are market orders (filled next bar open per backtrader).",
-      "reason": "OHLCV daily bars: 'reaching' a level means an intrabar touch (high), and market orders are the canonical default. 50% of a small/odd position can be fractional; backtrader permits fractional sizing."
-    },
-    {
-      "topic": "exit priority within a bar",
-      "choice": "Trailing stop is evaluated before the take-profits on each bar.",
-      "reason": "The spec frames the trailing stop as risk management; protective exits are given precedence where the spec is silent on ordering."
-    },
-    {
-      "topic": "re-entry / timeframe",
-      "choice": "One position at a time; after a full exit a new breakout entry may occur. Strategy runs on the daily feed as provided.",
-      "reason": "Canonical single-position default; the feed is already D1, matching the spec's D1 requirement, so no gap."
+      "choice": "Position size is 2% of current broker value divided by initial stop-loss distance, allowing fractional share sizes.",
+      "reason": "This exactly caps the calculated initial stop-loss exposure at 2% while allowing a literal 50% partial close."
     }
   ],
   "success": true,
   "error": null,
-  "total_trades": 7,
+  "total_trades": 1,
   "tape": [
     {
       "dt": "2025-08-05T04:00:00",
       "side": "BUY",
-      "size": 1.0,
+      "size": 1.1382308260522287,
       "price": 179.38107983649965
-    },
-    {
-      "dt": "2025-10-01T04:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 185.00404300205486
-    },
-    {
-      "dt": "2025-10-10T04:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 193.26350393527704
-    },
-    {
-      "dt": "2025-10-13T04:00:00",
-      "side": "BUY",
-      "size": 1.0,
-      "price": 187.73056363822363
-    },
-    {
-      "dt": "2025-10-14T04:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 184.53462639606815
-    },
-    {
-      "dt": "2025-10-29T04:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 207.715080745974
-    },
-    {
-      "dt": "2025-10-30T04:00:00",
-      "side": "BUY",
-      "size": 1.0,
-      "price": 204.88867704045037
-    },
-    {
-      "dt": "2025-10-31T04:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 206.18701808603035
-    },
-    {
-      "dt": "2025-11-03T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 207.81493866642379
-    },
-    {
-      "dt": "2025-11-04T05:00:00",
-      "side": "BUY",
-      "size": 1.0,
-      "price": 202.7414122562426
-    },
-    {
-      "dt": "2025-11-05T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 198.51681234435117
-    },
-    {
-      "dt": "2025-11-06T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 196.169796348482
-    },
-    {
-      "dt": "2025-11-07T05:00:00",
-      "side": "BUY",
-      "size": 1.0,
-      "price": 184.66447901682176
-    },
-    {
-      "dt": "2025-11-10T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 194.8614791513322
-    },
-    {
-      "dt": "2025-11-11T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 194.91140808059743
-    },
-    {
-      "dt": "2025-11-12T05:00:00",
-      "side": "BUY",
-      "size": 1.0,
-      "price": 195.4706988945922
-    },
-    {
-      "dt": "2025-11-13T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 190.80662838449902
-    },
-    {
-      "dt": "2025-11-21T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 181.00913979899244
-    },
-    {
-      "dt": "2025-11-25T05:00:00",
-      "side": "BUY",
-      "size": 1.0,
-      "price": 174.68719385821646
-    },
-    {
-      "dt": "2025-12-03T05:00:00",
-      "side": "SELL",
-      "size": -0.5,
-      "price": 180.8493441127912
     }
   ]
 }

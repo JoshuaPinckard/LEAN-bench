@@ -1,0 +1,222 @@
+```python
+import backtrader as bt
+
+
+class VolumeClimaxReversalStrategy(bt.Strategy):
+    params = (
+        ('sma_period', 50),
+        ('volume_sma_period', 20),
+        ('atr_period', 14),
+        ('move_bars', 6),
+        ('move_atr_multiple', 1.5),
+        ('volume_multiple', 2.0),
+        ('range_atr_multiple', 1.2),
+        ('close_location_threshold', 0.25),
+        ('pullback_bars', 8),
+        ('pullback_atr_multiple', 0.5),
+        ('stop_loss_pct', 0.02),
+        ('exit_volume_multiple', 1.5),
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.volume_sma20 = bt.indicators.SMA(
+            self.data.volume, period=self.p.volume_sma_period
+        )
+        self.atr14 = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.stop_order = None
+        self.entry_direction = None
+
+        self.blowoff_index = None
+        self.blowoff_direction = None
+        self.blowoff_high = None
+        self.blowoff_low = None
+        self.blowoff_close = None
+        self.pullback_occurred = False
+
+    def _clear_blowoff_state(self):
+        self.blowoff_index = None
+        self.blowoff_direction = None
+        self.blowoff_high = None
+        self.blowoff_low = None
+        self.blowoff_close = None
+        self.pullback_occurred = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.stop_order:
+            if order.status in [
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.stop_order = None
+                if order.status == order.Completed:
+                    self.entry_direction = None
+                    self._clear_blowoff_state()
+            return
+
+        if order == self.order:
+            if order.status == order.Completed:
+                if order.isbuy() and self.entry_direction == 'long':
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=order.executed.price * (1.0 - self.p.stop_loss_pct),
+                    )
+                elif order.issell() and self.entry_direction == 'short':
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop,
+                        price=order.executed.price * (1.0 + self.p.stop_loss_pct),
+                    )
+
+            if order.status in [
+                order.Completed,
+                order.Canceled,
+                order.Margin,
+                order.Rejected,
+            ]:
+                self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.entry_direction == 'short':
+                if (
+                    self.data.close[0] > self.blowoff_high
+                    and self.data.volume[0]
+                    >= self.p.exit_volume_multiple * self.volume_sma20[0]
+                ):
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                    self.order = self.close()
+                    self.entry_direction = None
+                    self._clear_blowoff_state()
+
+            elif self.entry_direction == 'long':
+                if (
+                    self.data.close[0] < self.blowoff_low
+                    and self.data.volume[0]
+                    >= self.p.exit_volume_multiple * self.volume_sma20[0]
+                ):
+                    if self.stop_order:
+                        self.cancel(self.stop_order)
+                    self.order = self.close()
+                    self.entry_direction = None
+                    self._clear_blowoff_state()
+
+            return
+
+        if self.blowoff_index is not None:
+            bars_since_blowoff = len(self) - self.blowoff_index
+
+            if bars_since_blowoff > self.p.pullback_bars:
+                self._clear_blowoff_state()
+            else:
+                if self.blowoff_direction == 'up':
+                    if (
+                        self.data.close[0]
+                        <= self.blowoff_close
+                        - self.p.pullback_atr_multiple * self.atr14[0]
+                    ):
+                        self.pullback_occurred = True
+
+                    if (
+                        self.pullback_occurred
+                        and self.data.close[0] < self.data.low[-1]
+                    ):
+                        self.entry_direction = 'short'
+                        self.order = self.sell()
+                        self._clear_blowoff_state()
+                        return
+
+                elif self.blowoff_direction == 'down':
+                    if (
+                        self.data.close[0]
+                        >= self.blowoff_close
+                        + self.p.pullback_atr_multiple * self.atr14[0]
+                    ):
+                        self.pullback_occurred = True
+
+                    if (
+                        self.pullback_occurred
+                        and self.data.close[0] > self.data.high[-1]
+                    ):
+                        self.entry_direction = 'long'
+                        self.order = self.buy()
+                        self._clear_blowoff_state()
+                        return
+
+        if self.blowoff_index is not None:
+            return
+
+        uptrend = (
+            self.data.close[0] > self.sma50[0]
+            and self.sma50[0] > self.sma50[-1]
+        )
+        downtrend = (
+            self.data.close[0] < self.sma50[0]
+            and self.sma50[0] < self.sma50[-1]
+        )
+
+        bar_range = self.data.high[0] - self.data.low[0]
+        if bar_range <= 0:
+            return
+
+        high_close_fraction = (
+            self.data.high[0] - self.data.close[0]
+        ) / bar_range
+        close_low_fraction = (
+            self.data.close[0] - self.data.low[0]
+        ) / bar_range
+
+        up_move = (
+            self.data.close[0] - self.data.close[-self.p.move_bars]
+            > self.p.move_atr_multiple * self.atr14[0]
+        )
+        down_move = (
+            self.data.close[-self.p.move_bars] - self.data.close[0]
+            > self.p.move_atr_multiple * self.atr14[0]
+        )
+
+        common_blowoff = (
+            self.data.volume[0] > self.p.volume_multiple * self.volume_sma20[0]
+            and bar_range > self.p.range_atr_multiple * self.atr14[0]
+        )
+
+        if (
+            uptrend
+            and up_move
+            and common_blowoff
+            and high_close_fraction < self.p.close_location_threshold
+        ):
+            self.blowoff_index = len(self)
+            self.blowoff_direction = 'up'
+            self.blowoff_high = self.data.high[0]
+            self.blowoff_low = self.data.low[0]
+            self.blowoff_close = self.data.close[0]
+            self.pullback_occurred = False
+
+        elif (
+            downtrend
+            and down_move
+            and common_blowoff
+            and close_low_fraction < self.p.close_location_threshold
+        ):
+            self.blowoff_index = len(self)
+            self.blowoff_direction = 'down'
+            self.blowoff_high = self.data.high[0]
+            self.blowoff_low = self.data.low[0]
+            self.blowoff_close = self.data.close[0]
+            self.pullback_occurred = False
+```
+
+```json
+{"assumptions":[{"topic":"pullback entry timing","choice":"The bar that first satisfies the pullback threshold may also trigger entry if its close crosses the prior bar's low/high.","reason":"This is the closest literal bar-by-bar interpretation of entering on the first qualifying close once the pullback condition is met."},{"topic":"multiple blow-off bars","choice":"An active blow-off setup is retained until entry or expiry; later blow-off bars are ignored during that window.","reason":"The specification describes waiting after a detected blow-off bar and provides one stored blow-off state."},{"topic":"stop execution","choice":"A Backtrader Stop order is placed after the market entry fills, using the actual executed entry price.","reason":"This implements the stated fixed percentage stop-loss and allows Backtrader to execute it intrabar according to its order model."}]}
+```

@@ -1,0 +1,208 @@
+```python
+import backtrader as bt
+
+
+class DailyORBRetestStrategy(bt.Strategy):
+    params = (
+        ('ema_fast_period', 20),
+        ('ema_slow_period', 50),
+        ('bb_period', 20),
+        ('bb_devfactor', 2.0),
+        ('atr_period', 14),
+    )
+
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(
+            self.data.close, period=self.p.ema_fast_period
+        )
+        self.ema50 = bt.indicators.EMA(
+            self.data.close, period=self.p.ema_slow_period
+        )
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close,
+            period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor,
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.order_roles = {}
+        self.state = 'idle'
+        self.first_stop_bar = None
+        self.second_stop_price = None
+        self.second_trail_amount = None
+
+    def _submit_first_entry(self, direction):
+        if direction == 'long':
+            self.order = self.buy(size=1)
+        else:
+            self.order = self.sell(size=1)
+
+        self.order_roles[self.order.ref] = 'first_entry'
+        self.state = 'first_pending'
+
+    def _submit_second_entry(self, direction):
+        if direction == 'long':
+            self.order = self.buy(size=1)
+        else:
+            self.order = self.sell(size=1)
+
+        self.order_roles[self.order.ref] = 'second_entry'
+        self.state = 'second_pending'
+
+    def _submit_first_exits(self, entry_order):
+        entry_price = entry_order.executed.price
+
+        if entry_order.isbuy():
+            stop = self.sell(
+                size=1,
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 - 0.003),
+            )
+            target = self.sell(
+                size=1,
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 + 0.005),
+                oco=stop,
+            )
+        else:
+            stop = self.buy(
+                size=1,
+                exectype=bt.Order.Stop,
+                price=entry_price * (1.0 + 0.003),
+            )
+            target = self.buy(
+                size=1,
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 - 0.005),
+                oco=stop,
+            )
+
+        self.order_roles[stop.ref] = 'first_stop'
+        self.order_roles[target.ref] = 'first_target'
+        self.state = 'first_active'
+
+    def _submit_second_exits(self, entry_order):
+        entry_price = entry_order.executed.price
+
+        if entry_order.isbuy():
+            initial_stop = self.sell(
+                size=1,
+                exectype=bt.Order.Stop,
+                price=self.second_stop_price,
+            )
+            trail_stop = self.sell(
+                size=1,
+                exectype=bt.Order.StopTrail,
+                price=entry_price,
+                trailamount=self.second_trail_amount,
+                oco=initial_stop,
+            )
+            target = self.sell(
+                size=1,
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 + 0.006),
+                oco=initial_stop,
+            )
+        else:
+            initial_stop = self.buy(
+                size=1,
+                exectype=bt.Order.Stop,
+                price=self.second_stop_price,
+            )
+            trail_stop = self.buy(
+                size=1,
+                exectype=bt.Order.StopTrail,
+                price=entry_price,
+                trailamount=self.second_trail_amount,
+                oco=initial_stop,
+            )
+            target = self.buy(
+                size=1,
+                exectype=bt.Order.Limit,
+                price=entry_price * (1.0 - 0.006),
+                oco=initial_stop,
+            )
+
+        self.order_roles[initial_stop.ref] = 'second_initial_stop'
+        self.order_roles[trail_stop.ref] = 'second_trail_stop'
+        self.order_roles[target.ref] = 'second_target'
+        self.state = 'second_active'
+
+    def notify_order(self, order):
+        role = self.order_roles.get(order.ref)
+
+        if order.status in (
+            order.Submitted,
+            order.Accepted,
+        ):
+            return
+
+        if order.status == order.Completed:
+            if role == 'first_entry':
+                self.order = None
+                self._submit_first_exits(order)
+            elif role == 'second_entry':
+                self.order = None
+                self._submit_second_exits(order)
+            elif role == 'first_stop':
+                self.first_stop_bar = len(self.data)
+                self.state = 'retest'
+            elif role == 'first_target':
+                self.state = 'idle'
+            elif role in (
+                'second_initial_stop',
+                'second_trail_stop',
+                'second_target',
+            ):
+                self.state = 'idle'
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            if order is self.order:
+                self.order = None
+
+            if role in ('first_entry', 'second_entry') and order.status != order.Completed:
+                self.state = 'idle'
+
+    def next(self):
+        if self.order is not None or self.position:
+            return
+
+        if self.state == 'retest':
+            elapsed_days = len(self.data) - self.first_stop_bar
+
+            if elapsed_days > 3:
+                self.state = 'idle'
+                return
+
+            if elapsed_days < 1:
+                return
+
+            if self.ema20[0] > self.ema50[0]:
+                if self.data.low[0] <= self.bb.mid[0] and self.data.close[0] > self.bb.mid[0]:
+                    self.second_stop_price = self.data.low[0]
+                    self.second_trail_amount = self.atr[0]
+                    self._submit_second_entry('long')
+            elif self.ema20[0] < self.ema50[0]:
+                if self.data.high[0] >= self.bb.mid[0] and self.data.close[0] < self.bb.mid[0]:
+                    self.second_stop_price = self.data.high[0]
+                    self.second_trail_amount = self.atr[0]
+                    self._submit_second_entry('short')
+
+            return
+
+        if self.state == 'idle':
+            if self.ema20[0] > self.ema50[0]:
+                self._submit_first_entry('long')
+            elif self.ema20[0] < self.ema50[0]:
+                self._submit_first_entry('short')
+```
+
+```json
+{"assumptions":[{"topic":"daily-order timing","choice":"Market entries are submitted after a completed daily bar and therefore fill at the following bar's open under Backtrader's standard broker timing.","reason":"The harness does not enable cheat-on-open execution, so a strategy cannot submit an order at the currently executing bar's open."},{"topic":"infeasible","choice":"Protective exits are installed when Backtrader confirms the entry fill; they become eligible from the subsequent broker processing cycle.","reason":"With standard Backtrader daily-bar processing, exact same-bar placement and evaluation of exits whose prices depend on the unknown market-entry fill is not available."},{"topic":"intrabar priority","choice":"For the first attempt, the stop order is created before the target; for the second attempt, the initial stop, trailing stop, then target are created in that order as OCO exits.","reason":"This makes stop-side execution take precedence where Backtrader must resolve same-bar ambiguous touches, including the specified conservative trailing-stop priority."},{"topic":"episode definition","choice":"A new first-trade episode may begin on a later eligible flat-bar signal after a first target, second-trade exit, or expired three-day retest window.","reason":"The specification defines the two-attempt limit within an episode but does not otherwise define episode boundaries."}]}
+```

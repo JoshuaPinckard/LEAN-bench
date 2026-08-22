@@ -1,0 +1,278 @@
+```python
+import backtrader as bt
+import math
+
+
+class HybridYieldAndCoreStrategy(bt.Strategy):
+    params = (
+        ('commission_rate', 0.001),
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=50)
+        self.macd = bt.indicators.MACD(
+            self.data.close, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2
+        )
+        self.bb_width = self.bb.top - self.bb.bot
+        self.bb_width_sma50 = bt.indicators.SMA(self.bb_width, period=50)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.high20 = bt.indicators.Highest(self.data.high, period=20)
+
+        self.order = None
+        self.order_action = None
+        self.order_atr = None
+
+        self.yield_size = 0
+        self.yield_entry_price = None
+        self.yield_entry_atr = None
+        self.yield_entry_bar = None
+
+        self.core_size = 0
+        self.core_high_water = None
+        self.core_buyback_size = 0
+        self.bearish_core_bars = 0
+
+    def _capital(self):
+        return self.broker.getvalue()
+
+    def _cash_limited_size(self, requested_size):
+        price = self.data.close[0]
+        capital = self._capital()
+        cash_reserve = 0.10 * capital
+        available_cash = self.broker.getcash() - cash_reserve
+
+        if price <= 0 or available_cash <= 0:
+            return 0
+
+        affordable = math.floor(
+            available_cash / (price * (1.0 + self.p.commission_rate))
+        )
+        return max(0, min(int(requested_size), affordable))
+
+    def _total_capacity_size(self, requested_size):
+        price = self.data.close[0]
+        capital = self._capital()
+
+        if price <= 0:
+            return 0
+
+        current_value = max(0, self.position.size) * price
+        room = (0.90 * capital) - current_value
+        return max(0, min(int(requested_size), math.floor(room / price)))
+
+    def _yield_capacity_size(self, requested_size):
+        price = self.data.close[0]
+        capital = self._capital()
+
+        if price <= 0:
+            return 0
+
+        room = (0.70 * capital) - (self.yield_size * price)
+        return max(0, min(int(requested_size), math.floor(room / price)))
+
+    def _core_can_buy_one_default_share(self):
+        price = self.data.close[0]
+        capital = self._capital()
+
+        if price <= 0:
+            return False
+
+        core_room = (0.30 * capital) - (self.core_size * price)
+        total_room = (0.90 * capital) - (max(0, self.position.size) * price)
+        cash_room = self.broker.getcash() - (0.10 * capital)
+
+        return (
+            core_room >= price
+            and total_room >= price
+            and cash_room >= price * (1.0 + self.p.commission_rate)
+        )
+
+    def _submit_buy(self, action, size=None, atr_value=None):
+        self.order_action = action
+        self.order_atr = atr_value
+        self.order = self.buy() if size is None else self.buy(size=size)
+
+    def _submit_sell(self, action, size):
+        self.order_action = action
+        self.order_atr = None
+        self.order = self.sell(size=size)
+
+    def notify_order(self, order):
+        if order is not self.order:
+            return
+
+        if order.status == order.Completed:
+            executed_size = abs(order.executed.size)
+
+            if self.order_action == 'yield_entry':
+                self.yield_size += executed_size
+                self.yield_entry_price = order.executed.price
+                self.yield_entry_atr = self.order_atr
+                self.yield_entry_bar = len(self)
+
+            elif self.order_action == 'yield_exit':
+                self.yield_size = 0
+                self.yield_entry_price = None
+                self.yield_entry_atr = None
+                self.yield_entry_bar = None
+
+            elif self.order_action in ('core_entry', 'core_add', 'core_buyback'):
+                self.core_size += executed_size
+                if self.order_action == 'core_buyback':
+                    self.core_buyback_size = max(
+                        0, self.core_buyback_size - executed_size
+                    )
+                if self.core_high_water is None:
+                    self.core_high_water = order.executed.price
+
+            elif self.order_action == 'core_partial_profit':
+                self.core_size = max(0, self.core_size - executed_size)
+                self.core_buyback_size += executed_size
+
+            elif self.order_action == 'core_liquidation':
+                self.core_size = 0
+                self.core_high_water = None
+                self.core_buyback_size = 0
+
+        if order.status in (
+            order.Completed,
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            self.order = None
+            self.order_action = None
+            self.order_atr = None
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        middle = self.bb.mid[0]
+        upper = self.bb.top[0]
+        lower = self.bb.bot[0]
+        atr = self.atr[0]
+        rsi = self.rsi[0]
+
+        # Module 1 exits
+        if self.yield_size > 0:
+            stop_price = self.yield_entry_price - self.yield_entry_atr
+            target_price = self.yield_entry_price + (0.7 * self.yield_entry_atr)
+            held_bars = len(self) - self.yield_entry_bar
+
+            if low <= stop_price:
+                self._submit_sell('yield_exit', self.yield_size)
+                return
+
+            if high >= target_price or high >= middle:
+                self._submit_sell('yield_exit', self.yield_size)
+                return
+
+            if held_bars >= 10:
+                self._submit_sell('yield_exit', self.yield_size)
+                return
+
+        # Module 2 trailing-stop management
+        if self.core_size > 0:
+            if self.core_high_water is None:
+                self.core_high_water = high
+            else:
+                self.core_high_water = max(self.core_high_water, high)
+
+            if low <= self.core_high_water - (3.0 * atr):
+                self._submit_sell('core_liquidation', self.core_size)
+                return
+
+        # Module 2 bearish liquidation condition
+        if self.ema50[0] < self.sma200[0] and self.macd.macd[0] < 0:
+            self.bearish_core_bars += 1
+        else:
+            self.bearish_core_bars = 0
+
+        if self.core_size > 0 and self.bearish_core_bars >= 5:
+            self._submit_sell('core_liquidation', self.core_size)
+            return
+
+        bullish_core = self.ema50[0] > self.sma200[0] and self.macd.macd[0] > 0
+
+        # Repurchase a prior partial core sale.
+        if (
+            self.core_size > 0
+            and self.core_buyback_size > 0
+            and (low <= middle or rsi < 45)
+        ):
+            desired = min(self.core_buyback_size, int(math.floor(
+                max(0, ((0.30 * self._capital()) - (self.core_size * close)) / close
+            )))
+            desired = self._total_capacity_size(desired)
+            desired = self._cash_limited_size(desired)
+            if desired > 0:
+                self._submit_buy('core_buyback', size=desired)
+                return
+
+        # Periodic core profit-taking.
+        if (
+            self.core_size > 0
+            and self.core_buyback_size == 0
+            and high >= upper
+            and rsi > 65
+        ):
+            partial_size = self.core_size * 0.10
+            if partial_size > 0:
+                self._submit_sell('core_partial_profit', partial_size)
+                return
+
+        # Core entry and permitted scaling.
+        ema_cross_up = (
+            self.ema50[0] > self.sma200[0]
+            and self.ema50[-1] <= self.sma200[-1]
+        )
+        middle_pullback = low <= middle
+
+        if self.core_size <= 0:
+            if bullish_core and (ema_cross_up or middle_pullback):
+                if self._core_can_buy_one_default_share():
+                    self._submit_buy('core_entry')
+                    return
+        else:
+            ten_percent_pullback = close <= (0.90 * self.high20[0])
+            if (
+                bullish_core
+                and ten_percent_pullback
+                and low <= lower
+                and 35 <= rsi <= 45
+                and self._core_can_buy_one_default_share()
+            ):
+                self._submit_buy('core_add')
+                return
+
+        # Module 1 entry: market order submitted now opens on the next bar.
+        yield_entry = (
+            close > self.sma200[0]
+            and self.bb_width[0] > self.bb_width_sma50[0]
+            and close <= lower
+            and rsi < 40
+        )
+
+        if yield_entry and self.yield_size <= 0 and atr > 0:
+            capital = self._capital()
+            risk_size = math.floor((0.01 * capital) / atr)
+            size = self._yield_capacity_size(risk_size)
+            size = self._total_capacity_size(size)
+            size = self._cash_limited_size(size)
+
+            if size > 0:
+                self._submit_buy('yield_entry', size=size, atr_value=atr)
+```
+
+```json
+{"assumptions":[{"topic":"capital basis","choice":"Capital limits and the 1% module-1 risk budget use current broker equity marked to market.","reason":"The specification uses 'capital' without stating whether it remains fixed at starting cash."},{"topic":"core sizing","choice":"Base core entries and core add entries use plain self.buy() (the default one-share sizer), only after confirming that one share respects the 30% module cap, 90% total-investment cap, and 10% cash reserve.","reason":"The specification gives no core order size, and the canonical default requires plain buy()/sell() where sizing is unstated."},{"topic":"module-1 sizing","choice":"Module-1 shares equal floor(1% of current capital divided by ATR), capped by the 70% module allocation, 90% total allocation, and available cash after reserving 10% plus commission.","reason":"This is the literal ATR-based implementation of the stated 1% risk ceiling and allocation constraints."},{"topic":"capital-limit measurement","choice":"Allocation caps use marked-to-market share value at the current close; purchase affordability includes the stated 0.001 commission.","reason":"The strategy has one asset and no specified alternative valuation method."},{"topic":"shared single-asset position","choice":"The strategy tracks module-1 and module-2 quantities separately and sells only the relevant module quantity for its exits.","reason":"Both modules may be active simultaneously on the sole feed, so self.close() for one module would incorrectly liquidate the other."},{"topic":"price-touch interpretation","choice":"Lower/middle/upper band touches use the bar low for downward pullbacks and the bar high for upward target or overbought touches; the 10% pullback uses close against the 20-day highest high.","reason":"OHLC bars provide no intrabar path, and the specification does not specify which bar price defines these touches."},{"topic":"same-bar stop-and-target conflict","choice":"Module-1 stop exit has priority if both the stop and a profit/middle-band condition are touched within the same daily bar.","reason":"Daily OHLC data does not reveal intrabar ordering; this is a deterministic conservative choice."},{"topic":"ATR at module-1 entry","choice":"The stop and target use ATR(14) from the signal bar, saved when the next-bar market entry is submitted.","reason":"The eventual next-bar execution price is known only after the order fills, while the entry signal is evaluated on the preceding completed bar."},{"topic":"holding-period count","choice":"The module-1 time-exit order is submitted once 10 bars have elapsed since the entry fill.","reason":"This gives a deterministic daily-bar interpretation of 'Max hold: 10 bars'; the market exit then executes on the following bar."},{"topic":"MACD condition","choice":"MACD > 0 and MACD < 0 refer to the MACD line, not its signal line or histogram.","reason":"The specification names MACD without selecting another component."},{"topic":"partial-profit amount","choice":"Each covered-call-style core profit-taking sale is 10% of current core shares, with no additional partial sale until that tranche is repurchased.","reason":"The stated allowable range is 10–20% and no cadence is specified; 10% is selected as the lower literal bound and tranche tracking gives 'buy back' a definite quantity."},{"topic":"order precedence","choice":"Pending orders block further orders; exits and core risk management are evaluated before new core entries/adds and then module-1 entries.","reason":"The specification does not define simultaneous-signal priority, while the canonical convention requires pending-order guarding."}]}
+```

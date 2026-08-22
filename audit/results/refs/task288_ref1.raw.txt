@@ -1,0 +1,142 @@
+```python
+import backtrader as bt
+
+
+class ReferenceStrategy(bt.Strategy):
+    params = ()
+
+    def __init__(self):
+        self.sma20 = bt.indicators.SimpleMovingAverage(self.data.close, period=20)
+        self.atr1 = bt.indicators.ATR(self.data, period=1)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=20, devfactor=2.0
+        )
+
+        self.order = None
+        self._pending_order_kind = None
+        self._pending_entry_proxy = None
+        self._pending_exit_penalty = 0.0
+
+        self.current_day = None
+        self.trades_today = 0
+
+        self.entry_price = None
+        self.max_since_entry = None
+        self.stop_activated = False
+
+        self.total_profit_loss = 0.0
+        self.number_of_trades = 0
+        self.proxy_spreads = []
+        self.average_proxy_spread_per_trade = 0.0
+        self.slippage_penalties = 0.0
+        self.net_profit_after_slippage = 0.0
+
+    def _proxy_spread(self):
+        return max(
+            self.data.high[0] - self.data.low[0],
+            self.atr1[0],
+        )
+
+    def notify_order(self, order):
+        if order.status != order.Completed and order.status not in (
+            order.Canceled,
+            order.Margin,
+            order.Rejected,
+        ):
+            return
+
+        kind = self._pending_order_kind
+
+        if order.status == order.Completed:
+            if kind == "entry":
+                self.trades_today += 1
+                self.entry_price = order.executed.price
+                self.max_since_entry = self.entry_price
+                self.stop_activated = False
+                self.proxy_spreads.append(self._pending_entry_proxy)
+                self.average_proxy_spread_per_trade = (
+                    sum(self.proxy_spreads) / len(self.proxy_spreads)
+                )
+            elif kind == "exit":
+                self.slippage_penalties += self._pending_exit_penalty
+                self.net_profit_after_slippage = (
+                    self.total_profit_loss - self.slippage_penalties
+                )
+                self.entry_price = None
+                self.max_since_entry = None
+                self.stop_activated = False
+
+        self.order = None
+        self._pending_order_kind = None
+        self._pending_entry_proxy = None
+        self._pending_exit_penalty = 0.0
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.total_profit_loss += trade.pnlcomm
+            self.number_of_trades += 1
+            self.net_profit_after_slippage = (
+                self.total_profit_loss - self.slippage_penalties
+            )
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        bar_day = dt.date()
+
+        if bar_day != self.current_day:
+            self.current_day = bar_day
+            self.trades_today = 0
+
+        if self.order:
+            return
+
+        proxy_spread = self._proxy_spread()
+
+        if self.position:
+            if self.max_since_entry is None:
+                self.max_since_entry = self.entry_price
+
+            self.max_since_entry = max(self.max_since_entry, self.data.high[0])
+
+            if not self.stop_activated:
+                if self.max_since_entry >= self.entry_price * 1.002:
+                    self.stop_activated = True
+
+            if self.stop_activated:
+                trailing_stop = self.max_since_entry * (1.0 - 0.0005)
+                if self.data.low[0] <= trailing_stop:
+                    if proxy_spread > 0.001 * self.data.close[0]:
+                        self._pending_exit_penalty = (
+                            0.0005
+                            * self.data.close[0]
+                            * abs(self.position.size)
+                        )
+                    self.order = self.close()
+                    self._pending_order_kind = "exit"
+            return
+
+        in_trade_time = (9, 45) <= (dt.hour, dt.minute) <= (11, 0)
+        upward_cross = (
+            self.data.close[-1] <= self.sma20[-1]
+            and self.data.close[0] > self.sma20[0]
+        )
+        narrow_spread = proxy_spread <= 0.001 * self.data.close[0]
+        near_mean = abs(self.data.close[0] - self.sma20[0]) / self.data.close[0] <= 0.005
+        bb_width = (self.bb.top[0] - self.bb.bot[0]) / self.bb.mid[0]
+        moderate_volatility = bb_width <= 0.015
+
+        if (
+            in_trade_time
+            and self.trades_today < 5
+            and upward_cross
+            and narrow_spread
+            and near_mean
+            and moderate_volatility
+        ):
+            self._pending_entry_proxy = proxy_spread
+            self.order = self.buy(size=100)
+            self._pending_order_kind = "entry"
+```
+
+```json
+{"assumptions":[{"topic":"Bollinger Bands parameters","choice":"Used Backtrader defaults of period=20 and devfactor=2.0.","reason":"The specification defines BB width but does not state Bollinger Bands parameters."},{"topic":"Timestamp timezone","choice":"Interpreted feed timestamps as Eastern Time.","reason":"The data window and trading-time filter are specified in ET."},{"topic":"Crossing price","choice":"Used Close values, requiring prior Close <= prior SMA(20) and current Close > current SMA(20).","reason":"The specification says price crosses upward but does not select an OHLC field."},{"topic":"Intrabar trailing-stop evaluation","choice":"Used High to update maximum since entry and Low to test the trailing-stop trigger within each one-minute bar.","reason":"OHLCV bars do not provide intrabar sequencing; High and Low are the closest literal representation of a rise and subsequent stop trigger."},{"topic":"Trade timing","choice":"Applied the time filter to entries only; open positions remain eligible for trailing-stop exits outside the entry window.","reason":"The filter says trades only from 09:45 to 11:00, while an exit rule is independently specified."},{"topic":"Slippage accounting","choice":"Recorded the stated fixed penalty when the trailing-stop exit order completes and exposed net_profit_after_slippage separately.","reason":"A Backtrader market close order cannot directly add a one-off per-share cost to broker commission in this strategy without altering broker configuration."}]}
