@@ -96,7 +96,7 @@ def main():
         for idx, family in REF_FAMILIES.items():
             if family not in allowed:
                 continue          # e.g. AUDIT_FAMILIES=codex while the claude session is busy elsewhere
-            model = {"claude": "claude-sonnet-5", "codex": "gpt-5.6-terra(medium)"}[family]
+            model = {"claude": "claude-sonnet-5", "codex": "gpt-5.6-terra(medium)", "gemini": "gemini-3.6-flash(vertex)"}[family]
             key = f"p2|{task['id']}|ref|{model}|{idx}"
             if key in done:
                 continue
