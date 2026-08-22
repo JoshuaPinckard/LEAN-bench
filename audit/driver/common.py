@@ -14,10 +14,18 @@ LEDGER = RESULTS / "ledger.jsonl"
 _ledger_lock = threading.Lock()
 
 
-def load_tasks():
-    """Final audit task list (post data-freeze swaps), keyed by id."""
-    data = json.loads((AUDIT / "sample_20_final.json").read_text(encoding="utf-8"))
-    return {t["id"]: t for t in data["tasks"]}
+def load_tasks(scope: str = "census"):
+    """Task list keyed by id.
+
+    scope='census' (default since the owner's 2026-08-19 full-corpus ruling):
+    ALL 400 QuantCode-Bench tasks, text from the bench's own frozen corpus
+    file - the same source census/phase1_census.py used.
+    scope='pilot': the original 20-task sample (kept for the pilot redo)."""
+    if scope == "pilot":
+        data = json.loads((AUDIT / "sample_20_final.json").read_text(encoding="utf-8"))
+        return {t["id"]: t for t in data["tasks"]}
+    tasks = json.loads((REPO / "data" / "benchmark_tasks_multiframe.json").read_text(encoding="utf-8"))
+    return {t["id"]: t for t in tasks}
 
 
 def load_requirements():

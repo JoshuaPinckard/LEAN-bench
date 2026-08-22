@@ -17,9 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import common  # noqa: E402
 import tape_exec  # noqa: E402
-from cli import call_claude, SessionLimitError  # noqa: E402
+from cli import SessionLimitError  # noqa: E402
+from call_surfaces import call_drafter  # noqa: E402
 
-REF_MODELS = {0: "opus", 1: "opus", 2: "sonnet"}
+# Owner ruling 2026-08-21: one drafter per FAMILY (was opus/opus/sonnet
+# in the claude-only pilot, a quota accident not a design). ref2 (gemini)
+# pends the Vertex word and is skipped until then; the ledger is
+# resumable so ref2 back-fills per task later.
+REF_FAMILIES = {0: "claude", 1: "codex", 2: "gemini"}
 TEMPLATE = (common.PROMPTS / "ref_impl_prompt.txt").read_text(encoding="utf-8")
 MANIFEST = json.loads((common.FROZEN / "cache_manifest.json").read_text(encoding="utf-8"))
 REFS_DIR = common.RESULTS / "refs"
@@ -42,7 +47,8 @@ def extract_blocks(text: str):
 
 
 def do_ref(task, idx, reqs):
-    model = REF_MODELS[idx]
+    family = REF_FAMILIES[idx]
+    model = {"claude": "claude-sonnet-5", "codex": "gpt-5.6-terra(medium)", "gemini": "gemini-flash(vertex-pending)"}[family]
     cache = common.cache_path_for(task)
     m = MANIFEST[cache.name]
     r = reqs[task["id"]]
@@ -53,7 +59,7 @@ def do_ref(task, idx, reqs):
               .replace("{task}", task["reformulated_task"]))
 
     raw_path = REFS_DIR / f"task{task['id']}_ref{idx}.raw.txt"
-    text = call_claude(prompt, model, raw_path, min_bytes=300)
+    text = call_drafter(family, prompt, raw_path)
     code, assumptions = extract_blocks(text)
 
     if code:
@@ -86,7 +92,10 @@ def main():
 
     jobs = []
     for task in sorted(tasks.values(), key=lambda t: t["id"]):
-        for idx, model in REF_MODELS.items():
+        for idx, family in REF_FAMILIES.items():
+            if family == "gemini":
+                continue          # pends the owner's Vertex word; ledger back-fills later
+            model = {"claude": "claude-sonnet-5", "codex": "gpt-5.6-terra(medium)"}[family]
             key = f"p2|{task['id']}|ref|{model}|{idx}"
             if key in done:
                 continue
