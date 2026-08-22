@@ -69,9 +69,14 @@ function extractProgram(text) {
 
 const OUTDIR = path.join(REPO, 'batches', stamp);
 fs.mkdirSync(OUTDIR, { recursive: true });
-const OUT = path.join(OUTDIR, `${SURFACE}_${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}_${PROMPT_ID.replace(/[^\w.-]/g, '')}${NOASK ? '_noask' : ''}.jsonl`);
+// ' -> 'p' so BL-02b' gets its own file (2026-08-22: bare stripping collided
+// it with BL-02b and resume silently skipped the latter)
+const SAFE_ID = PROMPT_ID.replace(/'/g, 'p').replace(/[^\w.-]/g, '');
+const OUT = path.join(OUTDIR, `${SURFACE}_${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}_${SAFE_ID}${NOASK ? '_noask' : ''}.jsonl`);
 const have = new Set();
-if (fs.existsSync(OUT)) for (const l of fs.readFileSync(OUT, 'utf8').split('\n')) if (l.trim()) { const j = JSON.parse(l); if (j.status !== 'harness-error') have.add(j.i); }
+// resume matches the PROMPT HASH per row, never just the index - a collided
+// or mislabeled file can no longer suppress a different prompt's draws
+if (fs.existsSync(OUT)) for (const l of fs.readFileSync(OUT, 'utf8').split('\n')) if (l.trim()) { const j = JSON.parse(l); if (j.status !== 'harness-error' && j.prompt_sha256 === sha) have.add(j.i); }
 fs.copyFileSync(PASS, path.join(OUTDIR, path.basename(PASS)));   // certificate ships beside the data
 
 function draw(cwd) {
