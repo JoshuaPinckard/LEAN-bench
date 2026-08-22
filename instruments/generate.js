@@ -20,7 +20,11 @@ if (!fs.existsSync(PASS)) {
 
 const [SURFACE, MODEL, EFFORT, PROMPT_ID, N_STR] = process.argv.slice(2);
 const N = parseInt(N_STR || '10', 10);
-if (!SURFACE || !MODEL || !EFFORT || !PROMPT_ID) { console.error('usage: generate.js <surface> <model> <effort> <prompt-id> <n>'); process.exit(2); }
+const NOASK = process.argv.includes('noask');
+// The registered no-ask instruction, verbatim (owner-picked from
+// LiveCodeBench code_generation.py L83; see arm/RUN-MANIFEST-2.json).
+const NOASK_SUFFIX = 'You will NOT return anything except for the program.';
+if (!SURFACE || !MODEL || !EFFORT || !PROMPT_ID) { console.error('usage: generate.js <surface> <model> <effort> <prompt-id> <n> [noask]'); process.exit(2); }
 
 const REPO = path.resolve(__dirname, '..');
 let prompt, sha;
@@ -34,6 +38,10 @@ if (PROMPT_ID === 'T1v0') {
   sha = crypto.createHash('sha256').update(v.prompt, 'utf8').digest('hex');
   if (sha !== v.sha256) throw new Error('FROZEN PROMPT MISMATCH ' + PROMPT_ID);
   prompt = v.prompt;
+}
+if (NOASK) {
+  prompt = prompt.replace(/\n+$/, '') + '\n\n' + NOASK_SUFFIX + '\n';
+  sha = crypto.createHash('sha256').update(prompt, 'utf8').digest('hex');   // combined sha, recorded per draw
 }
 
 const HOMES = path.join(ROOT, 'homes'), TMP = path.join(ROOT, 'tmp');
@@ -61,7 +69,7 @@ function extractProgram(text) {
 
 const OUTDIR = path.join(REPO, 'batches', stamp);
 fs.mkdirSync(OUTDIR, { recursive: true });
-const OUT = path.join(OUTDIR, `${SURFACE}_${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}_${PROMPT_ID.replace(/[^\w.-]/g, '')}.jsonl`);
+const OUT = path.join(OUTDIR, `${SURFACE}_${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}_${PROMPT_ID.replace(/[^\w.-]/g, '')}${NOASK ? '_noask' : ''}.jsonl`);
 const have = new Set();
 if (fs.existsSync(OUT)) for (const l of fs.readFileSync(OUT, 'utf8').split('\n')) if (l.trim()) { const j = JSON.parse(l); if (j.status !== 'harness-error') have.add(j.i); }
 fs.copyFileSync(PASS, path.join(OUTDIR, path.basename(PASS)));   // certificate ships beside the data
@@ -97,7 +105,7 @@ function draw(cwd) {
     const t0 = Date.now();
     const res = draw(cwd);
     const program = extractProgram(res.raw_text || '');
-    const env = { surface: SURFACE, model: MODEL, effort: EFFORT, prompt_id: PROMPT_ID, prompt_sha256: sha, i,
+    const env = { surface: SURFACE, model: MODEL, effort: EFFORT, prompt_id: PROMPT_ID, condition: NOASK ? 'noask' : 'base', prompt_sha256: sha, i,
                   status: res.raw_text === null ? 'harness-error' : (program ? 'program' : 'no-program'),
                   raw_text: res.raw_text, program, wall_ms: Date.now() - t0, canary: path.basename(PASS) };
     fs.appendFileSync(OUT, JSON.stringify(env) + '\n');
