@@ -136,8 +136,8 @@ your call: ______
 model said: What RSI threshold should Strategy B use for its sell rule?
 your call: ______
 
-## Item 32  (prompt BL-01b, claude-sonnet-5/max)
-model said: 
+## Item 32 [TRUNCATED CODE]  (prompt BL-01b, claude-sonnet-5/max)
+model said: .strategy_a_shares)                 self.strategy_a_shares = 0              if self.strategy_a_shares == 0 and crossed_above:                 target_value = 0.4 * self.Portfolio.TotalPortfolioValue                 shares = int(target_value / close)                 if shares > 0:                     self.MarketOrder(self.spy, shares)                     self.strategy_a_shares = shares          self.prev_spy_close = close         self.prev_spy_sma = sma      def _update_strategy_b(self, data: Slice):         close = data.Bars[self.aapl].Close          red_streak_ready = self.prev_aapl_close is not None         if red_streak_ready:             if close < self.prev_aapl_close:                 self.aapl_red_streak += 1             else:                 self.aapl_red_streak = 0          rsi_ready = self.aapl_rsi.IsReady         rsi_value = self.aapl_rsi.Current.Value if rsi_ready else None    
 your call: ______
 
 ## Item 33 [TRUNCATED CODE]  (prompt ER-01, gpt-5.6-terra/high)

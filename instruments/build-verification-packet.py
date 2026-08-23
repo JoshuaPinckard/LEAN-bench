@@ -76,14 +76,28 @@ rnd.shuffle(sample)
 
 
 def raw_for(r):
-    """The generation envelope behind a graded row."""
+    """The generation envelope behind a graded row.
+
+    A (prompt, replicate) slot can appear MORE than once: an unfinished
+    draw (harness-error / empty) stays on disk under the fairness rule and
+    the retry is appended after it. The graded row always refers to the
+    FINISHED draw, so prefer the last non-unfinished match - taking the
+    first one yields an empty response (owner caught this as 'item 32 is
+    missing', 2026-08-23)."""
+    best = {}
     for line in open(r["_gens"], encoding="utf-8"):
         e = json.loads(line)
         pid = e.get("variant") or e.get("prompt_id")
         idx = e.get("replicate") if "replicate" in e else e.get("i")
-        if pid == r["_prompt_id"] and idx == r["_i"]:
-            return e
-    return {}
+        if pid != r["_prompt_id"] or idx != r["_i"]:
+            continue
+        unfinished = e.get("status") == "harness-error" or (
+            e.get("status") == "no-program" and not (e.get("raw_text") or "").strip())
+        if not unfinished:
+            best = e                      # a finished draw always wins
+        elif not best:
+            best = e                      # keep something if that is all there is
+    return best
 
 
 index = []
