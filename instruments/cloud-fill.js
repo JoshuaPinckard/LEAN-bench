@@ -21,19 +21,20 @@ const TARGETS = (process.env.LB_TARGETS ? JSON.parse(process.env.LB_TARGETS) : [
   ['T1v0', 30, 1], ['BL-03', 30, 1], ['BL-05', 30, 1], ['BL-08', 30, 1], ['ER-01', 30, 1],
 ]);
 
-function countLaunched(prompt, attempts) {
+function countLaunched(prompt, attempts, noask) {
   const safe = prompt.replace(/'/g, 'p').replace(/[^\w.-]/g, '');
-  const f = path.join(REPO_ROOT, 'batches', 'cloud', `cloud_${safe}_attempts${attempts}.jsonl`);
+  const f = path.join(REPO_ROOT, 'batches', 'cloud', `cloud_${safe}_attempts${attempts}${noask ? '_noask' : ''}.jsonl`);
   if (!fs.existsSync(f)) return 0;
   let n = 0;
   for (const l of fs.readFileSync(f, 'utf8').split('\n')) if (l.trim() && JSON.parse(l).task_id) n++;
   return n;
 }
 
-function runLane(prompt, n, attempts) {
+function runLane(prompt, n, attempts, noask) {
   return new Promise(resolve => {
-    const p = spawn(process.execPath, [path.join(__dirname, 'cloud-lane.js'), ENV_ID, REPO, BRANCH, prompt, String(n), String(attempts), CONC],
-      { shell: false, windowsHide: true });
+    const args = [path.join(__dirname, 'cloud-lane.js'), ENV_ID, REPO, BRANCH, prompt, String(n), String(attempts), CONC];
+    if (noask) args.push('noask');
+    const p = spawn(process.execPath, args, { shell: false, windowsHide: true });
     let out = '';
     p.stdout.on('data', d => { out += d; });
     p.stderr.on('data', d => { out += d; });
@@ -49,14 +50,15 @@ function runLane(prompt, n, attempts) {
   while (Date.now() < DEADLINE) {
     pass++;
     let remaining = 0;
-    for (const [prompt, target, attempts] of TARGETS) {
+    for (const [prompt, target, attempts, mode] of TARGETS) {
       if (Date.now() >= DEADLINE) break;
-      const have = countLaunched(prompt, attempts);
+      const noask = mode === 'noask';
+      const have = countLaunched(prompt, attempts, noask);
       if (have >= target) continue;
       remaining += target - have;
-      const r = await runLane(prompt, target, attempts);
-      const now = countLaunched(prompt, attempts);
-      console.log(`pass ${pass} ${prompt} a${attempts}: ${now}/${target} launched (+${r.ok}, ${r.fail} refused)`);
+      const r = await runLane(prompt, target, attempts, noask);
+      const now = countLaunched(prompt, attempts, noask);
+      console.log(`pass ${pass} ${prompt} a${attempts}${noask ? ' noask' : ''}: ${now}/${target} launched (+${r.ok}, ${r.fail} refused)`);
       // breathe between lanes so the burst rate stays under the limit
       await new Promise(r2 => setTimeout(r2, 20000));
     }
@@ -65,7 +67,7 @@ function runLane(prompt, n, attempts) {
     await new Promise(r => setTimeout(r, 60000));
   }
   console.log('FILL DRIVER FINISHED');
-  for (const [prompt, target, attempts] of TARGETS) {
-    console.log(`  ${prompt} attempts=${attempts}: ${countLaunched(prompt, attempts)}/${target}`);
+  for (const [prompt, target, attempts, mode] of TARGETS) {
+    console.log(`  ${prompt} attempts=${attempts}${mode === 'noask' ? ' noask' : ''}: ${countLaunched(prompt, attempts, mode === 'noask')}/${target}`);
   }
 })();
