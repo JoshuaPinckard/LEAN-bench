@@ -1,0 +1,193 @@
+```python
+import backtrader as bt
+
+
+class ORBTwoAttemptRetestStrategy(bt.Strategy):
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(self.data.close, period=20)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=50)
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.pending = None
+
+        self.episode_state = 'idle'
+        self.trend_dir = 0
+
+        self.entry_price = None
+        self.tp_price = None
+        self.sl_price = None
+        self.exit_reason = None
+
+        self.retest_days_checked = 0
+        self.second_initial_sl = None
+        self.trail_stop = None
+        self.extreme_since_entry = None
+
+    def _reset_episode(self):
+        self.trend_dir = 0
+        self._reset_trade_levels()
+
+    def _reset_trade_levels(self):
+        self.entry_price = None
+        self.tp_price = None
+        self.sl_price = None
+        self.exit_reason = None
+        self.second_initial_sl = None
+        self.trail_stop = None
+        self.extreme_since_entry = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if self.pending == 'first_entry':
+                self.entry_price = order.executed.price
+                if self.trend_dir == 1:
+                    self.tp_price = self.entry_price * 1.005
+                    self.sl_price = self.entry_price * 0.997
+                else:
+                    self.tp_price = self.entry_price * 0.995
+                    self.sl_price = self.entry_price * 1.003
+                self.episode_state = 'first_pos'
+
+            elif self.pending == 'first_exit':
+                if self.exit_reason == 'sl':
+                    self.episode_state = 'retest_wait'
+                    self.retest_days_checked = 0
+                    self._reset_trade_levels()
+                else:
+                    self.episode_state = 'idle'
+                    self._reset_episode()
+
+            elif self.pending == 'second_entry':
+                self.entry_price = order.executed.price
+                self.trail_stop = self.second_initial_sl
+                if self.trend_dir == 1:
+                    self.tp_price = self.entry_price * 1.006
+                    self.extreme_since_entry = self.data.high[0]
+                else:
+                    self.tp_price = self.entry_price * 0.994
+                    self.extreme_since_entry = self.data.low[0]
+                self.episode_state = 'second_pos'
+
+            elif self.pending == 'second_exit':
+                self.episode_state = 'idle'
+                self._reset_episode()
+
+        self.order = None
+        self.pending = None
+
+    def _try_start_episode(self):
+        if self.ema20[0] > self.ema50[0]:
+            self.trend_dir = 1
+            self.order = self.buy(size=1)
+            self.pending = 'first_entry'
+        elif self.ema20[0] < self.ema50[0]:
+            self.trend_dir = -1
+            self.order = self.sell(size=1)
+            self.pending = 'first_entry'
+
+    def _check_retest(self):
+        mid = self.bb.mid[0]
+        if self.trend_dir == 1:
+            condition = (self.data.low[0] <= mid) and (self.data.close[0] > mid)
+        else:
+            condition = (self.data.high[0] >= mid) and (self.data.close[0] < mid)
+
+        if condition:
+            self.second_initial_sl = self.data.low[0] if self.trend_dir == 1 else self.data.high[0]
+            self.episode_state = 'second_pending'
+            return
+
+        self.retest_days_checked += 1
+        if self.retest_days_checked >= 3:
+            self.episode_state = 'idle'
+            self._reset_episode()
+
+    def _enter_second_trade(self):
+        if self.trend_dir == 1:
+            self.order = self.buy(size=1)
+        else:
+            self.order = self.sell(size=1)
+        self.pending = 'second_entry'
+
+    def _manage_first_pos(self):
+        high = self.data.high[0]
+        low = self.data.low[0]
+        if self.trend_dir == 1:
+            hit_tp = high >= self.tp_price
+            hit_sl = low <= self.sl_price
+        else:
+            hit_tp = low <= self.tp_price
+            hit_sl = high >= self.sl_price
+
+        if hit_sl:
+            self.exit_reason = 'sl'
+            self.order = self.close()
+            self.pending = 'first_exit'
+        elif hit_tp:
+            self.exit_reason = 'tp'
+            self.order = self.close()
+            self.pending = 'first_exit'
+
+    def _manage_second_pos(self):
+        high = self.data.high[0]
+        low = self.data.low[0]
+        if self.trend_dir == 1:
+            hit_tp = high >= self.tp_price
+            hit_trail = low <= self.trail_stop
+        else:
+            hit_tp = low <= self.tp_price
+            hit_trail = high >= self.trail_stop
+
+        if hit_trail:
+            self.order = self.close()
+            self.pending = 'second_exit'
+            return
+        elif hit_tp:
+            self.order = self.close()
+            self.pending = 'second_exit'
+            return
+
+        if self.trend_dir == 1:
+            self.extreme_since_entry = max(self.extreme_since_entry, high)
+            candidate = self.extreme_since_entry - self.atr[0] * 1.0
+            self.trail_stop = max(self.trail_stop, candidate)
+        else:
+            self.extreme_since_entry = min(self.extreme_since_entry, low)
+            candidate = self.extreme_since_entry + self.atr[0] * 1.0
+            self.trail_stop = min(self.trail_stop, candidate)
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.episode_state == 'first_pos':
+                self._manage_first_pos()
+            elif self.episode_state == 'second_pos':
+                self._manage_second_pos()
+            return
+
+        if self.episode_state == 'idle':
+            self._try_start_episode()
+        elif self.episode_state == 'retest_wait':
+            self._check_retest()
+        elif self.episode_state == 'second_pending':
+            self._enter_second_trade()
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Market orders submitted in next() fill at the following bar's open (standard backtrader default, no cheat-on-open/close available from the fixed harness broker). This following-bar open is treated as 'the day's open' for the first-trade entry, since the trend signal (EMA20 vs EMA50) is necessarily evaluated one bar ahead of the fill.", "reason": "The harness fixes cerebro/broker setup; same-bar-open execution on a signal derived from that same bar's close is not achievable without cheat-on-open, which the strategy cannot enable."},
+  {"topic": "infeasible", "choice": "TP/SL/trailing-stop breaches are detected by comparing the current bar's High/Low (including the entry day) against the stored thresholds; once detected, self.close() is issued but fills at the next bar's open rather than exactly at the TP/SL/trail price.", "reason": "Backtrader's default Market-order execution model has an inherent one-bar fill lag with no intrabar fill available under the fixed harness broker, so exact same-bar fill at the trigger price is not achievable; the detection logic (including the SL-wins and trail-wins tie-break rules) is nonetheless applied literally to each bar's H/L."},
+  {"topic": "trailing_stop_anchor", "choice": "The second trade's trailing stop is anchored to the highest high since entry (longs) / lowest low since entry (shorts), ratcheting only in the favorable direction, with distance = 1.0 * ATR(14) of the immediately preceding bar.", "reason": "Spec states the trail distance and that it is calculated on the previous bar's ATR, but does not specify which price series anchors the trail; highest-high/lowest-low is the standard trailing-stop convention."},
+  {"topic": "episode_restart_cadence", "choice": "Once fully idle (no open position, no pending retest window), a new first-trade episode may start on any subsequent bar where the trend condition holds, with no additional cooldown between episodes.", "reason": "Spec does not state a cooldown or a requirement that the trend regime must first change before a new episode can begin."},
+  {"topic": "second_trade_initial_stop_reference", "choice": "'Prior day's extreme' for the second trade's initial stop is read from the retest/bounce confirmation bar (the day immediately before the second-trade entry day).", "reason": "Spec says entry occurs on 'the next day's open' after the retest bar, so that retest bar is the natural 'prior day' relative to entry."},
+  {"topic": "retest_window_start", "choice": "The 3-trading-day retest window begins counting from the first bar after the first trade's stop-loss exit order is confirmed filled.", "reason": "Spec does not state precisely which bar starts the count; counting from the confirmed exit is the most literal 'after the first trade closed by stop-loss' reading."},
+  {"topic": "one_trade_per_day_scope", "choice": "The 'no more than one trade per day' constraint is applied to new position entries only; exit/close orders are not counted against it.", "reason": "The state machine only ever issues one entry order per day by construction, and 'trade' in the ORB-attempt context most naturally refers to opening a position rather than closing one."},
+  {"topic": "lot_size", "choice": "'1 lot' is implemented as size=1 (one share of AAPL) on all buy()/sell() entry calls.", "reason": "No contract multiplier or lot-size convention is given for this single-instrument equity feed, so 1 lot is read as 1 unit of the underlying."}
+]}
+```

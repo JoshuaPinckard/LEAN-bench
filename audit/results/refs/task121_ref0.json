@@ -1,0 +1,72 @@
+{
+  "task_id": 121,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass PullbackFibEmaStrategy(bt.Strategy):\n    params = dict(\n        ema_period=20,\n        fractal_bars=2,          # bars on each side used to confirm a swing fractal\n        fib_levels=(0.236, 0.382, 0.5, 0.618),\n        risk_pct=0.01,           # fraction of capital risked per trade\n        stop_buffer_pct=0.001,   # buffer placed beyond the stop reference price\n        stop_lookback=5,         # bars scanned for the \"nearest local low\"\n        rr_target=9.0,           # minimum reward:risk required to take the setup\n    )\n\n    def __init__(self):\n        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)\n\n        self.swing_low = None\n        self.swing_low_bar = None\n        self.swing_high = None\n        self.swing_high_bar = None\n\n        self.order = None\n        self.entry_price = None\n        self.stop_price = None\n        self.tp1_price = None\n        self.tp2_price = None\n        self.tp1_done = False\n\n    def _update_swings(self):\n        n = self.p.fractal_bars\n        if len(self) < 2 * n + 1:\n            return\n\n        center_high = self.data.high[-n]\n        if all(center_high > self.data.high[-n + off] for off in range(-n, n + 1) if off != 0):\n            self.swing_high = center_high\n            self.swing_high_bar = len(self) - n\n\n        center_low = self.data.low[-n]\n        if all(center_low < self.data.low[-n + off] for off in range(-n, n + 1) if off != 0):\n            self.swing_low = center_low\n            self.swing_low_bar = len(self) - n\n\n    def _fib_prices(self):\n        diff = self.swing_high - self.swing_low\n        return {r: self.swing_high - r * diff for r in self.p.fib_levels}\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def next(self):\n        self._update_swings()\n\n        if self.order:\n            return\n\n        if self.position:\n            self._manage_position()\n        else:\n            self._check_entry()\n\n    def _check_entry(self):\n        if self.swing_high is None or self.swing_low is None:\n            return\n        if self.swing_low_bar is None or self.swing_high_bar is None:\n            return\n        if self.swing_low_bar >= self.swing_high_bar:\n            return  # need a completed low-to-high impulse leg to retrace from\n\n        if not (self.data.close[0] > self.ema[0]):\n            return  # uptrend filter\n\n        bullish_reversal = (\n            self.data.close[0] > self.data.open[0]\n            and self.data.close[0] > self.data.close[-1]\n        )\n        if not bullish_reversal:\n            return\n\n        levels = self._fib_prices()\n        low = self.data.low[0]\n        close = self.data.close[0]\n\n        touched_price = None\n        touched_ratio = None\n        for ratio, price in levels.items():\n            if low <= price < close:\n                if touched_ratio is None or ratio > touched_ratio:\n                    touched_ratio = ratio\n                    touched_price = price\n\n        if touched_price is None:\n            return\n\n        recent_low = min(self.data.low[-i] for i in range(self.p.stop_lookback))\n        stop_ref = min(recent_low, touched_price)\n        stop_price = stop_ref * (1 - self.p.stop_buffer_pct)\n\n        entry_price = close\n        risk = entry_price - stop_price\n        if risk <= 0:\n            return\n\n        ratios_sorted = sorted(self.p.fib_levels)\n        idx = ratios_sorted.index(touched_ratio)\n\n        if idx == 0:\n            tp1 = self.swing_high\n            tp2 = self.swing_low + 1.272 * (self.swing_high - self.swing_low)\n        elif idx == 1:\n            tp1 = levels[ratios_sorted[0]]\n            tp2 = self.swing_high\n        else:\n            tp1 = levels[ratios_sorted[idx - 1]]\n            tp2 = levels[ratios_sorted[idx - 2]]\n\n        reward2 = tp2 - entry_price\n        if reward2 / risk < self.p.rr_target:\n            return\n\n        cash = self.broker.get_cash()\n        size = (cash * self.p.risk_pct) / risk\n        if size <= 0:\n            return\n\n        self.entry_price = entry_price\n        self.stop_price = stop_price\n        self.tp1_price = tp1\n        self.tp2_price = tp2\n        self.tp1_done = False\n\n        self.order = self.buy(size=size)\n\n    def _manage_position(self):\n        low = self.data.low[0]\n        high = self.data.high[0]\n\n        if not self.tp1_done:\n            if low <= self.stop_price:\n                self.order = self.close()\n                return\n            if high >= self.tp1_price:\n                half = self.position.size / 2\n                self.order = self.sell(size=half)\n                self.stop_price = self.entry_price\n                self.tp1_done = True\n        else:\n            if low <= self.stop_price:\n                self.order = self.close()\n                return\n            if high >= self.tp2_price:\n                self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "swing/fractal detection",
+      "choice": "A 'significant' swing high/low is a 5-bar fractal (2 bars either side): a bar's high/low that is strictly more extreme than its 2 preceding and 2 following bars, confirmed 2 bars after it forms.",
+      "reason": "Spec references 'last significant low' and 'the high' without defining swing detection; a standard causal fractal is the closest literal, non-repainting reading."
+    },
+    {
+      "topic": "uptrend definition",
+      "choice": "Uptrend = Close > EMA(20), checked every bar.",
+      "reason": "Spec gives this exact condition as its own example ('This can be, for example, when the price is above EMA(20)')."
+    },
+    {
+      "topic": "fib leg validity",
+      "choice": "Fibonacci levels are only computed, and entries only allowed, when the most recently confirmed swing low occurred chronologically before the most recently confirmed swing high (i.e. a completed low-to-high impulse leg).",
+      "reason": "Spec says levels run 'from the last significant low to the high' for long signals; this ordering constraint is required to make that leg meaningful and to invalidate it once a fresh lower low forms."
+    },
+    {
+      "topic": "reversal confirmation",
+      "choice": "Reversal signal = the bar is bullish (close > open) AND closes higher than the previous bar's close.",
+      "reason": "Spec's own examples ('bullish candlestick pattern' or 'start of an upswing') are illustrative, not exhaustive; combining both into one conjunctive, repeatable rule matches the strategy's emphasis on patience/confirmation rather than firing on either weak signal alone."
+    },
+    {
+      "topic": "fib level touch rule",
+      "choice": "A level counts as 'reached' if the bar's low is at or below the level while the close is above it; if several levels are touched in one bar, the deepest (highest-ratio) one is used as the entry level.",
+      "reason": "Spec says price 'reaches' a level and 'shows signs of reversal upward'; using low<=level<close operationalizes touch-then-reversal, and the deepest touched level is the one price actually traded from."
+    },
+    {
+      "topic": "stop-loss placement",
+      "choice": "Stop = min(lowest low of the last 5 bars, the fib level the entry occurred from) * (1 - 0.1%).",
+      "reason": "Spec says stop goes 'slightly below the nearest low or below the Fibonacci level from which entry occurred'; taking the lower of the two with a small fixed buffer implements 'slightly below' concretely."
+    },
+    {
+      "topic": "take-profit targets (TP1/TP2)",
+      "choice": "TP1/TP2 step toward the swing high through the next shallower fib level(s); from the shallowest level (23.6%) TP1=swing high and TP2 uses a 1.272 Fibonacci extension beyond the swing high as the 'higher price high'.",
+      "reason": "Spec: TP1 = next fib level or previous high, TP2 = subsequent fib level or a higher high; a 1.272 extension is the standard Fibonacci construct for a 'higher high' beyond the existing swing when no further retracement level exists."
+    },
+    {
+      "topic": "RR>=1:9 filter",
+      "choice": "Before entering, require (TP2 - entry) / (entry - stop) >= 9; skip the setup otherwise.",
+      "reason": "Spec states achieving RR>=1:9 is 'the goal' of the exit plan; implemented as a pre-entry filter since TP1/TP2/stop are all fixed by market structure at entry time and there is no other stated mechanism to enforce the ratio."
+    },
+    {
+      "topic": "partial exit / breakeven",
+      "choice": "At TP1, close 50% of the position and move the stop to the entry price (breakeven); the remainder exits at TP2 or at the (now breakeven) stop.",
+      "reason": "Spec explicitly allows 'partially closing the position at the first level and moving the stop-loss to breakeven' to help reach the RR goal."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "Size = (cash * 1%) / (entry - stop), i.e. risk exactly 1% of current cash per trade.",
+      "reason": "Spec states size is 'calculated based on the stop-loss size' with risk 'not exceed 1-2%'; 1% (the conservative end of the stated range) is used since no exact figure is given."
+    },
+    {
+      "topic": "long-only",
+      "choice": "Only long entries are implemented; no short entries.",
+      "reason": "Per canonical default #4, shorting requires explicit entry rules; the spec gives a full 'Conditions for entering a position (Long)' section but no matching short-entry section, only passing mentions of short-side Fibonacci direction and stop-loss symmetry."
+    },
+    {
+      "topic": "infeasible: intrabar stop/TP execution",
+      "choice": "Stop-loss and take-profit levels are checked against each bar's High/Low, but exit orders are plain market orders that fill at the next bar's open (standard backtrader next()-driven execution), not at the exact intrabar level.",
+      "reason": "The feed is OHLCV only with no bracket/stop order infrastructure specified; true same-bar fills at the precise stop/TP price are not obtainable from next()-based logic without look-ahead, so next-bar-open execution is the closest feasible approximation."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

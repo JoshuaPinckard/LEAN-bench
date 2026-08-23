@@ -1,0 +1,205 @@
+```python
+import backtrader as bt
+import statistics
+from collections import deque
+
+
+class RegimeFilteredScalper(bt.Strategy):
+    def __init__(self):
+        self.bbands = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2.0)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.ema9 = bt.indicators.EMA(self.data.close, period=9)
+        self.ema21 = bt.indicators.EMA(self.data.close, period=21)
+        self.crossover_trend = bt.indicators.CrossOver(self.ema9, self.ema21)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.position_type = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.mr_tp_mult = None
+        self.pending_position_type = None
+        self.pending_mr_tp_mult = None
+
+        self.session_date = None
+        self.bar_idx_in_session = 0
+        self.first_bar_open = None
+        self.first6_close = None
+        self.bb_width_sum = 0.0
+        self.spotvol_value = None
+        self.day_direction = None
+        self.current_regime = None
+        self.regime_ready = False
+
+        self.gamma_history = deque(maxlen=20)
+        self.spotvol_history = deque(maxlen=20)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if self.position.size == 0:
+                self.position_type = None
+                self.entry_price = None
+                self.entry_atr = None
+                self.mr_tp_mult = None
+            else:
+                self.position_type = self.pending_position_type
+                self.entry_price = order.executed.price
+                self.entry_atr = self.atr[0]
+                if self.position_type == 'mr':
+                    self.mr_tp_mult = self.pending_mr_tp_mult
+        self.order = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        if current_date != self.session_date:
+            self.session_date = current_date
+            self.bar_idx_in_session = 0
+            self.bb_width_sum = 0.0
+            self.first6_close = None
+            self.regime_ready = False
+            self.first_bar_open = self.data.open[0]
+            if len(self) > 1:
+                prev_close = self.data.close[-1]
+                self.spotvol_value = abs(self.data.open[0] - prev_close) / prev_close
+            else:
+                self.spotvol_value = None
+
+        self.bar_idx_in_session += 1
+
+        if self.bar_idx_in_session <= 6:
+            self.bb_width_sum += (self.bbands.top[0] - self.bbands.bot[0])
+            if self.bar_idx_in_session == 6:
+                self.first6_close = self.data.close[0]
+                gamma_value = self.bb_width_sum / 6.0
+                agg_return = (self.first6_close - self.first_bar_open) / self.first_bar_open
+                self.day_direction = 1 if agg_return > 0 else -1
+
+                if len(self.gamma_history) > 0 and self.spotvol_value is not None:
+                    gamma_median = statistics.median(self.gamma_history)
+                    spotvol_median = statistics.median(self.spotvol_history)
+                    gamma_class = 'H' if gamma_value < gamma_median else 'L'
+                    spotvol_class = 'H' if self.spotvol_value > spotvol_median else 'L'
+                    self.current_regime = gamma_class + spotvol_class
+                    self.regime_ready = True
+
+                if self.spotvol_value is not None:
+                    self.gamma_history.append(gamma_value)
+                    self.spotvol_history.append(self.spotvol_value)
+
+        if self.position:
+            if self.order is None:
+                self._manage_exit()
+            return
+
+        if self.order is not None or not self.regime_ready or self.bar_idx_in_session <= 6:
+            return
+
+        self._check_entries()
+
+    def _manage_exit(self):
+        if self.position.size > 0:
+            if self.position_type == 'mr':
+                stop = self.entry_price - 1.0 * self.entry_atr
+                tp = self.entry_price + self.mr_tp_mult * self.entry_atr
+                if (self.data.close[0] >= self.bbands.mid[0] or self.rsi[0] > 70
+                        or self.data.close[0] <= stop or self.data.close[0] >= tp):
+                    self.order = self.close()
+            elif self.position_type == 'trend':
+                stop = self.entry_price - 1.5 * self.entry_atr
+                tp = self.entry_price + 2.0 * self.entry_atr
+                if (self.crossover_trend[0] < 0
+                        or self.data.close[0] <= stop or self.data.close[0] >= tp):
+                    self.order = self.close()
+        elif self.position.size < 0:
+            if self.position_type == 'mr':
+                stop = self.entry_price + 1.0 * self.entry_atr
+                tp = self.entry_price - self.mr_tp_mult * self.entry_atr
+                if (self.data.close[0] <= self.bbands.mid[0] or self.rsi[0] < 30
+                        or self.data.close[0] >= stop or self.data.close[0] <= tp):
+                    self.order = self.close()
+            elif self.position_type == 'trend':
+                stop = self.entry_price + 1.5 * self.entry_atr
+                tp = self.entry_price - 2.0 * self.entry_atr
+                if (self.crossover_trend[0] > 0
+                        or self.data.close[0] >= stop or self.data.close[0] <= tp):
+                    self.order = self.close()
+
+    def _check_entries(self):
+        regime = self.current_regime
+        rsi_cross_up_30 = self.rsi[-1] <= 30 and self.rsi[0] > 30
+        rsi_cross_down_70 = self.rsi[-1] >= 70 and self.rsi[0] < 70
+        bb_touch_low = self.data.low[0] <= self.bbands.bot[0]
+        bb_touch_high = self.data.high[0] >= self.bbands.top[0]
+
+        mr_long = False
+        mr_short = False
+        mr_long_tp = 1.0
+        mr_short_tp = 1.0
+
+        if regime[0] == 'H':
+            if rsi_cross_up_30:
+                mr_long = True
+            if rsi_cross_down_70:
+                mr_short = True
+            if regime == 'HH':
+                if bb_touch_low:
+                    mr_long = True
+                    mr_long_tp = 0.75
+                if bb_touch_high:
+                    mr_short = True
+                    mr_short_tp = 0.75
+        else:
+            if rsi_cross_up_30 and bb_touch_low:
+                mr_long = True
+            if rsi_cross_down_70 and bb_touch_high:
+                mr_short = True
+            if regime == 'LL':
+                if mr_long and not (self.crossover_trend[0] > 0):
+                    mr_long = False
+                if mr_short and not (self.crossover_trend[0] < 0):
+                    mr_short = False
+
+        trend_long = False
+        trend_short = False
+        if regime == 'HH':
+            trend_long = self.crossover_trend[0] > 0
+            trend_short = self.crossover_trend[0] < 0
+        elif regime == 'LH':
+            if self.day_direction > 0:
+                trend_long = self.crossover_trend[0] > 0
+            else:
+                trend_short = self.crossover_trend[0] < 0
+
+        if mr_long:
+            self.pending_position_type = 'mr'
+            self.pending_mr_tp_mult = mr_long_tp
+            self.order = self.buy()
+        elif mr_short:
+            self.pending_position_type = 'mr'
+            self.pending_mr_tp_mult = mr_short_tp
+            self.order = self.sell()
+        elif trend_long:
+            self.pending_position_type = 'trend'
+            self.order = self.buy()
+        elif trend_short:
+            self.pending_position_type = 'trend'
+            self.order = self.sell()
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Indicators (BBands20, RSI14, EMA9/21, ATR14) and the 'first 6 bars'/'first 30 minutes' windows are computed directly on the harness's native 1-minute AAPL feed rather than on resampled 5-minute bars.", "reason": "The strategy class receives a single fixed 1-minute PandasData feed added by the harness; a bt.Strategy cannot add/resample data feeds itself, so a true 5-minute timeframe is not obtainable in this environment. This is the closest literal reading, applying the stated parameters unchanged."},
+  {"topic": "infeasible", "choice": "Maintain a rolling deque (maxlen=20) of finalized daily GammaProxy/SpotVolProxy values and compute medians over whatever prior sessions exist (fewer than 20 early on); Day 1 has zero prior sessions so no regime is classified and no trades occur that day.", "reason": "The fixed dataset spans only ~7 trading sessions (2026-08-11 to 2026-08-19), far fewer than the 20-session lookback the spec assumes."},
+  {"topic": "infeasible", "choice": "Day 1's 'first 6 bars of the day' window is measured starting from the first bar on which next() actually fires, not literally the session's bar 1.", "reason": "backtrader withholds next() until all indicators reach minperiod (~21 bars from EMA21/BBands20); per canonical default 6 we rely on automatic minperiod rather than adding manual prenext handling, so only Day 1 of the dataset is affected."},
+  {"topic": "touch definition", "choice": "'Touches the outer BBands' is read as bar High >= top band (upper touch) or bar Low <= bottom band (lower touch), not Close-based.", "reason": "Spec is silent on which price field defines a 'touch'; High/Low is the more literal reading of intrabar contact with the band."},
+  {"topic": "aggregate move return", "choice": "'Return of the first 30 minutes' for the LH trend-direction gate = (Close of the day's 6th bar - Open of the day's 1st bar) / Open of the day's 1st bar; a non-positive value routes to shorts-only.", "reason": "Spec states the rule conceptually but not the exact formula; this is the direct closed-form reading of 'the return of the first 6 bars'."},
+  {"topic": "median tie-break", "choice": "A proxy value exactly equal to its rolling median is classified Low (Low Gamma / Low SpotVol) for both proxies.", "reason": "Spec defines High/Low only as relative to the median without specifying tie behavior."},
+  {"topic": "entry timing", "choice": "New entries are only permitted from the 7th bar of each session onward, once that day's regime is finalized from its first 6 bars; no entries during the first 6 bars.", "reason": "Spec frames the first 30 minutes as the regime-detection window; entries require a known regime, which is unavailable until that window closes."},
+  {"topic": "signal priority", "choice": "When an MR entry signal and a Trend entry signal both fire on the same bar, MR is evaluated/placed first.", "reason": "Spec lists Entry logic as '1) Mean reversion... 2) Trend...', suggesting MR precedence; spec does not otherwise address simultaneous signals."},
+  {"topic": "LL EMA confirmation", "choice": "'Require CrossOver(EMA9, EMA21) confirmation for MR entries' in LL is read as requiring the EMA9/21 crossover to fire in the same direction on the same bar as the qualifying MR signal (RSI cross + outer-band touch).", "reason": "Spec names the confirmation mechanism (CrossOver indicator) but not its exact timing window; same-bar directional match is the most literal reading of 'confirmation'."},
+  {"topic": "HH outer-band MR trigger", "choice": "In HH, an outer-band touch is treated as an independent additional MR entry trigger (not requiring a simultaneous RSI cross), and only trades entered via this trigger use the closer 0.75xATR take-profit; RSI-cross-triggered MR trades in HH keep the standard 1.0xATR optional take-profit.", "reason": "Spec separately states H* allows standard RSI-cross MR and, for HH specifically, additionally allows MR on outer-band touches with a closer take-profit, implying two distinct trigger paths with different TP targets."},
+  {"topic": "ATR level recomputation", "choice": "Stop-loss and optional ATR take-profit levels are computed once at entry fill (entry price +/- multiple x ATR at the fill bar) and held fixed for the trade's duration, not trailed or recomputed each bar.", "reason": "Spec states fixed ATR multiples for stop-loss/take-profit without mentioning trailing behavior."},
+  {"topic": "position sizing", "choice": "Plain self.buy()/self.sell() with the default sizer (no explicit size).", "reason": "Canonical default 1: spec does not state a position-sizing rule."}
+]}
+```

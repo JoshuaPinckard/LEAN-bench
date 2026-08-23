@@ -1,0 +1,149 @@
+```python
+import backtrader as bt
+import collections
+
+
+class ORBEmaTrendFuturesStrategy(bt.Strategy):
+    params = dict(
+        ema_fast_period=9,
+        ema_slow_period=21,
+        orb_minutes=30,
+        take_profit_pct=0.005,
+        risk_pct=0.01,
+        vol_lookback_days=20,
+        vol_threshold_mult=1.2,
+        time_exit_minutes_before_close=15,
+        session_open_minute=9 * 60 + 30,
+        session_close_minute=16 * 60,
+    )
+
+    def __init__(self):
+        self.ema_fast = bt.indicators.EMA(self.data.close, period=self.p.ema_fast_period)
+        self.ema_slow = bt.indicators.EMA(self.data.close, period=self.p.ema_slow_period)
+        self.crossover = bt.indicators.CrossOver(self.ema_fast, self.ema_slow)
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+
+        self.current_day = None
+        self.orb_high = None
+        self.orb_low = None
+        self.orb_locked = False
+        self.orb_end_minute = self.p.session_open_minute + self.p.orb_minutes
+        self.exit_cutoff_minute = self.p.session_close_minute - self.p.time_exit_minutes_before_close
+
+        self.day_high = None
+        self.day_low = None
+        self.day_close = None
+        self.prev_day_close = None
+        self.daily_tr_history = collections.deque(maxlen=self.p.vol_lookback_days)
+        self.high_vol_day = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+            if order == self.limit_order:
+                self.limit_order = None
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        bar_date = dt.date()
+        minute_of_day = dt.hour * 60 + dt.minute
+
+        if self.current_day != bar_date:
+            if self.current_day is not None and self.day_high is not None:
+                if self.prev_day_close is not None:
+                    tr = max(
+                        self.day_high - self.day_low,
+                        abs(self.day_high - self.prev_day_close),
+                        abs(self.day_low - self.prev_day_close),
+                    )
+                else:
+                    tr = self.day_high - self.day_low
+                self.daily_tr_history.append(tr)
+                self.prev_day_close = self.day_close
+
+            self.current_day = bar_date
+            self.day_high = self.data.high[0]
+            self.day_low = self.data.low[0]
+            self.day_close = self.data.close[0]
+            self.orb_high = self.data.high[0]
+            self.orb_low = self.data.low[0]
+            self.orb_locked = False
+
+            if len(self.daily_tr_history) >= self.p.vol_lookback_days:
+                prev_tr = self.daily_tr_history[-1]
+                avg_tr = sum(self.daily_tr_history) / len(self.daily_tr_history)
+                self.high_vol_day = prev_tr > self.p.vol_threshold_mult * avg_tr
+            else:
+                self.high_vol_day = False
+        else:
+            self.day_high = max(self.day_high, self.data.high[0])
+            self.day_low = min(self.day_low, self.data.low[0])
+            self.day_close = self.data.close[0]
+
+        if not self.orb_locked:
+            if minute_of_day < self.orb_end_minute:
+                self.orb_high = max(self.orb_high, self.data.high[0])
+                self.orb_low = min(self.orb_low, self.data.low[0])
+                return
+            self.orb_locked = True
+
+        if self.position and minute_of_day >= self.exit_cutoff_minute:
+            if self.stop_order:
+                self.cancel(self.stop_order)
+            if self.limit_order:
+                self.cancel(self.limit_order)
+            self.close()
+            return
+
+        if self.order or self.position or self.high_vol_day:
+            return
+
+        price = self.data.close[0]
+
+        if self.crossover[0] > 0 and price > self.orb_high:
+            stop_price = self.orb_low
+            stop_distance = price - stop_price
+            if stop_distance <= 0:
+                return
+            size = int((self.p.risk_pct * self.broker.getvalue()) / stop_distance)
+            if size < 1:
+                return
+            take_profit = self.orb_high + self.p.take_profit_pct * price
+            orders = self.buy_bracket(size=size, exectype=bt.Order.Market,
+                                       stopprice=stop_price, limitprice=take_profit)
+            self.order, self.stop_order, self.limit_order = orders
+
+        elif self.crossover[0] < 0 and price < self.orb_low:
+            stop_price = self.orb_high
+            stop_distance = stop_price - price
+            if stop_distance <= 0:
+                return
+            size = int((self.p.risk_pct * self.broker.getvalue()) / stop_distance)
+            if size < 1:
+                return
+            take_profit = self.orb_low - self.p.take_profit_pct * price
+            orders = self.sell_bracket(size=size, exectype=bt.Order.Market,
+                                        stopprice=stop_price, limitprice=take_profit)
+            self.order, self.stop_order, self.limit_order = orders
+```
+```json
+{"assumptions": [
+  {"topic": "session_filter", "choice": "No explicit 9:30-16:00 session filter is coded; the supplied 5m feed only contains bars from 09:30 to 15:55, which already lies within the stated session, so the rule is satisfied by the data itself.", "reason": "Spec's session-hours rule is a no-op given the fixed data feed; adding a redundant filter would not change behavior."},
+  {"topic": "orb_breakout_price", "choice": "Use the bar close to evaluate 'price breaks above/below the ORB high/low'.", "reason": "Spec doesn't specify which price field defines the breakout; close is consistent with the EMA calculation basis and canonical simplicity."},
+  {"topic": "entry_price_for_targets", "choice": "Use the signal bar's close as the 'entry price' when computing the take-profit offset (0.5% of entry price) and the position size, since the actual fill price is unknown until the market order executes.", "reason": "Bracket orders (entry+stop+limit) must be sized and priced at submission time, before the fill occurs."},
+  {"topic": "entry_order_type", "choice": "Entry (parent) order of the bracket uses bt.Order.Market.", "reason": "Spec doesn't specify an order type for entries; matches canonical default of immediate market execution."},
+  {"topic": "position_sizing", "choice": "size = floor(risk_pct * broker.getvalue() / stop_distance); skip the trade if size < 1.", "reason": "Spec says the stop loss determines size via 1% equity risk but doesn't address fractional units or a minimum size; whole-unit sizing with a skip guard is the literal, safe reading."},
+  {"topic": "infeasible", "choice": "Daily ATR/True-Range values are computed manually inside the strategy by aggregating each calendar day's High/Low/Close from the single 5m intraday feed (day boundaries detected via bar datetime), rather than from a genuine daily-timeframe data source.", "reason": "The harness supplies only one 5m AAPL data feed; a separate daily-resolution feed or resampling at the cerebro level isn't available to the strategy, so manual daily aggregation from the same feed is the closest literal implementation."},
+  {"topic": "atr_definition", "choice": "'ATR of the previous day' = that single day's manually computed True Range (day High-Low vs. prior day's close); '20-day average ATR' = the simple mean of the last 20 daily True Range values (including the previous day).", "reason": "The spec treats these as two distinct quantities to compare, so a single-day TR vs. a 20-day mean of TRs is the most literal non-circular reading; a further-smoothed multi-day ATR 'of the previous day' would collapse that distinction."},
+  {"topic": "vol_filter_warmup", "choice": "Treat any day as NOT high-volatility (i.e., allow trading) until 20 completed trading days of daily-TR history have accumulated.", "reason": "Spec doesn't address the warm-up period before a 20-day average can exist."},
+  {"topic": "market_close_time", "choice": "Assume market close = 16:00 for the 'exit 15 minutes before close' rule (i.e., exit at/after 15:45), even though the supplied feed's last bar is 15:55.", "reason": "Spec explicitly defines the session as 9:30 AM-4:00 PM, so 16:00 is the literal close reference for the time-based exit."}
+]}
+```

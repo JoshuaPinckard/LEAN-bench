@@ -1,0 +1,149 @@
+I have enough context on the environment and backtrader conventions. Writing the reference implementation now.
+
+```python
+import backtrader as bt
+
+
+class RegimeSwitchingStrategy(bt.Strategy):
+    params = dict(
+        sma_trend_period=200,
+        sma_signal_period=50,
+        rsi_period=14,
+        atr_period=14,
+        atr_baseline_period=50,
+        stddev_period=20,
+        sideways_proximity_pct=0.02,
+        entry_max_dev_pct=0.05,
+        rsi_exit_long=30,
+        rsi_exit_short=70,
+        stop_atr_mult=1.5,
+        target_stop_mult=3.0,
+        position_pct=0.01,
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.sma_trend_period)
+        self.sma50 = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.sma_signal_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_baseline = bt.indicators.SimpleMovingAverage(
+            self.atr, period=self.p.atr_baseline_period)
+        self.stddev20 = bt.indicators.StandardDeviation(
+            self.data.close, period=self.p.stddev_period)
+        self.cross50 = bt.indicators.CrossOver(self.data.close, self.sma50)
+
+        self.order = None
+        self.exit_order = None
+        self.stop_order = None
+        self.limit_order = None
+
+    def _get_regime(self):
+        price = self.data.close[0]
+        sma200 = self.sma200[0]
+        atr_high = self.atr[0] > self.atr_baseline[0]
+        proximity = abs(price - sma200) / sma200
+
+        if price > sma200 and self.rsi[0] > 50 and atr_high:
+            return 1
+        if price < sma200 and self.rsi[0] < 50 and atr_high:
+            return 2
+        if proximity < self.p.sideways_proximity_pct and atr_high:
+            return 3
+        return 4
+
+    def _place_protective_orders(self, order):
+        entry_price = order.executed.price
+        entry_atr = self.atr[0]
+        stop_distance = self.p.stop_atr_mult * entry_atr
+        target_distance = self.p.target_stop_mult * stop_distance
+        size = abs(order.executed.size)
+
+        if order.isbuy():
+            stop_price = entry_price - stop_distance
+            target_price = entry_price + target_distance
+            self.stop_order = self.sell(
+                exectype=bt.Order.Stop, price=stop_price, size=size)
+            self.limit_order = self.sell(
+                exectype=bt.Order.Limit, price=target_price, size=size)
+        else:
+            stop_price = entry_price + stop_distance
+            target_price = entry_price - target_distance
+            self.stop_order = self.buy(
+                exectype=bt.Order.Stop, price=stop_price, size=size)
+            self.limit_order = self.buy(
+                exectype=bt.Order.Limit, price=target_price, size=size)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self._place_protective_orders(order)
+            elif order == self.stop_order and self.limit_order is not None:
+                self.cancel(self.limit_order)
+            elif order == self.limit_order and self.stop_order is not None:
+                self.cancel(self.stop_order)
+
+        if order == self.order:
+            self.order = None
+        elif order == self.exit_order:
+            self.exit_order = None
+        elif order == self.stop_order:
+            self.stop_order = None
+        elif order == self.limit_order:
+            self.limit_order = None
+
+    def next(self):
+        if self.order or self.exit_order:
+            return
+
+        price = self.data.close[0]
+        sma200 = self.sma200[0]
+        dev_from_sma200 = abs(price - sma200) / sma200
+
+        if self.position.size == 0:
+            regime = self._get_regime()
+
+            if regime == 1 and self.cross50[0] > 0:
+                if dev_from_sma200 <= self.p.entry_max_dev_pct:
+                    size = (self.p.position_pct * self.broker.getvalue()) / price
+                    if size > 0:
+                        self.order = self.buy(size=size)
+
+            elif regime == 2 and self.cross50[0] < 0:
+                if dev_from_sma200 <= self.p.entry_max_dev_pct:
+                    size = (self.p.position_pct * self.broker.getvalue()) / price
+                    if size > 0:
+                        self.order = self.sell(size=size)
+
+        elif self.position.size > 0:
+            if self.cross50[0] < 0 or self.rsi[0] < self.p.rsi_exit_long:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                if self.limit_order is not None:
+                    self.cancel(self.limit_order)
+                self.exit_order = self.close()
+
+        elif self.position.size < 0:
+            if self.cross50[0] > 0 or self.rsi[0] > self.p.rsi_exit_short:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                if self.limit_order is not None:
+                    self.cancel(self.limit_order)
+                self.exit_order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "ATR volatility baseline", "choice": "Interpreted 'ATR(14) over the previous 50 periods' as a 50-period SMA of ATR(14) (self.atr_baseline), compared against the current ATR(14) value.", "reason": "Spec is ambiguous between a single point-in-time ATR value from 50 bars ago and a smoothed baseline over that window; a 50-period moving average is the more standard, robust reading of 'volatility over the previous N periods.'"},
+  {"topic": "Regime precedence", "choice": "Evaluated regimes in the literal order given (Uptrend, then Downtrend, then Sideways/Volatile, then Stable) as sequential precedence when conditions could overlap near the SMA(200).", "reason": "Spec presents regimes as an ordered list with Regime 4 explicitly defined as 'all other conditions not met', implying the first three are checked in sequence."},
+  {"topic": "Position sizing granularity", "choice": "Sized each entry as a fractional (float) share count equal to 1% of current portfolio value divided by current close price, without rounding down to whole shares.", "reason": "AAPL's price level relative to the $10,000 starting cash means 1% of capital is often less than one share; rounding to whole shares would make the stated sizing rule non-functional on this feed, so fractional sizing was used to honor '1% of total capital' literally."},
+  {"topic": "Stop-loss / take-profit mechanism", "choice": "Implemented as two protective orders (bt.Order.Stop and bt.Order.Limit) submitted once the entry order fills, sized to the ATR value observed at that fill bar, sized to the full position, manually canceling whichever leg does not fill (manual OCO).", "reason": "Spec requires an ATR-based stop-loss and a proportional take-profit 'at the moment of entry'; native Stop/Limit order types let these levels react to intrabar price action rather than only being checked on daily closes."},
+  {"topic": "Entry/proximity price reference", "choice": "Used the current bar's close as the proxy for 'entry price' when evaluating the 5% max-deviation-from-SMA(200) filter and the 2% 'close to SMA(200)' regime-3 check.", "reason": "The true fill price is unknown at signal time since orders execute on the next bar; the signal-bar close is the only price available when the entry decision is made."},
+  {"topic": "Price standard deviation(20)", "choice": "Computed StandardDeviation(close, 20) as an indicator per the spec's indicator list, but did not attach any conditional rule to it.", "reason": "The spec instructs using this indicator but never defines a threshold or rule involving it in the regime or entry/exit logic, so no rule was invented for it."},
+  {"topic": "Asset-class restriction (forex/indices only)", "choice": "Not enforced; strategy runs unconditionally on the provided AAPL equity feed.", "reason": "infeasible — asset class cannot be determined from OHLCV bars, and the harness fixes the single data feed to AAPL regardless of strategy logic."},
+  {"topic": "Truncated regime-flip rule", "choice": "No additional behavior implemented for 'if after entering a position the market regime changes to the opposite (...)'.", "reason": "infeasible — the specification text is cut off before stating the required action, so the intended rule cannot be implemented as written; existing crossover/RSI exit rules remain the only exit logic."}
+]}
+```

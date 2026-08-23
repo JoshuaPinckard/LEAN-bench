@@ -1,0 +1,316 @@
+```python
+import math
+import collections
+
+import backtrader as bt
+
+
+class MultiStrategyORBIncome(bt.Strategy):
+    params = dict(
+        bb_period=20, bb_dev=2, atr_period=14, ema_period=20, rsi_period=14,
+        vol_sma_period=20, bw_lookback=252, or_bars=6,
+        base_capital=150000.0, risk_pct=0.01,
+        alloc_s1=0.40, alloc_s2=0.30, alloc_s3=0.30,
+        s1_timeout_bars=4,
+        session_end_hour=15, session_end_minute=55,
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data, period=self.p.bb_period, devfactor=self.p.bb_dev)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema = bt.indicators.EMA(self.data, period=self.p.ema_period)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.bw_history = collections.deque(maxlen=self.p.bw_lookback)
+
+        self.order = None
+        self.active_strategy = None
+        self.entry_price = None
+        self.stop_price = None
+        self.tp_price = None
+        self.entry_bar = None
+        self.risk_r = None
+
+        self.session_date = None
+        self.session_bar_idx = 0
+        self.or_high = None
+        self.or_low = None
+        self.or_complete = False
+        self.mid_or = None
+        self.broke_above_or = False
+        self.broke_below_or = False
+        self.above_or_count = 0
+        self.below_or_count = 0
+
+        self.log_records = []
+
+    def log(self, msg):
+        dt = self.data.datetime.datetime(0)
+        self.log_records.append("%s %s" % (dt.isoformat(), msg))
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Margin, order.Rejected, order.Canceled) and not self.position:
+            self.active_strategy = None
+            self.entry_price = None
+            self.stop_price = None
+            self.tp_price = None
+            self.risk_r = None
+            self.entry_bar = None
+        self.order = None
+
+    def _new_session_reset(self):
+        self.session_bar_idx = 0
+        self.or_high = None
+        self.or_low = None
+        self.or_complete = False
+        self.mid_or = None
+        self.broke_above_or = False
+        self.broke_below_or = False
+        self.above_or_count = 0
+        self.below_or_count = 0
+
+    def _update_or(self):
+        h = self.data.high[0]
+        l = self.data.low[0]
+        if self.or_high is None:
+            self.or_high = h
+            self.or_low = l
+        else:
+            self.or_high = max(self.or_high, h)
+            self.or_low = min(self.or_low, l)
+        if self.session_bar_idx == self.p.or_bars:
+            self.or_complete = True
+            self.mid_or = (self.or_high + self.or_low) / 2.0
+
+    def _bandwidth_percentile(self, bw):
+        self.bw_history.append(bw)
+        hist = self.bw_history
+        n = len(hist)
+        rank = sum(1 for x in hist if x <= bw)
+        return (rank / n) * 100.0
+
+    def _position_size(self, risk_dist, alloc_pct, price):
+        if risk_dist <= 0 or price <= 0:
+            return 0
+        risk_amount = self.p.base_capital * self.p.risk_pct
+        risk_size = int(round(risk_amount / risk_dist))
+        alloc_capital = self.p.base_capital * alloc_pct
+        alloc_size = int(alloc_capital // price)
+        return max(0, min(risk_size, alloc_size))
+
+    def _register_trade(self, strategy, entry_price, stop, tp, risk_dist, direction, pct):
+        self.active_strategy = strategy
+        self.entry_price = entry_price
+        self.stop_price = stop
+        self.tp_price = tp
+        self.risk_r = risk_dist
+        self.entry_bar = len(self)
+        self.log("ENTRY strat=%d dir=%d price=%.2f stop=%.2f tp=%.2f R=%.4f bw_pct=%.2f" %
+                  (strategy, direction, entry_price, stop, tp, risk_dist, pct))
+
+    def _reset_trade_state(self):
+        self.log("EXIT strat=%s" % self.active_strategy)
+        self.active_strategy = None
+        self.entry_price = None
+        self.stop_price = None
+        self.tp_price = None
+        self.risk_r = None
+        self.entry_bar = None
+
+    def _manage_position(self, close, is_eod):
+        if self.order:
+            return
+        strat = self.active_strategy
+        pos_size = self.position.size
+
+        if strat == 1:
+            bars_held = len(self) - self.entry_bar
+            if pos_size > 0:
+                tp_hit = close >= self.tp_price
+                sl_hit = close <= self.stop_price
+            else:
+                tp_hit = close <= self.tp_price
+                sl_hit = close >= self.stop_price
+            timeout_hit = bars_held >= self.p.s1_timeout_bars
+            if tp_hit or sl_hit or timeout_hit:
+                self.order = self.close()
+                self._reset_trade_state()
+            return
+
+        if strat == 2:
+            if pos_size > 0:
+                tp_hit = close >= self.tp_price
+                sl_hit = close <= self.stop_price
+            else:
+                tp_hit = close <= self.tp_price
+                sl_hit = close >= self.stop_price
+            if tp_hit or sl_hit or is_eod:
+                self.order = self.close()
+                self._reset_trade_state()
+            return
+
+        if strat == 3:
+            atr = self.atr[0]
+            if pos_size > 0:
+                tp_hit = close >= self.tp_price
+                sl_hit = close <= self.stop_price
+                trail_level = max(self.ema[0], close - atr)
+                trail_hit = close <= trail_level
+            else:
+                tp_hit = close <= self.tp_price
+                sl_hit = close >= self.stop_price
+                trail_level = min(self.ema[0], close + atr)
+                trail_hit = close >= trail_level
+            if tp_hit or sl_hit or trail_hit or is_eod:
+                self.order = self.close()
+                self._reset_trade_state()
+            return
+
+    def _try_strategy1(self, close, top, bot, mid, pct):
+        atr = self.atr[0]
+        rsi = self.rsi[0]
+        if close >= top and rsi > 60:
+            stop = top + atr
+            risk_dist = stop - close
+            tp = max(mid, close - 0.5 * risk_dist)
+            size = self._position_size(risk_dist, self.p.alloc_s1, close)
+            if size > 0:
+                self.order = self.sell(size=size)
+                self._register_trade(1, close, stop, tp, risk_dist, -1, pct)
+        elif close <= bot and rsi < 40:
+            stop = bot - atr
+            risk_dist = close - stop
+            tp = min(mid, close + 0.5 * risk_dist)
+            size = self._position_size(risk_dist, self.p.alloc_s1, close)
+            if size > 0:
+                self.order = self.buy(size=size)
+                self._register_trade(1, close, stop, tp, risk_dist, 1, pct)
+
+    def _try_strategy2(self, close, pct):
+        atr = self.atr[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        if high > self.or_high:
+            self.broke_above_or = True
+        if low < self.or_low:
+            self.broke_below_or = True
+
+        if self.broke_above_or and close < self.or_high:
+            stop = self.or_high + 0.5 * atr
+            risk_dist = stop - close
+            if risk_dist > 0:
+                size = self._position_size(risk_dist, self.p.alloc_s2, close)
+                if size > 0:
+                    self.order = self.sell(size=size)
+                    self._register_trade(2, close, stop, self.mid_or, risk_dist, -1, pct)
+                    self.broke_above_or = False
+            return
+        if self.broke_below_or and close > self.or_low:
+            stop = self.or_low - 0.5 * atr
+            risk_dist = close - stop
+            if risk_dist > 0:
+                size = self._position_size(risk_dist, self.p.alloc_s2, close)
+                if size > 0:
+                    self.order = self.buy(size=size)
+                    self._register_trade(2, close, stop, self.mid_or, risk_dist, 1, pct)
+                    self.broke_below_or = False
+
+    def _try_strategy3(self, close, pct):
+        atr = self.atr[0]
+        ema_rising = self.ema[0] > self.ema[-1]
+        ema_falling = self.ema[0] < self.ema[-1]
+
+        if self.above_or_count >= 2 and ema_rising:
+            stop = max(close - atr, self.or_low)
+            risk_dist = close - stop
+            if risk_dist > 0:
+                size = self._position_size(risk_dist, self.p.alloc_s3, close)
+                if size > 0:
+                    tp = close + 2 * risk_dist
+                    self.order = self.buy(size=size)
+                    self._register_trade(3, close, stop, tp, risk_dist, 1, pct)
+            return
+        if self.below_or_count >= 2 and ema_falling:
+            stop = min(close + atr, self.or_high)
+            risk_dist = stop - close
+            if risk_dist > 0:
+                size = self._position_size(risk_dist, self.p.alloc_s3, close)
+                if size > 0:
+                    tp = close - 2 * risk_dist
+                    self.order = self.sell(size=size)
+                    self._register_trade(3, close, stop, tp, risk_dist, -1, pct)
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        date_key = (dt.year, dt.month, dt.day)
+        if date_key != self.session_date:
+            self.session_date = date_key
+            self._new_session_reset()
+        self.session_bar_idx += 1
+        if self.session_bar_idx <= self.p.or_bars:
+            self._update_or()
+
+        close = self.data.close[0]
+        mid = self.bb.mid[0]
+        top = self.bb.top[0]
+        bot = self.bb.bot[0]
+        bw = (top - bot) / mid if mid else 0.0
+        pct = self._bandwidth_percentile(bw)
+
+        is_eod = (dt.hour == self.p.session_end_hour and dt.minute == self.p.session_end_minute)
+
+        if self.position:
+            self._manage_position(close, is_eod)
+            return
+
+        if self.order:
+            return
+
+        if pct < 10:
+            return
+
+        if self.data.volume[0] < self.vol_sma[0]:
+            return
+
+        if self.or_complete:
+            if close > self.or_high:
+                self.above_or_count += 1
+            else:
+                self.above_or_count = 0
+            if close < self.or_low:
+                self.below_or_count += 1
+            else:
+                self.below_or_count = 0
+
+        if 0 <= pct <= 30:
+            self._try_strategy1(close, top, bot, mid, pct)
+            if self.order:
+                return
+
+        if self.or_complete and 70 <= pct <= 90:
+            self._try_strategy2(close, pct)
+            if self.order:
+                return
+
+        if self.or_complete:
+            self._try_strategy3(close, pct)
+```
+```json
+{"assumptions": [
+{"topic": "infeasible", "choice": "Only one net position can be open at a time (across all three subsystems), with priority order Strategy1 > Strategy2 > Strategy3 when signals coincide; per-strategy position tracking is otherwise logical bookkeeping only.", "reason": "The harness provides a single bt.PandasData feed and default broker, which only support one net position per data feed. The spec's 'max 3 simultaneously, 1 per strategy' requires independent concurrent positions on the same instrument, which is not representable with real broker orders in this environment; a single active position is the closest literal reading."},
+{"topic": "capital_basis", "choice": "Risk and allocation sizing use the spec-stated base_capital=150000 (1%=1500 risk/trade) regardless of the harness's actual $10,000 starting cash.", "reason": "Spec explicitly states 'Base capital: 150000'; using the harness's $10,000 would silently substitute a different figure than specified. Resulting orders may exceed actual account equity and be rejected by the broker (handled via notify_order), which is an expected consequence of the spec's own capital assumption, not an added filter."},
+{"topic": "allocation_limit", "choice": "The 40/30/30 allocation percentages are implemented as a secondary position-size cap (floor(alloc_pct*base_capital/price)), taken as the min against the risk-based share count.", "reason": "Spec frames allocation as 'a limit on simultaneously deployed margin exposure'; translating it into a per-trade notional cap is the closest literal enforcement given the single-position model, while risk/trade remains capped at 1% independently as stated."},
+{"topic": "indicator_scope", "choice": "CrossOver indicator is not separately instantiated; band 'touch/breach' (Strategy 1) and OR breakout/reversion (Strategy 2/3) are evaluated via direct price-vs-level comparisons.", "reason": "The spec lists CrossOver among permitted indicators but 'touch/breach' and 'broke...then closed back inside' describe level conditions on dynamically session-scoped OR levels, not a fixed indicator-line crossing event that can be wired up in __init__; using it would not change or clarify the stated logic."},
+{"topic": "s1_timeout", "choice": "Strategy 1 timeout fixed at 4 bars (midpoint of the stated 3-5 bar range).", "reason": "Spec gives a range ('close after 3-5 bars') rather than a single value; no other guidance is given to pick within the range, so the midpoint is used as a single deterministic parameter."},
+{"topic": "s1_take_profit", "choice": "Strategy 1 TP level = the price nearer to entry among {mid band, entry ± 0.5R} (max of the two for shorts, min for longs), exiting when close reaches it.", "reason": "Spec says TP is 'mavg or +0.5R, whichever comes first'; since intrabar sequencing is unobservable from OHLC, the level closer to entry is treated as the one reached first under monotonic price movement toward the target."},
+{"topic": "s2_breakout_flag", "choice": "Strategy 2's 'broke then closed back inside' is tracked via a per-session boolean (set on any high/low breach of OR_high/OR_low) that clears on a successful reversion entry or at the next session reset.", "reason": "Spec does not specify how long a breach remains 'active' before the reversion counts; a persistent per-session flag that re-arms after use is the simplest literal state machine matching the described sequence (breakout, then close back inside)."},
+{"topic": "s3_exit", "choice": "Strategy 3 exits on whichever of {2R target, trailing stop} is hit first each bar; the trailing stop level is recomputed each bar as max(EMA20, close-ATR) for longs / min(EMA20, close+ATR) for shorts, with no additional ratcheting beyond that formula.", "reason": "Spec states TP as '2R or ATR trailing (max of EMA(20) trail and 1x ATR trail)' without specifying ratchet/lock-in behavior; the literal formula is applied bar-by-bar as given."},
+{"topic": "opening_range", "choice": "Opening range = first 6 bars of each session (first 30 minutes on the 5-minute feed), using the harness's stated 09:30 session start.", "reason": "Spec gives 'first 30 minutes' as its example ORB window; 6 bars of 5-minute data covers exactly that window."},
+{"topic": "eod_detection", "choice": "End-of-day is detected by bar time equal to 15:55 (the harness's stated session close), without look-ahead to the next bar's date.", "reason": "The harness fixes the session end time; comparing bar time attributes (no datetime import needed, since the value comes from backtrader's own datetime line) is sufficient and avoids inventing a look-ahead mechanism."},
+{"topic": "volume_filter", "choice": "The volume filter (current volume >= SMA(20) volume) is applied unconditionally as a global entry gate, matching the spec's stated condition.", "reason": "Spec lists it as '(optional)' but still specifies the exact rule; it is implemented as stated rather than adding an unrequested on/off parameter."},
+{"topic": "bandwidth_percentile", "choice": "BandWidth percentile is computed as the self-inclusive rank of the current bar's BandWidth within a rolling window of up to 252 prior values (window grows from 1 up to 252, no manual bar-skipping).", "reason": "Spec references percentile 'over 252 bars' without defining the exact formula or requiring a full 252-bar warm-up before use; per canonical default 6, no extra manual warm-up gating is added beyond backtrader's own indicator minperiods."}
+]}
+```

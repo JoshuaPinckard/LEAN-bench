@@ -1,0 +1,32 @@
+{
+  "task_id": 281,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\n\nimport backtrader as bt\n\n\nclass MstrSqueezeMomentum(bt.Strategy):\n    params = dict(\n        bb_period=20,\n        bb_devfactor=2.0,\n        rsi_period=14,\n        atr_period=14,\n        width_sma_period=20,\n        atr_sma_period=20,\n        vol_sma_fast=3,\n        vol_sma_slow=20,\n        squeeze_factor=0.75,\n        range_factor=0.25,\n        rsi_oversold=35,\n        vol_ratio=1.5,\n        risk_pct=0.02,\n        tp_atr_mult=2.0,\n        sl_atr_mult=1.5,\n        rsi_accel=50,\n    )\n\n    def __init__(self):\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.sma_vol_fast = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_fast)\n        self.sma_vol_slow = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_slow)\n        self.crossover = bt.indicators.CrossOver(self.data.close, self.bb.mid)\n\n        self.bb_width = self.bb.top - self.bb.bot\n        self.width_sma = bt.indicators.SMA(self.bb_width, period=self.p.width_sma_period)\n        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)\n\n        self.order = None\n        self.awaiting_expansion = False\n\n        self.entry_price = None\n        self.stop_level = None\n        self.tp_level = None\n\n        self._pending_bot = None\n        self._pending_atr = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status == order.Completed:\n            if order.isbuy():\n                self.entry_price = order.executed.price\n                self.stop_level = min(\n                    self._pending_bot,\n                    self.entry_price - self.p.sl_atr_mult * self._pending_atr)\n                self.tp_level = self.entry_price + self.p.tp_atr_mult * self._pending_atr\n            else:\n                self.awaiting_expansion = True\n                self.entry_price = None\n                self.stop_level = None\n                self.tp_level = None\n\n        self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if self.position:\n            if self.data.high[0] >= self.tp_level:\n                self.order = self.close()\n            elif self.data.low[0] <= self.stop_level:\n                self.order = self.close()\n            elif self.data.close[0] > self.bb.top[0] and self.rsi[0] > self.p.rsi_accel:\n                self.order = self.close()\n            return\n\n        w = self.bb_width[0]\n\n        if self.awaiting_expansion and w > self.width_sma[0]:\n            self.awaiting_expansion = False\n\n        if self.awaiting_expansion:\n            return\n\n        squeeze = (w < self.p.squeeze_factor * self.width_sma[0]\n                   and self.atr[0] < self.atr_sma[0])\n        narrow_range = ((self.bb.mid[0] - self.p.range_factor * w) <= self.data.close[0]\n                         <= (self.bb.mid[0] + self.p.range_factor * w))\n        oversold = self.rsi[0] < self.p.rsi_oversold\n        abnormal_volume = self.sma_vol_fast[0] > self.p.vol_ratio * self.sma_vol_slow[0]\n        momentum_trigger = self.crossover[0] > 0\n\n        if squeeze and narrow_range and oversold and abnormal_volume and momentum_trigger:\n            entry_price_est = self.data.close[0]\n            stop_level_est = min(self.bb.bot[0], entry_price_est - self.p.sl_atr_mult * self.atr[0])\n            risk_per_unit = entry_price_est - stop_level_est\n            if risk_per_unit <= 0:\n                return\n            equity = self.broker.getvalue()\n            size = math.floor(self.p.risk_pct * equity / risk_per_unit)\n            if size <= 0:\n                return\n            self._pending_bot = self.bb.bot[0]\n            self._pending_atr = self.atr[0]\n            self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "sizing_entry_price_proxy",
+      "choice": "The risk-based size formula uses the current (signal-day) close as entry_price, since the actual fill price is unknown until order execution under standard backtrader broker timing.",
+      "reason": "Spec requires size = floor(0.02*equity/(entry_price - stop_level)) computed at order submission, but the true fill price is not yet known; the signal-day close is the closest available literal value at decision time."
+    },
+    {
+      "topic": "exit_level_reference",
+      "choice": "stop_level (min of bb.bot and entry_price - 1.5*ATR) and the take-profit level (entry_price + 2*ATR) are both computed once, using the entry/signal bar's bb.bot and ATR(14), and then held fixed for the life of the trade rather than recalculated each bar.",
+      "reason": "The spec explicitly ties bb.bot to 'the entry bar' and itself equates 'entry day' with the crossover/signal day (condition 5); by symmetry the paired ATR(14) terms in both the TP and SL formulas are read as entry-bar values, giving a single well-defined stop_level/tp_level per trade."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "The acceleration exit is triggered via self.close() as soon as Close > bb.top and RSI > 50 are detected on the bar, but the resulting order fills per the harness's standard broker execution (next bar's open), not literally 'at the daily close' of the signal bar.",
+      "reason": "Strategy code has no access to broker/Cerebro execution-timing settings (fixed by the harness), so forcing a same-bar close-price fill is not achievable from within the strategy; this is the closest literal reading available."
+    },
+    {
+      "topic": "reentry_gate_initial_state",
+      "choice": "The expansion+new-squeeze re-entry gate is inactive before the very first trade and only activates after an exit occurs.",
+      "reason": "The spec states the gating rule as applying 'after exit', implying no such restriction exists prior to any trade having occurred."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

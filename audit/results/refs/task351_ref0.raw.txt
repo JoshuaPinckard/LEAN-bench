@@ -1,0 +1,94 @@
+```python
+import backtrader as bt
+
+
+class VolStochTrendStrategy(bt.Strategy):
+    params = dict(
+        vol_period=20,
+        stoch_period=14,
+        stoch_pfast=3,
+        stoch_pslow=3,
+        atr_period=14,
+        atr_mult=2.0,
+    )
+
+    def __init__(self):
+        close = self.data.close
+        returns = (close - close(-1)) / close(-1)
+        self.volatility = bt.indicators.StandardDeviation(
+            returns, period=self.p.vol_period
+        )
+
+        self.stoch = bt.indicators.StochasticGeneric(
+            self.volatility, self.volatility, self.volatility,
+            period=self.p.stoch_period,
+            period_dfast=self.p.stoch_pfast,
+            period_dslow=self.p.stoch_pslow,
+        )
+        self.crossover = bt.indicators.CrossOver(self.stoch.percK, self.stoch.percD)
+
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order is self.stop_order:
+                self.stop_order = None
+                self.order = None
+            elif order is self.order:
+                self.order = None
+                if self.position:
+                    stop_dist = self.p.atr_mult * self.atr[0]
+                    if order.isbuy():
+                        stop_price = order.executed.price - stop_dist
+                        self.stop_order = self.sell(
+                            exectype=bt.Order.Stop, price=stop_price
+                        )
+                    else:
+                        stop_price = order.executed.price + stop_dist
+                        self.stop_order = self.buy(
+                            exectype=bt.Order.Stop, price=stop_price
+                        )
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self.order:
+                self.order = None
+            elif order is self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        crossover = self.crossover[0]
+        percK_prev = self.stoch.percK[-1]
+
+        if not self.position:
+            if (crossover > 0 and percK_prev < 20
+                    and self.volatility[0] > self.volatility[-1]):
+                self.order = self.buy()
+            elif (crossover < 0 and percK_prev > 80
+                    and self.volatility[0] < self.volatility[-1]):
+                self.order = self.sell()
+        else:
+            long_exit = self.position.size > 0 and crossover < 0
+            short_exit = self.position.size < 0 and crossover > 0
+            if long_exit or short_exit:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "volatility-definition", "choice": "Volatility line = 20-bar StandardDeviation of close-to-close returns, computed as bt.indicators.StandardDeviation((close-close(-1))/close(-1), period=20).", "reason": "Spec offered a binary choice and required declaring it explicitly; the returns-based definition is the more literal reading of 'volatility measure' as opposed to raw price dispersion."},
+  {"topic": "infeasible", "choice": "StochasticGeneric is fed the single volatility line as its high, low, and close inputs simultaneously (StochasticGeneric(vol, vol, vol, ...)).", "reason": "StochasticGeneric requires OHLC-style inputs but the volatility measure is a single line with no independent high/low/close; using the same line for all three, mirroring the standard StochasticRSI construction, is the closest literal way to run 'a stochastic oscillator on this volatility line'."},
+  {"topic": "stop-mechanism", "choice": "Used a dependent stop order (not a combined bracket): after the entry order fills, a bt.Order.Stop order is submitted at entry_price -/+ 2*ATR(14), with ATR sampled at fill time.", "reason": "Spec permits 'a stop or bracket order'; a stop placed off the actual fill price is simplest to size correctly and to cancel independently on a signal-based exit."},
+  {"topic": "exit-order-management", "choice": "On an opposite stochastic crossover, the resting ATR stop order is canceled before issuing a market close(); if the ATR stop instead fills first, the broker's fill closes the position directly with no further action.", "reason": "Keeps exactly one live exit path at a time and follows the order-tracking guard convention for pending orders."}
+]}
+```

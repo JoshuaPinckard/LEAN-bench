@@ -1,0 +1,150 @@
+```python
+import math
+
+import backtrader as bt
+
+
+class OptionsProxyStrategy(bt.Strategy):
+    params = (
+        ('strategy_type', 1),  # 1 = Strategy 1 (CSP-proxy), 2 = Strategy 2 (CC-proxy)
+        ('atr_period', 14),
+        ('bb_period', 20),
+        ('bb_devfactor', 2.0),
+        ('sma_period', 50),
+        ('ema_period', 20),
+        ('rsi_period', 14),
+        ('vol_sma_period', 20),
+        ('k_min', 0.01),
+        ('k_max', 0.05),
+        ('expiration_bars', 20),
+        ('rsi_entry_threshold', 35.0),
+        ('size_pct_s1', 0.20),
+        ('size_pct_s2', 1.00),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data, period=self.p.bb_period, devfactor=self.p.bb_devfactor)
+        self.sma50 = bt.indicators.SMA(self.data, period=self.p.sma_period)
+        self.ema20 = bt.indicators.EMA(self.data, period=self.p.ema_period)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+        self.crossover = bt.indicators.CrossOver(self.ema20, self.sma50)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_bar = None
+        self.k_entry = None
+        self.atr_entry = None
+        self.protection_active = False
+        self.pending_k = None
+        self.pending_atr = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_price = order.executed.price
+            self.entry_bar = len(self)
+            self.protection_active = False
+            if self.p.strategy_type == 1:
+                self.k_entry = self.pending_k
+                self.atr_entry = self.pending_atr
+            else:
+                self.k_entry = self._k()
+                self.atr_entry = self.atr[0]
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _k(self):
+        k_raw = self.atr[0] / self.data.close[0]
+        return max(self.p.k_min, min(self.p.k_max, k_raw))
+
+    def _liquidity_ok(self):
+        return self.data.volume[0] > self.vol_sma[0]
+
+    def next(self):
+        if self.order is not None:
+            return
+        if self.p.strategy_type == 1:
+            self._next_strategy1()
+        else:
+            self._next_strategy2()
+
+    def _next_strategy1(self):
+        if not self.position:
+            if (self.data.close[0] < self.bb.lines.bot[0]
+                    and self.rsi[0] < self.p.rsi_entry_threshold
+                    and self._liquidity_ok()):
+                k = self._k()
+                limit_price = self.data.close[0] * (1 - k)
+                alloc = self.broker.getvalue() * self.p.size_pct_s1
+                size = math.floor(alloc / limit_price)
+                if size > 0:
+                    self.pending_k = k
+                    self.pending_atr = self.atr[0]
+                    self.order = self.buy(exectype=bt.Order.Limit, price=limit_price, size=size)
+            return
+
+        bars_held = len(self) - self.entry_bar
+        tp_level = max(self.entry_price + 0.5 * self.k_entry * self.entry_price,
+                        self.bb.lines.mid[0])
+        sl_level = self.entry_price - 1.5 * self.atr_entry
+
+        if self.data.close[0] >= tp_level:
+            self.order = self.close()
+        elif self.data.close[0] <= sl_level:
+            self.order = self.close()
+        elif bars_held >= self.p.expiration_bars:
+            self.order = self.close()
+
+    def _next_strategy2(self):
+        if not self.position:
+            if (self.crossover[0] > 0
+                    and self.data.close[0] > self.ema20[0]
+                    and self._liquidity_ok()):
+                alloc = self.broker.getvalue() * self.p.size_pct_s2
+                size = math.floor(alloc / self.data.close[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
+            return
+
+        bars_held = len(self) - self.entry_bar
+        protect_trigger = self.entry_price * (1 + 0.5 * self.k_entry)
+        tp_pct_level = self.entry_price * (1 + self.k_entry)
+
+        if not self.protection_active and self.data.close[0] >= protect_trigger:
+            self.protection_active = True
+
+        take_profit = (self.data.close[0] >= self.bb.lines.top[0]
+                        or self.data.close[0] >= tp_pct_level)
+
+        if self.protection_active:
+            stop_trigger = self.data.close[0] < self.ema20[0]
+        else:
+            stop_trigger = (self.data.close[0] < (self.ema20[0] - 1.0 * self.atr[0])
+                             or self.crossover[0] < 0)
+
+        if take_profit:
+            self.order = self.close()
+        elif stop_trigger:
+            self.order = self.close()
+        elif bars_held >= self.p.expiration_bars:
+            self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "The harness permits only ONE module-level bt.Strategy class, but the spec describes two strategies to be run separately and compared. Implemented both as branches of a single class selected by a 'strategy_type' param (1=CSP-proxy, default; 2=CC-proxy), since two live strategy classes cannot be output.", "reason": "Hard constraint of the execution environment; closest literal reading preserves both strategies' full logic, selectable rather than simultaneous."},
+  {"topic": "position sizing base", "choice": "'% of capital' interpreted as % of current total portfolio value (self.broker.getvalue()), not just free cash.", "reason": "Spec says 'capital', not 'cash'; getvalue() is the standard equity measure and equals cash when flat (only one position held at a time)."},
+  {"topic": "position sizing rounding", "choice": "Share count floored to a whole number via math.floor.", "reason": "Spec doesn't state fractional-share handling; equities are conventionally traded in whole shares."},
+  {"topic": "Strategy 1 take-profit formula", "choice": "tp_level = max(Entry + 0.5*k*Entry, current Bollinger mid-band value); triggered when Close >= tp_level.", "reason": "Literal parsing of 'max(Entry + 0.5*k*Entry, middle Bollinger line reached...)' as a max of two candidate exit price levels, checked against Close for consistency with the rest of the spec's Close-based conditions."},
+  {"topic": "Strategy 1 stop-loss ATR reference", "choice": "ATR(14) in 'Entry - 1.5*ATR(14)' is fixed at the entry/signal bar (not recomputed daily), giving a fixed-distance stop.", "reason": "The formula anchors to a fixed 'Entry' price, implying a fixed stop distance computed once, matching common ATR-stop technique."},
+  {"topic": "Strategy 1 k snapshot", "choice": "k used in L and in exit TP formulas is computed once at the bar the limit order is placed (signal bar) and reused through the trade's exits, rather than recomputed on the fill bar or daily.", "reason": "k is defined once to size L; reusing the same value keeps the position's implied 'strike/premium' internally consistent for that trade."},
+  {"topic": "Strategy 1 resting limit order", "choice": "The entry limit order has no explicit expiry and is left as a standard GTC order until filled/canceled/margin-rejected by the broker; the 'activate only if...' filters gate only the initial placement, not re-checked while the order is outstanding.", "reason": "Spec doesn't state how long the pending limit order remains active before entry."},
+  {"topic": "Strategy 2 stop-loss/protection interaction", "choice": "The '50% protection' trailing-stop-to-EMA(20) supersedes (tightens) the base stop-loss once Close first reaches Entry*(1+0.5k); before that threshold, the base stop-loss (Close < EMA-1*ATR, or reverse crossover) applies. These are treated as one stateful stop mechanism rather than two independently-checked exits.", "reason": "The two adjacent bullets both describe stop behavior around EMA(20); treating protection as tightening the stop avoids a contradictory reading where two different EMA-based stop levels are checked simultaneously."},
+  {"topic": "Strategy 2 reverse crossover direction", "choice": "'reverse CrossOver (SMA(50) crosses EMA(20) from above to below)' implemented as EMA(20) crossing below SMA(50) (the mirror of the entry golden-cross), i.e., crossover[0] < 0 on the same CrossOver(EMA,SMA) indicator used for entry.", "reason": "Read literally, 'SMA crosses EMA from above to below' describes the same directional event as the entry signal (a contradiction for an exit condition); interpreted as a wording slip and resolved to the standard death-cross exit."},
+  {"topic": "exit condition priority", "choice": "When multiple exit conditions are true on the same bar, priority follows the spec's bullet order: take-profit first, then stop-loss/protection, then time-out, for both strategies.", "reason": "Spec doesn't state a tie-break; using the stated listing order is the most literal deterministic choice."},
+  {"topic": "exit trigger price reference", "choice": "All TP/SL/protection level checks (besides the explicit entry-fill rule 'Low <= L') are evaluated against the daily Close, not High/Low.", "reason": "Spec expresses its other conditions (Close < lower band, Close > EMA, RSI, etc.) in terms of Close, so Close was used for consistency where the trigger reference wasn't stated."}
+]}
+```

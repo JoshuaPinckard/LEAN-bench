@@ -1,0 +1,131 @@
+```python
+import math
+import backtrader as bt
+
+
+class MeanReversionPseudoSpread(bt.Strategy):
+    params = dict(
+        sma_trend_period=200,
+        sma_base_period=50,
+        atr_period=14,
+        atr_sma_period=30,
+        long_entry_dev=0.95,
+        short_entry_dev=1.05,
+        vol_filter_max=0.05,
+        entry_slippage_pct=0.005,
+        stop_multiplier=1.1,
+        liquidity_sma_period=20,
+        liquidity_threshold=10_000_000,
+        risk_pct=0.01,
+        atr_risk_mult=2.0,
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_trend_period)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_base_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma30 = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.dollar_vol_sma = bt.indicators.SMA(self.data.close * self.data.volume, period=self.p.liquidity_sma_period)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma50)
+
+        self.order = None
+        self.pending_intent = None
+        self.direction = None
+        self.entry_price = None
+        self.sma50_entry = None
+        self.d0 = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.pending_intent == 'long_entry':
+                self.direction = 'long'
+                self.entry_price = order.executed.price
+                self.sma50_entry = self.sma50[0]
+                self.d0 = self.sma50_entry - self.entry_price
+            elif self.pending_intent == 'short_entry':
+                self.direction = 'short'
+                self.entry_price = order.executed.price
+                self.sma50_entry = self.sma50[0]
+                self.d0 = self.entry_price - self.sma50_entry
+            elif self.pending_intent == 'exit':
+                self.direction = None
+                self.entry_price = None
+                self.sma50_entry = None
+                self.d0 = None
+
+        self.order = None
+        self.pending_intent = None
+
+    def next(self):
+        if self.order:
+            return
+
+        price = self.data.close[0]
+
+        if not self.position:
+            vol_ok = self.atr_sma30[0] / price <= self.p.vol_filter_max
+            liquidity_ok = self.dollar_vol_sma[0] > self.p.liquidity_threshold
+
+            long_signal = (
+                price > self.sma200[0]
+                and price <= self.sma50[0] * self.p.long_entry_dev
+                and vol_ok
+                and liquidity_ok
+            )
+            short_signal = (
+                price < self.sma200[0]
+                and price >= self.sma50[0] * self.p.short_entry_dev
+                and vol_ok
+                and liquidity_ok
+            )
+
+            if not (long_signal or short_signal):
+                return
+
+            atr_val = self.atr[0]
+            if atr_val <= 0:
+                return
+            equity = self.broker.getvalue()
+            size = math.floor((self.p.risk_pct * equity) / (self.p.atr_risk_mult * atr_val))
+            if size <= 0:
+                return
+
+            if long_signal:
+                limit_price = price * (1 + self.p.entry_slippage_pct)
+                self.pending_intent = 'long_entry'
+                self.order = self.buy(exectype=bt.Order.Limit, price=limit_price, size=size)
+            else:
+                limit_price = price * (1 - self.p.entry_slippage_pct)
+                self.pending_intent = 'short_entry'
+                self.order = self.sell(exectype=bt.Order.Limit, price=limit_price, size=size)
+            return
+
+        if self.direction == 'long':
+            d = self.sma50[0] - price
+            stop_hit = d >= self.p.stop_multiplier * self.d0
+            cross_exit = self.crossover[0] > 0
+        else:
+            d = price - self.sma50[0]
+            stop_hit = d >= self.p.stop_multiplier * self.d0
+            cross_exit = self.crossover[0] < 0
+
+        if cross_exit or stop_hit:
+            self.pending_intent = 'exit'
+            self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "liquidity_threshold value", "choice": "SMA(20) of (close*volume) > $10,000,000", "reason": "spec references 'a specified threshold' without giving a number; chose a representative dollar-volume liquidity floor for a large-cap like AAPL."},
+  {"topic": "risk_pct value", "choice": "1% of equity (0.01)", "reason": "spec states risk per trade is 'a fixed fraction of capital' without specifying the fraction; 1% is a conventional per-trade risk assumption."},
+  {"topic": "ATR position-sizing multiplier k", "choice": "k = 2.0", "reason": "spec's formula qty = floor((risk_pct*equity)/(k*ATR14)) leaves k unspecified; 2x ATR is a common volatility-based stop-distance multiple."},
+  {"topic": "equity basis for sizing", "choice": "equity = self.broker.getvalue() (total portfolio value)", "reason": "spec says 'equity' generically; using total portfolio value rather than uninvested cash matches standard usage of the term."},
+  {"topic": "price reference", "choice": "use bar close for all price comparisons (SMA200/SMA50 filters, pseudo-spread, ATR/close ratio, signal-candle price for the limit order)", "reason": "spec doesn't specify open/close/typical price; close is the conventional 'price' for end-of-day signal evaluation."},
+  {"topic": "SMA(50)_entry timing", "choice": "use SMA(50) value at the bar the entry order is filled (Completed), paired with the executed fill price", "reason": "spec doesn't clarify whether the entry deviation d0 is measured on the signal bar or the fill bar; measuring both entry_price and SMA50_entry at the same (fill) bar keeps d0 internally consistent."},
+  {"topic": "short-side volatility/liquidity filters", "choice": "apply the same ATR filter (SMA(ATR14,30)/close<=0.05) and same liquidity filter (dollar-volume SMA20 above threshold) to short entries as to long entries", "reason": "spec calls the short case a 'symmetric' scenario and says only 'volatility is within normal range' without a distinct formula, and doesn't restate liquidity; symmetry implies reuse of the long-side filters."},
+  {"topic": "entry limit order validity", "choice": "no explicit expiration (backtrader default valid=None, effectively good-till-cancelled)", "reason": "spec defines the limit price offset but not an expiration window for the entry order, so the broker default persistence is used; a pending order blocks new signals per the standard pending-order guard."},
+  {"topic": "exit order type", "choice": "self.close() (market order)", "reason": "spec specifies a limit order only for entries; canonical default applies self.close() for exits since no exit order type is stated."}
+]}
+```

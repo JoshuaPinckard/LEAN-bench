@@ -1,0 +1,207 @@
+```python
+        sxx = sum(i * i for i in range(n))
+        sxy = sum(i * v for i, v in enumerate(values))
+        denom = n * sxx - sx * sx
+        if denom == 0:
+            return 0.0
+        return (n * sxy - sx * sy) / denom
+```
+
+Continuing with swing detection and pattern helpers:
+
+```python
+    def _update_swings(self):
+        order = self.p.swing_order
+        need = 2 * order
+        if self.bar_num < need:
+            return
+        idx = self.bar_num - order
+        left_h = [self.data.high[-order - k] for k in range(1, order + 1)]
+        right_h = [self.data.high[-order + k] for k in range(1, order + 1)]
+        cand_h = self.data.high[-order]
+        if cand_h > max(left_h) and cand_h > max(right_h):
+            self.swing_highs.append((idx, cand_h))
+        left_l = [self.data.low[-order - k] for k in range(1, order + 1)]
+        right_l = [self.data.low[-order + k] for k in range(1, order + 1)]
+        cand_l = self.data.low[-order]
+        if cand_l < min(left_l) and cand_l < min(right_l):
+            self.swing_lows.append((idx, cand_l))
+
+    def _find_trough_between(self, idx1, idx2):
+        cands = [(i, p) for i, p in self.swing_lows if idx1 < i < idx2]
+        if not cands:
+            return None
+        return min(cands, key=lambda t: t[1])
+```
+
+Now the pattern detectors:
+
+```python
+    def _check_head_shoulders(self):
+        if len(self.swing_highs) < 3:
+            return None
+        ls_idx, ls_p = self.swing_highs[-3]
+        h_idx, h_p = self.swing_highs[-2]
+        rs_idx, rs_p = self.swing_highs[-1]
+        if not (ls_idx < h_idx < rs_idx):
+            return None
+        if self.bar_num - rs_idx > self.p.max_swing_gap:
+            return None
+        if rs_p > h_p or h_p <= ls_p:
+            return None
+        if abs(ls_p - rs_p) / h_p > self.p.shoulder_tol:
+            return None
+        if not self._is_uptrend(h_idx):
+            return None
+        t1 = self._find_trough_between(ls_idx, h_idx)
+        t2 = self._find_trough_between(h_idx, rs_idx)
+        if t1 is None or t2 is None:
+            return None
+        i1, p1 = t1
+        i2, p2 = t2
+        if i2 == i1:
+            return None
+        neck_now = p1 + (p2 - p1) * (self.bar_num - i1) / (i2 - i1)
+        if self.data.close[0] >= neck_now:
+            return None
+        neck_head = p1 + (p2 - p1) * (h_idx - i1) / (i2 - i1)
+        height = h_p - neck_head
+        if height <= 0:
+            return None
+        return dict(stop=rs_p, height=height)
+
+    def _check_double_top(self):
+        if len(self.swing_highs) < 2:
+            return None
+        t1_idx, t1_p = self.swing_highs[-2]
+        t2_idx, t2_p = self.swing_highs[-1]
+        if self.bar_num - t2_idx > self.p.max_swing_gap:
+            return None
+        avg = (t1_p + t2_p) / 2
+        if abs(t1_p - t2_p) / avg > self.p.top_tol:
+            return None
+        if not self._is_uptrend(t2_idx):
+            return None
+        trough = self._find_trough_between(t1_idx, t2_idx)
+        if trough is None:
+            return None
+        tr_idx, tr_p = trough
+        if self.data.close[0] >= tr_p:
+            return None
+        height = max(t1_p, t2_p) - tr_p
+        if height <= 0:
+            return None
+        return dict(stop=t2_p, height=height)
+```
+
+Flag/Pennant detector and the `next()` entry logic:
+
+```python
+    def _check_flag_pennant(self):
+        cl = self.p.consol_len
+        il = self.p.impulse_len
+        if self.bar_num < cl + il:
+            return None
+        start_close = self.data.close[-cl]
+        base_close = self.data.close[-(cl + il)]
+        if base_close <= 0:
+            return None
+        impulse_move = start_close - base_close
+        if impulse_move / base_close < self.p.impulse_threshold:
+            return None
+        # ago=-1 excludes the current (potential breakout) bar from the window
+        highs = self.data.high.get(ago=-1, size=cl)
+        lows = self.data.low.get(ago=-1, size=cl)
+        vols = self.data.volume.get(ago=-1, size=cl)
+        if len(highs) < cl or len(lows) < cl or len(vols) < cl:
+            return None
+        upper = max(highs)
+        lower = min(lows)
+        if (upper - lower) > self.p.narrow_range_mult * impulse_move:
+            return None
+        if self._slope(vols) >= 0:
+            return None
+        slope_high = self._slope(highs)
+        slope_low = self._slope(lows)
+        if slope_high >= 0:
+            return None
+        if not (slope_low < 0 or slope_low > 0):
+            return None
+        avg_vol = sum(vols) / cl
+        if self.data.close[0] <= upper:
+            return None
+        if self.data.volume[0] <= self.p.vol_spike_mult * avg_vol:
+            return None
+        return dict(stop=lower, height=upper - lower)
+
+    def next(self):
+        self.bar_num += 1
+        self._update_swings()
+
+        if self.order or self.position:
+            return
+
+        entry_price = self.data.close[0]
+        equity = self.broker.getvalue()
+        risk_amount = equity * self.p.risk_pct
+
+        hs = self._check_head_shoulders()
+        if hs is not None:
+            risk_per_share = hs['stop'] - entry_price
+            if risk_per_share > 0:
+                size = int(risk_amount / risk_per_share)
+                if size >= 1:
+                    tp = entry_price - hs['height']
+                    orders = self.sell_bracket(
+                        size=size, exectype=bt.Order.Market,
+                        stopprice=hs['stop'], limitprice=tp,
+                    )
+                    self.order = orders[0]
+            return
+
+        dt_ = self._check_double_top()
+        if dt_ is not None:
+            risk_per_share = dt_['stop'] - entry_price
+            if risk_per_share > 0:
+                size = int(risk_amount / risk_per_share)
+                if size >= 1:
+                    tp = entry_price - dt_['height']
+                    orders = self.sell_bracket(
+                        size=size, exectype=bt.Order.Market,
+                        stopprice=dt_['stop'], limitprice=tp,
+                    )
+                    self.order = orders[0]
+            return
+
+        fp = self._check_flag_pennant()
+        if fp is not None:
+            risk_per_share = entry_price - fp['stop']
+            if risk_per_share > 0:
+                size = int(risk_amount / risk_per_share)
+                if size >= 1:
+                    tp = entry_price + fp['height']
+                    orders = self.buy_bracket(
+                        size=size, exectype=bt.Order.Market,
+                        stopprice=fp['stop'], limitprice=tp,
+                    )
+                    self.order = orders[0]
+            return
+```
+
+```json
+{"assumptions": [
+  {"topic": "trend_definition", "choice": "Uptrend/downtrend inferred by comparing close to SMA(20) at the pattern's key peak bar", "reason": "Spec requires SMA20 to gauge trend for H&S/Double Top but does not define the comparison rule"},
+  {"topic": "swing_detection", "choice": "Fractal peaks/troughs confirmed with 3 bars on each side (order=3)", "reason": "Spec describes shoulders/heads/tops/troughs geometrically but gives no peak-detection algorithm"},
+  {"topic": "shoulder_top_tolerance", "choice": "3% relative tolerance for left/right shoulder and double-top peak similarity", "reason": "Spec requires similar peak levels but no numeric tolerance"},
+  {"topic": "pattern_freshness", "choice": "Breakout must occur within 8 bars of the last confirmed shoulder/top", "reason": "Prevents trading on stale, long-completed peaks; spec does not address staleness"},
+  {"topic": "head_vs_left_shoulder", "choice": "Require head price to exceed left shoulder price, not just right shoulder", "reason": "Spec only states right shoulder must not exceed head; head-as-highest-peak is implied by the pattern's definition"},
+  {"topic": "flag_pennant_parameters", "choice": "Impulse lookback=8 bars, impulse threshold=5%, consolidation length=6 bars, narrow-range <=70% of impulse move, volume spike >=1.5x consolidation average", "reason": "Spec describes these conditions qualitatively with no numeric thresholds"},
+  {"topic": "flag_vs_pennant_geometry", "choice": "Both require a negative-slope upper boundary; lower boundary slope negative (parallel channel) => Flag, positive (converging) => Pennant", "reason": "Spec distinguishes them narratively (channel vs triangle) but not geometrically"},
+  {"topic": "risk_per_trade", "choice": "Fixed at 1% of current portfolio value per trade", "reason": "Spec states a 1-2% range; chose the lower bound as the 'does not exceed' ceiling"},
+  {"topic": "position_size_rounding", "choice": "Share size truncated to whole shares", "reason": "Equity instrument; spec silent on fractional shares"},
+  {"topic": "entry_execution", "choice": "Market order at breakout bar (fills next bar open per backtrader default); stop/limit measured from breakout bar's close and submitted together as an OCO bracket", "reason": "Spec defines breakout point and stop/TP levels but not order mechanics; bracket order implements the stated simultaneous SL/TP without adding extra logic"},
+  {"topic": "pattern_priority", "choice": "When multiple patterns qualify on the same bar, priority is Head-and-Shoulders > Double Top > Flag/Pennant", "reason": "Spec does not state a tie-break order"},
+  {"topic": "double_top_height", "choice": "Pattern height = higher of the two tops minus neckline, mirroring H&S's head-to-neckline measurement", "reason": "Spec defines 'height of pattern' explicitly for H&S and flag/pennant but not for Double Top"},
+  {"topic": "spec_truncation", "choice": "Implemented only the stated 1-2% risk rule; made no assumption about further risk/position-size text", "reason": "Provided specification text cuts off mid-sentence ('St') under Risk and position size management", "infeasible": true}
+]}
+```

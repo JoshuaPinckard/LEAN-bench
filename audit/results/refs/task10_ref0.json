@@ -1,0 +1,57 @@
+{
+  "task_id": 10,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass OpeningRangeBreakoutStrategy(bt.Strategy):\n    SESSION_STARTS = {\n        'Tokyo': (9, 0),\n        'London': (8, 0),\n        'New York': (9, 30),\n    }\n\n    params = (\n        ('session', 'New York'),\n        ('range_minutes', 120),\n        ('tp_multiple', 1.5),\n        ('risk_pct', 0.01),\n        ('vol_filter_pct', 0.002),\n    )\n\n    def __init__(self):\n        start_hour, start_minute = self.SESSION_STARTS[self.p.session]\n        self.session_start_min = start_hour * 60 + start_minute\n        self.range_end_min = self.session_start_min + self.p.range_minutes\n\n        self.current_day = None\n        self.range_high = None\n        self.range_low = None\n        self.zone_ready = False\n        self.zone_valid = False\n        self.zone_upper = None\n        self.zone_lower = None\n\n        self.order = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            if order == self.order:\n                self.order = None\n\n    def next(self):\n        dt = self.data.datetime.datetime(0)\n        bar_date = dt.date()\n        bar_min = dt.hour * 60 + dt.minute\n\n        if bar_date != self.current_day:\n            self.current_day = bar_date\n            self.range_high = None\n            self.range_low = None\n            self.zone_ready = False\n            self.zone_valid = False\n            self.zone_upper = None\n            self.zone_lower = None\n\n        high = self.data.high[0]\n        low = self.data.low[0]\n        close = self.data.close[0]\n\n        if self.session_start_min <= bar_min < self.range_end_min:\n            self.range_high = high if self.range_high is None else max(self.range_high, high)\n            self.range_low = low if self.range_low is None else min(self.range_low, low)\n            return\n\n        if bar_min < self.session_start_min:\n            return\n\n        if not self.zone_ready:\n            if self.range_high is None or self.range_low is None:\n                return\n            self.zone_upper = self.range_high\n            self.zone_lower = self.range_low\n            zone_range = self.zone_upper - self.zone_lower\n            self.zone_valid = zone_range >= (close * self.p.vol_filter_pct)\n            self.zone_ready = True\n\n        if not self.zone_valid:\n            return\n\n        if self.order or self.position:\n            return\n\n        zone_range = self.zone_upper - self.zone_lower\n\n        if close > self.zone_upper:\n            stop_price = self.zone_lower\n            take_profit = self.zone_upper + self.p.tp_multiple * zone_range\n            risk_per_share = close - stop_price\n            if risk_per_share <= 0:\n                return\n            size = int((self.broker.getvalue() * self.p.risk_pct) / risk_per_share)\n            if size <= 0:\n                return\n            orders = self.buy_bracket(\n                size=size,\n                price=close,\n                exectype=bt.Order.Market,\n                stopprice=stop_price,\n                limitprice=take_profit,\n            )\n            self.order = orders[0]\n\n        elif close < self.zone_lower:\n            stop_price = self.zone_upper\n            take_profit = self.zone_lower - self.p.tp_multiple * zone_range\n            risk_per_share = stop_price - close\n            if risk_per_share <= 0:\n                return\n            size = int((self.broker.getvalue() * self.p.risk_pct) / risk_per_share)\n            if size <= 0:\n                return\n            orders = self.sell_bracket(\n                size=size,\n                price=close,\n                exectype=bt.Order.Market,\n                stopprice=stop_price,\n                limitprice=take_profit,\n            )\n            self.order = orders[0]",
+  "assumptions": [
+    {
+      "topic": "default session",
+      "choice": "Default 'session' parameter is 'New York' (09:30 start)",
+      "reason": "Spec requires a selectable session but names no default; the feed's timestamps are already in NY local time (-04:00) matching NYSE cash-session hours, so New York is the only option whose 120-minute range window has full data coverage."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "London (08:00) and Tokyo (09:00) are implemented as selectable session-start options for API completeness, but selecting them against this single NYSE-hours feed only captures whatever bars fall in the nominal window intersected with 09:30-16:00 NY time, producing a truncated range rather than a genuine London/Tokyo session.",
+      "reason": "The environment supplies only one data feed, in one timezone/session (NYSE regular hours); no other-timezone or pre-market bars are available."
+    },
+    {
+      "topic": "position sizing entry price",
+      "choice": "Use the signal bar's close (the bar whose close triggers the breakout) as the entry-price estimate for computing risk-per-share and share size.",
+      "reason": "Spec defines size from the distance between entry and stop-loss, but backtrader requires order size to be submitted before the actual next-bar-open fill price is known; the triggering close is the closest literal proxy."
+    },
+    {
+      "topic": "volatility filter current price",
+      "choice": "Use the close of the bar immediately after range formation (when the zone is finalized) as 'Current Price' for the 0.2% threshold check; validity is decided once per day at zone formation.",
+      "reason": "Spec references 'Current Price' without specifying the measurement point; the zone is a static per-day property, so its validity is most naturally fixed at formation time."
+    },
+    {
+      "topic": "position size rounding",
+      "choice": "Floor the computed share size to an integer via int().",
+      "reason": "Equities are traded in whole shares by default; spec is silent on rounding."
+    },
+    {
+      "topic": "stop-loss/take-profit mechanism",
+      "choice": "Use backtrader's buy_bracket()/sell_bracket() with a Market entry plus linked Stop and Limit child orders (OCO) for the stated SL/TP levels.",
+      "reason": "Spec requires simultaneous stop-loss and take-profit exits without detailing order mechanics; bracket orders are backtrader's direct native mechanism for this."
+    },
+    {
+      "topic": "re-entry after intraday exit",
+      "choice": "If a position is closed intraday via stop-loss or take-profit, a new breakout entry against the same day's zone is permitted if price re-crosses the boundary, until the next day's range resets.",
+      "reason": "Canonical default only forbids pyramiding while a position is open; the spec does not restrict re-entry after an exit within the same formed zone."
+    },
+    {
+      "topic": "overnight positions",
+      "choice": "Open positions are not force-closed at day rollover; they remain governed by their existing bracket stop-loss/take-profit until one triggers.",
+      "reason": "Spec states no end-of-day close rule."
+    },
+    {
+      "topic": "capital base for sizing",
+      "choice": "Use self.broker.getvalue() (total account equity) as 'total trading capital' for the 1% risk calculation.",
+      "reason": "Spec says 'total trading capital', read as total account equity rather than only free cash."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

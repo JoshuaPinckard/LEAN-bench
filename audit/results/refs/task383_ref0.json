@@ -1,0 +1,55 @@
+{
+  "task_id": 383,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\nimport backtrader as bt\n\n\nclass AutocorrZScore(bt.Indicator):\n    lines = ('corr', 'z')\n    params = (('period', 20),)\n\n    def __init__(self):\n        self.addminperiod(2 * self.p.period)\n\n    def _update_corr(self):\n        period = self.p.period\n        if len(self.data) < period + 1:\n            self.lines.corr[0] = float('nan')\n            return\n        x = [self.data.close[-i] for i in range(period)]\n        y = [self.data.close[-i] for i in range(1, period + 1)]\n        mean_x = sum(x) / period\n        mean_y = sum(y) / period\n        cov = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))\n        var_x = sum((xi - mean_x) ** 2 for xi in x)\n        var_y = sum((yi - mean_y) ** 2 for yi in y)\n        denom = math.sqrt(var_x * var_y)\n        self.lines.corr[0] = (cov / denom) if denom != 0 else 0.0\n\n    def _update_z(self):\n        period = self.p.period\n        if len(self.data) < 2 * period:\n            self.lines.z[0] = float('nan')\n            return\n        history = [self.lines.corr[-i] for i in range(period)]\n        if any(math.isnan(v) for v in history):\n            self.lines.z[0] = float('nan')\n            return\n        mean_c = sum(history) / period\n        var_c = sum((v - mean_c) ** 2 for v in history) / period\n        std_c = math.sqrt(var_c)\n        self.lines.z[0] = 0.0 if std_c == 0 else (self.lines.corr[0] - mean_c) / std_c\n\n    def prenext(self):\n        self._update_corr()\n        self._update_z()\n\n    def next(self):\n        self._update_corr()\n        self._update_z()\n\n\nclass AutocorrMeanReversionStrategy(bt.Strategy):\n    params = (\n        ('lookback', 20),\n        ('entry_z', 2.0),\n        ('stop_pct', 0.02),\n    )\n\n    def __init__(self):\n        self.zind = AutocorrZScore(self.data, period=self.p.lookback)\n        self.entry_order = None\n        self.stop_order = None\n        self.close_order = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        terminal = order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected)\n\n        if order is self.entry_order:\n            if order.status == order.Completed:\n                if order.isbuy():\n                    stop_price = order.executed.price * (1 - self.p.stop_pct)\n                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price)\n                else:\n                    stop_price = order.executed.price * (1 + self.p.stop_pct)\n                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price)\n            if terminal:\n                self.entry_order = None\n        elif order is self.stop_order:\n            if terminal:\n                self.stop_order = None\n        elif order is self.close_order:\n            if terminal:\n                self.close_order = None\n\n    def next(self):\n        z0 = self.zind.lines.z[0]\n        z1 = self.zind.lines.z[-1]\n        if math.isnan(z0) or math.isnan(z1):\n            return\n\n        if self.position:\n            if self.close_order is not None:\n                return\n            if self.position.size > 0:\n                crossed = z1 < 0 and z0 >= 0\n            else:\n                crossed = z1 > 0 and z0 <= 0\n            if crossed:\n                if self.stop_order is not None:\n                    self.cancel(self.stop_order)\n                self.close_order = self.close()\n            return\n\n        if self.entry_order is not None or self.stop_order is not None or self.close_order is not None:\n            return\n\n        if z0 > self.p.entry_z and z0 < z1:\n            self.entry_order = self.sell()\n        elif z0 < -self.p.entry_z and z0 > z1:\n            self.entry_order = self.buy()",
+  "assumptions": [
+    {
+      "topic": "autocorrelation_definition",
+      "choice": "Used the primary definition given: rolling Pearson correlation (LookbackPeriod=20) between close and its 1-bar-lagged close, rather than the parenthetical returns-based alternative.",
+      "reason": "Spec offers two equivalent options; the close-vs-lagged-close version is stated first and is the direct literal reading."
+    },
+    {
+      "topic": "variance_convention",
+      "choice": "Used population (N-divisor) variance/standard deviation for both the correlation window and the rolling mean/std of the correlation series.",
+      "reason": "Spec does not specify sample vs. population std; population form matches backtrader's built-in StandardDeviation indicator convention, used as the bench's implicit default where unstated."
+    },
+    {
+      "topic": "entry_turn_definition",
+      "choice": "Interpreted 'z > +2.0 and then z turns down' (and the mirrored long case) as both conditions evaluated on the current bar: z[0] beyond the threshold AND z[0] < z[-1] (or > for the long case).",
+      "reason": "Spec's parenthetical example (z[0] < z[-1]) only defines the turn; it does not state a separate bar for the threshold breach, so the most literal reading applies both clauses to the same signal bar."
+    },
+    {
+      "topic": "exit_cross_definition",
+      "choice": "Implemented 'z crossing back through 0' as a true sign-crossing check between z[-1] and z[0] (opposite sides of zero on consecutive bars), rather than z[0] alone reaching zero.",
+      "reason": "Faithfully captures 'crossing' as a two-bar event, matching standard crossover semantics."
+    },
+    {
+      "topic": "stop_loss_mechanism",
+      "choice": "Placed a native backtrader Stop order at 2% from the actual filled entry price immediately after entry executes; it is canceled if the mean-reversion (z-cross) exit fires first, and vice versa.",
+      "reason": "Spec states a stop-loss level but not its implementation mechanics; a broker-side stop order is the closest literal reading of 'place a stop loss'."
+    },
+    {
+      "topic": "degenerate_variance_guard",
+      "choice": "If the correlation-window variance is zero, corr is set to 0.0; if the rolling std of corr is zero, z is set to 0.0 (both avoid division by zero).",
+      "reason": "Spec does not address zero-variance edge cases; this is a minimal, non-signal-generating fallback for an event not expected to occur with continuous 5-minute price data."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2026-04-15T17:35:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 264.9200134277344
+    },
+    {
+      "dt": "2026-04-15T18:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 265.19000244140625
+    }
+  ]
+}

@@ -2,75 +2,65 @@
 import backtrader as bt
 
 
-class NvdaBreakoutEmaTrail(bt.Strategy):
-    params = (
-        ('ema_period', 8),
-        ('resistance', 179.33),
-        ('tp1', 184.89),
-        ('tp2', 192.95),
-        ('risk_pct', 0.02),
+class NvdaEmaBreakoutStrategy(bt.Strategy):
+    params = dict(
+        ema_period=8,
+        entry_level=179.33,
+        tp1_price=184.89,
+        tp2_price=192.95,
+        risk_pct=0.02,
     )
 
     def __init__(self):
-        # Indicator: 8-period Exponential Moving Average
-        self.ema = bt.indicators.ExponentialMovingAverage(
-            self.data.close, period=self.p.ema_period)
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
         self.order = None
-        self.trail_stop = None      # ratcheting trailing-stop level
-        self.took_partial = False   # whether the 50% take-profit was taken
+        self.stop_price = None
+        self.tp1_done = False
+        self.entry_size = None
 
     def notify_order(self, order):
-        if order.status in [order.Completed, order.Canceled,
-                            order.Margin, order.Rejected]:
-            self.order = None
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_size = order.executed.size
+        self.order = None
 
     def next(self):
-        # Guard against pending orders
         if self.order:
             return
 
-        # ---- Entry ----
         if not self.position:
-            # Buy if the current bar's close exceeds the resistance level
-            if self.data.close[0] > self.p.resistance:
-                # Trailing-stop distance = value of the 8-period EMA, so the
-                # per-share risk (entry - stop) equals that same distance.
-                risk_per_share = self.ema[0]
-                if risk_per_share > 0:
-                    cash_risk = self.p.risk_pct * self.broker.getvalue()
-                    # Position size so that potential loss <= 2% of capital
-                    size = int(cash_risk / risk_per_share)
-                    if size > 0:
-                        self.order = self.buy(size=size)
-                        self.trail_stop = None
-                        self.took_partial = False
+            self.stop_price = None
+            self.tp1_done = False
+            self.entry_size = None
+            if self.data.close[0] > self.p.entry_level:
+                # per-share risk equals the trailing stop's initial distance (the EMA value)
+                risk_amount = self.p.risk_pct * self.broker.getvalue()
+                size = int(risk_amount / self.ema[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
             return
 
-        # ---- In a position ----
-        # Update the trailing stop: it lags the price by a distance equal to
-        # the EMA value and never falls below its previous value.
-        new_stop = self.data.close[0] - self.ema[0]
-        if self.trail_stop is None or new_stop > self.trail_stop:
-            self.trail_stop = new_stop
+        candidate_stop = self.data.close[0] - self.ema[0]
+        self.stop_price = candidate_stop if self.stop_price is None else max(self.stop_price, candidate_stop)
 
-        # Trailing stop hit -> exit the whole remaining position
-        if self.data.low[0] <= self.trail_stop:
+        if not self.tp1_done and self.data.high[0] >= self.p.tp1_price:
+            self.tp1_done = True
+            close_size = self.entry_size // 2
+            if close_size > 0:
+                self.order = self.sell(size=close_size)
+        elif self.tp1_done and self.data.high[0] >= self.p.tp2_price:
             self.order = self.close()
-            return
-
-        # Final take-profit -> close the remaining part of the position
-        if self.data.high[0] >= self.p.tp2:
+        elif self.data.low[0] <= self.stop_price:
             self.order = self.close()
-            return
-
-        # First take-profit -> close 50% of the position
-        if not self.took_partial and self.data.high[0] >= self.p.tp1:
-            half = int(abs(self.position.size) * 0.5)
-            if half > 0:
-                self.order = self.sell(size=half)
-            self.took_partial = True
-            return
 ```
 ```json
-{"assumptions": [{"topic": "trailing stop distance", "choice": "Implemented the trailing stop literally as stop = close - EMA(8) value (distance below price equals the EMA value), ratcheting upward and never decreasing; trigger evaluated on the bar's low <= stop.", "reason": "The spec states the stop lags the price 'by a distance equal to the value of the 8-period EMA'. Taken literally the EMA value (~150-200) is a very large distance, so the stop sits near/below zero and rarely triggers; this is the closest literal reading of the stated rule. Reference price chosen as close since entry is defined on close."}, {"topic": "reaching price", "choice": "'Upon reaching the price 184.89 / 192.95' is evaluated as the bar's high >= target level; entry uses the explicitly stated close > 179.33.", "reason": "Take-profit wording ('upon reaching the price') implies the level being touched during the bar, so the intrabar high is used; the spec is explicit that entry keys off the closing price."}, {"topic": "position sizing", "choice": "size = int((0.02 * broker.getvalue()) / EMA(8)), where the stop distance (EMA value) is the per-share risk; total capital = current portfolio value.", "reason": "Spec: risk per trade <= 2% of total capital, size so the stop-loss loss does not exceed it. Per-share risk equals the stop distance, which by the trailing-stop rule equals the EMA value."}, {"topic": "same-bar take-profits", "choice": "If a bar's high reaches the final target (192.95) the entire remaining position is closed in that bar; the 50% partial (184.89) is only taken when the final target is not yet reached that bar.", "reason": "Only one order per bar is placed; when both levels are hit in one bar the net result of taking 50% then the remainder is a full close, so closing fully is equivalent."}, {"topic": "partial size rounding", "choice": "When 50% of the (integer) position rounds to 0 shares, no partial order is sent but the partial-take flag is set so it is not retried; the remainder exits at the final take-profit or trailing stop.", "reason": "With ~$10,000 capital and an EMA-sized risk distance the computed position size is often 1 share, which cannot be halved into whole shares."}]}
+{"assumptions": [
+  {"topic": "position_sizing_formula", "choice": "Per-share risk at entry is defined as the current 8-period EMA value (since the trailing stop's initial level is entry close minus EMA, so the initial loss-per-share equals the EMA value exactly); size = floor(0.02 * broker.getvalue() / EMA_at_entry).", "reason": "The spec's own trailing-stop distance definition ('distance equal to the value of the 8-period EMA') fixes the per-share risk at entry, which the 2% risk-cap sizing formula must use directly."},
+  {"topic": "risk_capital_base", "choice": "Interpreted 'total trading capital' as the live portfolio value (self.broker.getvalue()) at the moment of entry, not the fixed initial deposit.", "reason": "Spec does not specify static vs. dynamic capital base; using current equity is the standard convention for per-trade risk sizing."},
+  {"topic": "trailing_stop_reference_price", "choice": "Trailing stop candidate computed each bar as close[0] - EMA[0], ratcheted upward via max(previous, candidate), never lowered.", "reason": "Spec says the stop 'follows the price' without specifying high/low/close; close was chosen for consistency with the EMA's own close-based computation and the close-based entry condition."},
+  {"topic": "exit_trigger_detection", "choice": "Take-profit levels are checked against the bar's high (high[0] >= target) and the trailing stop against the bar's low (low[0] <= stop); once triggered, the exit is a plain market order (self.sell()/self.close()) filled at the next bar's open per backtrader defaults.", "reason": "Spec states prices are 'reached'/'upon reaching', implying intrabar threshold crossing; no order type is specified, so canonical default market-order execution is used."},
+  {"topic": "exit_priority_same_bar", "choice": "If multiple exit conditions are true on the same bar, priority follows the spec's listed order: take-profit 1, then final take-profit, then trailing stop.", "reason": "Only one order can be guarded/pending at a time, and the spec enumerates these three exits in that sequence."},
+  {"topic": "partial_close_rounding", "choice": "50% take-profit size = floor(entry_size / 2) whole shares; if that floors to zero, no partial order is submitted (tp1 is still marked done) and the full remaining position is left for the final take-profit/trailing stop.", "reason": "Backtrader trades whole shares by default; integer floor is the standard convention when share counts are odd or small."}
+]}
 ```

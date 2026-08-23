@@ -1,0 +1,122 @@
+```python
+import backtrader as bt
+
+
+class SessionVWAP(bt.Indicator):
+    lines = ('vwap',)
+
+    def __init__(self):
+        self._cum_pv = 0.0
+        self._cum_v = 0.0
+        self._last_date = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        if dt != self._last_date:
+            self._cum_pv = 0.0
+            self._cum_v = 0.0
+            self._last_date = dt
+        typical_price = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0
+        vol = self.data.volume[0]
+        self._cum_pv += typical_price * vol
+        self._cum_v += vol
+        self.lines.vwap[0] = self._cum_pv / self._cum_v if self._cum_v else typical_price
+
+
+class SlopeIndicator(bt.Indicator):
+    lines = ('slope',)
+    params = (('period', 20),)
+
+    def __init__(self):
+        self.lines.slope = self.data - self.data(-self.p.period)
+
+
+class VWAPMeanReversion(bt.Strategy):
+    params = (
+        ('slope_period', 20),
+        ('stddev_period', 20),
+        ('vwap_base_period', 20),
+        ('threshold_mult', 2.0),
+        ('stop_loss_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.vwap = SessionVWAP(self.data)
+        self.slope = SlopeIndicator(self.vwap, period=self.p.slope_period)
+        self.slope_std = bt.indicators.StdDev(self.slope, period=self.p.stddev_period)
+        self.threshold = self.slope_std * self.p.threshold_mult
+        self.vwap_base = bt.indicators.SMA(self.vwap, period=self.p.vwap_base_period)
+        self.crossover = bt.indicators.CrossOver(self.vwap, self.vwap_base)
+
+        self.entry_order = None
+        self.exit_order = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order is self.entry_order:
+                entry_price = order.executed.price
+                if order.isbuy():
+                    stop_price = entry_price * (1.0 - self.p.stop_loss_pct)
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=order.executed.size)
+                else:
+                    stop_price = entry_price * (1.0 + self.p.stop_loss_pct)
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=abs(order.executed.size))
+                self.entry_order = None
+            elif order is self.stop_order:
+                self.stop_order = None
+                self.exit_order = None
+            elif order is self.exit_order:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.exit_order = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self.entry_order:
+                self.entry_order = None
+            elif order is self.stop_order:
+                self.stop_order = None
+            elif order is self.exit_order:
+                self.exit_order = None
+
+    def next(self):
+        if self.entry_order is not None or self.exit_order is not None:
+            return
+
+        prior_slope = self.slope[-1]
+        prior_threshold = self.threshold[-1]
+        cur_slope = self.slope[0]
+
+        if not self.position:
+            long_setup = prior_slope < -prior_threshold and cur_slope > prior_slope
+            short_setup = prior_slope > prior_threshold and cur_slope < prior_slope
+
+            if long_setup:
+                self.entry_order = self.buy()
+            elif short_setup:
+                self.entry_order = self.sell()
+        else:
+            if self.position.size > 0 and self.crossover[0] > 0:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.exit_order = self.close()
+            elif self.position.size < 0 and self.crossover[0] < 0:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.exit_order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "vwap_price_component", "choice": "Use typical price (High+Low+Close)/3 as the per-bar price input to the session VWAP", "reason": "Spec names 'session VWAP' but does not state which price component to weight by volume; typical price is the standard VWAP convention."},
+  {"topic": "threshold_reference_bar", "choice": "The 'prior bar' threshold check compares slope(-1) against threshold(-1) (i.e. 2*slope_std computed at the same prior bar), not the current bar's threshold", "reason": "Literal reading of 'slope was below -threshold on the prior bar' evaluates both slope and its threshold at that same past bar, since threshold is itself a rolling, time-varying quantity."},
+  {"topic": "slope_day_boundary", "choice": "The 20-bar slope lookback (VWAP - VWAP(-20)) is not reset or blanked at session/day boundaries; it always compares to the value 20 bars earlier even if that spans two trading days", "reason": "Spec explicitly states only the VWAP's cumulative PV/V reset each day; the slope difference is defined purely as a 20-bar offset with no stated day-boundary exception."},
+  {"topic": "stop_order_size", "choice": "The protective stop order's size is explicitly set to match the entry order's executed size rather than relying on the default sizer", "reason": "Ensures the stop-loss fully closes the exact position that was opened, as required by 'protective stop-loss' guarding that specific position."},
+  {"topic": "stop_mechanism", "choice": "Implemented via a native backtrader Stop order (bt.Order.Stop) submitted immediately after entry fill at entry_price*(1 -/+ StopLossPercent), rather than manual price-checking logic in next()", "reason": "Spec explicitly allows either 'stop orders or manual stop logic'; a native stop order is the more literal and precise implementation of a stop-loss."}
+]}
+```

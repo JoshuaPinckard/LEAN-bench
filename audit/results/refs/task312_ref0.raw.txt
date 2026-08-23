@@ -1,0 +1,197 @@
+```python
+import backtrader as bt
+
+
+class VolumeClimaxReversalStrategy(bt.Strategy):
+    N_TREND_BARS = 6
+    TREND_MOVE_ATR_MULT = 1.5
+    M_PULLBACK_BARS = 8
+    RETRACE_ATR_MULT = 0.5
+    BLOWOFF_VOL_MULT = 2.0
+    BLOWOFF_RANGE_ATR_MULT = 1.2
+    BLOWOFF_CLOSE_POS_THRESH = 0.25
+    EXIT_VOL_MULT = 1.5
+    STOP_LOSS_PCT = 0.02
+
+    def __init__(self):
+        self.sma_close = bt.indicators.SMA(self.data.close, period=50)
+        self.sma_vol = bt.indicators.SMA(self.data.volume, period=20)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.order_action = None
+
+        self.setup_state = 'idle'
+        self.blowoff_trend = None
+        self.blowoff_high = None
+        self.blowoff_low = None
+        self.blowoff_close = None
+        self.bars_since_blowoff = 0
+
+        self.entry_trend = None
+        self.pos_blowoff_high = None
+        self.pos_blowoff_low = None
+        self.entry_price = None
+        self.stop_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if self.order_action == 'entry':
+                self.entry_price = order.executed.price
+                if self.entry_trend == 'up':
+                    self.stop_price = self.entry_price * (1.0 + self.STOP_LOSS_PCT)
+                else:
+                    self.stop_price = self.entry_price * (1.0 - self.STOP_LOSS_PCT)
+            elif self.order_action == 'exit':
+                self._reset_trade_state()
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if self.order_action == 'entry':
+                self._reset_trade_state()
+
+        self.order = None
+        self.order_action = None
+
+    def _reset_trade_state(self):
+        self.setup_state = 'idle'
+        self.blowoff_trend = None
+        self.blowoff_high = None
+        self.blowoff_low = None
+        self.blowoff_close = None
+        self.bars_since_blowoff = 0
+        self.entry_trend = None
+        self.pos_blowoff_high = None
+        self.pos_blowoff_low = None
+        self.entry_price = None
+        self.stop_price = None
+
+    def _enter_short(self):
+        self.entry_trend = 'up'
+        self.pos_blowoff_high = self.blowoff_high
+        self.pos_blowoff_low = self.blowoff_low
+        self.setup_state = 'idle'
+        self.blowoff_trend = None
+        self.order_action = 'entry'
+        self.order = self.sell()
+
+    def _enter_long(self):
+        self.entry_trend = 'down'
+        self.pos_blowoff_high = self.blowoff_high
+        self.pos_blowoff_low = self.blowoff_low
+        self.setup_state = 'idle'
+        self.blowoff_trend = None
+        self.order_action = 'entry'
+        self.order = self.buy()
+
+    def _manage_position(self):
+        close = self.data.close[0]
+        volume = self.data.volume[0]
+        smavol = self.sma_vol[0]
+
+        if self.entry_trend == 'up':
+            if close >= self.stop_price:
+                self.order_action = 'exit'
+                self.order = self.close()
+                return
+            if close > self.pos_blowoff_high and volume >= self.EXIT_VOL_MULT * smavol:
+                self.order_action = 'exit'
+                self.order = self.close()
+                return
+        else:
+            if close <= self.stop_price:
+                self.order_action = 'exit'
+                self.order = self.close()
+                return
+            if close < self.pos_blowoff_low and volume >= self.EXIT_VOL_MULT * smavol:
+                self.order_action = 'exit'
+                self.order = self.close()
+                return
+
+    def _scan_for_setup(self):
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        volume = self.data.volume[0]
+        sma50 = self.sma_close[0]
+        sma50_prev = self.sma_close[-1]
+        smavol = self.sma_vol[0]
+        atr = self.atr[0]
+
+        uptrend = close > sma50 and sma50 > sma50_prev
+        downtrend = close < sma50 and sma50 < sma50_prev
+
+        if self.setup_state == 'wait_entry':
+            if self.blowoff_trend == 'up':
+                if close < self.data.low[-1]:
+                    self._enter_short()
+                    return
+            else:
+                if close > self.data.high[-1]:
+                    self._enter_long()
+                    return
+
+        elif self.setup_state == 'wait_pullback':
+            self.bars_since_blowoff += 1
+            if self.bars_since_blowoff > self.M_PULLBACK_BARS:
+                self.setup_state = 'idle'
+            else:
+                if self.blowoff_trend == 'up':
+                    if close <= self.blowoff_close - self.RETRACE_ATR_MULT * atr:
+                        self.setup_state = 'wait_entry'
+                        if close < self.data.low[-1]:
+                            self._enter_short()
+                            return
+                else:
+                    if close >= self.blowoff_close + self.RETRACE_ATR_MULT * atr:
+                        self.setup_state = 'wait_entry'
+                        if close > self.data.high[-1]:
+                            self._enter_long()
+                            return
+
+        if uptrend:
+            strong_move = (close - self.data.close[-self.N_TREND_BARS]) > self.TREND_MOVE_ATR_MULT * atr
+            if strong_move:
+                rng = high - low
+                if volume > self.BLOWOFF_VOL_MULT * smavol and rng > self.BLOWOFF_RANGE_ATR_MULT * atr:
+                    if rng > 0 and (high - close) / rng < self.BLOWOFF_CLOSE_POS_THRESH:
+                        self.blowoff_trend = 'up'
+                        self.blowoff_high = high
+                        self.blowoff_low = low
+                        self.blowoff_close = close
+                        self.bars_since_blowoff = 0
+                        self.setup_state = 'wait_pullback'
+        elif downtrend:
+            strong_move = (self.data.close[-self.N_TREND_BARS] - close) > self.TREND_MOVE_ATR_MULT * atr
+            if strong_move:
+                rng = high - low
+                if volume > self.BLOWOFF_VOL_MULT * smavol and rng > self.BLOWOFF_RANGE_ATR_MULT * atr:
+                    if rng > 0 and (close - low) / rng < self.BLOWOFF_CLOSE_POS_THRESH:
+                        self.blowoff_trend = 'down'
+                        self.blowoff_high = high
+                        self.blowoff_low = low
+                        self.blowoff_close = close
+                        self.bars_since_blowoff = 0
+                        self.setup_state = 'wait_pullback'
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self._manage_position()
+            return
+
+        self._scan_for_setup()
+```
+```json
+{"assumptions": [
+  {"topic": "blow-off bar definition", "choice": "Require both the strong directional move (definition 2, over the trailing N=6 bars ending at the current bar) and the blow-off signature (definition 3: volume/range/close-position) to hold simultaneously on the same bar before flagging it a blow-off/climax bar.", "reason": "Spec presents 2 and 3 as sequential components of one climax pattern culminating in a 'blow-off (climax) bar'; a single combined per-bar test is the most literal, coherent reading."},
+  {"topic": "setup re-scanning", "choice": "Blow-off detection runs every bar (while flat, no order pending) regardless of an in-progress pullback/entry setup; a newly qualifying blow-off bar overwrites the stored setup and restarts the M=8-bar pullback clock.", "reason": "Spec does not state whether an in-progress setup should be locked against newer blow-off bars; treating the most recent qualifying bar as authoritative avoids ignoring newer evidence."},
+  {"topic": "entry window after pullback", "choice": "Once the pullback condition (definition 4) is confirmed within the M=8 bar window, the entry trigger (close breaking the prior bar's high/low) is watched with no additional expiry.", "reason": "Spec bounds only 'wait up to M=8 bars for a pullback'; no separate timeout is stated for the entry trigger after pullback confirmation."},
+  {"topic": "retrace ATR reference bar", "choice": "The 0.5*ATR(14) pullback retrace threshold uses the current bar's live ATR(14) at the time the pullback is checked, not the ATR recorded at the blow-off bar.", "reason": "Spec writes 'retrace=0.5*ATR(14)' without an explicit bar index; using the live ATR at check time is consistent with the per-bar evaluation of every other condition."},
+  {"topic": "stop-loss execution mechanics", "choice": "Stop-loss and both discretionary exits are evaluated by comparing each bar's close price to the threshold inside next() and issuing a market self.close(), rather than placing a resting broker Stop order.", "reason": "Every exit condition in the spec is defined via close-price comparisons (e.g., 'close > blowoff_high'); evaluating the stop the same way keeps all exit logic on one consistent literal basis, since the spec does not specify intrabar stop-order mechanics."},
+  {"topic": "zero-range guard on close-position ratio", "choice": "Require range (high-low) > 0 before computing the (high-close)/range or (close-low)/range blow-off ratio.", "reason": "Purely defensive against division by zero; the enclosing range > 1.2*ATR condition already makes a zero-range bar unable to qualify, so this never filters out a bar the spec would otherwise count."}
+]}
+```

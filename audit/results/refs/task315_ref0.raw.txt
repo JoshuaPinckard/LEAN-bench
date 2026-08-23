@@ -1,0 +1,71 @@
+```python
+import backtrader as bt
+
+
+class MonthlySmaStopStrategy(bt.Strategy):
+    params = dict(
+        sma_period=20,
+        entry_day=25,
+        exit_day=5,
+        stop_pct=0.02,
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.order = None
+        self.stop_order = None
+        self.entry_trigger_key = None
+        self.exit_trigger_key = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order is self.stop_order:
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+            return
+
+        if order is self.order:
+            if order.status == order.Completed and order.isbuy():
+                stop_price = order.executed.price * (1 - self.p.stop_pct)
+                self.stop_order = self.sell(
+                    exectype=bt.Order.Stop,
+                    price=stop_price,
+                    size=order.executed.size,
+                )
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                self.order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        month_key = (dt.year, dt.month)
+
+        if dt.day >= self.p.exit_day and self.exit_trigger_key != month_key:
+            self.exit_trigger_key = month_key
+            if self.position and self.order is None:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+
+        if dt.day >= self.p.entry_day and self.entry_trigger_key != month_key:
+            self.entry_trigger_key = month_key
+            if not self.position and self.order is None:
+                if self.data.close[0] > self.sma[0]:
+                    cash = self.broker.get_cash()
+                    price = self.data.close[0]
+                    commission = self.broker.getcommissioninfo(self.data).p.commission
+                    size = int(cash / (price * (1 + commission)))
+                    if size > 0:
+                        self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "trigger detection", "choice": "Track the (year, month) of the last fired entry/exit trigger and only act on the first bar per month where day >= threshold (25 for entry, 5 for exit), rather than re-checking the condition on every day past the threshold.", "reason": "Spec says 'the first trading session on or after the Nth calendar day', which names a single specific session per month, not a standing condition checked every day."},
+  {"topic": "max-shares sizing basis", "choice": "Compute size as int(cash / (close_price * (1 + commission))) using the trigger day's close price and the broker's live commission rate.", "reason": "Spec says 'sized to use all available cash (max shares considering commission)' but doesn't specify which price to base the calculation on; the actual fill occurs at the next bar's open under Backtrader's default execution timing, so the trigger-day close is the best available literal basis at decision time."},
+  {"topic": "stop order validity", "choice": "Submit the stop order without a 'valid' parameter so it remains active (GTC) across multiple sessions until it fills or is explicitly canceled at the next exit trigger.", "reason": "The stop must persist from entry until the following month's exit trigger; Backtrader's default broker simulation keeps unvalidated orders live until filled/canceled, matching this requirement without extra logic."},
+  {"topic": "following month exit semantics", "choice": "Implement the exit trigger identically every month (first session with day >= 5) and only act if a position is currently open, rather than explicitly tracking 'the month after entry'.", "reason": "Because the day-5 exit check in a given month always occurs chronologically before that month's day-25 entry check, this naturally reproduces 'close on/after the 5th of the month following entry' without extra state."},
+  {"topic": "order overlap guard", "choice": "Guard both the market order (self.order) and the stop order (self.stop_order) independently, resetting each to None on Completed/Canceled/Margin/Rejected in notify_order.", "reason": "Canonical default requires guarding pending orders; the stop order and the entry/exit market order are distinct order lifecycles that must be tracked separately."}
+]}
+```

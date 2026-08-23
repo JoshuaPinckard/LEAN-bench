@@ -1,0 +1,216 @@
+```python
+import backtrader as bt
+
+
+class SwingTrendSMAStrategy(bt.Strategy):
+    params = dict(
+        sma_fast=50,
+        sma_slow=200,
+        vol_period=20,
+        atr_period=14,
+        atr_sma_period=50,
+        pullback_min=10,
+        pullback_max=20,
+        vol_mult=1.5,
+        stop_lookback=20,
+        swing_min=20,
+        swing_max=30,
+        max_stop_pct=0.05,
+        risk_pct=0.01,
+        trail_r_multiple=1.5,
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_fast)
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_slow)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma50)
+
+        self.order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.target_price = None
+        self.risk_per_share = None
+        self.direction = None
+        self.trail_moved = False
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self._manage_trailing_stop()
+            return
+
+        if self.stop_order or self.target_order:
+            return
+
+        long_trend = self.data.close[0] > self.sma200[0]
+        short_trend = self.data.close[0] < self.sma200[0]
+
+        was_below = any(
+            self.data.close[-i] < self.sma50[-i]
+            for i in range(self.p.pullback_min, self.p.pullback_max + 1)
+        )
+        was_above = any(
+            self.data.close[-i] > self.sma50[-i]
+            for i in range(self.p.pullback_min, self.p.pullback_max + 1)
+        )
+
+        long_signal = long_trend and was_below and self.crossover[0] > 0
+        short_signal = short_trend and was_above and self.crossover[0] < 0
+
+        if not (long_signal or short_signal):
+            return
+
+        volume_confirmed = self.data.volume[0] >= self.p.vol_mult * self.vol_sma[0]
+        volatility_confirmed = self.atr[0] > self.atr_sma[0]
+
+        if not (volume_confirmed and volatility_confirmed):
+            return
+
+        if long_signal:
+            self._try_enter_long()
+        else:
+            self._try_enter_short()
+
+    def _try_enter_long(self):
+        entry_est = self.data.close[0]
+        recent_low = min(
+            self.data.low[-i] for i in range(1, self.p.stop_lookback + 1)
+        )
+        stop_distance = entry_est - recent_low
+        if stop_distance <= 0 or stop_distance > self.p.max_stop_pct * entry_est:
+            return
+
+        swing_high = max(
+            self.data.high[-i] for i in range(self.p.swing_min, self.p.swing_max + 1)
+        )
+
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        size = risk_amount / stop_distance
+        if size <= 0:
+            return
+
+        self.direction = 'long'
+        self.stop_price = recent_low
+        self.target_price = swing_high
+        self.trail_moved = False
+        self.order = self.buy(size=size)
+
+    def _try_enter_short(self):
+        entry_est = self.data.close[0]
+        recent_high = max(
+            self.data.high[-i] for i in range(1, self.p.stop_lookback + 1)
+        )
+        stop_distance = recent_high - entry_est
+        if stop_distance <= 0 or stop_distance > self.p.max_stop_pct * entry_est:
+            return
+
+        swing_low = min(
+            self.data.low[-i] for i in range(self.p.swing_min, self.p.swing_max + 1)
+        )
+
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        size = risk_amount / stop_distance
+        if size <= 0:
+            return
+
+        self.direction = 'short'
+        self.stop_price = recent_high
+        self.target_price = swing_low
+        self.trail_moved = False
+        self.order = self.sell(size=size)
+
+    def _manage_trailing_stop(self):
+        if self.trail_moved or self.entry_price is None or self.risk_per_share is None:
+            return
+        if not self.stop_order:
+            return
+
+        if self.direction == 'long':
+            profit = self.data.close[0] - self.entry_price
+        else:
+            profit = self.entry_price - self.data.close[0]
+
+        if profit >= self.p.trail_r_multiple * self.risk_per_share:
+            self.cancel(self.stop_order)
+            if self.direction == 'long':
+                self.stop_order = self.sell(
+                    exectype=bt.Order.Stop, price=self.entry_price, size=self.position.size
+                )
+            else:
+                self.stop_order = self.buy(
+                    exectype=bt.Order.Stop, price=self.entry_price, size=abs(self.position.size)
+                )
+            self.stop_price = self.entry_price
+            self.trail_moved = True
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self.entry_price = order.executed.price
+                self.risk_per_share = abs(self.entry_price - self.stop_price)
+                self.order = None
+                if self.direction == 'long':
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=self.stop_price, size=self.position.size
+                    )
+                    self.target_order = self.sell(
+                        exectype=bt.Order.Limit, price=self.target_price, size=self.position.size
+                    )
+                else:
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=self.stop_price, size=abs(self.position.size)
+                    )
+                    self.target_order = self.buy(
+                        exectype=bt.Order.Limit, price=self.target_price, size=abs(self.position.size)
+                    )
+            elif order == self.stop_order:
+                if self.target_order and self.target_order.alive():
+                    self.cancel(self.target_order)
+                self._reset_trade_state()
+            elif order == self.target_order:
+                if self.stop_order and self.stop_order.alive():
+                    self.cancel(self.stop_order)
+                self._reset_trade_state()
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+                self.direction = None
+                self.stop_price = None
+                self.target_price = None
+            elif order == self.stop_order:
+                self._reset_trade_state()
+            elif order == self.target_order:
+                self._reset_trade_state()
+
+    def _reset_trade_state(self):
+        self.order = None
+        self.stop_order = None
+        self.target_order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.target_price = None
+        self.risk_per_share = None
+        self.direction = None
+        self.trail_moved = False
+```
+```json
+{"assumptions": [
+  {"topic": "pullback lookback window", "choice": "Interpreted 'below/above SMA(50) in the last 10-20 bars' as checking bar offsets -10 through -20 (inclusive) from the current bar for the required prior condition, separate from the crossover bar itself.", "reason": "Spec gives a range (10-20) rather than a single lookback; this window mirrors how the range is stated."},
+  {"topic": "swing level lookback window", "choice": "Interpreted 'previous high/low over 20-30 bars' as the max/min over bar offsets -20 through -30 (inclusive), analogous to the pullback window phrasing.", "reason": "Spec states the same '10-20'/'20-30' style range for two different lookbacks; applied consistent interpretation to both."},
+  {"topic": "entry price for stop-distance/sizing checks", "choice": "Used the signal bar's close as the entry-price estimate for the 5%-stop-distance mandatory check and initial position sizing; after the entry order fills, entry_price and risk_per_share are recomputed from the actual executed fill price for R-multiple/break-even tracking.", "reason": "Orders submitted in next() fill at the following bar's open under the harness's default broker; close is the best information available at signal time, and using the real fill price afterward keeps R-multiple tracking accurate."},
+  {"topic": "risk per trade percentage", "choice": "Fixed risk_pct at 1% of current portfolio value (self.broker.getvalue()) at signal time.", "reason": "Spec states a 1-2% range without pinning an exact value; picked a single fixed value within the stated range as required by the canonical-defaults instruction to declare unstated choices."},
+  {"topic": "stop/target order management", "choice": "Stop and take-profit are placed as two independent Stop/Limit orders (not backtrader's built-in OCO bracket), with each side's fill manually canceling the other.", "reason": "The spec requires moving the stop to break-even mid-trade while keeping the take-profit order alive; backtrader's native OCO bracket would auto-cancel the take-profit when the stop is replaced, so manual linkage was used instead."},
+  {"topic": "non-positive stop distance", "choice": "If the computed stop distance is <= 0 (e.g., recent low/high is not on the correct side of the estimated entry price), the signal is skipped.", "reason": "The risk-based sizing formula (risk$/distance) is undefined/nonsensical for non-positive distance, and the spec provides no other guard for this degenerate case."},
+  {"topic": "optional trailing to break-even", "choice": "Implemented as an unconditional mechanic that triggers exactly when floating profit reaches 1.5R, moving the stop order to the entry price.", "reason": "The spec names an exact trigger (1.5R) and action (move stop to break-even); 'optional' was read as 'conditionally activates' rather than 'may be omitted'."}
+]}
+```

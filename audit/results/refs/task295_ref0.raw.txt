@@ -1,0 +1,108 @@
+```python
+import backtrader as bt
+
+
+class DividendPitchforkStrategist(bt.Strategy):
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+
+        self.order = None
+        self.state = None
+        self.entry_bar = None
+        self.stop_price = None
+        self.target_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _calc_entry_size(self):
+        value = self.broker.getvalue()
+        cash = self.broker.getcash()
+        price = self.data.close[0]
+        commission = 0.001
+        cap = 0.5 * value
+        size = int(cap // price)
+        while size > 0:
+            invested = size * price
+            cost = invested * (1 + commission)
+            if invested <= cap and (cash - cost) >= cap:
+                break
+            size -= 1
+        return max(size, 0)
+
+    def _enter_position(self):
+        size = self._calc_entry_size()
+        if size <= 0:
+            return
+        price = self.data.close[0]
+        atr_now = self.atr[0]
+        self.order = self.buy(size=size)
+        self.stop_price = price - 1.5 * atr_now
+        self.target_price = price + 1.0 * atr_now
+        self.entry_bar = len(self)
+        self.state = 'putsell'
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            self.state = None
+            if self.data.close[0] <= self.bb.bot[0] and 25 <= self.rsi[0] <= 45:
+                self._enter_position()
+            return
+
+        close = self.data.close[0]
+
+        if self.state == 'core':
+            if close > self.sma50[0] or self.rsi[0] > 60:
+                self.order = self.close()
+                self.state = None
+            return
+
+        bars_held = len(self) - self.entry_bar
+
+        if close <= self.stop_price:
+            self.order = self.close()
+            self.state = None
+            return
+
+        if close >= self.bb.mid[0] or close >= self.target_price:
+            self.order = self.close()
+            self.state = None
+            return
+
+        if close <= (self.bb.bot[0] - self.atr[0]) or self.rsi[0] < 25:
+            position_share = (self.position.size * close) / self.broker.getvalue()
+            if position_share <= 0.5:
+                self.state = 'core'
+                return
+
+        if 25 <= bars_held <= 27:
+            self.order = self.close()
+            self.state = None
+            if close <= self.bb.bot[0]:
+                self._enter_position()
+            return
+
+        if bars_held >= 30:
+            self.order = self.close()
+            self.state = None
+```
+```json
+{"assumptions": [
+  {"topic": "capital definition", "choice": "All '% of capital' checks (50% invested-share cap at entry, cash-after-trade floor, and the capital-share re-check at conversion) use current total portfolio equity (self.broker.getvalue()), not the fixed starting cash.", "reason": "Spec repeatedly frames these as live risk limits on the account, which is standard practice for ongoing position-sizing caps rather than a one-time reference to initial capital."},
+  {"topic": "ATR reference for stop/target", "choice": "Freeze the ATR(14) value at entry and use it for both the protective stop (entry-1.5xATR) and the profit target (entry+1xATR); these become fixed price levels set at trade inception, not trailing/rolling values.", "reason": "The spec explicitly anchors the stop 'at entry', so the parallel profit-taking threshold is read the same way for internal consistency."},
+  {"topic": "ATR reference for assignment trigger", "choice": "The 'closes below the lower BB by another 1xATR(14)' assignment/conversion trigger uses the current (bar-by-bar) lower band and ATR(14), not the entry-time snapshot.", "reason": "This clause is phrased against 'the lower BB', an ongoing indicator series, unlike the stop/target's entry-anchored wording."},
+  {"topic": "evaluation basis for all price triggers", "choice": "Every threshold (stop, target, assignment, roll, SMA/RSI exits) is evaluated against the daily close only, never intrabar high/low.", "reason": "The spec consistently uses 'close' language throughout; using intrabar extremes would be an unstated addition."},
+  {"topic": "core-state exits supersede put-selling exits", "choice": "Once converted to 'core', the protective stop, profit target, DTE/roll, and 30-bar cap are all ignored; the position only closes on close>SMA(50) or RSI(14)>60.", "reason": "Spec calls the core holding 'long-term ... without a time stop' and gives a standalone exit rule for it, implying the prior stop/timer machinery no longer governs the position."},
+  {"topic": "priority among simultaneous exit signals", "choice": "Check order each bar: protective stop, then profit target, then assignment/conversion, then the 25-27 bar DTE/roll rule, then the 30-bar cap.", "reason": "Spec does not state precedence; this ordering treats the hard risk stop as an override, profit-taking next, drawdown-driven conversion next, and time decay last, matching the options-analogy narrative (risk cut > profit > assignment > expiry)."},
+  {"topic": "roll reopen conditions", "choice": "On a roll (bar 25-27, close still <= lower BB), the old position is closed and a new one is opened unconditionally via the same sizing routine, without re-checking the RSI 25-45 entry filter.", "reason": "The spec ties 'roll' only to price still being at the lower band, not to the full original entry condition."},
+  {"topic": "infeasible", "choice": "The roll's close() and reopening buy() are issued within the same next() call so both orders are placed together; actual fill timing (same bar vs. next bar's open) is controlled by the harness's broker configuration, which the strategy cannot override.", "reason": "Backtrader's default broker fills market orders at the next bar's open, so a literally instantaneous same-bar close-and-reopen at one identical price cannot be guaranteed from strategy code alone; this is the closest literal implementation given the fixed execution environment."}
+]}
+```

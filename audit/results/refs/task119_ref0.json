@@ -1,0 +1,325 @@
+{
+  "task_id": 119,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass SupplyDemandSwingStrategy(bt.Strategy):\n    params = (\n        ('consol_window', 3),\n        ('consol_max_pct', 0.01),\n        ('impulse_min_pct', 0.01),\n        ('min_zone_height_pct', 0.005),\n        ('risk_pct', 0.01),\n        ('sl_buffer_pct', 0.005),\n        ('rr_default', 2.0),\n        ('trend_sma_period', 20),\n        ('rsi_period', 14),\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n\n        self._day_date = None\n        self._day_o = None\n        self._day_h = None\n        self._day_l = None\n        self._day_c = None\n        self.daily_bars = []\n        self.daily_closes = []\n\n        self._h4_count = 0\n        self._h4_o = None\n        self._h4_h = None\n        self._h4_l = None\n        self._h4_c = None\n        self.h4_bars = []\n\n        self.demand_zones = []\n        self.supply_zones = []\n\n        self.order = None\n        self.stop_order = None\n        self.limit_order = None\n        self._pending_stop = None\n        self._pending_target = None\n\n    def _update_daily(self):\n        dt = self.data.datetime.date(0)\n        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]\n        if self._day_date is None:\n            self._day_date = dt\n            self._day_o, self._day_h, self._day_l, self._day_c = o, h, l, c\n        elif dt == self._day_date:\n            self._day_h = max(self._day_h, h)\n            self._day_l = min(self._day_l, l)\n            self._day_c = c\n        else:\n            self.daily_bars.append((self._day_o, self._day_h, self._day_l, self._day_c))\n            self.daily_closes.append(self._day_c)\n            self._detect_zone(self.daily_bars)\n            self._day_date = dt\n            self._day_o, self._day_h, self._day_l, self._day_c = o, h, l, c\n\n    def _update_h4(self):\n        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]\n        if self._h4_count == 0:\n            self._h4_o, self._h4_h, self._h4_l, self._h4_c = o, h, l, c\n        else:\n            self._h4_h = max(self._h4_h, h)\n            self._h4_l = min(self._h4_l, l)\n            self._h4_c = c\n        self._h4_count += 1\n        if self._h4_count == 4:\n            self.h4_bars.append((self._h4_o, self._h4_h, self._h4_l, self._h4_c))\n            self._detect_zone(self.h4_bars)\n            self._h4_count = 0\n\n    def _detect_zone(self, bars):\n        w = self.p.consol_window\n        if len(bars) < w + 1:\n            return\n        window = bars[-(w + 1):-1]\n        i_open, i_high, i_low, i_close = bars[-1]\n        zone_high = max(b[1] for b in window)\n        zone_low = min(b[2] for b in window)\n        ref_price = i_close\n        if ref_price <= 0:\n            return\n        if (zone_high - zone_low) / ref_price > self.p.consol_max_pct:\n            return\n        if (zone_high - zone_low) / ref_price < self.p.min_zone_height_pct:\n            return\n        if abs(i_close - i_open) / ref_price < self.p.impulse_min_pct:\n            return\n        if i_close > i_open and i_close > zone_high:\n            self.demand_zones.append({'low': zone_low, 'high': zone_high})\n        elif i_close < i_open and i_close < zone_low:\n            self.supply_zones.append({'low': zone_low, 'high': zone_high})\n\n    def _enter_long(self, zone):\n        entry_price = self.data.close[0]\n        stop_price = zone['low'] * (1 - self.p.sl_buffer_pct)\n        risk_per_unit = entry_price - stop_price\n        if risk_per_unit <= 0:\n            return\n        target = None\n        for sz in self.supply_zones:\n            if sz['low'] > entry_price and (target is None or sz['low'] < target):\n                target = sz['low']\n        if target is None:\n            target = entry_price + self.p.rr_default * risk_per_unit\n        size = (self.broker.getvalue() * self.p.risk_pct) / risk_per_unit\n        if size <= 0:\n            return\n        self._pending_stop = stop_price\n        self._pending_target = target\n        self.order = self.buy(size=size)\n\n    def _enter_short(self, zone):\n        entry_price = self.data.close[0]\n        stop_price = zone['high'] * (1 + self.p.sl_buffer_pct)\n        risk_per_unit = stop_price - entry_price\n        if risk_per_unit <= 0:\n            return\n        target = None\n        for dz in self.demand_zones:\n            if dz['high'] < entry_price and (target is None or dz['high'] > target):\n                target = dz['high']\n        if target is None:\n            target = entry_price - self.p.rr_default * risk_per_unit\n        size = (self.broker.getvalue() * self.p.risk_pct) / risk_per_unit\n        if size <= 0:\n            return\n        self._pending_stop = stop_price\n        self._pending_target = target\n        self.order = self.sell(size=size)\n\n    def next(self):\n        self._update_daily()\n        self._update_h4()\n\n        if self.order or self.position:\n            return\n\n        if len(self.daily_closes) < self.p.trend_sma_period:\n            return\n\n        sma = sum(self.daily_closes[-self.p.trend_sma_period:]) / self.p.trend_sma_period\n        last_daily_close = self.daily_closes[-1]\n        uptrend = last_daily_close > sma\n        downtrend = last_daily_close < sma\n\n        price_open = self.data.open[0]\n        price_high = self.data.high[0]\n        price_low = self.data.low[0]\n        price_close = self.data.close[0]\n\n        if uptrend:\n            for zone in reversed(self.demand_zones):\n                zlow, zhigh = zone['low'], zone['high']\n                zmid = (zlow + zhigh) / 2.0\n                if zlow <= price_low <= zhigh and price_low <= zmid:\n                    if price_close > price_low and price_close > price_open:\n                        if self.rsi[0] < 50:\n                            self._enter_long(zone)\n                            break\n        elif downtrend:\n            for zone in reversed(self.supply_zones):\n                zlow, zhigh = zone['low'], zone['high']\n                zmid = (zlow + zhigh) / 2.0\n                if zlow <= price_high <= zhigh and price_high >= zmid:\n                    if price_close < price_high and price_close < price_open:\n                        if self.rsi[0] > 50:\n                            self._enter_short(zone)\n                            break\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order == self.order:\n            self.order = None\n            if order.status == order.Completed:\n                size = abs(order.executed.size)\n                if order.isbuy():\n                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=self._pending_stop, size=size)\n                    self.limit_order = self.sell(exectype=bt.Order.Limit, price=self._pending_target, size=size)\n                else:\n                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=self._pending_stop, size=size)\n                    self.limit_order = self.buy(exectype=bt.Order.Limit, price=self._pending_target, size=size)\n            return\n\n        if order == self.stop_order or order == self.limit_order:\n            if order.status == order.Completed:\n                other = self.limit_order if order == self.stop_order else self.stop_order\n                if other is not None and other.status in [other.Submitted, other.Accepted]:\n                    self.cancel(other)\n            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n                if order == self.stop_order:\n                    self.stop_order = None\n                else:\n                    self.limit_order = None",
+  "assumptions": [
+    {
+      "topic": "infeasible: multi-timeframe data",
+      "choice": "Synthesize 1D and 4H bars internally from the single supplied 1H feed (daily bars split on calendar-date change; 4H bars grouped every 4 consecutive 1H bars), instead of using separate resampled bt datafeeds.",
+      "reason": "The harness supplies only one 1H PandasData feed; backtrader's real multi-timeframe resampling is configured at the cerebro level, which is outside the strategy class, so this is the closest literal reading achievable inside a single bt.Strategy."
+    },
+    {
+      "topic": "4H bar alignment",
+      "choice": "4H synthetic bars group every 4 consecutive 1H bars in feed order, not aligned to fixed clock boundaries.",
+      "reason": "Spec does not specify session/clock alignment for the 4H timeframe."
+    },
+    {
+      "topic": "consolidation/zone detection algorithm",
+      "choice": "A candidate zone is the high/low range of a 3-bar consolidation window (on daily or 4H synthetic bars) whose range is <=1% of price, immediately followed by a directional impulse bar with body >=1% of price closing beyond the range (demand if bullish breakout, supply if bearish breakdown).",
+      "reason": "Spec describes zones qualitatively but gives no numeric thresholds for 'period of consolidation' or 'sharp' move; concrete values were chosen to operationalize the rule."
+    },
+    {
+      "topic": "minimum zone height enforcement",
+      "choice": "Candidate zones with height < 0.5% of the impulse bar's close are discarded rather than artificially widened.",
+      "reason": "Spec states a minimum height requirement but not how to expand an undersized zone; treating it as a validity filter is the more literal reading."
+    },
+    {
+      "topic": "zone lifecycle",
+      "choice": "Once identified, a zone remains valid for the rest of the backtest with no expiry/invalidation logic.",
+      "reason": "Spec never states that zones expire or get invalidated after being touched or broken."
+    },
+    {
+      "topic": "trend filter definition",
+      "choice": "Daily trend = uptrend if the latest completed daily close > SMA(20) of daily closes, downtrend if below.",
+      "reason": "Spec requires checking trend direction on 1D but names no indicator/method for it."
+    },
+    {
+      "topic": "optional RSI and 1H confirmation",
+      "choice": "Both the RSI(14) confirmation (<50 long, >50 short) and 1H-level pullback entries are implemented as active, required conditions.",
+      "reason": "Although marked '(Optional)' in prose, the spec gives concrete RSI(14) parameters and explicitly allows 1H entries; since the environment only provides 1H bars, using them for entries is also the literal way to satisfy the 'lower timeframe' pullback rule."
+    },
+    {
+      "topic": "bounce trigger definition",
+      "choice": "A bounce is: the bar's low (long) / high (short) touches the lower/upper half of the zone (boundary to midpoint), and the bar closes back beyond its own low/high in the trade direction.",
+      "reason": "Spec's 'bounces off the boundary or central part' is descriptive, not a precise numeric trigger."
+    },
+    {
+      "topic": "entry order timing",
+      "choice": "Entries are submitted as plain market self.buy()/self.sell() in next(), filled at the following bar's open.",
+      "reason": "Spec allows either close-of-current or open-of-next; next-open fill is backtrader's native market-order behavior and matches canonical default #1."
+    },
+    {
+      "topic": "stop-loss / take-profit execution",
+      "choice": "After entry fills, a real Stop order (0.5%-buffered zone boundary) and a real Limit order (nearest opposing zone's near edge, else 2:1 R:R) are submitted as a manual OCO pair; whichever fills first cancels the other. SL/TP levels and size are computed from the signal bar's close as an entry-price proxy.",
+      "reason": "Genuine Stop/Limit order types give faithful 'reaches this price' exit semantics; the true fill price is unknown until the next bar's open."
+    },
+    {
+      "topic": "position sizing risk percentage",
+      "choice": "Risk 1% of current portfolio value per trade.",
+      "reason": "Spec specifies a 1-2% range without pinning an exact value; 1% is the conservative bound within that stated range."
+    },
+    {
+      "topic": "zone selection priority",
+      "choice": "When multiple zones qualify for a pullback touch on the same bar, the most recently formed zone is checked first.",
+      "reason": "Spec does not state how to prioritize among overlapping/qualifying zones."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 21,
+  "tape": [
+    {
+      "dt": "2024-03-22T19:00:00",
+      "side": "BUY",
+      "size": 4.355125387685618,
+      "price": 2164.60009765625
+    },
+    {
+      "dt": "2024-03-26T10:00:00",
+      "side": "SELL",
+      "size": -4.355125387685618,
+      "price": 2198.699951171875
+    },
+    {
+      "dt": "2024-07-29T02:00:00",
+      "side": "SELL",
+      "size": -3.7470199975680223,
+      "price": 2391.5
+    },
+    {
+      "dt": "2024-07-29T05:00:00",
+      "side": "BUY",
+      "size": 3.7470199975680223,
+      "price": 2389.9999999999995
+    },
+    {
+      "dt": "2024-08-05T14:00:00",
+      "side": "BUY",
+      "size": 1.371617862319079,
+      "price": 2433.39990234375
+    },
+    {
+      "dt": "2024-09-12T14:00:00",
+      "side": "SELL",
+      "size": -1.371617862319079,
+      "price": 2581.6223901367184
+    },
+    {
+      "dt": "2024-11-27T15:00:00",
+      "side": "SELL",
+      "size": -3.396341365217073,
+      "price": 2676.39990234375
+    },
+    {
+      "dt": "2024-12-10T14:00:00",
+      "side": "BUY",
+      "size": 3.396341365217073,
+      "price": 2706.8669018554683
+    },
+    {
+      "dt": "2025-01-02T14:00:00",
+      "side": "SELL",
+      "size": -4.524203235563103,
+      "price": 2656.199951171875
+    },
+    {
+      "dt": "2025-01-03T03:00:00",
+      "side": "BUY",
+      "size": 4.524203235563103,
+      "price": 2678.8275
+    },
+    {
+      "dt": "2025-01-07T07:00:00",
+      "side": "SELL",
+      "size": -3.765935888773304,
+      "price": 2652.0
+    },
+    {
+      "dt": "2025-01-08T14:00:00",
+      "side": "BUY",
+      "size": 3.765935888773304,
+      "price": 2678.8275
+    },
+    {
+      "dt": "2025-05-05T14:00:00",
+      "side": "SELL",
+      "size": -3.4069693038201074,
+      "price": 3324.39990234375
+    },
+    {
+      "dt": "2025-05-06T01:00:00",
+      "side": "BUY",
+      "size": 3.4069693038201074,
+      "price": 3354.288098144531
+    },
+    {
+      "dt": "2025-05-29T14:00:00",
+      "side": "SELL",
+      "size": -3.3688570255555765,
+      "price": 3337.5
+    },
+    {
+      "dt": "2025-06-02T06:00:00",
+      "side": "BUY",
+      "size": 3.3688570255555765,
+      "price": 3366.448450927734
+    },
+    {
+      "dt": "2025-06-25T18:00:00",
+      "side": "SELL",
+      "size": -4.000071006962113,
+      "price": 3342.300048828125
+    },
+    {
+      "dt": "2025-07-01T12:00:00",
+      "side": "BUY",
+      "size": 4.000071006962113,
+      "price": 3366.448450927734
+    },
+    {
+      "dt": "2025-07-01T19:00:00",
+      "side": "SELL",
+      "size": -4.971132666166459,
+      "price": 3350.1999511718745
+    },
+    {
+      "dt": "2025-07-02T19:00:00",
+      "side": "BUY",
+      "size": 4.971132666166459,
+      "price": 3369.4634509277334
+    },
+    {
+      "dt": "2025-07-07T22:00:00",
+      "side": "SELL",
+      "size": -4.712049602685913,
+      "price": 3348.89990234375
+    },
+    {
+      "dt": "2025-07-11T12:00:00",
+      "side": "BUY",
+      "size": 4.712049602685913,
+      "price": 3366.448450927734
+    },
+    {
+      "dt": "2025-07-16T10:00:00",
+      "side": "SELL",
+      "size": -4.173185809722287,
+      "price": 3347.10009765625
+    },
+    {
+      "dt": "2025-07-16T15:00:00",
+      "side": "BUY",
+      "size": 4.173185809722287,
+      "price": 3369.463450927734
+    },
+    {
+      "dt": "2025-07-29T10:00:00",
+      "side": "SELL",
+      "size": -2.96295786458962,
+      "price": 3323.10009765625
+    },
+    {
+      "dt": "2025-07-30T07:00:00",
+      "side": "BUY",
+      "size": 2.96295786458962,
+      "price": 3354.288098144531
+    },
+    {
+      "dt": "2025-07-31T04:00:00",
+      "side": "SELL",
+      "size": -4.089755941059109,
+      "price": 3344.39990234375
+    },
+    {
+      "dt": "2025-07-31T08:00:00",
+      "side": "BUY",
+      "size": 4.089755941059109,
+      "price": 3366.448450927734
+    },
+    {
+      "dt": "2025-08-11T14:00:00",
+      "side": "BUY",
+      "size": 2.4225413564012768,
+      "price": 3414.89990234375
+    },
+    {
+      "dt": "2025-08-14T16:00:00",
+      "side": "SELL",
+      "size": -2.4225413564012768,
+      "price": 3377.925402832031
+    },
+    {
+      "dt": "2025-08-26T23:00:00",
+      "side": "SELL",
+      "size": -3.1187383878490795,
+      "price": 3440.39990234375
+    },
+    {
+      "dt": "2025-08-28T14:00:00",
+      "side": "BUY",
+      "size": 3.1187383878490795,
+      "price": 3468.958450927734
+    },
+    {
+      "dt": "2025-11-18T16:00:00",
+      "side": "SELL",
+      "size": -1.8182392564424985,
+      "price": 4053.39990234375
+    },
+    {
+      "dt": "2025-11-19T09:00:00",
+      "side": "BUY",
+      "size": 1.8182392564424985,
+      "price": 4101.405
+    },
+    {
+      "dt": "2026-02-20T16:00:00",
+      "side": "SELL",
+      "size": -1.2387011327335964,
+      "price": 5062.2998046875
+    },
+    {
+      "dt": "2026-02-22T23:00:00",
+      "side": "BUY",
+      "size": 1.2387011327335964,
+      "price": 5157.0
+    },
+    {
+      "dt": "2026-04-20T02:00:00",
+      "side": "BUY",
+      "size": 1.296192117257708,
+      "price": 4827.39990234375
+    },
+    {
+      "dt": "2026-04-21T14:00:00",
+      "side": "SELL",
+      "size": -1.296192117257708,
+      "price": 4761.970402832031
+    },
+    {
+      "dt": "2026-06-26T12:00:00",
+      "side": "SELL",
+      "size": -2.0877407026810246,
+      "price": 4061.1000976562505
+    },
+    {
+      "dt": "2026-06-26T14:00:00",
+      "side": "BUY",
+      "size": 2.0877407026810246,
+      "price": 4101.405
+    },
+    {
+      "dt": "2026-07-02T02:00:00",
+      "side": "SELL",
+      "size": -2.136728128042099,
+      "price": 4062.6000976562505
+    },
+    {
+      "dt": "2026-07-02T12:00:00",
+      "side": "BUY",
+      "size": 2.136728128042099,
+      "price": 4101.405
+    }
+  ]
+}

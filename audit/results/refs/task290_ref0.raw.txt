@@ -1,0 +1,100 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionZScoreStrategy(bt.Strategy):
+    params = dict(
+        bb_period=252,
+        bb_devfactor=2,
+        z_threshold=1.5,
+        exit_bars=63,
+        stop_pct=0.015,
+        risk_pct=0.01,
+        std_eps=1e-6,
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.bb.mid)
+        self.order = None
+        self.stop_order = None
+        self.exit_order = None
+        self.bar_executed = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.order:
+            if order.status == order.Completed:
+                self.bar_executed = len(self)
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                if order.isbuy():
+                    stop_price = entry_price * (1 - self.p.stop_pct)
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=size
+                    )
+                else:
+                    stop_price = entry_price * (1 + self.p.stop_pct)
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=size
+                    )
+            self.order = None
+
+        elif order == self.stop_order:
+            if order.status == order.Completed:
+                self.bar_executed = None
+            self.stop_order = None
+
+        elif order == self.exit_order:
+            if order.status == order.Completed:
+                self.bar_executed = None
+            self.exit_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.exit_order:
+                return
+            exit_by_cross = self.crossover[0] != 0
+            exit_by_timer = (
+                self.bar_executed is not None
+                and (len(self) - self.bar_executed) >= self.p.exit_bars
+            )
+            if exit_by_cross or exit_by_timer:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.exit_order = self.close()
+            return
+
+        std = (self.bb.top[0] - self.bb.mid[0]) / 2.0
+        if std <= self.p.std_eps:
+            return
+
+        z = (self.data.close[0] - self.bb.mid[0]) / std
+
+        capital = self.broker.getvalue()
+        price = self.data.close[0]
+        size = (capital * self.p.risk_pct) / (price * self.p.stop_pct)
+
+        if z <= -self.p.z_threshold:
+            self.order = self.buy(size=size)
+        elif z >= self.p.z_threshold:
+            self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "entry_gating", "choice": "Treated 'no open opposite position' as equivalent to 'flat (no open position of either direction)' before allowing a new entry — i.e., no pyramiding/re-entry while any position is open.", "reason": "The stop-loss and 63-bar timer are each defined per single entry with no rule for how they'd combine across stacked same-direction entries; honoring literal same-side pyramiding would require inventing unstated logic for multi-entry stop/timer handling, which the rules forbid. Canonical default 3 (single-position lifecycle) applies since the spec's own risk framework presumes one active trade."},
+  {"topic": "stop_loss_mechanism", "choice": "Implemented the 1.5% stop-loss as a native backtrader Stop order (bt.Order.Stop) submitted immediately after entry fills, sized to match the filled entry, and canceled if the crossover/timer exit fires first.", "reason": "Spec states the stop-loss distance but not the trigger mechanism; a resting Stop order gives realistic intrabar-triggered execution, closest literal reading of 'stop-loss'."},
+  {"topic": "exit_crossover_direction", "choice": "Exit on any CrossOver(Close, SMA) event (either direction) while a position is open, without separately checking which side it favors.", "reason": "Since entries only occur when Z is already beyond +-1.5 (i.e., strictly on one side of the mean), the first zero-crossing event after entry is necessarily the reversion crossing for that trade, so 'Z crosses 0' needs no extra directional condition."},
+  {"topic": "capital_definition", "choice": "Capital in the position-size formula = current portfolio value (self.broker.getvalue()) at signal time, not the fixed starting cash.", "reason": "Standard convention for fixed-fractional risk-based position sizing formulas ('Capital * risk% / (price * stop%)'); spec does not specify fixed vs. mark-to-market capital."},
+  {"topic": "entry_price_basis_for_sizing", "choice": "Entry price in the sizing formula uses the signal bar's Close price, not the eventual fill price.", "reason": "Order size must be computed when the order is submitted, before the actual fill price (next bar's open, by default backtrader timing) is known."},
+  {"topic": "volatility_threshold", "choice": "Interpreted 'Std ~ 0' as std <= 1e-6 (numerical-safety epsilon) to skip entry-signal generation only.", "reason": "Spec gives no explicit numeric threshold; a small epsilon guards the Z division without materially affecting real AAPL daily-price volatility, and the exit path (CrossOver) does not divide by Std so it is left unaffected."},
+  {"topic": "position_size_rounding", "choice": "Position size passed to buy()/sell() as the raw computed float (no rounding to whole shares).", "reason": "Spec gives an explicit formula with no rounding instruction; canonical defaults do not address share rounding."}
+]}
+```

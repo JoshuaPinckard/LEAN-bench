@@ -1,0 +1,37 @@
+{
+  "task_id": 389,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass VolumeSmaCrossoverStrategy(bt.Strategy):\n    params = dict(\n        vol_sma_fast=10,\n        vol_sma_slow=50,\n        price_sma_period=200,\n        stop_loss_pct=0.01,\n        take_profit_pct=0.02,\n        use_take_profit=True,\n        risk_pct=0.01,\n    )\n\n    def __init__(self):\n        self.vol_sma_fast = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_fast)\n        self.vol_sma_slow = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_slow)\n        self.price_sma = bt.indicators.SMA(self.data.close, period=self.p.price_sma_period)\n\n        self.vol_cross = bt.indicators.CrossOver(self.vol_sma_fast, self.vol_sma_slow)\n        self.price_cross = bt.indicators.CrossOver(self.data.close, self.price_sma)\n\n        self.order = None\n        self.stop_order = None\n        self.tp_order = None\n\n    def _cancel_protective_orders(self):\n        if self.stop_order:\n            self.cancel(self.stop_order)\n            self.stop_order = None\n        if self.tp_order:\n            self.cancel(self.tp_order)\n            self.tp_order = None\n\n    def _place_protective_orders(self, entry_price):\n        size = abs(self.position.size)\n        if self.position.size > 0:\n            stop_price = entry_price * (1 - self.p.stop_loss_pct)\n            self.stop_order = self.sell(size=size, exectype=bt.Order.Stop, price=stop_price)\n            if self.p.use_take_profit:\n                tp_price = entry_price * (1 + self.p.take_profit_pct)\n                self.tp_order = self.sell(size=size, exectype=bt.Order.Limit, price=tp_price)\n        else:\n            stop_price = entry_price * (1 + self.p.stop_loss_pct)\n            self.stop_order = self.buy(size=size, exectype=bt.Order.Stop, price=stop_price)\n            if self.p.use_take_profit:\n                tp_price = entry_price * (1 - self.p.take_profit_pct)\n                self.tp_order = self.buy(size=size, exectype=bt.Order.Limit, price=tp_price)\n\n    def _enter_long(self):\n        price = self.data.close[0]\n        stop_price = price * (1 - self.p.stop_loss_pct)\n        stop_distance = price - stop_price\n        if stop_distance <= 0:\n            return\n        risk_amount = self.broker.getvalue() * self.p.risk_pct\n        size = int(risk_amount / stop_distance)\n        if size < 1:\n            return\n        self.order = self.buy(size=size)\n\n    def _enter_short(self):\n        price = self.data.close[0]\n        stop_price = price * (1 + self.p.stop_loss_pct)\n        stop_distance = stop_price - price\n        if stop_distance <= 0:\n            return\n        risk_amount = self.broker.getvalue() * self.p.risk_pct\n        size = int(risk_amount / stop_distance)\n        if size < 1:\n            return\n        self.order = self.sell(size=size)\n\n    def next(self):\n        if self.order:\n            return\n\n        if not self.position:\n            if self.vol_cross[0] > 0 and self.data.close[0] > self.price_sma[0]:\n                self._enter_long()\n            elif self.vol_cross[0] < 0 and self.data.close[0] < self.price_sma[0]:\n                self._enter_short()\n        else:\n            if self.position.size > 0:\n                if self.vol_cross[0] < 0 or self.price_cross[0] < 0:\n                    self._cancel_protective_orders()\n                    self.order = self.close()\n            elif self.position.size < 0:\n                if self.vol_cross[0] > 0 or self.price_cross[0] > 0:\n                    self._cancel_protective_orders()\n                    self.order = self.close()\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted, order.Partial):\n            return\n\n        if order.status == order.Completed:\n            if order is self.stop_order:\n                self.stop_order = None\n                if self.tp_order:\n                    self.cancel(self.tp_order)\n                    self.tp_order = None\n                self.order = None\n            elif order is self.tp_order:\n                self.tp_order = None\n                if self.stop_order:\n                    self.cancel(self.stop_order)\n                    self.stop_order = None\n                self.order = None\n            elif order is self.order:\n                if self.position:\n                    self._place_protective_orders(order.executed.price)\n                self.order = None\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            if order is self.order:\n                self.order = None\n            elif order is self.stop_order:\n                self.stop_order = None\n            elif order is self.tp_order:\n                self.tp_order = None",
+  "assumptions": [
+    {
+      "topic": "sizing_price_reference",
+      "choice": "Compute stop distance and position size at signal time using the current bar's close price (the actual fill price is unknown until the next bar executes the market order)",
+      "reason": "spec requires sizing 'computed from stop distance' but does not specify which price to use before the order fills; the real executed price is used afterward to place the actual protective stop/take-profit orders"
+    },
+    {
+      "topic": "take_profit_toggle",
+      "choice": "Added a use_take_profit boolean parameter, defaulted to True",
+      "reason": "spec calls the take-profit 'optional' while also giving a concrete default (2.0%), so it is implemented as always-on by default but exposed as a togglable, configurable parameter"
+    },
+    {
+      "topic": "position_size_rounding",
+      "choice": "Round the risk-based size down to a whole number of shares and skip the entry if the computed size is less than 1",
+      "reason": "spec is silent on fractional shares for an equity strategy; whole-share sizing is the standard convention and avoids invalid fractional orders"
+    },
+    {
+      "topic": "oco_handling",
+      "choice": "Manually cancel the take-profit order when the stop-loss fills and vice versa, tracked via explicit order references in notify_order, instead of using backtrader's built-in oco order parameter",
+      "reason": "keeps the one-cancels-other bracket behavior explicit and auditable rather than relying on undocumented library-internal OCO semantics"
+    },
+    {
+      "topic": "position_change_stop_handling",
+      "choice": "Cancel any live stop-loss/take-profit orders before submitting a signal-driven close(), and only allow a new opposite-direction entry once flat on a later bar",
+      "reason": "implements 'cancel/replace stops on position changes' and 'one position at a time' without an explicit reversal rule, which the spec does not state"
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

@@ -1,0 +1,108 @@
+{
+  "task_id": 98,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass MeanReversionStrategy(bt.Strategy):\n    params = (\n        ('rsi_period', 14),\n        ('sma_fast_period', 20),\n        ('sma_slow_period', 50),\n        ('bb_period', 20),\n        ('bb_devfactor', 2.0),\n        ('rsi_oversold', 30),\n        ('rsi_overbought', 70),\n        ('position_pct', 0.01),\n        ('stop_devfactor', 1.5),\n        ('vol_lookback', 20),\n        ('vol_threshold', 1000000),\n        ('min_bars', 200),\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.sma_fast = bt.indicators.SMA(self.data.close, period=self.p.sma_fast_period)\n        self.sma_slow = bt.indicators.SMA(self.data.close, period=self.p.sma_slow_period)\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor)\n        self.stddev = bt.indicators.StandardDeviation(self.data.close, period=self.p.bb_period)\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_lookback)\n        self.cross_mid = bt.indicators.CrossOver(self.data.close, self.bb.lines.mid)\n\n        self.order = None\n        self.stop_order = None\n        self.limit_order = None\n\n    def _cancel_bracket(self):\n        if self.stop_order is not None and self.stop_order.alive():\n            self.cancel(self.stop_order)\n        if self.limit_order is not None and self.limit_order.alive():\n            self.cancel(self.limit_order)\n        self.stop_order = None\n        self.limit_order = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted, order.Partial):\n            return\n\n        if order.status == order.Completed:\n            if order == self.order:\n                self.order = None\n            elif order == self.stop_order:\n                if self.limit_order is not None and self.limit_order.alive():\n                    self.cancel(self.limit_order)\n                self.stop_order = None\n                self.limit_order = None\n            elif order == self.limit_order:\n                if self.stop_order is not None and self.stop_order.alive():\n                    self.cancel(self.stop_order)\n                self.stop_order = None\n                self.limit_order = None\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            if order == self.order:\n                self.order = None\n            elif order == self.stop_order:\n                self.stop_order = None\n            elif order == self.limit_order:\n                self.limit_order = None\n\n    def next(self):\n        if len(self) < self.p.min_bars:\n            return\n\n        if self.order:\n            return\n\n        price = self.data.close[0]\n\n        if not self.position:\n            volume_ok = self.vol_sma[0] > self.p.vol_threshold\n            if not volume_ok:\n                return\n\n            long_signal = (\n                price < self.bb.lines.bot[0]\n                and self.rsi[0] < self.p.rsi_oversold\n                and self.sma_fast[0] > self.sma_slow[0]\n            )\n            short_signal = (\n                price > self.bb.lines.top[0]\n                and self.rsi[0] > self.p.rsi_overbought\n                and self.sma_fast[0] < self.sma_slow[0]\n            )\n\n            size = (self.broker.getvalue() * self.p.position_pct) / price\n\n            if long_signal:\n                stop_price = price - self.p.stop_devfactor * self.stddev[0]\n                limit_price = self.bb.lines.mid[0]\n                main, stop, limit = self.buy_bracket(\n                    size=size,\n                    exectype=bt.Order.Market,\n                    stopprice=stop_price,\n                    limitprice=limit_price,\n                )\n                self.order, self.stop_order, self.limit_order = main, stop, limit\n            elif short_signal:\n                stop_price = price + self.p.stop_devfactor * self.stddev[0]\n                limit_price = self.bb.lines.mid[0]\n                main, stop, limit = self.sell_bracket(\n                    size=size,\n                    exectype=bt.Order.Market,\n                    stopprice=stop_price,\n                    limitprice=limit_price,\n                )\n                self.order, self.stop_order, self.limit_order = main, stop, limit\n        else:\n            cross_exit = self.cross_mid[0] != 0\n\n            if self.position.size > 0:\n                rsi_exit = self.rsi[0] > self.p.rsi_overbought\n                if cross_exit or rsi_exit:\n                    self._cancel_bracket()\n                    self.order = self.close()\n            elif self.position.size < 0:\n                rsi_exit = self.rsi[0] < self.p.rsi_oversold\n                if cross_exit or rsi_exit:\n                    self._cancel_bracket()\n                    self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "position sizing formula",
+      "choice": "size = (broker.getvalue() * 0.01) / current close price, recomputed at each entry signal",
+      "reason": "Spec states 'fixed percentage of total trading capital (1% per trade)' but does not give a formula; this is the standard literal reading of allocating 1% of current portfolio value to the position notional."
+    },
+    {
+      "topic": "volume liquidity threshold value",
+      "choice": "20-bar SMA of volume must exceed 1,000,000 shares",
+      "reason": "Spec says to ignore signals when volume over the last N=20 candles does not exceed 'a specified threshold' but never states the threshold or whether it's a sum or average; chose an average-volume floor as a reasonable, declared liquidity gate."
+    },
+    {
+      "topic": "stop-loss / take-profit execution mechanism",
+      "choice": "Implemented as native OCO bracket orders (bt.Order.Stop and bt.Order.Limit) placed at entry via buy_bracket/sell_bracket, evaluated intrabar against High/Low, in addition to the bar-close signal-based exits (BB mid crossover, RSI extremes) checked each bar; whichever exit condition fires first closes the position",
+      "reason": "The spec's imperative language ('set a stop-loss', 'set the take-profit') most literally maps to real broker orders rather than a manual close-price check; the signal-based exits are separate stated conditions and are monitored independently each bar."
+    },
+    {
+      "topic": "standard deviation used for stop-loss distance",
+      "choice": "Added a separate raw bt.indicators.StandardDeviation(period=20) (1x, unscaled) distinct from the Bollinger Bands' internal devfactor=2 stddev, and used it as stop_distance = 1.5 * stddev",
+      "reason": "Spec explicitly asks for '1.5 standard deviations', which is a different quantity than 1.5x the BB band half-width (which would be 3x raw stddev if reusing the BB-scaled value)."
+    },
+    {
+      "topic": "take-profit reference level",
+      "choice": "Take-profit price is fixed at the Bollinger middle band value observed at the moment of entry (not the moving current mid line)",
+      "reason": "Spec phrases both stop-loss and take-profit as distances/levels 'from the entry point', implying a price level fixed at entry time, mirrored from the stop-loss wording."
+    },
+    {
+      "topic": "'price crosses its middle line' exit signal",
+      "choice": "Implemented via bt.indicators.CrossOver(close, bb.mid), evaluated every bar the position is open, independent of the fixed take-profit order",
+      "reason": "This is a separate stated exit condition from the take-profit rule and uses the current (moving) mid line rather than a fixed entry-time value, per its literal wording."
+    },
+    {
+      "topic": "volume filter scope",
+      "choice": "Applied only when evaluating new entry signals, not to exit logic",
+      "reason": "Spec ties the volume/liquidity rule explicitly to 'avoid entering positions in illiquid assets', so exits remain unrestricted to allow risk management to function regardless of liquidity."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 5,
+  "tape": [
+    {
+      "dt": "2021-02-26T05:00:00",
+      "side": "BUY",
+      "size": 0.8493633339066087,
+      "price": 119.2921941436735
+    },
+    {
+      "dt": "2021-03-17T04:00:00",
+      "side": "SELL",
+      "size": -0.8493633339066087,
+      "price": 120.71293967926184
+    },
+    {
+      "dt": "2023-08-08T04:00:00",
+      "side": "BUY",
+      "size": 0.5670230835144152,
+      "price": 177.20572916857282
+    },
+    {
+      "dt": "2023-08-18T04:00:00",
+      "side": "SELL",
+      "size": -0.5670230835144152,
+      "price": 169.99317823172382
+    },
+    {
+      "dt": "2024-01-05T05:00:00",
+      "side": "BUY",
+      "size": 0.5557622788436766,
+      "price": 179.95303087035154
+    },
+    {
+      "dt": "2024-01-19T05:00:00",
+      "side": "SELL",
+      "size": -0.5557622788436766,
+      "price": 187.21084277328777
+    },
+    {
+      "dt": "2025-01-22T05:00:00",
+      "side": "BUY",
+      "size": 0.4520499606455851,
+      "price": 218.39466636780546
+    },
+    {
+      "dt": "2025-01-29T05:00:00",
+      "side": "SELL",
+      "size": -0.4520499606455851,
+      "price": 232.63368426706168
+    },
+    {
+      "dt": "2025-03-14T04:00:00",
+      "side": "BUY",
+      "size": 0.4797621512872646,
+      "price": 210.13965751241793
+    },
+    {
+      "dt": "2025-04-01T04:00:00",
+      "side": "SELL",
+      "size": -0.4797621512872646,
+      "price": 218.65468232589998
+    }
+  ]
+}

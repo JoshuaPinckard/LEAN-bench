@@ -1,0 +1,75 @@
+```python
+import backtrader as bt
+
+
+class TimeSeriesMomentumStrategy(bt.Strategy):
+    params = dict(
+        N=90,
+        R=21,
+        w=0.20,
+        max_alloc=0.10,
+        vol_period=21,
+        min_dollar_vol=1_000_000,
+        flat_band=1e-4,
+    )
+
+    def __init__(self):
+        dollar_volume = self.data.close * self.data.volume
+        self.avg_dollar_vol = bt.indicators.SMA(dollar_volume, period=self.p.vol_period)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.data.close(-self.p.N))
+        self.orders = []
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order in self.orders:
+                self.orders.remove(order)
+
+    def next(self):
+        if self.orders:
+            return
+
+        is_rebalance_day = len(self) % self.p.R == 0
+
+        if not is_rebalance_day:
+            if self.position and self.crossover[0] != 0:
+                order = self.close()
+                if order:
+                    self.orders.append(order)
+            return
+
+        if self.position:
+            order = self.close()
+            if order:
+                self.orders.append(order)
+
+        has_history = len(self) >= self.p.N + 1
+        liquid = self.avg_dollar_vol[0] >= self.p.min_dollar_vol
+        if not (has_history and liquid):
+            return
+
+        momentum = self.data.close[0] / self.data.close[-self.p.N] - 1.0
+        if abs(momentum) < self.p.flat_band:
+            return
+
+        alloc_fraction = min(self.p.w, self.p.max_alloc)
+        target_value = self.broker.getvalue() * alloc_fraction
+        size = int(target_value / self.data.close[0])
+        if size <= 0:
+            return
+
+        if momentum > 0:
+            order = self.buy(size=size)
+        else:
+            order = self.sell(size=size)
+        if order:
+            self.orders.append(order)
+```
+```json
+{"assumptions": [
+  {"topic": "flat-momentum threshold", "choice": "Treat |M| < 1e-4 as 'close to 0' and stay out on the rebalancing date", "reason": "Spec requires a distinct stay-out band around zero momentum but never gives a numeric epsilon; a small fixed threshold is needed to make the three-way M>0/M<0/M~0 decision computable."},
+  {"topic": "rebalancing schedule anchor", "choice": "Rebalance whenever len(self) % R == 0, i.e. every R-th bar counted from the very first bar of the whole feed (not from the first bar with valid indicators)", "reason": "Spec states rebalancing frequency R but not the calendar phase/anchor of the cycle; anchoring to the raw bar index is the simplest deterministic choice."},
+  {"topic": "liquidity filter scope", "choice": "Apply the SMA(21) dollar-volume and N-day-history filter only to new entries at rebalancing, not to the zero-crossing exit or to the mandatory close-all-positions step at each rebalance", "reason": "The liquidity sentence directly follows the entry-decision description; forcing a position to remain open because volume dried up would contradict normal risk practice and the spec never says exits are liquidity-gated."},
+  {"topic": "share sizing", "choice": "size = int(broker.getvalue() * min(w, 10%) / close[0]), truncated to whole shares, no commission buffer", "reason": "Spec states the target capital allocation as a percentage but not how to convert it to a discrete share count; whole-share rounding is the standard, simplest interpretation."},
+  {"topic": "rebalance order sequencing", "choice": "On a rebalancing bar, submit a self.close() order for any existing position, then separately evaluate the (possibly new) signal and submit a fresh buy()/sell() order in the same call, rather than a single order_target_percent adjustment", "reason": "Spec literally describes rebalancing as two discrete steps ('all positions are closed and the signal is re-evaluated'); issuing two sequential orders preserves that structure for the execution-trace comparison instead of collapsing it into one net-position order."}
+]}
+```

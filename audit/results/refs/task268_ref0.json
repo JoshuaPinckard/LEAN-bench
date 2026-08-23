@@ -1,0 +1,52 @@
+{
+  "task_id": 268,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass BullTrendBounceVolatilityFilter(bt.Strategy):\n    params = dict(\n        sma_period=20,\n        rsi_period=14,\n        bb_period=20,\n        bb_devfactor=2.0,\n        rsi_level=40.0,\n        proxy_low=0.05,\n        proxy_high=0.10,\n        bb_width_max=0.02,\n        limit_discount=0.005,\n        tp_pct=0.02,\n        sl_pct=0.015,\n        max_hold_bars=5,\n        risk_pct=0.02,\n        max_entries=3,\n        session_start_min=600,\n        session_end_min=960,\n    )\n\n    def __init__(self):\n        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor\n        )\n        self.rsi_cross = bt.indicators.CrossUp(self.rsi, self.p.rsi_level)\n        self.entries = []\n\n    def _in_session(self):\n        t = self.data.datetime.time(0)\n        minutes = t.hour * 60 + t.minute\n        return self.p.session_start_min <= minutes <= self.p.session_end_min\n\n    def _find_entry(self, order):\n        for e in self.entries:\n            if order in (e.get('main'), e.get('stop'), e.get('limit'), e.get('force')):\n                return e\n        return None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        entry = self._find_entry(order)\n        if entry is None:\n            return\n\n        if order == entry.get('main'):\n            if order.status == order.Completed:\n                entry['status'] = 'open'\n                entry['entry_price'] = order.executed.price\n                entry['bar_open'] = len(self)\n                stop_price = entry['entry_price'] * (1 - self.p.sl_pct)\n                tp_price = entry['entry_price'] * (1 + self.p.tp_pct)\n                stop_order = self.sell(\n                    size=entry['size'], exectype=bt.Order.Stop, price=stop_price\n                )\n                limit_order = self.sell(\n                    size=entry['size'], exectype=bt.Order.Limit, price=tp_price,\n                    oco=stop_order\n                )\n                entry['stop'] = stop_order\n                entry['limit'] = limit_order\n            elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n                self.entries.remove(entry)\n        elif order in (entry.get('stop'), entry.get('limit')):\n            if order.status == order.Completed and entry in self.entries:\n                self.entries.remove(entry)\n        elif order == entry.get('force'):\n            if order.status == order.Completed and entry in self.entries:\n                self.entries.remove(entry)\n\n    def next(self):\n        for entry in list(self.entries):\n            if entry.get('status') == 'open':\n                bars_held = len(self) - entry['bar_open']\n                if bars_held >= self.p.max_hold_bars:\n                    stop_order = entry.get('stop')\n                    limit_order = entry.get('limit')\n                    if stop_order is not None and stop_order.status in [\n                        stop_order.Submitted, stop_order.Accepted\n                    ]:\n                        self.cancel(stop_order)\n                    if limit_order is not None and limit_order.status in [\n                        limit_order.Submitted, limit_order.Accepted\n                    ]:\n                        self.cancel(limit_order)\n                    force_order = self.sell(size=entry['size'], exectype=bt.Order.Market)\n                    entry['force'] = force_order\n                    entry['status'] = 'forced'\n\n        if len(self.entries) >= self.p.max_entries:\n            return\n        if not self._in_session():\n            return\n\n        close = self.data.close[0]\n        sma = self.sma[0]\n\n        trend_ok = close > sma\n        bounce_ok = self.rsi_cross[0] > 0\n        proxy = (close - sma) / sma\n        proxy_ok = self.p.proxy_low <= proxy <= self.p.proxy_high\n        bb_width = (self.bb.top[0] - self.bb.bot[0]) / self.bb.mid[0]\n        vol_ok = bb_width < self.p.bb_width_max\n\n        if trend_ok and bounce_ok and proxy_ok and vol_ok:\n            equity = self.broker.getvalue()\n            qty = int(self.p.risk_pct * equity / close)\n            if qty <= 0:\n                return\n            limit_price = close * (1 - self.p.limit_discount)\n            main_order = self.buy(size=qty, exectype=bt.Order.Limit, price=limit_price)\n            self.entries.append({\n                'main': main_order,\n                'size': qty,\n                'status': 'pending',\n            })",
+  "assumptions": [
+    {
+      "topic": "forced_close_bar_count",
+      "choice": "bars_held = current_bar_index - fill_bar_index; forced close triggers once bars_held >= 5, i.e. on the 5th bar after the entry fill.",
+      "reason": "Spec says 'forced close after 5 bars' without stating an inclusive/exclusive convention; counting elapsed bars since the actual fill is the most literal reading."
+    },
+    {
+      "topic": "rsi_cross_implementation",
+      "choice": "Implemented the 'RSI crosses 40 from below' condition with bt.indicators.CrossUp(rsi, 40) instead of a hand-written self.rsi[-1]/self.rsi[0] check.",
+      "reason": "A manual two-bar lookback would read one bar before backtrader's automatic minperiod guarantees valid RSI data on the very first eligible bar; CrossUp lets backtrader extend minperiod correctly, per the canonical rule to rely on automatic minperiod. Tie-break at an exact RSI value of 40.0 follows CrossUp's internal comparison, which is immaterial with continuous float RSI."
+    },
+    {
+      "topic": "tp_sl_entry_price_basis",
+      "choice": "Take-profit/stop-loss levels are computed from the buy limit order's actual executed.price, not the originally quoted limit price.",
+      "reason": "Spec says TP/SL are '% from entry price'; the true entry price is what was actually filled (which can be better than the limit price on a gap), so this is the more literal basis than the pre-fill quote."
+    },
+    {
+      "topic": "pending_order_cap_and_validity",
+      "choice": "Unfilled buy-limit orders count toward the 'no more than 3 open entries' cap, and orders otherwise use backtrader's default (GTC) validity since the spec states no expiration.",
+      "reason": "Spec caps 'open entries' at 3 but is silent on limit-order expiration; counting pending orders toward the cap prevents the strategy from ever exceeding 3 concurrent commitments, while validity itself is left at the framework default rather than inventing an expiry rule."
+    },
+    {
+      "topic": "proxy_range_inclusivity",
+      "choice": "(Close-SMA)/SMA in the closed interval [0.05, 0.10] (inclusive bounds).",
+      "reason": "Spec writes the range with square brackets, which conventionally denotes inclusive bounds."
+    },
+    {
+      "topic": "session_filter_scope",
+      "choice": "The 10:00-16:00 window gates only the generation of new entry signals; TP/SL exits and the 5-bar forced close for already-open entries are evaluated every bar regardless of time.",
+      "reason": "Spec text 'signals are active only between 10:00 and 16:00' is stated in the context of the entry-signal section, not the exit/risk-management section, so exit processing on already-open risk is treated as unaffected."
+    },
+    {
+      "topic": "zero_quantity_guard",
+      "choice": "If int(0.02*equity/Close) evaluates to 0, the signal is skipped that bar without placing an order.",
+      "reason": "Not a strategy filter, just a numerical guard against submitting a zero-size order; the spec's own sizing formula can floor to 0 in principle and the environment forbids non-stated additions, but a size-0 order is not a valid instruction to send to the broker."
+    },
+    {
+      "topic": "local_time_source",
+      "choice": "Bar timestamps from the feed (self.data.datetime.time(0)) are used directly as local time with no further timezone conversion.",
+      "reason": "The feed is documented as already representing local (America/New_York) wall-clock bars, so no additional conversion is applied or invented."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

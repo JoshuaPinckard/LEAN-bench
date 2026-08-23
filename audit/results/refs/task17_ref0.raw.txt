@@ -1,0 +1,142 @@
+```python
+import backtrader as bt
+
+
+class ORBMeanReversionStrategy(bt.Strategy):
+    RISK_PCT = 0.01
+
+    NY_OPEN_MIN = 13 * 60
+    ORB_END_MIN = 14 * 60
+    ENTRY_CUTOFF_MIN = 16 * 60
+    DAY_END_MIN = 22 * 60
+
+    def __init__(self):
+        self.current_day = None
+
+        self.orb_ready = False
+        self.orb_high = None
+        self.orb_low = None
+        self.orb_mid = None
+        self._orb_h_temp = None
+        self._orb_l_temp = None
+
+        self.swept_low = False
+        self.swept_high = False
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order is self.order:
+                self.order = None
+            if order is self.stop_order:
+                self.stop_order = None
+            if order is self.limit_order:
+                self.limit_order = None
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        day = dt.date()
+        t_min = dt.hour * 60 + dt.minute
+
+        if self.current_day != day:
+            self.current_day = day
+            self.orb_ready = False
+            self.orb_high = None
+            self.orb_low = None
+            self.orb_mid = None
+            self._orb_h_temp = None
+            self._orb_l_temp = None
+            self.swept_low = False
+            self.swept_high = False
+
+        if not self.orb_ready:
+            if self.NY_OPEN_MIN <= t_min < self.ORB_END_MIN:
+                h = self.data.high[0]
+                l = self.data.low[0]
+                if self._orb_h_temp is None:
+                    self._orb_h_temp = h
+                    self._orb_l_temp = l
+                else:
+                    if h > self._orb_h_temp:
+                        self._orb_h_temp = h
+                    if l < self._orb_l_temp:
+                        self._orb_l_temp = l
+            elif t_min >= self.ORB_END_MIN and self._orb_h_temp is not None:
+                self.orb_high = self._orb_h_temp
+                self.orb_low = self._orb_l_temp
+                self.orb_mid = (self.orb_high + self.orb_low) / 2.0
+                self.orb_ready = True
+
+        if self.position and t_min >= self.DAY_END_MIN:
+            if self.stop_order is not None and self.stop_order.alive():
+                self.cancel(self.stop_order)
+            if self.limit_order is not None and self.limit_order.alive():
+                self.cancel(self.limit_order)
+            self.close()
+            return
+
+        if (self.orb_ready and not self.position and self.order is None
+                and t_min < self.ENTRY_CUTOFF_MIN):
+            close = self.data.close[0]
+
+            if not self.swept_low and close < self.orb_low:
+                self.swept_low = True
+            elif self.swept_low and close > self.orb_low:
+                stop_price = self.orb_low
+                target_price = self.orb_mid
+                stop_distance = close - stop_price
+                if stop_distance > 0:
+                    risk_amount = self.broker.getvalue() * self.RISK_PCT
+                    size = int(risk_amount / stop_distance)
+                    if size > 0:
+                        orders = self.buy_bracket(
+                            size=size,
+                            exectype=bt.Order.Market,
+                            stopprice=stop_price,
+                            limitprice=target_price,
+                        )
+                        self.order = orders[0]
+                        self.stop_order = orders[1]
+                        self.limit_order = orders[2]
+                self.swept_low = False
+                self.swept_high = False
+
+            if self.order is None:
+                if not self.swept_high and close > self.orb_high:
+                    self.swept_high = True
+                elif self.swept_high and close < self.orb_high:
+                    stop_price = self.orb_high
+                    target_price = self.orb_mid
+                    stop_distance = stop_price - close
+                    if stop_distance > 0:
+                        risk_amount = self.broker.getvalue() * self.RISK_PCT
+                        size = int(risk_amount / stop_distance)
+                        if size > 0:
+                            orders = self.sell_bracket(
+                                size=size,
+                                exectype=bt.Order.Market,
+                                stopprice=stop_price,
+                                limitprice=target_price,
+                            )
+                            self.order = orders[0]
+                            self.stop_order = orders[1]
+                            self.limit_order = orders[2]
+                    self.swept_low = False
+                    self.swept_high = False
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "NY session open = 08:00 America/New_York, mapped to 13:00 in the feed's fixed +01:00 timestamps (08:00 EDT, UTC-4, since the entire 2026-05-28..2026-08-19 range falls inside US daylight saving time, so a single fixed offset applies with no DST transition to handle).", "reason": "Raw OHLCV has no session/timezone metadata; 8:00 AM ET is the standard forex convention for the New York session open, and the feed's constant +01:00 offset lets the EDT mapping be applied uniformly across the whole backtest."},
+  {"topic": "infeasible", "choice": "'End of the trading day' = NY session close, 17:00 America/New_York -> 22:00 feed time; any open position is force-closed (cancelling pending SL/TP orders) at or after that bar.", "reason": "The spec's day-close rule is broader than the 3-hour entry cutoff (16:00), so it must refer to the actual session close; 5pm ET is the standard forex NY-session close, consistent with the 8am open assumption."},
+  {"topic": "risk_pct", "choice": "Used 1% of current broker equity (self.broker.getvalue()) as the fixed per-trade risk.", "reason": "Spec gives a range ('e.g., 1-2%') without pinning a value; 1% was picked as the more conservative literal option within the stated range."},
+  {"topic": "conflict", "choice": "Take-profit is the ORB Midpoint exactly, as explicitly instructed; the '1:2 RR' sentence is treated as descriptive rationale rather than an independent target level.", "reason": "The spec gives two TP definitions (midpoint vs. 2x stop distance) that are not algebraically guaranteed to coincide; the midpoint is stated first and unconditionally ('close it when price reaches Midpoint'), so it is treated as the binding rule."},
+  {"topic": "price_reference", "choice": "Used bar Close to detect the ORB-boundary breach and the reclaim/reversal back across it (drop-below / rise-back-above logic).", "reason": "Spec says 'the price' without specifying close vs. wick; Close is the simplest literal reading and avoids inventing an unstated intrabar-wick rule."},
+  {"topic": "sizing_price", "choice": "Position size is computed using the signal bar's Close as the anticipated entry price (risk_amount / (close - stop)).", "reason": "The market entry order fills at the next bar's open per backtrader's default execution model, so the exact fill price is unknown at the moment of sizing; Close is the best available estimate at signal time."},
+  {"topic": "exit_mechanism", "choice": "SL/TP are implemented as native backtrader Stop and Limit child orders via buy_bracket/sell_bracket (OCO), so they fill intrabar when High/Low touches the level rather than only at bar close.", "reason": "The spec says the position is closed 'when the price reaches' the SL/TP level, which literally describes a price level being touched, matching backtrader's native Stop/Limit order semantics more closely than a close-only check."}
+]}
+```

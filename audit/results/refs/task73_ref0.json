@@ -1,0 +1,52 @@
+{
+  "task_id": 73,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass MultiTimeframeCandlestickAggregationStrategy(bt.Strategy):\n    params = (\n        ('timeframes', (120, 60, 30, 15)),\n        ('risk_perc', 0.01),\n        ('tp_atr_mult', 1.5),\n        ('sl_atr_mult', 0.5),\n        ('atr_period', 14),\n        ('printlog', False),\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.base_width = self.p.timeframes[0] // 15\n        self.entry_width = self.p.timeframes[-1] // 15\n        self.order = None\n        self.tp_price = None\n        self.sl_price = None\n        self._pending_atr = None\n\n    def log(self, txt):\n        dt = self.data.datetime.datetime(0)\n        print('%s %s' % (dt.isoformat(), txt))\n\n    def _candle(self, width, k):\n        # k=0 is the `width`-bar candle ending at the current bar;\n        # k=1 is the immediately preceding candle of the same width, etc.\n        ago_end = k * width\n        ago_start = ago_end + width - 1\n        o = self.data.open[-ago_start]\n        c = self.data.close[-ago_end]\n        h = max(self.data.high[-a] for a in range(ago_end, ago_start + 1))\n        lo = min(self.data.low[-a] for a in range(ago_end, ago_start + 1))\n        return o, h, lo, c\n\n    def _bullish_engulfing(self, prev, curr):\n        po, ph, pl, pc = prev\n        co, ch, cl, cc = curr\n        return pc < po and cc > co and co <= pc and cc >= po\n\n    def _bearish_engulfing(self, prev, curr):\n        po, ph, pl, pc = prev\n        co, ch, cl, cc = curr\n        return pc > po and cc < co and co >= pc and cc <= po\n\n    def _drill_down(self):\n        widths = [tf // 15 for tf in self.p.timeframes]\n        prev_top = self._candle(widths[0], 1)\n        curr_top = self._candle(widths[0], 0)\n        if not self._bullish_engulfing(prev_top, curr_top):\n            return False\n        counts = {self.p.timeframes[0]: 1}\n        prev_count = 1\n        for tf, w in zip(self.p.timeframes[1:], widths[1:]):\n            n = widths[0] // w\n            cnt = 0\n            for k in range(n):\n                prevc = self._candle(w, k + 1)\n                currc = self._candle(w, k)\n                if self._bullish_engulfing(prevc, currc):\n                    cnt += 1\n            counts[tf] = cnt\n            if self.p.printlog:\n                self.log('pattern instance counts by timeframe: %s' % counts)\n            if cnt <= prev_count:\n                return False\n            prev_count = cnt\n        return True\n\n    def notify_order(self, order):\n        if order.status not in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            return\n        if order.status == order.Completed:\n            if order.isbuy():\n                self.tp_price = order.executed.price + self.p.tp_atr_mult * self._pending_atr\n                self.sl_price = order.executed.price - self.p.sl_atr_mult * self._pending_atr\n            else:\n                self.tp_price = None\n                self.sl_price = None\n        self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if self.position:\n            if len(self) >= 2 * self.entry_width:\n                prevc = self._candle(self.entry_width, 1)\n                currc = self._candle(self.entry_width, 0)\n                if self._bearish_engulfing(prevc, currc):\n                    self.order = self.close()\n                    return\n            if self.tp_price is not None and self.data.high[0] >= self.tp_price:\n                self.order = self.close()\n                return\n            if self.sl_price is not None and self.data.low[0] <= self.sl_price:\n                self.order = self.close()\n                return\n            return\n\n        if len(self) < 2 * self.base_width:\n            return\n        bar_idx = len(self) - 1\n        if (bar_idx + 1) % self.base_width != 0:\n            return\n\n        if not self._drill_down():\n            return\n\n        atr = self.atr[0]\n        if atr is None or atr <= 0:\n            return\n\n        capital = self.broker.getvalue()\n        sl_dist = self.p.sl_atr_mult * atr\n        size = (capital * self.p.risk_perc) / sl_dist\n        if size <= 0:\n            return\n\n        self._pending_atr = atr\n        self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Higher timeframes (2h/1h/30m) are synthesized from the single 15m feed using fixed tumbling windows counted from the start of data (bar_index // N), not calendar/session-aligned resampling.",
+      "reason": "The harness supplies only one bt.PandasData feed (15m); the strategy has no access to cerebro to add resampled/replayed data feeds, so true calendar-aligned multi-timeframe resampling is unavailable. Tumbling windows of 8/4/2/1 base bars are the closest literal construction of 2h/1h/30m/15m candles from the given feed."
+    },
+    {
+      "topic": "confinement window / instance counting",
+      "choice": "The 'specific 2-hour candle's period' confinement is read as the current higher-timeframe candle's bar range; within that range, lower-timeframe pattern completions are counted using the immediately preceding lower-tf candle as context (which may fall just before the window). The count for the top timeframe is always 1 (a single confirmed instance). Drill-down continues only while each lower timeframe's count is strictly greater than the timeframe above it, all the way to 15m.",
+      "reason": "Because every timeframe in the default set is exactly 2x the next lower one, a higher-tf candle contains only 2 lower-tf sub-candles, so a strict same-window-only comparison could never exceed a count of 1 vs 1. Allowing the boundary-crossing prior candle as pattern context (standard TA practice) makes 'finds a greater number of instances on the immediately lower timeframe' achievable and internally consistent, matching the spec's intent of recursively finding higher concentration on lower timeframes."
+    },
+    {
+      "topic": "entry timing",
+      "choice": "Entry is submitted as a market buy at the close of the bar on which the full 2h->1h->30m->15m drill-down is confirmed (i.e., the bar completing the 2-hour window), rather than at the close of whichever specific 15m candle inside the window last completed the pattern.",
+      "reason": "The full recursive signal can only be causally confirmed once the 2-hour window closes; any earlier in-window 15m pattern instance has already passed by that point, so a non-look-ahead reference implementation must act at window completion."
+    },
+    {
+      "topic": "ATR period",
+      "choice": "ATR period = 14 (backtrader's standard default).",
+      "reason": "The spec names ATR of the entry timeframe but never states a lookback period."
+    },
+    {
+      "topic": "total trading capital",
+      "choice": "'Total Capital' in the position-sizing formula is read as the current broker portfolio value (self.broker.getvalue()) at the moment of the entry signal.",
+      "reason": "The spec does not specify whether this is fixed starting cash or current equity; current equity is the more common reading for a 'risk per trade' formula that should scale with account performance."
+    },
+    {
+      "topic": "TP/SL ATR snapshot",
+      "choice": "The ATR value used to compute both the position size and the take-profit/stop-loss levels is captured once at the entry signal bar and held fixed for that trade (not recalculated on later bars).",
+      "reason": "The spec ties position size directly to '0.5x ATR' stop distance; using a single consistent ATR snapshot keeps the realized stop distance and the sizing formula in agreement for the life of the trade."
+    },
+    {
+      "topic": "pattern instance logging",
+      "choice": "Implemented via a `printlog` parameter (default False) that, when enabled, prints the cumulative per-timeframe instance-count dictionary as the drill-down proceeds.",
+      "reason": "The spec requires the strategy be 'able to' output counts for logging/analysis but does not mandate it always print; defaulting off keeps output clean while the capability is present."
+    },
+    {
+      "topic": "pattern extensibility",
+      "choice": "Only Bullish/Bearish Engulfing (the spec's stated default) are implemented, as dedicated, swappable methods (_bullish_engulfing/_bearish_engulfing) rather than a full library of candlestick patterns.",
+      "reason": "The spec asks that the pattern be 'easily replaceable', a structural requirement, not that additional pattern types be implemented; adding unrequested patterns would exceed the specification."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

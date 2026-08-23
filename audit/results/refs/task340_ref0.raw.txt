@@ -1,0 +1,102 @@
+```python
+import backtrader as bt
+
+
+class SessionVWAP(bt.Indicator):
+    lines = ('vwap',)
+
+    def __init__(self):
+        self._session_date = None
+        self._cum_pv = 0.0
+        self._cum_vol = 0.0
+        self.addminperiod(1)
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        if dt != self._session_date:
+            self._session_date = dt
+            self._cum_pv = 0.0
+            self._cum_vol = 0.0
+        typical_price = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0
+        self._cum_pv += typical_price * self.data.volume[0]
+        self._cum_vol += self.data.volume[0]
+        self.lines.vwap[0] = self._cum_pv / self._cum_vol
+
+
+class VWAPWilliamsRMeanReversion(bt.Strategy):
+    params = (
+        ('wr_period', 14),
+        ('stop_distance', 2.0),
+    )
+
+    def __init__(self):
+        self.vwap = SessionVWAP(self.data)
+        self.wr = bt.indicators.WilliamsR(self.data, period=self.p.wr_period)
+        self.order = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self.order = None
+                if order.isbuy() and self.position.size > 0 and self.stop_order is None:
+                    entry_price = order.executed.price
+                    entry_vwap = self.vwap[0]
+                    stop_price = max(entry_price - self.p.stop_distance,
+                                      entry_vwap - self.p.stop_distance)
+                    self.stop_order = self.sell(exectype=bt.Order.Stop,
+                                                 price=stop_price,
+                                                 size=self.position.size)
+                elif order.issell() and self.position.size < 0 and self.stop_order is None:
+                    entry_price = order.executed.price
+                    entry_vwap = self.vwap[0]
+                    stop_price = min(entry_price + self.p.stop_distance,
+                                      entry_vwap + self.p.stop_distance)
+                    self.stop_order = self.buy(exectype=bt.Order.Stop,
+                                                price=stop_price,
+                                                size=abs(self.position.size))
+            elif order == self.stop_order:
+                self.stop_order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.order:
+                self.order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            wr_cross_down = self.wr[-1] >= -80 and self.wr[0] < -80
+            wr_cross_up = self.wr[-1] <= -20 and self.wr[0] > -20
+
+            if self.data.close[0] < self.vwap[0] and wr_cross_down:
+                self.order = self.buy()
+            elif self.data.close[0] > self.vwap[0] and wr_cross_up:
+                self.order = self.sell()
+        else:
+            cross_above = self.data.close[-1] <= self.vwap[-1] and self.data.close[0] > self.vwap[0]
+            cross_below = self.data.close[-1] >= self.vwap[-1] and self.data.close[0] < self.vwap[0]
+
+            if self.position.size > 0 and cross_above:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+            elif self.position.size < 0 and cross_below:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "entry-time VWAP reference bar", "choice": "Use the VWAP value observed at the bar where the entry order actually fills (captured inside notify_order via order.executed.price and self.vwap[0]), not the earlier signal bar.", "reason": "Spec says 'the entry bar's VWAP value'; with default market-order execution the fill occurs on the next bar's open, so the fill bar is the literal entry bar, and backtrader updates indicator lines before notify_order fires so self.vwap[0] correctly reflects it."},
+  {"topic": "stop price combination", "choice": "stop_price = max(entry_price - 2.0, entry_vwap - 2.0) for longs, min(entry_price + 2.0, entry_vwap + 2.0) for shorts.", "reason": "Both 'at most 2.0 from entry price' and 'not farther than 2.0 from entry-time VWAP' must hold simultaneously; taking the bound closer to the entry price satisfies both inequalities at once."},
+  {"topic": "stop order cancellation on signal exit", "choice": "Cancel the pending fixed stop order before submitting the VWAP-cross close order.", "reason": "Prevents an orphaned stop order from acting after the position is already flattened by the signal exit; required for correct single-position order bookkeeping though not stated explicitly in the spec."},
+  {"topic": "session definition", "choice": "A session equals one calendar trading day as given by the data feed's date; the VWAP cumulative sums reset whenever the bar's date changes.", "reason": "Spec says VWAP 'resets at the start of each trading day'; the feed only contains regular-session 5m bars, so a date change is an unambiguous session boundary."},
+  {"topic": "stop order type", "choice": "Implemented as a native backtrader bt.Order.Stop placed once at entry and left unmodified for the life of the trade.", "reason": "Spec explicitly requires 'a fixed stop (not trailing) using the entry bar's VWAP value.'"}
+]}
+```

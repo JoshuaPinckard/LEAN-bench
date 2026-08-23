@@ -2,124 +2,90 @@
 import backtrader as bt
 
 
-class FutureReturnDistributionStrategy(bt.Strategy):
+class ReturnDistributionMACrossRSIStrategy(bt.Strategy):
     params = dict(
-        fast_period=13,          # Fast SMA
-        slow_period=40,          # Slow SMA
-        rsi_period=14,           # RSI standard period
-        macd_fast=12,            # MACD fast EMA
-        macd_slow=26,            # MACD slow EMA
-        macd_signal=9,           # MACD signal SMA
-        bars_per_window=6,       # 6 x 5-minute bars = one 30-minute candle
-        hold_periods=6,          # exit after 6 completed 30-minute periods (return_6)
-        ma_crosses_required=1,   # entry: exactly one upward SMA cross in the window
-        avg_rsi_threshold=70.0,  # entry: average RSI above 70
-        stop_loss=0.015,         # 1.5% stop-loss
-        take_profit=0.03,        # 3.0% take-profit
-        capital_fraction=0.99,   # ~100% of available capital (buffered)
+        fast_period=13,
+        slow_period=40,
+        rsi_period=14,
+        agg_bars=6,       # number of 5-minute bars per 30-minute candle
+        hold_periods=6,   # 30-minute periods to hold after entry
+        stop_loss_pct=0.015,
+        take_profit_pct=0.03,
     )
 
     def __init__(self):
-        # Indicators are computed on the 5-minute feed; the two 30-minute
-        # conditions are aggregated from these in next() (see assumptions).
         self.fast_sma = bt.indicators.SMA(self.data.close, period=self.p.fast_period)
         self.slow_sma = bt.indicators.SMA(self.data.close, period=self.p.slow_period)
-        self.crossover = bt.indicators.CrossOver(self.fast_sma, self.slow_sma)
         self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
-        # MACD is specified among the indicators; instantiated for fidelity.
-        self.macd = bt.indicators.MACD(
-            self.data.close,
-            period_me1=self.p.macd_fast,
-            period_me2=self.p.macd_slow,
-            period_signal=self.p.macd_signal,
-        )
+        self.macd = bt.indicators.MACD(self.data.close)
+        self.crossover = bt.indicators.CrossOver(self.fast_sma, self.slow_sma)
 
-        # 30-minute window aggregation state
-        self.cur_bucket = None
-        self.bar_in_window = 0
-        self.ma_crosses = 0
-        self.rsi_sum = 0.0
-        self.rsi_count = 0
-
-        # position / order state
         self.order = None
         self.entry_price = None
-        self.hold_count = 0
+        self.periods_held = 0
 
-    def _bucket(self, dt):
-        # Group 5-minute bars by calendar half-hour (open-time labeled).
-        return (dt.year, dt.month, dt.day, (dt.hour * 60 + dt.minute) // 30)
-
-    def _check_risk(self):
-        if self.entry_price is None:
-            return
-        price = self.data.close[0]
-        if price <= self.entry_price * (1.0 - self.p.stop_loss):
-            self.order = self.close()
-        elif price >= self.entry_price * (1.0 + self.p.take_profit):
-            self.order = self.close()
-
-    def _finalize_window(self):
-        full = (self.bar_in_window == self.p.bars_per_window)
-        avg_rsi = self.rsi_sum / self.rsi_count if self.rsi_count else 0.0
-        ma_crosses = self.ma_crosses
-
-        # Fixed holding period: close after 6 completed 30-minute periods.
-        if self.position and self.order is None:
-            self.hold_count += 1
-            if self.hold_count >= self.p.hold_periods:
-                self.order = self.close()
-                return
-
-        # Entry filter evaluated on the just-completed 30-minute candle.
-        if full and not self.position and self.order is None:
-            if (ma_crosses == self.p.ma_crosses_required
-                    and avg_rsi > self.p.avg_rsi_threshold):
-                cash = self.broker.get_cash()
-                price = self.data.close[0]
-                size = int(cash * self.p.capital_fraction / price)
-                if size > 0:
-                    self.order = self.buy(size=size)
-                    self.hold_count = 0
-
-    def next(self):
-        dt = self.data.datetime.datetime(0)
-        bucket = self._bucket(dt)
-
-        # 1) Risk management evaluated on every 5-minute bar.
-        if self.position and self.order is None:
-            self._check_risk()
-
-        # 2) 30-minute window boundary: finalize the completed candle.
-        if self.cur_bucket is None:
-            self.cur_bucket = bucket
-        elif bucket != self.cur_bucket:
-            self._finalize_window()
-            self.cur_bucket = bucket
-            self.bar_in_window = 0
-            self.ma_crosses = 0
-            self.rsi_sum = 0.0
-            self.rsi_count = 0
-
-        # 3) Accumulate the current 5-minute bar into the current 30-min window.
-        self.bar_in_window += 1
-        if self.crossover[0] > 0:          # fast SMA crossed above slow SMA
-            self.ma_crosses += 1
-        self.rsi_sum += float(self.rsi[0])
-        self.rsi_count += 1
+        self.group_cross_count = 0
+        self.group_rsi_sum = 0.0
+        self.group_bar_count = 0
 
     def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
+        if order.status in [order.Submitted, order.Accepted]:
             return
         if order.status == order.Completed:
             if order.isbuy():
                 self.entry_price = order.executed.price
             else:
                 self.entry_price = None
-                self.hold_count = 0
-        # Completed / Canceled / Margin / Rejected -> clear the pending order.
-        self.order = None
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        bar_index = len(self.data) - 1
+        group_position = bar_index % self.p.agg_bars
+
+        if group_position == 0:
+            self.group_cross_count = 0
+            self.group_rsi_sum = 0.0
+            self.group_bar_count = 0
+
+        if self.crossover[0] > 0:
+            self.group_cross_count += 1
+        self.group_rsi_sum += self.rsi[0]
+        self.group_bar_count += 1
+
+        group_complete = (group_position == self.p.agg_bars - 1)
+
+        if self.position and self.entry_price is not None and not self.order:
+            price = self.data.close[0]
+            if price <= self.entry_price * (1.0 - self.p.stop_loss_pct):
+                self.order = self.close()
+            elif price >= self.entry_price * (1.0 + self.p.take_profit_pct):
+                self.order = self.close()
+
+        if group_complete:
+            avg_rsi = self.group_rsi_sum / self.group_bar_count
+            ma_crosses = self.group_cross_count
+
+            if self.position:
+                if not self.order:
+                    self.periods_held += 1
+                    if self.periods_held >= self.p.hold_periods:
+                        self.order = self.close()
+            elif not self.order:
+                if ma_crosses == 1 and avg_rsi > 70:
+                    size = int(self.broker.getcash() / self.data.close[0])
+                    if size > 0:
+                        self.order = self.buy(size=size)
+                        self.periods_held = 0
 ```
 ```json
-{"assumptions": [{"topic": "aggregation", "choice": "Computed SMA(13), SMA(40), RSI(14) and MACD on the provided 5-minute feed and aggregated the two conditions (ma_crosses, avg_rsi) per 30-minute window inside next().", "reason": "The harness supplies a single 5-minute feed, and the spec's condition definitions are explicitly 5-minute-based ('based on 5-minute data'; 'average RSI over the 30-minute period' implies multiple 5-min RSI values). A separate resampled 30-min feed cannot be added inside the strategy and would contradict those definitions."}, {"topic": "30-minute window boundaries", "choice": "Grouped 5-minute bars by calendar half-hour ((hour*60+minute)//30) using the bar's open-time timestamp; each window is 6 bars (09:30-09:55, 10:00-10:25, ...).", "reason": "The feed is regular RTH 5-minute bars aligned to :00/:05.../:55, so this yields exactly 6 bars per 30-minute candle."}, {"topic": "entry/exit timing", "choice": "A 30-minute candle is finalized/evaluated at the first bar of the following window; entries and exits are market orders that fill at the next 5-minute bar's open.", "reason": "backtrader executes next()-submitted market orders at the following bar's open; with a single 5-minute feed, execution exactly at a 30-minute candle's close is not possible."}, {"topic": "hold period", "choice": "The fixed-holding exit counts completed 30-minute windows after entry and closes once 6 have elapsed (return_6 semantics).", "reason": "Spec: close after 6 30-minute periods following opening (~3 hours)."}, {"topic": "MACD usage", "choice": "Instantiated MACD(12,26,9) as listed but did not reference it in the signal logic.", "reason": "The spec lists MACD among indicators but defines no MACD condition in its signal-generation logic; using it would invent an unspecified filter."}, {"topic": "position sizing", "choice": "size = floor(available_cash * 0.99 / close): ~100% of available capital with a 1% buffer.", "reason": "Spec says 'for example, 100% of available capital per trade'; the buffer prevents margin rejection from the 0.001 commission and next-bar open gaps."}, {"topic": "stop-loss/take-profit evaluation", "choice": "Evaluated on each 5-minute bar's close versus the executed entry price, exiting via market self.close() at the next bar's open; stop-loss checked before take-profit.", "reason": "Spec adds these as supplementary risk rules without specifying fill mechanics; a close-based market exit is deterministic and comparable in this single-feed environment."}, {"topic": "single position", "choice": "At most one open position at a time; no pyramiding or re-entry while a position is open, and re-entry is gated by a pending-order guard.", "reason": "Canonical default; the spec does not call for pyramiding or scaling."}, {"topic": "infeasible", "choice": "Implemented only on the single provided AAPL 5-minute feed over the fixed date range; the 30-50 liquid-ticker universe and multi-year evaluation are not implemented inside the strategy class.", "reason": "The fixed execution environment provides one data feed and one date range; multi-asset selection and multi-year testing are harness/testing-scope concerns outside a single bt.Strategy on this feed."}]}
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Manually aggregate 5-minute bars into 30-minute candles inside next() using the absolute bar index (len(self.data)) rather than cerebro.resampledata/replaydata", "reason": "The harness fixes a single 5-minute PandasData feed added by its own cerebro setup; the strategy has no access to cerebro to add a resampled second feed, so the 30-minute aggregation described in the spec is reproduced arithmetically from the 5-minute series instead."},
+  {"topic": "group alignment", "choice": "30-minute group boundaries are computed from the absolute feed bar index (len(self.data)-1) modulo 6, not a counter that starts at the first next() call", "reason": "Backtrader delays next() until indicator minperiod (slow SMA=40) is satisfied; anchoring to the absolute bar index keeps 30-minute groups aligned to the 09:30 session start (4680 bars = 60 days x 78 bars/day, evenly divisible by 6) despite the warm-up delay."},
+  {"topic": "MACD usage", "choice": "MACD(12,26,9) is instantiated as required by the 'Indicators' section but is not referenced in the entry/exit logic", "reason": "The spec's 'Signal generation logic' section defines the entry filter using only ma_crosses and avg_rsi; no MACD condition is stated, and the instructions forbid inventing additional filters."},
+  {"topic": "position sizing", "choice": "Size computed manually as int(available_cash / current_close) at signal time and passed to self.buy(size=...)", "reason": "Spec explicitly requires 100% of capital per trade (not silent), but the strategy has no access to cerebro to add a PercentSizer, so the equivalent full-cash share count is computed directly."},
+  {"topic": "stop-loss/take-profit price reference", "choice": "SL/TP thresholds are checked against the 5-minute bar close price on every bar while a position is open", "reason": "Spec states percentage thresholds off entry price without specifying which price series to monitor intrabar; close price is the simplest literal reading given only OHLCV bars are available."},
+  {"topic": "infeasible", "choice": "Implemented the strategy logic against the single fixed AAPL 5-minute feed only; the 30-50 ticker S&P 500 universe and multi-year historical backtest described under 'Additional rules' are not implemented", "reason": "The execution environment fixes one AAPL data feed for one date range; multi-ticker scanning and alternate history periods require data/assets outside what the harness provides."},
+  {"topic": "order fill timing", "choice": "Entry/exit orders are submitted with plain self.buy()/self.close() at the bar where the condition is detected and fill per backtrader's default next-bar-open behavior", "reason": "Spec does not specify order execution timing, so the environment's default broker fill semantics are used unmodified."}
+]}
 ```

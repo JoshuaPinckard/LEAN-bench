@@ -1,0 +1,133 @@
+```python
+import backtrader as bt
+
+
+class PreMarketGapRiskStrategy(bt.Strategy):
+    params = dict(
+        atr_period=14,
+        sma_period=20,
+        atr_filter_short=5,
+        atr_filter_long=20,
+        atr_filter_mult=1.5,
+        gap_pct=0.02,
+        stop_atr_mult=1.5,
+        trail_trigger_atr_mult=1.0,
+        trail_atr_mult=1.0,
+        risk_pct=0.015,
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.atr_avg_short = bt.indicators.SMA(self.atr, period=self.p.atr_filter_short)
+        self.atr_avg_long = bt.indicators.SMA(self.atr, period=self.p.atr_filter_long)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.order = None
+        self.entry_order_pending = False
+        self.pending_atr = None
+
+        self.entry_price = None
+        self.atr_at_entry = None
+        self.stop_price = None
+        self.trail_active = False
+        self.trail_extreme = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if self.entry_order_pending:
+                self.entry_price = order.executed.price
+                self.atr_at_entry = self.pending_atr
+                if order.isbuy():
+                    self.stop_price = self.entry_price - self.p.stop_atr_mult * self.atr_at_entry
+                else:
+                    self.stop_price = self.entry_price + self.p.stop_atr_mult * self.atr_at_entry
+                self.trail_active = False
+                self.trail_extreme = self.entry_price
+                self.entry_order_pending = False
+            if not self.position:
+                self.entry_price = None
+                self.atr_at_entry = None
+                self.stop_price = None
+                self.trail_active = False
+                self.trail_extreme = None
+            self.order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            self.entry_order_pending = False
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self._manage_open_position()
+            return
+
+        vol_ok = self.atr_avg_short[0] <= self.p.atr_filter_mult * self.atr_avg_long[0]
+        gap_down = self.data.open[0] <= self.data.close[-1] * (1.0 - self.p.gap_pct)
+        gap_up = self.data.open[0] >= self.data.close[-1] * (1.0 + self.p.gap_pct)
+
+        if self.crossover[0] > 0:
+            trend_ok = self.data.close[0] > self.sma[0]
+            if vol_ok and not gap_down and trend_ok:
+                self._enter(is_long=True)
+        elif self.crossover[0] < 0:
+            trend_ok = self.data.close[0] < self.sma[0]
+            if vol_ok and not gap_up and trend_ok:
+                self._enter(is_long=False)
+
+    def _enter(self, is_long):
+        stop_distance = self.p.stop_atr_mult * self.atr[0]
+        if stop_distance <= 0:
+            return
+        risk_amount = self.p.risk_pct * self.broker.getvalue()
+        size = int(risk_amount / stop_distance)
+        if size < 1:
+            return
+        self.pending_atr = self.atr[0]
+        self.entry_order_pending = True
+        if is_long:
+            self.order = self.buy(size=size)
+        else:
+            self.order = self.sell(size=size)
+
+    def _manage_open_position(self):
+        atr = self.atr_at_entry
+        is_long = self.position.size > 0
+
+        if is_long:
+            profit = self.data.close[0] - self.entry_price
+            if not self.trail_active and profit >= self.p.trail_trigger_atr_mult * atr:
+                self.trail_active = True
+                self.trail_extreme = self.data.high[0]
+                self.stop_price = self.trail_extreme - self.p.trail_atr_mult * atr
+            elif self.trail_active and self.data.high[0] > self.trail_extreme:
+                self.trail_extreme = self.data.high[0]
+                self.stop_price = self.trail_extreme - self.p.trail_atr_mult * atr
+
+            if self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+        else:
+            profit = self.entry_price - self.data.close[0]
+            if not self.trail_active and profit >= self.p.trail_trigger_atr_mult * atr:
+                self.trail_active = True
+                self.trail_extreme = self.data.low[0]
+                self.stop_price = self.trail_extreme + self.p.trail_atr_mult * atr
+            elif self.trail_active and self.data.low[0] < self.trail_extreme:
+                self.trail_extreme = self.data.low[0]
+                self.stop_price = self.trail_extreme + self.p.trail_atr_mult * atr
+
+            if self.data.high[0] >= self.stop_price:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "primary_entry_signal", "choice": "Use a crossover of Close price over SMA(20) (the specified trend indicator) as the primary trading signal: a cross above generates a long signal, a cross below generates a short signal.", "reason": "The spec leaves the main entry logic unspecified ('e.g., moving average crossover, level breakout, etc.'); reusing the already-specified SMA(20) avoids introducing an indicator the spec never names."},
+  {"topic": "infeasible", "choice": "The pre-market volume indicator is not implemented.", "reason": "The feed contains only daily OHLCV bars with no pre-market session data; the spec itself conditions this indicator on data availability ('if data is available'), and no such data exists in this environment."},
+  {"topic": "infeasible", "choice": "The time-based exit ('close all open positions 15 minutes before market close') is not implemented.", "reason": "The feed is daily-bar OHLCV with no intraday timestamps, so there is no way to identify a point 15 minutes before the close within a bar; stop-loss/trailing-stop management still runs on every bar, but this specific intraday timing rule cannot be represented on this timeframe."},
+  {"topic": "stop_distance_basis", "choice": "Freeze the ATR(14) value observed at the moment the entry signal is generated, and use that frozen value for both the fixed 1.5xATR stop-loss and the 1xATR trailing-stop distance for the entire life of the trade.", "reason": "The spec states the stop is '1.5 ATR(14) below the entry price', implying a level fixed at entry; the spec does not state that the trailing distance should be recalculated from a live ATR, so the entry-time value was kept for internal consistency."},
+  {"topic": "stop_trigger_price", "choice": "Stop-loss and trailing-stop levels are checked against the bar's intrabar Low (for longs) / High (for shorts) rather than Close.", "reason": "Checking only the Close could miss a level touched intrabar; using High/Low is the closest literal reading of the stop being 'hit'."},
+  {"topic": "position_sizing", "choice": "Share size = floor(1.5% of current portfolio value / (1.5 * ATR(14) at signal time)); if this rounds down to zero shares, the entry signal is skipped for that bar.", "reason": "The spec requires the potential stop-loss loss to not exceed 1.5% of capital; whole-share rounding is the practical convention for equities, and skipping unattainable zero-size trades is necessary since fractional shares are not assumed available."}
+]}
+```

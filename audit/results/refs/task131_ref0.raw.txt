@@ -1,101 +1,82 @@
 ```python
 import backtrader as bt
-import collections
-import statistics
 
 
-class NVDAPreEarningsMomentumBreakout(bt.Strategy):
+class NvdaPreEarningsMomentumBreakout(bt.Strategy):
     params = dict(
-        support_low=6455.0,      # lower boundary of nearest support zone
-        support_high=6465.0,     # upper boundary of nearest support zone
-        key_support=6430.75,     # 50% retracement key support
-        resistance=6496.25,      # previous high / breakout level
-        target=6508.75,          # take-profit target (new ATH)
-        stop_price=6455.0,       # stop-loss at lower boundary of support zone
-        risk_pct=0.02,           # max loss per trade as fraction of capital (1-2% -> 2% cap)
-        trend_period=200,        # 200-period SMA on the daily timeframe
+        nearest_support_low=6455.0,
+        nearest_support_high=6465.0,
+        key_support=6430.75,
+        resistance=6496.25,
+        target=6508.75,
+        stop_loss=6455.0,
+        volume_sma_period=20,
+        risk_pct=0.01,
     )
 
     def __init__(self):
+        self.volume_sma = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.volume_sma_period)
         self.order = None
-        self.pullback_occurred = False
-        self.current_day = None
-        self.daily_closes = collections.deque(maxlen=self.p.trend_period)
+        self.pulled_back = False
+        self.recovering = False
 
     def notify_order(self, order):
-        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
             self.order = None
 
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.pulled_back = False
+            self.recovering = False
+
     def next(self):
-        d = self.data
-
-        # --- build the daily-timeframe series for the 200-day SMA (feed is 1h) ---
-        dt = d.datetime.date(0)
-        if self.current_day is None:
-            self.current_day = dt
-        elif dt != self.current_day:
-            self.daily_closes.append(d.close[-1])  # prior day's closing bar
-            self.current_day = dt
-
-        # --- pullback to the key support (50% retracement) has occurred ---
-        if d.low[0] <= self.p.key_support:
-            self.pullback_occurred = True
-
-        if len(d) < 2:
-            return
         if self.order:
             return
 
         if not self.position:
-            # Entry condition 1: price above or within nearest support zone (>= 6455)
-            in_support = d.close[0] >= self.p.support_low
-            # Entry condition 2: a pullback from 6430.75 occurred and price is recovering
-            recovering = self.pullback_occurred and d.close[0] > d.close[-1]
-            # Entry condition 3: break above resistance 6496.25 with increased volume
-            breakout = d.close[0] > self.p.resistance and d.close[-1] <= self.p.resistance
-            rising_vol = d.volume[0] > d.volume[-1]
-            # Optional confirmation: global uptrend (price above 200-day SMA)
-            trend_ok = (len(self.daily_closes) >= self.p.trend_period and
-                        d.close[0] > statistics.mean(self.daily_closes))
-
-            if in_support and recovering and breakout and rising_vol and trend_ok:
-                entry_price = d.close[0]
-                stop_dist = entry_price - self.p.stop_price
-                risk_capital = self.broker.getvalue() * self.p.risk_pct
-                size = int(risk_capital / stop_dist) if stop_dist > 0 else 0
-                max_affordable = int(self.broker.getcash() / entry_price)
-                size = min(size, max_affordable)
-                if size >= 1:
-                    self.order = self.buy(size=size)
-                    self.pullback_occurred = False
-        else:
-            # Exit 1: take-profit on reaching the target (new ATH)
-            if d.high[0] >= self.p.target:
-                self.order = self.close()
-            # Exit 2: stop-loss on dropping below the support zone (stop at 6455)
-            elif d.low[0] <= self.p.stop_price:
-                self.order = self.close()
+            if not self.pulled_back:
+                if self.data.low[0] <= self.p.key_support:
+                    self.pulled_back = True
+            elif not self.recovering:
+                if self.data.close[0] > self.data.close[-1]:
+                    self.recovering = True
             else:
-                # Exit 3 (alternative): bearish reversal candle on increased volume
-                bearish_engulf = (d.close[0] < d.open[0] and
-                                  d.close[-1] > d.open[-1] and
-                                  d.close[0] < d.open[-1] and
-                                  d.open[0] > d.close[-1])
-                if bearish_engulf and d.volume[0] > d.volume[-1]:
-                    self.order = self.close()
+                above_support_zone = self.data.close[0] >= self.p.nearest_support_low
+                breakout = (self.data.close[-1] <= self.p.resistance
+                            and self.data.close[0] > self.p.resistance)
+                increased_volume = self.data.volume[0] > self.volume_sma[0]
+
+                if above_support_zone and breakout and increased_volume:
+                    entry_price = self.data.close[0]
+                    stop_distance = entry_price - self.p.stop_loss
+                    if stop_distance > 0:
+                        risk_amount = self.broker.getvalue() * self.p.risk_pct
+                        size = int(risk_amount / stop_distance)
+                        if size > 0:
+                            self.order = self.buy(size=size)
+        else:
+            if self.data.close[0] >= self.p.target:
+                self.order = self.close()
+            elif self.data.close[0] < self.p.stop_loss:
+                self.order = self.close()
+            elif (self.data.close[0] < self.data.open[0]
+                  and self.data.close[0] < self.data.close[-1]
+                  and self.data.volume[0] > self.volume_sma[0]):
+                self.order = self.close()
 ```
 ```json
 {"assumptions": [
-  {"topic": "trend filter (200 SMA daily)", "choice": "Computed a 200-day SMA manually by sampling each prior day's closing bar from the 1h feed, and required close > SMA as a required entry confirmation.", "reason": "Feed is 1h with no separate daily feed; strategy cannot add resampled data, so the daily SMA is reconstructed from daily closes. The named indicator is included as written; 'for confirmation' is treated as a gating condition."},
-  {"topic": "increased/rising volume", "choice": "volume[0] > volume[-1] on the breakout bar.", "reason": "Both 'increased volume' (entry cond. 3) and 'rising trading volume at the moment of the breakout' (rule 3) are read most literally as a bar-over-bar increase."},
-  {"topic": "pullback from key support 6430.75", "choice": "A boolean flag is set True once any bar's low <= 6430.75; 'started to recover' = current close > previous close; flag reset on entry so re-entry needs a fresh pullback.", "reason": "Spec describes a retrace down to the 50% key support followed by recovery, then a subsequent breakout."},
-  {"topic": "breakout definition", "choice": "Fresh upward cross: close[-1] <= 6496.25 and close[0] > 6496.25.", "reason": "'Breaks above the resistance (the last high)' implies a crossing event rather than merely being above."},
-  {"topic": "take-profit / stop-loss triggers", "choice": "Take-profit when bar high >= 6508.75; stop-loss when bar low <= 6455; both exit via self.close() (market at next open).", "reason": "'Upon reaching the target' and 'if price drops below the zone' are intrabar; stop placed at the lower boundary 6455 exactly as stated."},
-  {"topic": "alternative reversal exit", "choice": "Bearish engulfing candle (down candle engulfing the prior up candle) combined with volume[0] > volume[-1].", "reason": "Spec gives 'formation of a bearish candlestick pattern on increased volume' as an example; engulfing chosen as a canonical bearish reversal pattern."},
-  {"topic": "position sizing / risk %", "choice": "size = floor(risk_pct * portfolio value / (entry - 6455)), capped by affordable cash, requiring size >= 1; risk_pct = 0.02 (upper bound of the stated 1-2%).", "reason": "Encodes 'stop-loss size in points x lot size <= established limit' and 'loss <= 1-2% of capital'; cash cap prevents margin rejection."},
-  {"topic": "infeasible - NVDA ATH filter", "choice": "Optional NVDA 183-185 ATH filter omitted.", "reason": "Only the ES 1h feed is available; NVDA price data is not present in the environment, so the filter cannot be evaluated."},
-  {"topic": "infeasible - no trading during NVDA earnings", "choice": "News/earnings blackout not implemented; trades allowed on all bars meeting the signal.", "reason": "No earnings calendar or news data is available in the OHLCV feed, so the closest literal reading applies no suppression."},
-  {"topic": "infeasible - 4h+ timeframe", "choice": "Logic runs on the provided 1h bars; no internal 4h resampling.", "reason": "The harness fixes a single 1h PandasData feed and the strategy cannot add a resampled feed; the same levels/logic are applied on 1h as the closest literal reading."},
-  {"topic": "infeasible - ES contract multiplier", "choice": "Risk sizing computed in raw price points (1 unit x 1 point = $1 P&L).", "reason": "The harness sets a 0.1% percentage commission and no futures multiplier, so ES is modeled cash/stock-like rather than at $50/point; sizing is done consistently with the environment's economics."}
+  {"topic": "infeasible", "choice": "200-period daily SMA trend filter not implemented", "reason": "Listed as optional-for-confirmation in the indicators section, not among the four numbered entry conditions, and requires a daily timeframe not derivable from the single 1h ES data feed provided by the harness."},
+  {"topic": "infeasible", "choice": "NVDA ATH filter (entry condition 4) not implemented", "reason": "Explicitly marked optional and requires NVDA price data, which is not provided (harness supplies only a single ES=F feed)."},
+  {"topic": "infeasible", "choice": "logic runs on the provided 1h bars as-is", "reason": "Spec calls for 4h+ timeframes, but the harness fixes a single 1h data feed; resampling is not controllable from within the Strategy class."},
+  {"topic": "infeasible", "choice": "news/earnings blackout filter not implemented", "reason": "Requires an external NVDA earnings calendar not derivable from OHLCV data."},
+  {"topic": "pullback/recovery detection", "choice": "pullback flagged when low[0] <= 6430.75; recovery confirmed on a later bar where close[0] > close[-1]", "reason": "Spec states a pullback-then-recovery sequence but does not define an exact trigger; used the simplest literal one-bar confirmation."},
+  {"topic": "increased volume reference", "choice": "20-period simple moving average of volume; 'increased' means current volume above this average", "reason": "Spec requires 'increased volume' at breakout/reversal but specifies no lookback period."},
+  {"topic": "bearish candlestick reversal exit", "choice": "close[0] < open[0] and close[0] < close[-1] and volume[0] > 20-period volume SMA", "reason": "Spec names a 'bearish candlestick pattern on increased volume' without defining a specific pattern; used the simplest literal down-bar-on-above-average-volume reading."},
+  {"topic": "stop-loss / take-profit / breakout evaluation basis", "choice": "evaluated against bar close, not intrabar high/low", "reason": "Spec does not specify intrabar vs. close-based triggers; close-based checks keep all conditions internally consistent."},
+  {"topic": "risk-per-trade percentage", "choice": "1% of current portfolio value", "reason": "Spec gives a 1-2% range without pinning an exact figure; chose the conservative end."},
+  {"topic": "point value / position sizing", "choice": "assume $1 of account value per point per unit (no futures multiplier)", "reason": "Harness's fixed cerebro setup specifies no contract multiplier or margin scheme, so backtrader's default cash-per-unit-price behavior was used."},
+  {"topic": "setup invalidation", "choice": "pullback/recovering state persists until an entry occurs or a trade closes; no time/price expiration", "reason": "Spec does not define when a detected pullback/recovery becomes stale; avoided inventing unstated invalidation rules."}
 ]}
 ```

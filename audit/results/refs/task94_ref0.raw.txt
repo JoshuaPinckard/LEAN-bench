@@ -1,0 +1,104 @@
+```python
+import backtrader as bt
+
+
+class NXXTMultiMATrendStrategy(bt.Strategy):
+    params = dict(
+        sma_fast=30,
+        sma_mid=60,
+        sma_slow=120,
+        consolidation_pct=0.05,
+        consolidation_bars=5,
+        take_profit_pct=0.10,
+        risk_pct=0.02,
+        atr_period=14,
+        atr_avg_period=30,
+        vol_mult=1.5,
+    )
+
+    def __init__(self):
+        self.sma30 = bt.indicators.SMA(self.data.close, period=self.p.sma_fast)
+        self.sma60 = bt.indicators.SMA(self.data.close, period=self.p.sma_mid)
+        self.sma120 = bt.indicators.SMA(self.data.close, period=self.p.sma_slow)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_avg = bt.indicators.SMA(self.atr, period=self.p.atr_avg_period)
+
+        self.order = None
+        self.entry_price = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+            self.order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _consolidation_breakout(self):
+        n = self.p.consolidation_bars
+        window = [self.data.close[-i] for i in range(1, n + 1)]
+        hi = max(window)
+        lo = min(window)
+        if lo <= 0:
+            return False, None
+        in_range = (hi - lo) / lo <= self.p.consolidation_pct
+        if not in_range:
+            return False, None
+        return self.data.close[0] > hi, hi
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.entry_price is not None and \
+                    self.data.close[0] >= self.entry_price * (1 + self.p.take_profit_pct):
+                self.order = self.close()
+                return
+            if self.data.close[0] < self.sma30[0]:
+                self.order = self.close()
+                return
+            return
+
+        above_all = (self.data.close[0] > self.sma30[0] and
+                     self.data.close[0] > self.sma60[0] and
+                     self.data.close[0] > self.sma120[0])
+        rising = (self.sma30[0] > self.sma30[-1] and
+                  self.sma60[0] > self.sma60[-1] and
+                  self.sma120[0] > self.sma120[-1])
+        if not (above_all and rising):
+            return
+
+        breakout, range_hi = self._consolidation_breakout()
+        if not breakout:
+            return
+
+        if self.atr_avg[0] and self.atr[0] > self.p.vol_mult * self.atr_avg[0]:
+            return
+
+        stop_price = self.sma30[0]
+        signal_price = self.data.close[0]
+        risk_per_share = signal_price - stop_price
+        if risk_per_share <= 0:
+            return
+
+        risk_amount = self.p.risk_pct * self.broker.getvalue()
+        size = risk_amount / risk_per_share
+        if size <= 0:
+            return
+
+        self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Treat the 'regular trading hours' filter as always satisfied (no-op).", "reason": "Only daily OHLCV bars are available with no intraday/session timestamp data, so an intraday trading-hours filter cannot be evaluated; every bar is a regular daily close by construction of the feed."},
+  {"topic": "consolidation window", "choice": "Use exactly the trailing 5 bars (excluding the breakout bar) to test the 5% range condition, rather than searching for the longest qualifying run.", "reason": "Spec requires 'at least 5 consecutive sessions'; checking the minimum 5-bar window is the most literal, deterministic reading and any run of 5+ in-range bars will satisfy this test on its final in-range bar."},
+  {"topic": "consolidation basis", "choice": "Compute the 5% range using Close prices only, with (max-min)/min as the range percentage.", "reason": "Spec says 'price trading within a range'; Close is the canonical 'price' series, and using the window low as the percentage base is a standard convention when the spec doesn't specify a base."},
+  {"topic": "breakout definition", "choice": "Breakout = current bar's Close > max(Close) of the prior 5-bar consolidation window.", "reason": "Spec states entry price is 'the close of the session that breaks above the consolidation range'; the upper bound of that range is the window's high close."},
+  {"topic": "infeasible", "choice": "Use the signal bar's Close (and same-bar SMA30) for the risk/position-size calculation, then submit a plain self.buy(size=...) which backtrader fills at the next bar's open.", "reason": "Backtrader's default broker executes next()-submitted market orders on the following bar; the harness's fixed cerebro setup gives no control to force close-price fills, so this is the closest feasible approximation to 'entry price at the breakout close'."},
+  {"topic": "risk capital base", "choice": "Use self.broker.getvalue() (current portfolio value) at signal time as the 'total trading capital' for the 2% risk calculation.", "reason": "Spec does not specify whether risk is based on initial or current capital; current portfolio value is the standard live-risk-management convention."},
+  {"topic": "volatility threshold", "choice": "High volatility = ATR(14) > 1.5 x SMA(ATR(14), 30).", "reason": "Direct translation of 'ATR over the last 14 days being more than 50% higher than its 30-day average', where the 30-day average of ATR14 is a 30-period SMA applied to the ATR14 line."},
+  {"topic": "trailing stop evaluation", "choice": "Stop-loss check uses the current bar's SMA30 value (recomputed each bar) compared to current Close, rather than freezing the SMA30 value from entry.", "reason": "Spec explicitly describes the SMA30 stop as 'a trailing stop, adjusting as the SMA 30 moves up', so it must be re-evaluated with the live SMA30 on every bar while in position."},
+  {"topic": "exit priority", "choice": "When both take-profit and stop-loss conditions are true on the same bar, take-profit is checked and applied first.", "reason": "Spec does not state a priority between the two exit rules; an explicit, deterministic tie-break is required since only one exit order can be sensibly issued per bar."}
+]}
+```

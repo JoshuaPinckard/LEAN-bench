@@ -1,0 +1,131 @@
+```python
+import backtrader as bt
+
+
+class Fibo114XBBATRProxy(bt.Strategy):
+    params = dict(
+        sma_period=200,
+        bb_period=20,
+        bb_devfactor=2.0,
+        ema_period=9,
+        atr_period=14,
+        spike_mult=0.114,
+        trail_atr_mult=1.5,
+        stop_atr_mult=0.5,
+        risk_pct=0.01,
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+        self.ema9 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.cross_up = bt.indicators.CrossOver(self.data.close, self.ema9)
+        self.cross_down = bt.indicators.CrossOver(self.ema9, self.data.close)
+
+        self.order = None
+
+        # Spike-then-confirmation is a two-bar pattern: "armed" latches the
+        # spike until a later bar supplies the trend + crossover confirmation.
+        self.long_armed = False
+        self.short_armed = False
+        self.long_breakout_level = None
+        self.short_breakout_level = None
+        self.long_stop_price = None
+        self.short_stop_price = None
+        self.long_extreme = None
+        self.short_extreme = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        close = self.data.close[0]
+        bb_top = self.bb.lines.top[0]
+        bb_mid = self.bb.lines.mid[0]
+        bb_bot = self.bb.lines.bot[0]
+        bb_width = bb_top - bb_bot
+        atr = self.atr[0]
+
+        if close < bb_bot and (bb_bot - close) >= self.p.spike_mult * bb_width:
+            self.long_armed = True
+            self.long_breakout_level = bb_bot - self.p.spike_mult * bb_width
+        if close > bb_top and (close - bb_top) >= self.p.spike_mult * bb_width:
+            self.short_armed = True
+            self.short_breakout_level = bb_top + self.p.spike_mult * bb_width
+
+        long_signal = self.long_armed and (close > self.sma200[0]) and (self.cross_up[0] > 0)
+        short_signal = self.short_armed and (close < self.sma200[0]) and (self.cross_down[0] > 0)
+
+        if self.order:
+            return
+
+        if not self.position:
+            if long_signal:
+                stop_price = self.long_breakout_level - self.p.stop_atr_mult * atr
+                distance = abs(close - stop_price)
+                if distance > 0:
+                    risk_money = self.broker.getvalue() * self.p.risk_pct
+                    size = risk_money / distance
+                    self.long_stop_price = stop_price
+                    self.long_extreme = close
+                    self.order = self.buy(size=size)
+                    self.long_armed = False
+            elif short_signal:
+                stop_price = self.short_breakout_level + self.p.stop_atr_mult * atr
+                distance = abs(stop_price - close)
+                if distance > 0:
+                    risk_money = self.broker.getvalue() * self.p.risk_pct
+                    size = risk_money / distance
+                    self.short_stop_price = stop_price
+                    self.short_extreme = close
+                    self.order = self.sell(size=size)
+                    self.short_armed = False
+
+        elif self.position.size > 0:
+            self.long_extreme = max(self.long_extreme, close)
+            trail_stop = self.long_extreme - self.p.trail_atr_mult * atr
+            exit_now = False
+            if short_signal:
+                exit_now = True
+                self.short_armed = False
+            elif close >= bb_mid:
+                exit_now = True
+            elif close <= trail_stop:
+                exit_now = True
+            elif self.long_stop_price is not None and close <= self.long_stop_price:
+                exit_now = True
+            if exit_now:
+                self.order = self.close()
+
+        elif self.position.size < 0:
+            self.short_extreme = min(self.short_extreme, close)
+            trail_stop = self.short_extreme + self.p.trail_atr_mult * atr
+            exit_now = False
+            if long_signal:
+                exit_now = True
+                self.long_armed = False
+            elif close <= bb_mid:
+                exit_now = True
+            elif close >= trail_stop:
+                exit_now = True
+            elif self.short_stop_price is not None and close >= self.short_stop_price:
+                exit_now = True
+            if exit_now:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "spike-then-confirmation sequencing", "choice": "Implemented as a state machine: an 'armed' flag latches when the extreme BB spike condition is met on a bar; on any later bar the trend filter (close vs SMA200) and CrossOver condition are re-checked against the armed flag to fire entry. The armed flag has no timeout and persists until consumed (by entry or by the opposite-signal exit).", "reason": "The spec explicitly separates the spike from a 'subsequent' crossover confirmation, meaning entry logic must span more than one bar; no invalidation/timeout rule is given, so none was invented."},
+  {"topic": "breakout level and ATR snapshot timing for fixed stop-loss", "choice": "The 'breakout level' (lower/upper band ± 0.114×width) is captured from the bar where the spike was detected/armed; the 0.5×ATR(14) offset uses the ATR value at the bar the trade is actually opened.", "reason": "The spec ties 'breakout level' conceptually to the spike event itself, while ATR is described generally for risk management at trade initiation; spec does not state which bar's values to snapshot."},
+  {"topic": "risk percent per trade", "choice": "Used a fixed 1% of current portfolio equity (self.broker.getvalue() * 0.01) as risk_in_money, the lower bound of the stated 1-2% range.", "reason": "Spec gives a range without pinning an exact figure and this is not covered by the canonical defaults; the conservative bound was chosen."},
+  {"topic": "distance-to-stop reference price for sizing", "choice": "distance_to_stop = abs(current bar close - computed fixed stop-loss price); size = risk_in_money / distance_to_stop.", "reason": "The actual fill price is unknown at signal time (market orders fill at the next bar's open in backtrader), so the signal bar's close is used as the best available proxy for entry price, keeping the sizing formula literally computable in next()."},
+  {"topic": "trailing-stop reference price", "choice": "Trailing stop is tracked from the running extreme close price since entry (highest close for longs, lowest for shorts): stop = extreme_close ∓ 1.5×ATR(14), recalculated each bar with the live ATR value.", "reason": "Spec does not specify high/low vs close for trailing; close was used for consistency with the close-based conditions used throughout the rest of the spec."},
+  {"topic": "close-upon-opposite-signal does not auto-reverse", "choice": "When a full opposite entry signal fires while a position is open, only self.close() is called; no new opposite position is opened on the same bar. A fresh opposite entry can occur later, once flat, if its own conditions are (re-)met.", "reason": "The spec lists 'close upon opposite signal' purely as an exit rule and does not state a reversal; this also respects canonical default #3 (no simultaneous/pyramided positions)."},
+  {"topic": "price source for SMA/BB/EMA", "choice": "SMA(200), BollingerBands(20,2), and EMA(9) are all computed on the close price series.", "reason": "Spec does not specify an alternate price source for these indicators; close is the standard convention and matches the close-based entry/exit conditions elsewhere in the spec."},
+  {"topic": "infeasible: intrabar order-book/session information", "choice": "All signal and exit logic uses only bar close (and OHLC via ATR), no intrabar or order-book data.", "reason": "The harness supplies only OHLCV 1h bars; no finer-grained or order-book data is available, matching the feasible literal reading of an H1 timeframe strategy."}
+]}
+```

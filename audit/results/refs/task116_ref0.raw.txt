@@ -1,0 +1,170 @@
+```python
+import backtrader as bt
+import math
+import collections
+import statistics
+
+
+class OrbStrategy(bt.Strategy):
+    params = dict(
+        or_minutes=30,                 # opening-range window: first 30 minutes of the session
+        fib_low=0.382,
+        fib_high=0.618,
+        wick_body_mult=2.0,            # "long upper wick" = wick >= 2x candle body
+        volume_sma_period=20,
+        htf_bucket_minutes=15,         # manual 15-minute aggregation of the 1m feed
+        htf_sma_period=20,
+        htf_sma_min_periods=5,
+        entry_cutoff_minutes=120,      # entries only within first 120 minutes of the session
+        risk_pct=0.01,                 # risk per trade as % of current portfolio value
+        tp_retracement_pct=0.5,        # take-profit: % retracement from the move's peak
+    )
+
+    def __init__(self):
+        self.order = None
+
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_sma_period)
+
+        self.current_day = None
+        self.day_bar_count = -1
+
+        self.orh = None
+        self.orl = None
+        self.fib_levels = {}
+
+        # state machine: 1=waiting breakout, 2=waiting pullback+selling-pressure wick, 3=waiting recovery entry
+        self.state = 1
+        self.pressure_high = None
+        self.pressure_low = None
+
+        self.htf_closes = collections.deque(maxlen=self.p.htf_sma_period)
+
+        self.stop_price = None
+        self.entry_price = None
+        self.peak_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order.status == order.Completed:
+                if order.isbuy():
+                    self.entry_price = order.executed.price
+                    self.peak_price = self.entry_price
+                else:
+                    self.state = 1
+                    self.pressure_high = None
+                    self.pressure_low = None
+                    self.stop_price = None
+                    self.entry_price = None
+                    self.peak_price = None
+            self.order = None
+
+    def _uptrend(self):
+        if len(self.htf_closes) < self.p.htf_sma_min_periods:
+            return False
+        return self.htf_closes[-1] > statistics.mean(self.htf_closes)
+
+    def _manage_open_position(self):
+        if self.order:
+            return
+
+        if self.data.high[0] > self.peak_price:
+            self.peak_price = self.data.high[0]
+
+        if self.data.low[0] <= self.stop_price:
+            self.order = self.close()
+            return
+
+        gain = self.peak_price - self.entry_price
+        if gain > 0:
+            retracement = self.peak_price - self.data.close[0]
+            if retracement >= self.p.tp_retracement_pct * gain:
+                self.order = self.close()
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        day = dt.date()
+
+        if day != self.current_day:
+            self.current_day = day
+            self.day_bar_count = 0
+            self.orh = None
+            self.orl = None
+            if not self.position:
+                self.state = 1
+                self.pressure_high = None
+                self.pressure_low = None
+        else:
+            self.day_bar_count += 1
+
+        if self.day_bar_count % self.p.htf_bucket_minutes == self.p.htf_bucket_minutes - 1:
+            self.htf_closes.append(self.data.close[0])
+
+        if self.day_bar_count < self.p.or_minutes:
+            if self.orh is None or self.data.high[0] > self.orh:
+                self.orh = self.data.high[0]
+            if self.orl is None or self.data.low[0] < self.orl:
+                self.orl = self.data.low[0]
+            return
+
+        if self.orh is None or self.orl is None:
+            return
+
+        if self.position:
+            self._manage_open_position()
+            return
+
+        if self.order:
+            return
+
+        rng = self.orh - self.orl
+        self.fib_levels = {
+            '23.6': self.orl + 0.236 * rng,
+            '38.2': self.orl + self.p.fib_low * rng,
+            '50.0': self.orl + 0.5 * rng,
+            '61.8': self.orl + self.p.fib_high * rng,
+        }
+        fib382 = self.fib_levels['38.2']
+        fib618 = self.fib_levels['61.8']
+
+        if self.state == 1:
+            if self.data.close[0] > self.orh:
+                volume_ok = self.data.volume[0] > self.volume_sma[0]
+                trend_ok = self._uptrend()
+                if volume_ok and trend_ok:
+                    self.state = 2
+
+        elif self.state == 2:
+            if fib382 <= self.data.close[0] <= fib618:
+                upper_wick = self.data.high[0] - max(self.data.open[0], self.data.close[0])
+                body = abs(self.data.close[0] - self.data.open[0])
+                if upper_wick > 0 and (body == 0 or upper_wick >= self.p.wick_body_mult * body):
+                    self.pressure_high = self.data.high[0]
+                    self.pressure_low = self.data.low[0]
+                    self.state = 3
+
+        elif self.state == 3:
+            if self.day_bar_count <= self.p.entry_cutoff_minutes:
+                if self.data.close[0] > self.data.open[0] and self.data.close[0] > self.pressure_high:
+                    stop_price = self.pressure_low
+                    stop_distance = self.data.close[0] - stop_price
+                    if stop_distance > 0:
+                        risk_amount = self.broker.getvalue() * self.p.risk_pct
+                        size = math.floor(risk_amount / stop_distance)
+                        if size >= 1:
+                            self.stop_price = stop_price
+                            self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "take_profit", "choice": "Trailing take-profit: track the highest high reached since entry; close when price retraces >= 50% of the peak's gain over entry (Close-based).", "reason": "Spec's fixed-price example (3717) is asset-specific and not transferable to AAPL; the spec's other stated option, 'a percentage retracement from the move's high,' is generic, so it was implemented with a declared 50% threshold since no exact percentage was given."},
+  {"topic": "stop_loss", "choice": "Stop-loss placed at the low of the identified selling-pressure (long-upper-wick) candle, checked intrabar via Low[0].", "reason": "Spec says the stop should be 'close to the entry point'; the most recent swing low immediately preceding entry is the nearest structural level available."},
+  {"topic": "position_sizing", "choice": "Risk-based sizing: risk 1% of current broker value per trade; size = floor(risk_amount / (entry_close - stop_price)).", "reason": "Spec states sizing must be risk-based (1-2% of capital) but gives no exact percentage; chose the conservative end of the stated range and used live portfolio value as 'trading capital'."},
+  {"topic": "volume_filter", "choice": "Implemented as a hard requirement (breakout-bar volume > 20-period SMA of volume) rather than a soft weighting.", "reason": "Backtrader entries are boolean; a 'weight increase' has no direct mechanical meaning, so it was operationalized as a required elevated-volume filter at the breakout bar. Period (20) unstated, chosen as a common default."},
+  {"topic": "infeasible", "choice": "True 15-minute chart is unavailable (only a single 1-minute feed is provided). Approximated by manually aggregating 1-minute closes into 15-bar buckets and comparing the latest bucket close to the mean of the last 20 buckets (min 5 buckets required); checked once, at breakout confirmation.", "reason": "The harness supplies only one 1m PandasData feed, so a genuine higher-timeframe series cannot be constructed; this is the closest literal proxy."},
+  {"topic": "entry_time", "choice": "Entries only allowed within the first 120 minutes of the trading day (day-bar-count <= 120).", "reason": "Spec requires an entry-time cutoff 'within a specified time' but does not give a number; 120 minutes was chosen as a reasonable declared default."},
+  {"topic": "wick_definition", "choice": "'Long upper wick' = (High - max(Open,Close)) >= 2x candle body (or any positive wick on a zero-body/doji candle), evaluated only while price is within the 38.2%-61.8% Fib zone.", "reason": "Spec names the pattern qualitatively without a numeric threshold; 2x body was chosen as a defensible, declared multiplier."},
+  {"topic": "recovery_trigger", "choice": "Entry fires on a bullish candle (Close>Open) whose Close exceeds the High of the previously identified selling-pressure candle.", "reason": "Operationalizes the spec's qualitative description 'price starts to recover... and shows signs of continuation upward.'"},
+  {"topic": "trade_cycles_per_day", "choice": "After a position closes, the state machine resets to 'waiting for breakout' (rather than ending for the day), so a new OR-breakout/pullback cycle can produce another trade the same day.", "reason": "Spec restricts holding only one position at a time (canonical default) but does not cap the number of sequential trades per day."},
+  {"topic": "htf_continuity", "choice": "The manually aggregated 15-minute close buffer used for the trend filter is not reset at day boundaries; it persists continuously across days.", "reason": "A real higher-timeframe chart's trend context does not reset overnight, so continuity was preserved for a more faithful trend read."}
+]}
+```

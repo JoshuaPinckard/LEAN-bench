@@ -1,0 +1,114 @@
+```python
+                    stop_price = entry_price * (1 + self.p.stop_pct)
+                    self.stop_order = self.buy(
+                        size=abs(order.executed.size), exectype=bt.Order.Stop, price=stop_price)
+                self.order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+
+    def _size_for_entry(self, price):
+        stop_distance = price * self.p.stop_pct
+        if stop_distance <= 0:
+            return 0
+        return int((self.broker.getvalue() * self.p.risk_pct) / stop_distance)
+
+    def _enter_long(self):
+        size = self._size_for_entry(self.data.close[0])
+        if size > 0:
+            self.order = self.buy(size=size)
+
+    def _enter_short(self):
+        size = self._size_for_entry(self.data.close[0])
+        if size > 0:
+            self.order = self.sell(size=size)
+
+    def _exit_position(self):
+        # cancel any live stop before closing, else it can fire against a flat
+        # position and open an unintended reverse position
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        self.close()
+
+    def next(self):
+        bar_date = self.data.datetime.date(0)
+        if self.current_date is None or bar_date != self.current_date:
+            self.current_date = bar_date
+            self.day_open = self.data.open[0]
+            self.day_high = self.data.high[0]
+            self.day_low = self.data.low[0]
+        else:
+            self.day_high = max(self.day_high, self.data.high[0])
+            self.day_low = min(self.day_low, self.data.low[0])
+
+        if not self.position and self.order is None and self.last_day_high is not None:
+            if self.streak_dir == 'red' and self.streak_count >= self.p.streak_len:
+                if self.data.close[0] > self.last_day_high:
+                    self._enter_long()
+            elif self.streak_dir == 'green' and self.streak_count >= self.p.streak_len:
+                if self.data.close[0] < self.last_day_low:
+                    self._enter_short()
+
+        bar_time = self.data.datetime.time(0)
+        # feed's fixed regular session is 09:30-15:55; no calendar import is
+        # allowed, so the known session close bar is hardcoded
+        is_session_end = (bar_time.hour == 15 and bar_time.minute == 55)
+
+        if is_session_end:
+            day_close = self.data.close[0]
+
+            if self.p.mode == 'day':
+                if day_close > self.day_open:
+                    color = 'green'
+                elif day_close < self.day_open:
+                    color = 'red'
+                else:
+                    color = None
+            else:
+                color = None
+                if self.prev_close is not None:
+                    if day_close > self.prev_close:
+                        color = 'green'
+                    elif day_close < self.prev_close:
+                        color = 'red'
+
+            if self.position:
+                if self.p.mode == 'day':
+                    self._exit_position()
+                elif self.p.mode == 'swing':
+                    is_long = self.position.size > 0
+                    if (is_long and color == 'red') or (not is_long and color == 'green'):
+                        self._exit_position()
+
+            if color is None:
+                self.streak_dir = None
+                self.streak_count = 0
+            elif color == self.streak_dir:
+                self.streak_count += 1
+            else:
+                self.streak_dir = color
+                self.streak_count = 1
+
+            self.last_day_high = self.day_high
+            self.last_day_low = self.day_low
+            self.prev_close = day_close
+```
+```json
+{"assumptions": [
+  {"topic": "strategy-mode-default", "choice": "Implemented both the swing (Previous-Close vs Current-Close) and day-trading (Open-Close) variants behind a `mode` parameter; default is mode='swing'.", "reason": "The spec describes two parallel strategies, one per trader type, rather than a single unambiguous one; a runtime default was still required since the harness invokes the class unconfigured. mode='day' reproduces the day-trading variant exactly as specified."},
+  {"topic": "price-action-confirmation", "choice": "Entry confirmation is a close-based breakout of the immediately preceding completed trading day's high (long bias) or low (short bias).", "reason": "The spec requires 'confirmation from price action (e.g., a level breakout...)' but names no specific pattern; the prior day's high/low is the level-breakout example given verbatim in the spec, so it was implemented literally."},
+  {"topic": "stop-loss-percent", "choice": "Stop-loss fixed at 2% from entry price (long: entry*0.98, short: entry*1.02), submitted as a stop order right after entry fills.", "reason": "Spec calls for 'a fixed percentage from entry price' as an example without stating the number; 2% is a conventional default value."},
+  {"topic": "position-sizing", "choice": "size = floor(broker.getvalue() * risk_pct / (entry_price * stop_pct)), risk_pct = 1%.", "reason": "Spec mandates risk-based sizing tied to the predefined stop distance, citing 1-2% of capital per trade; 1% was chosen within that stated range and equity (getvalue) was used to represent 'capital'."},
+  {"topic": "tie-day-handling", "choice": "A day where close equals open (day mode) or close equals prior close (swing mode) is treated as colorless and resets the streak counter to 0.", "reason": "The spec only defines 'green' and 'red' via strict inequality; the tie case is unaddressed, so it is treated as neutral rather than arbitrarily colored."},
+  {"topic": "swing-exit-timing", "choice": "The opposite-color-day exit is evaluated at the close of the reversal day (last 5m bar), submitting a market close order that fills at the next bar's open.", "reason": "A day's color cannot be known until it fully closes, so the earliest non-lookahead execution point is right after that day's last bar; this is standard backtrader signal-then-next-bar-fill behavior, not an added delay."},
+  {"topic": "session-end-detection", "choice": "The last bar of each trading day is identified via a hardcoded 15:55 bar-time check.", "reason": "The feed's fixed 5m AAPL session always runs 09:30-15:55 and no calendar/session library is importable (only backtrader/math/collections/statistics allowed), so the known fixed boundary is hardcoded instead of inferred."},
+  {"topic": "consolidation-filter", "choice": "No explicit consolidation/range-detection filter was added.", "reason": "The spec only states the strategy 'is most effective in trending or volatile conditions' as a descriptive caveat with no concrete indicator or threshold; adding one would invent a filter the spec does not define."},
+  {"topic": "trading-session-tuning", "choice": "No additional session/timezone logic was added.", "reason": "The harness's single feed is already NYSE regular-session AAPL 5m bars (09:30-15:55 America/New_York), satisfying the spec's requirement that the strategy be tuned to a specific session."},
+  {"topic": "shorting-enabled", "choice": "Short entries are implemented via self.sell() with no prior long position, overriding canonical default #4 (long-only).", "reason": "The spec explicitly requires short entries after green streaks for both trader types."}
+]}
+```

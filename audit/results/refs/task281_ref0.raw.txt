@@ -1,0 +1,119 @@
+```python
+import math
+
+import backtrader as bt
+
+
+class MstrSqueezeMomentum(bt.Strategy):
+    params = dict(
+        bb_period=20,
+        bb_devfactor=2.0,
+        rsi_period=14,
+        atr_period=14,
+        width_sma_period=20,
+        atr_sma_period=20,
+        vol_sma_fast=3,
+        vol_sma_slow=20,
+        squeeze_factor=0.75,
+        range_factor=0.25,
+        rsi_oversold=35,
+        vol_ratio=1.5,
+        risk_pct=0.02,
+        tp_atr_mult=2.0,
+        sl_atr_mult=1.5,
+        rsi_accel=50,
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_vol_fast = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_fast)
+        self.sma_vol_slow = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_slow)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.bb.mid)
+
+        self.bb_width = self.bb.top - self.bb.bot
+        self.width_sma = bt.indicators.SMA(self.bb_width, period=self.p.width_sma_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+
+        self.order = None
+        self.awaiting_expansion = False
+
+        self.entry_price = None
+        self.stop_level = None
+        self.tp_level = None
+
+        self._pending_bot = None
+        self._pending_atr = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.stop_level = min(
+                    self._pending_bot,
+                    self.entry_price - self.p.sl_atr_mult * self._pending_atr)
+                self.tp_level = self.entry_price + self.p.tp_atr_mult * self._pending_atr
+            else:
+                self.awaiting_expansion = True
+                self.entry_price = None
+                self.stop_level = None
+                self.tp_level = None
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.data.high[0] >= self.tp_level:
+                self.order = self.close()
+            elif self.data.low[0] <= self.stop_level:
+                self.order = self.close()
+            elif self.data.close[0] > self.bb.top[0] and self.rsi[0] > self.p.rsi_accel:
+                self.order = self.close()
+            return
+
+        w = self.bb_width[0]
+
+        if self.awaiting_expansion and w > self.width_sma[0]:
+            self.awaiting_expansion = False
+
+        if self.awaiting_expansion:
+            return
+
+        squeeze = (w < self.p.squeeze_factor * self.width_sma[0]
+                   and self.atr[0] < self.atr_sma[0])
+        narrow_range = ((self.bb.mid[0] - self.p.range_factor * w) <= self.data.close[0]
+                         <= (self.bb.mid[0] + self.p.range_factor * w))
+        oversold = self.rsi[0] < self.p.rsi_oversold
+        abnormal_volume = self.sma_vol_fast[0] > self.p.vol_ratio * self.sma_vol_slow[0]
+        momentum_trigger = self.crossover[0] > 0
+
+        if squeeze and narrow_range and oversold and abnormal_volume and momentum_trigger:
+            entry_price_est = self.data.close[0]
+            stop_level_est = min(self.bb.bot[0], entry_price_est - self.p.sl_atr_mult * self.atr[0])
+            risk_per_unit = entry_price_est - stop_level_est
+            if risk_per_unit <= 0:
+                return
+            equity = self.broker.getvalue()
+            size = math.floor(self.p.risk_pct * equity / risk_per_unit)
+            if size <= 0:
+                return
+            self._pending_bot = self.bb.bot[0]
+            self._pending_atr = self.atr[0]
+            self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "sizing_entry_price_proxy", "choice": "The risk-based size formula uses the current (signal-day) close as entry_price, since the actual fill price is unknown until order execution under standard backtrader broker timing.", "reason": "Spec requires size = floor(0.02*equity/(entry_price - stop_level)) computed at order submission, but the true fill price is not yet known; the signal-day close is the closest available literal value at decision time."},
+  {"topic": "exit_level_reference", "choice": "stop_level (min of bb.bot and entry_price - 1.5*ATR) and the take-profit level (entry_price + 2*ATR) are both computed once, using the entry/signal bar's bb.bot and ATR(14), and then held fixed for the life of the trade rather than recalculated each bar.", "reason": "The spec explicitly ties bb.bot to 'the entry bar' and itself equates 'entry day' with the crossover/signal day (condition 5); by symmetry the paired ATR(14) terms in both the TP and SL formulas are read as entry-bar values, giving a single well-defined stop_level/tp_level per trade."},
+  {"topic": "infeasible", "choice": "The acceleration exit is triggered via self.close() as soon as Close > bb.top and RSI > 50 are detected on the bar, but the resulting order fills per the harness's standard broker execution (next bar's open), not literally 'at the daily close' of the signal bar.", "reason": "Strategy code has no access to broker/Cerebro execution-timing settings (fixed by the harness), so forcing a same-bar close-price fill is not achievable from within the strategy; this is the closest literal reading available."},
+  {"topic": "reentry_gate_initial_state", "choice": "The expansion+new-squeeze re-entry gate is inactive before the very first trade and only activates after an exit occurs.", "reason": "The spec states the gating rule as applying 'after exit', implying no such restriction exists prior to any trade having occurred."}
+]}
+```

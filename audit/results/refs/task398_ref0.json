@@ -1,0 +1,52 @@
+{
+  "task_id": 398,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport math\n\n\nclass RSI2RandomForestStrategy(bt.Strategy):\n    params = dict(\n        rsi_period=2,\n        warmup_bars=50,\n        train_window=200,\n        n_estimators=25,\n        max_depth=4,\n        min_samples_split=2,\n        rsi_entry=30,\n        rsi_exit=70,\n        random_seed=42,\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.order = None\n        self._rng_state = self.p.random_seed\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    # scikit-learn is not importable in this environment; this LCG stands in for\n    # `random` (also not in the allowed-import list) to give the forest its\n    # bootstrap/feature-subsample randomness while staying reproducible.\n    def _next_rand(self):\n        self._rng_state = (1103515245 * self._rng_state + 12345) & 0x7fffffff\n        return self._rng_state / 2147483648.0\n\n    def _rand_index(self, n):\n        return int(self._next_rand() * n) % n\n\n    def _sample_features(self, n_features, k):\n        pool = list(range(n_features))\n        chosen = []\n        for _ in range(k):\n            idx = self._rand_index(len(pool))\n            chosen.append(pool.pop(idx))\n        return chosen\n\n    def _bootstrap(self, n):\n        return [self._rand_index(n) for _ in range(n)]\n\n    def _gini(self, labels):\n        n = len(labels)\n        if n == 0:\n            return 0.0\n        p1 = sum(labels) / n\n        return 1.0 - p1 * p1 - (1.0 - p1) * (1.0 - p1)\n\n    def _best_split(self, data, labels, feature_indices):\n        n = len(data)\n        best_gini = None\n        best_feature = None\n        best_threshold = None\n        for f_idx in feature_indices:\n            values = sorted(set(row[f_idx] for row in data))\n            for i in range(len(values) - 1):\n                threshold = (values[i] + values[i + 1]) / 2.0\n                left_labels = [labels[j] for j in range(n) if data[j][f_idx] <= threshold]\n                right_labels = [labels[j] for j in range(n) if data[j][f_idx] > threshold]\n                if not left_labels or not right_labels:\n                    continue\n                weighted = (len(left_labels) * self._gini(left_labels) +\n                            len(right_labels) * self._gini(right_labels)) / n\n                if best_gini is None or weighted < best_gini:\n                    best_gini = weighted\n                    best_feature = f_idx\n                    best_threshold = threshold\n        return best_feature, best_threshold\n\n    def _build_tree(self, data, labels, depth):\n        n = len(labels)\n        ones = sum(labels)\n        if depth >= self.p.max_depth or n < self.p.min_samples_split or ones == 0 or ones == n:\n            return {'leaf': True, 'value': 1 if ones * 2 >= n else 0}\n\n        n_features = len(data[0])\n        k = max(1, int(math.sqrt(n_features)))\n        feature_indices = self._sample_features(n_features, k)\n        f_idx, threshold = self._best_split(data, labels, feature_indices)\n        if f_idx is None:\n            return {'leaf': True, 'value': 1 if ones * 2 >= n else 0}\n\n        left_data, left_labels, right_data, right_labels = [], [], [], []\n        for row, y in zip(data, labels):\n            if row[f_idx] <= threshold:\n                left_data.append(row)\n                left_labels.append(y)\n            else:\n                right_data.append(row)\n                right_labels.append(y)\n\n        return {\n            'leaf': False,\n            'feature': f_idx,\n            'threshold': threshold,\n            'left': self._build_tree(left_data, left_labels, depth + 1),\n            'right': self._build_tree(right_data, right_labels, depth + 1),\n        }\n\n    def _predict_tree(self, node, x):\n        while not node['leaf']:\n            node = node['left'] if x[node['feature']] <= node['threshold'] else node['right']\n        return node['value']\n\n    def _train_forest(self, data, labels):\n        n = len(data)\n        forest = []\n        for _ in range(self.p.n_estimators):\n            idx = self._bootstrap(n)\n            sample_data = [data[i] for i in idx]\n            sample_labels = [labels[i] for i in idx]\n            forest.append(self._build_tree(sample_data, sample_labels, 0))\n        return forest\n\n    def _forest_predict(self, forest, x):\n        votes = sum(self._predict_tree(tree, x) for tree in forest)\n        return 1 if votes * 2 >= len(forest) else 0\n\n    def _build_training_set(self):\n        # offset=1 is bar t-1; its label compares close[t] (offset-1=0, known)\n        # against close[t-1], so every sample uses only data known as of t.\n        t_idx = len(self.data) - 1\n        max_offset = min(self.p.train_window, t_idx - 1)\n        features = []\n        labels = []\n        for offset in range(1, max_offset + 1):\n            close_i = self.data.close[-offset]\n            close_im1 = self.data.close[-offset - 1]\n            close_ip1 = self.data.close[-offset + 1]\n            rsi_i = self.rsi[-offset]\n            if math.isnan(rsi_i) or close_im1 == 0:\n                continue\n            ret_i = close_i / close_im1 - 1\n            label = 1 if close_ip1 > close_i else 0\n            features.append((rsi_i, ret_i))\n            labels.append(label)\n        return features, labels\n\n    def next(self):\n        if self.order:\n            return\n\n        rsi_val = self.rsi[0]\n        available_bars = len(self.data)\n\n        if available_bars < self.p.warmup_bars:\n            if rsi_val < self.p.rsi_entry:\n                self.order = self.order_target_percent(target=1.0)\n            elif rsi_val > self.p.rsi_exit:\n                self.order = self.order_target_percent(target=0.0)\n            return\n\n        features, labels = self._build_training_set()\n        forest = self._train_forest(features, labels)\n\n        close_t = self.data.close[0]\n        close_tm1 = self.data.close[-1]\n        if close_tm1 == 0 or math.isnan(rsi_val):\n            return\n        ret_t = close_t / close_tm1 - 1\n        prediction = self._forest_predict(forest, (rsi_val, ret_t))\n\n        if prediction == 1:\n            self.order = self.order_target_percent(target=1.0)\n        else:\n            self.order = self.order_target_percent(target=0.0)",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "scikit-learn is not in the allowed import set (backtrader, math, collections, statistics only), so RandomForestClassifier is hand-implemented in pure Python: bootstrap-aggregated CART decision trees with Gini-impurity best-split search, sqrt(n_features) random feature subsampling per split, and majority-vote prediction.",
+      "reason": "Closest literal reading possible given the fixed execution environment does not permit importing sklearn."
+    },
+    {
+      "topic": "randomness source",
+      "choice": "A hand-rolled linear congruential generator (seeded from params.random_seed=42) supplies bootstrap-sample and feature-subsample randomness instead of the `random` module.",
+      "reason": "`random` is also outside the stated allowed-import list; a self-contained PRNG keeps the forest genuinely randomized while staying within the permitted imports and reproducible."
+    },
+    {
+      "topic": "forest hyperparameters",
+      "choice": "n_estimators=25, max_depth=4, min_samples_split=2, max_features=sqrt(n_features) (=1 of 2)",
+      "reason": "Spec does not specify hyperparameters. sqrt(n_features) mirrors sklearn's classifier default for max_features; n_estimators/max_depth are reduced from sklearn's own defaults (100 trees, unbounded depth) because refitting on up to 200 samples every single bar (~1450 refits) in pure Python without vectorization would otherwise be computationally impractical."
+    },
+    {
+      "topic": "refit schedule",
+      "choice": "Refit every day (bar) while in the ML branch, using only samples with fully known labels as of that bar.",
+      "reason": "Spec explicitly allows 'each day or a fixed schedule'; daily refit is the simplest literal reading and requires no extra unstated scheduling logic."
+    },
+    {
+      "topic": "warmup gating",
+      "choice": "available_bars = len(self.data) (count of completed bars including current) >= 50 switches from the fallback RSI rule to the ML branch; below that, only the fallback rule runs.",
+      "reason": "Spec states 'after a warmup of at least 50 completed bars' / 'while fewer than 50 bars are available'; len(self.data) is backtrader's natural count of bars processed so far."
+    },
+    {
+      "topic": "fallback rule structure",
+      "choice": "Fallback branch checks RSI2<30 -> target 1.0, RSI2>70 -> target 0.0 unconditionally each bar (no explicit position-state branching), relying on order_target_percent being a no-op when already at the target.",
+      "reason": "Matches the literal wording 'enter if RSI2<30, exit if RSI2>70' without inventing extra position-aware conditionals not stated in the spec."
+    },
+    {
+      "topic": "training window",
+      "choice": "N=200 most recent bars, capped by available history (fewer near the start of the ML branch).",
+      "reason": "Directly uses the example N=200 given in the spec."
+    },
+    {
+      "topic": "features/labels",
+      "choice": "Feature vector (RSI2[i], close[i]/close[i-1]-1); label = 1 if close[i+1]>close[i] else 0; only samples with valid (non-NaN) RSI2 and known i+1 (<=t) are included.",
+      "reason": "Implements the exact feature/label definitions stated in the spec while guaranteeing no lookahead."
+    }
+  ],
+  "success": false,
+  "error": "timeout",
+  "total_trades": 0,
+  "tape": []
+}

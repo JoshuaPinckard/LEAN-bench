@@ -1,0 +1,57 @@
+{
+  "task_id": 176,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass SyntheticWheelStrategy(bt.Strategy):\n\n    def __init__(self):\n        self.bb = bt.indicators.BollingerBands(self.data, period=20, devfactor=2)\n        self.atr = bt.indicators.ATR(self.data, period=14)\n        self.ema50 = bt.indicators.EMA(self.data, period=50)\n        self.ema200 = bt.indicators.EMA(self.data, period=200)\n        self.rsi = bt.indicators.RSI(self.data, period=14)\n\n        self.buy_order = None\n        self.sell_order = None\n        self.close_order = None\n\n        self.tranche_count = 0\n        self.position_cost = 0.0\n        self.avg_price = 0.0\n\n        self.sell_placed_bar = None\n        self.next_entry_bar = 0\n\n        self.realized_profit_total = 0.0\n        self.cycle_records = []\n        self.current_cycle = None\n\n    def _tranche_size(self, buy_lim, portfolio_value):\n        if buy_lim <= 0:\n            return 0\n        size = int((0.03 * portfolio_value) // buy_lim)\n        if size <= 0:\n            return 0\n        if self.position_cost + buy_lim * size > 0.09 * portfolio_value:\n            return 0\n        return size\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        if order.status == order.Completed:\n            dt = self.data.datetime.date(0)\n            if order.isbuy():\n                fill_price = order.executed.price\n                fill_size = order.executed.size\n                self.position_cost += fill_price * fill_size\n                self.tranche_count += 1\n                self.avg_price = self.position_cost / self.position.size\n                buy_record = {'date': dt, 'price': fill_price, 'size': fill_size}\n                if self.current_cycle is None:\n                    self.current_cycle = {\n                        'buys': [buy_record],\n                        'sell_date': None,\n                        'sell_price': None,\n                        'realized_profit': 0.0,\n                        'tranches': self.tranche_count,\n                        'avg_price': self.avg_price,\n                        'exit_reason': None,\n                    }\n                else:\n                    self.current_cycle['buys'].append(buy_record)\n                    self.current_cycle['tranches'] = self.tranche_count\n                    self.current_cycle['avg_price'] = self.avg_price\n                if order is self.buy_order:\n                    self.buy_order = None\n            else:\n                fill_price = order.executed.price\n                fill_size = abs(order.executed.size)\n                realized = (fill_price - self.avg_price) * fill_size\n                self.realized_profit_total += realized\n                if self.current_cycle is not None:\n                    self.current_cycle['sell_date'] = dt\n                    self.current_cycle['sell_price'] = fill_price\n                    self.current_cycle['realized_profit'] = realized\n                    self.current_cycle['exit_reason'] = (\n                        'protective_stop' if order is self.close_order else 'take_profit'\n                    )\n                    self.cycle_records.append(self.current_cycle)\n                    self.current_cycle = None\n                if order is self.sell_order:\n                    self.sell_order = None\n                if order is self.close_order:\n                    self.close_order = None\n                self.position_cost = 0.0\n                self.avg_price = 0.0\n                self.tranche_count = 0\n\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            # identity check: our own reference may already point at a newer\n            # replacement order placed the same bar the cancel was requested\n            if order is self.buy_order:\n                self.buy_order = None\n            if order is self.sell_order:\n                self.sell_order = None\n            if order is self.close_order:\n                self.close_order = None\n\n    def next(self):\n        close = self.data.close[0]\n        upper = self.bb.top[0]\n        lower = self.bb.bot[0]\n        mid = self.bb.mid[0]\n\n        price_filter = 1.0 <= close <= 15.0\n        vol_bb = mid != 0 and ((upper - lower) / mid) > 0.06\n        vol_atr = close != 0 and (self.atr[0] / close) > 0.03\n        high_vol = vol_bb or vol_atr\n        trend_ok = self.ema50[0] >= self.ema200[0]\n        filters_ok = price_filter and high_vol and trend_ok\n\n        position_open = self.position.size > 0\n        portfolio_value = self.broker.getvalue()\n\n        if position_open:\n            catastrophic = (close < self.ema200[0] * 0.9) or \\\n                            (close <= self.avg_price - 4 * self.atr[0])\n            if catastrophic:\n                if self.close_order is None:\n                    if self.sell_order is not None:\n                        self.cancel(self.sell_order)\n                        self.sell_order = None\n                    if self.buy_order is not None:\n                        self.cancel(self.buy_order)\n                        self.buy_order = None\n                    self.close_order = self.close()\n                return\n\n        if position_open and self.sell_order is not None and self.sell_placed_bar is not None:\n            if (len(self) - self.sell_placed_bar) >= 20:\n                self.cancel(self.sell_order)\n                self.sell_order = None\n\n        if (position_open and self.tranche_count < 3 and self.buy_order is None\n                and close <= self.avg_price - 1.5 * self.atr[0] and self.rsi[0] < 35):\n            buy_lim = min(lower, close * 0.93)\n            size = self._tranche_size(buy_lim, portfolio_value)\n            if size > 0:\n                if self.sell_order is not None:\n                    self.cancel(self.sell_order)\n                    self.sell_order = None\n                self.buy_order = self.buy(exectype=bt.Order.Limit, price=buy_lim, size=size)\n\n        if position_open and self.sell_order is None and self.buy_order is None:\n            sell_lim = max(upper, self.avg_price * 1.07)\n            self.sell_order = self.sell(exectype=bt.Order.Limit, price=sell_lim, size=self.position.size)\n            self.sell_placed_bar = len(self)\n\n        if (not position_open and self.buy_order is None and filters_ok\n                and len(self) >= self.next_entry_bar):\n            buy_lim = min(lower, close * 0.93)\n            size = self._tranche_size(buy_lim, portfolio_value)\n            if size > 0:\n                self.buy_order = self.buy(exectype=bt.Order.Limit, price=buy_lim, size=size)\n                self.next_entry_bar = len(self) + 20",
+  "assumptions": [
+    {
+      "topic": "entry_cooldown",
+      "choice": "The 'once every 20 bars' entry gate is implemented as a rolling counter (bar index must reach next_entry_bar, set to fill/attempt bar + 20) rather than a fixed bar-modulo schedule.",
+      "reason": "Spec states the cadence but not the exact scheduling mechanism; a rolling cooldown from the last placement is the natural reading."
+    },
+    {
+      "topic": "covered_call_scope",
+      "choice": "The covered-call sell limit is a single leg sized to the entire current position, cancelled and re-placed (at the new average price/size) after every buy fill or 20-bar timeout, rather than one leg per tranche.",
+      "reason": "SellLim is defined off one 'position average price'; the spec never describes multiple concurrent sell legs."
+    },
+    {
+      "topic": "partial_profit_taking",
+      "choice": "Because both defined exits (take-profit limit sell and protective stop) always close the full position, there is no rule-defined path that produces a partial fill; cost-basis bookkeeping therefore resets fully at each cycle close rather than decrementing partially.",
+      "reason": "The spec mentions breakeven 'decreases with partial profit-taking' but defines no mechanism producing a partial close under the stated entry/exit rules; implemented the closest literal reading (full-position exits only) while still tracking a decrementable cost-basis structure."
+    },
+    {
+      "topic": "nine_percent_cap",
+      "choice": "Enforced as (existing cost basis + new tranche notional) <= 9% of current portfolio value at order-placement time, in addition to the separate 3-tranche count limit.",
+      "reason": "Spec gives both a per-tranche 3% cap and an aggregate 3-tranche/9% cap; both are checked directly."
+    },
+    {
+      "topic": "share_rounding",
+      "choice": "Tranche size = floor((3% of portfolio value) / BuyLim), guaranteeing BuyLim*size never exceeds the 3% cap.",
+      "reason": "Fractional shares are not tradable; flooring keeps the stated inequality strictly satisfied."
+    },
+    {
+      "topic": "protective_exit_order_type",
+      "choice": "The catastrophic exit uses self.close(), a default Market order.",
+      "reason": "Canonical default for 'close the position'; spec does not specify a limit price for this exit."
+    },
+    {
+      "topic": "order_validity",
+      "choice": "All limit orders (entry buy, tranche-add buy, covered-call sell) use the default valid=None, i.e. remain pending across multiple bars (good-til-canceled) until filled or explicitly cancelled by strategy logic.",
+      "reason": "Required for the described multi-bar limit orders and the 20-bar covered-call roll to be meaningful; spec states no explicit order expiration otherwise."
+    },
+    {
+      "topic": "realized_profit_basis",
+      "choice": "Recorded realized profit per cycle = (exit fill price - tracked avg price) * exit size, a gross figure; commission is handled automatically by the broker and not re-subtracted in the record.",
+      "reason": "Spec requires recording realized profit but is silent on whether commission should be netted into that specific figure."
+    },
+    {
+      "topic": "recordkeeping_storage",
+      "choice": "Cycle records (buy dates/prices, sell date/price, realized profit, tranche count, avg price) are kept in the instance attributes self.cycle_records / self.realized_profit_total; nothing is printed.",
+      "reason": "The environment forbids print statements/top-level side effects, so records are exposed only via inspectable strategy state."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

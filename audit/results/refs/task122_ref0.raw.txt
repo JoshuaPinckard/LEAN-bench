@@ -1,0 +1,138 @@
+```python
+import math
+import statistics
+
+import backtrader as bt
+
+
+class FinancialTurbulenceStrategy(bt.Strategy):
+    params = dict(
+        lookback=24,
+        exit_ma_period=12,
+        threshold_pct=95,
+        stop_loss_pct=0.02,
+        position_pct=0.05,
+    )
+
+    def __init__(self):
+        self.order = None
+        self.month_key = None
+        self.month_end_closes = []
+        self.monthly_returns = []
+        self.ft_values = []
+        self.ft_thresholds = []
+        self.ft_ma = None
+        self.entry_price = None
+        self.stop_price = None
+
+    def _percentile(self, data, pct):
+        s = sorted(data)
+        n = len(s)
+        if n == 1:
+            return s[0]
+        k = (n - 1) * (pct / 100.0)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return s[int(k)]
+        return s[int(f)] * (c - k) + s[int(c)] * (k - f)
+
+    def _calc_size(self, price):
+        value = self.broker.getvalue() * self.p.position_pct
+        return int(value / price)
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order.isbuy() and self.position.size > 0:
+                self.entry_price = order.executed.price
+                self.stop_price = self.entry_price * (1 - self.p.stop_loss_pct)
+            elif order.issell() and self.position.size < 0:
+                self.entry_price = order.executed.price
+                self.stop_price = self.entry_price * (1 + self.p.stop_loss_pct)
+            elif not self.position:
+                self.entry_price = None
+                self.stop_price = None
+            self.order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _on_month_end(self, close_price):
+        self.month_end_closes.append(close_price)
+        if len(self.month_end_closes) < 2:
+            return
+
+        r_t = (self.month_end_closes[-1] - self.month_end_closes[-2]) / self.month_end_closes[-2]
+        self.monthly_returns.append(r_t)
+
+        N = self.p.lookback
+        if len(self.monthly_returns) < N + 1:
+            return
+
+        window = self.monthly_returns[-(N + 1):-1]
+        mu = statistics.mean(window)
+        var = statistics.variance(window)
+        d_t = ((r_t - mu) ** 2) / var if var > 0 else 0.0
+
+        prev_ft = self.ft_values[-1] if self.ft_values else None
+        prev_threshold = self.ft_thresholds[-1] if self.ft_thresholds else None
+
+        hist_window = self.ft_values[-N:] if self.ft_values else []
+        current_threshold = self._percentile(hist_window, self.p.threshold_pct) if hist_window else None
+
+        self.ft_values.append(d_t)
+        self.ft_thresholds.append(current_threshold)
+
+        if len(self.ft_values) >= self.p.exit_ma_period:
+            self.ft_ma = statistics.mean(self.ft_values[-self.p.exit_ma_period:])
+        else:
+            self.ft_ma = None
+
+        if self.order is not None:
+            return
+
+        if not self.position:
+            crossed_above = (
+                prev_ft is not None and prev_threshold is not None
+                and prev_ft <= prev_threshold
+                and current_threshold is not None and d_t > current_threshold
+            )
+            if crossed_above:
+                price = self.data.close[0]
+                size = self._calc_size(price)
+                if size > 0:
+                    if r_t < 0:
+                        self.order = self.buy(size=size)
+                    elif r_t > 0:
+                        self.order = self.sell(size=size)
+        else:
+            if self.ft_ma is not None and d_t < self.ft_ma:
+                self.order = self.close()
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        current_key = (dt.year, dt.month)
+        if self.month_key is None:
+            self.month_key = current_key
+        elif current_key != self.month_key:
+            self._on_month_end(self.data.close[-1])
+            self.month_key = current_key
+
+        if self.position and self.order is None and self.stop_price is not None:
+            if self.position.size > 0 and self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+            elif self.position.size < 0 and self.data.high[0] >= self.stop_price:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "single-asset covariance", "choice": "With only one asset in the feed, the covariance matrix Sigma degenerates to the scalar sample variance of the return window, so d_t = (R_t - mu)^2 / variance.", "reason": "Spec's matrix formula requires multiple assets to be non-trivial; single-asset reduction is the literal, mathematically consistent reading."},
+  {"topic": "month-end detection", "choice": "Month-end close is inferred from daily bars: when the current bar's month differs from the previous bar's, the previous bar's close is treated as the month-end price. The final partial month at the end of the dataset is never resolved (no forward bar to confirm it).", "reason": "Only a daily OHLCV feed is available; no monthly resample tool is provided by the harness."},
+  {"topic": "long vs short direction", "choice": "Since the spec gives an identical trigger condition for both long and short entries with no stated disambiguator, direction is chosen by the sign of the current month's return R_t that produced the turbulence spike: R_t < 0 -> long (bet on rebound), R_t > 0 -> short (bet on pullback).", "reason": "Consistent with the strategy's stated mean-reversion rationale (\"betting on a return to normal conditions\"); the spec provides no other mechanism to pick a direction."},
+  {"topic": "turbulence threshold window and crossing", "choice": "The 95th percentile threshold is computed (via linear-interpolation percentile) over a rolling window of the last N=24 historical FT values, using only values strictly prior to the current observation. A 'cross above' requires the previous month's FT vs. the threshold contemporaneous with it, and the current FT vs. the threshold computed just before it.", "reason": "Ties 'historical FT values during the lookback period' to the same N=24 lookback parameter and avoids look-ahead bias in both the percentile and the crossing test."},
+  {"topic": "variance estimator", "choice": "Sample variance (N-1 denominator, statistics.variance) is used for both mu's supporting covariance and the FT calculation.", "reason": "Spec does not specify population vs. sample variance; sample variance is the common default in statistical/financial tooling (pandas, numpy.cov)."},
+  {"topic": "stop-loss trigger", "choice": "Stop-loss is checked every bar using intrabar High/Low touching entry_price +/- 2%, rather than only closing prices.", "reason": "OHLC data is available and a real stop-loss order would trigger intrabar; this is the more literal/realistic reading of '2% from entry price' as a hard stop."},
+  {"topic": "position sizing", "choice": "Size = floor(current portfolio value * 5% / current price), whole shares only.", "reason": "Spec states 'fixed percentage of total portfolio capital' but not fractional-share handling; backtrader's default sizing is share-integer based."},
+  {"topic": "exit moving average type", "choice": "12-month moving average of FT is a simple moving average (SMA) over the last 12 monthly FT values.", "reason": "Spec says 'moving average' without specifying type; SMA is the standard default."},
+  {"topic": "infeasible: backtest period and asset universe", "choice": "The harness fixes a single AAPL daily feed for 2020-01-02 to 2025-12-30 (~6 years), not the suggested Dow Jones index over a 10-15 year window.", "reason": "Data feed and backtest period are fixed by the execution environment and cannot be changed by the strategy code."}
+]}
+```

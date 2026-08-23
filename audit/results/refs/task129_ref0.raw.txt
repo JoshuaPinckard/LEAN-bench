@@ -1,114 +1,114 @@
 ```python
-# complete strategy class
 import backtrader as bt
 
 
-class FallingChannelBreakout(bt.Strategy):
+class FallingChannelBreakoutStrategy(bt.Strategy):
     params = (
-        ('bb_period', 20),      # Bollinger Bands period
-        ('bb_dev', 2.0),        # Bollinger Bands standard deviation
-        ('vol_period', 10),     # lookback for average-volume filter
-        ('struct_len', 3),      # required consecutive lower highs / lower lows
-        ('risk_pct', 0.01),     # fixed risk per trade (1% of equity)
-        ('dd_threshold', 0.10), # max drawdown allowed before taking a new trade
+        ('bb_period', 20),
+        ('bb_dev', 2),
+        ('vol_period', 10),
+        ('risk_pct', 0.02),
+        ('dd_threshold', 0.10),
     )
 
     def __init__(self):
-        # Channel = Bollinger Bands(20, 2): mid = midline, top = resistance, bot = support
         self.bb = bt.indicators.BollingerBands(
-            self.data, period=self.p.bb_period, devfactor=self.p.bb_dev)
-
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.vol_sma = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.vol_period
+        )
         self.order = None
-        self.stop_price = None
-        self.target_price = None
-
-        # peak equity for the drawdown gate
+        self.tp_order = None
+        self.sl_order = None
+        self.pending_channel_height = None
+        self.pending_stop_price = None
         self.peak_value = self.broker.getvalue()
+
+    def _falling_structure(self):
+        for i in range(1, 4):
+            if not (self.data.high[-i] < self.data.high[-i - 1]):
+                return False
+            if not (self.data.low[-i] < self.data.low[-i - 1]):
+                return False
+        return True
+
+    def _place_exit_orders(self, fill_price):
+        size = self.position.size
+        tp_price = fill_price + self.pending_channel_height
+        sl_price = self.pending_stop_price
+        self.tp_order = self.sell(exectype=bt.Order.Limit, price=tp_price, size=size)
+        self.sl_order = self.sell(
+            exectype=bt.Order.Stop, price=sl_price, size=size, oco=self.tp_order
+        )
+
+    def next(self):
+        current_value = self.broker.getvalue()
+        if current_value > self.peak_value:
+            self.peak_value = current_value
+        drawdown = (
+            (self.peak_value - current_value) / self.peak_value
+            if self.peak_value > 0 else 0.0
+        )
+
+        if self.position or self.order:
+            return
+
+        if drawdown > self.p.dd_threshold:
+            return
+
+        upper = self.bb.lines.top[0]
+        lower = self.bb.lines.bot[0]
+
+        if self.data.close[0] <= upper:
+            return
+
+        if not self._falling_structure():
+            return
+
+        if self.data.volume[0] <= self.vol_sma[-1]:
+            return
+
+        channel_height = upper - lower
+        stop_price = lower
+        entry_price_est = self.data.close[0]
+        risk_per_share = entry_price_est - stop_price
+        if risk_per_share <= 0:
+            return
+
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        size = int(risk_amount / risk_per_share)
+        if size < 1:
+            return
+
+        self.pending_channel_height = channel_height
+        self.pending_stop_price = stop_price
+        self.order = self.buy(size=size)
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
             return
-        if order.status in [order.Completed, order.Canceled,
-                            order.Margin, order.Rejected]:
+
+        if order == self.order:
+            if order.status == order.Completed and order.isbuy():
+                self._place_exit_orders(order.executed.price)
             self.order = None
-
-    def next(self):
-        # --- track peak equity for drawdown control ---
-        value = self.broker.getvalue()
-        if value > self.peak_value:
-            self.peak_value = value
-
-        # pending order guard
-        if self.order:
-            return
-
-        # --- exit management for an open position ---
-        if self.position:
-            # stop-loss takes priority if both levels are touched in the same bar
-            if self.data.low[0] <= self.stop_price:
-                self.order = self.close()
-            elif self.data.high[0] >= self.target_price:
-                self.order = self.close()
-            return
-
-        # --- drawdown gate: no new trade if drawdown exceeds threshold ---
-        drawdown = (self.peak_value - value) / self.peak_value
-        if drawdown > self.p.dd_threshold:
-            return
-
-        # --- falling channel structure: >= 3 consecutive lower highs & lower lows ---
-        h = self.data.high
-        l = self.data.low
-        lower_highs = True
-        lower_lows = True
-        for i in range(1, self.p.struct_len + 1):
-            if not (h[-i] < h[-i - 1]):
-                lower_highs = False
-                break
-        if lower_highs:
-            for i in range(1, self.p.struct_len + 1):
-                if not (l[-i] < l[-i - 1]):
-                    lower_lows = False
-                    break
-
-        if not (lower_highs and lower_lows):
-            return
-
-        # --- breakout: close above the upper channel boundary ---
-        if not (self.data.close[0] > self.bb.top[0]):
-            return
-
-        # --- volume filter: breakout volume above average of previous 10 periods ---
-        avg_vol = 0.0
-        for i in range(1, self.p.vol_period + 1):
-            avg_vol += self.data.volume[-i]
-        avg_vol /= self.p.vol_period
-        if not (self.data.volume[0] > avg_vol):
-            return
-
-        # --- levels captured at the time of the breakout ---
-        upper = self.bb.top[0]
-        lower = self.bb.bot[0]
-        entry_ref = self.data.close[0]
-        channel_height = upper - lower
-
-        stop_price = lower                          # stop below/at the lower band
-        target_price = entry_ref + channel_height   # TP a channel-height away
-
-        risk_per_unit = entry_ref - stop_price
-        if risk_per_unit <= 0:
-            return
-
-        # --- risk-based position size ---
-        risk_amount = self.p.risk_pct * value
-        size = risk_amount / risk_per_unit
-        if size <= 0:
-            return
-
-        self.stop_price = stop_price
-        self.target_price = target_price
-        self.order = self.buy(size=size)
+        elif order == self.tp_order:
+            self.tp_order = None
+        elif order == self.sl_order:
+            self.sl_order = None
 ```
 ```json
-{"assumptions": [{"topic": "indicator choice", "choice": "Used Bollinger Bands (period 20, devfactor 2) as the channel, not the Donchian alternative.", "reason": "The spec offers 'either' BB or Donchian; BB is listed first and its parameters are fully specified."}, {"topic": "falling structure window", "choice": "Required 3 consecutive lower highs AND 3 consecutive lower lows on the 4 bars immediately preceding the breakout bar (bars -1..-4), excluding the breakout bar itself.", "reason": "Spec says the falling channel must be 'established ... before considering a breakout'; the breakout bar typically prints a higher high, so the structure is measured on the prior bars."}, {"topic": "stop loss level", "choice": "Stop placed exactly at the lower band value at breakout; risk distance = entry - lower band, no extra buffer added.", "reason": "Spec says 'below the lower band' but names no buffer; inventing a buffer would add an unstated parameter, so the band level is used as the literal boundary."}, {"topic": "entry price reference", "choice": "Breakout bar's close is used as the entry price for both take-profit distance and position sizing.", "reason": "Market orders fill at the next bar's open which is unknown when sizing; the breakout close is the price at the moment the entry condition is confirmed and channel levels are captured."}, {"topic": "risk percent", "choice": "Fixed risk of 1% of account equity per trade.", "reason": "Spec gives 'e.g., 1% or 2%'; 1% chosen as the conservative option from the stated examples."}, {"topic": "drawdown threshold", "choice": "No new trade when drawdown > 10%, where drawdown = (peak broker value - current value) / peak.", "reason": "Spec gives 'e.g., 10% of the account balance'; peak-to-current equity drawdown is the standard reading."}, {"topic": "volume filter", "choice": "Breakout bar volume must exceed the simple average of the previous 10 bars (bars -1..-10, excluding the current bar).", "reason": "Spec requires volume 'higher than the average volume of the last 10 periods'; excluding the breakout bar keeps the baseline independent of the spike being tested. Volume is available, so the filter is applied."}, {"topic": "exit precedence", "choice": "If both stop and target are touched within the same bar, the stop-loss is triggered first.", "reason": "Spec does not define intrabar precedence; the conservative choice is to assume the stop was hit."}, {"topic": "position sizing cap", "choice": "Size is purely risk-based with no affordability/leverage cap; orders exceeding available cash are simply rejected by the broker.", "reason": "Spec defines size solely via risk-per-trade; adding a cash cap would be an unstated substitution."}, {"topic": "infeasible", "choice": "Strategy runs on the provided 1h AAPL feed instead of the H4 chart the spec requests; no resampling is applied.", "reason": "The harness supplies a single fixed 1h PandasData feed and cerebro setup is external, so the strategy cannot resample to 4h. Closest literal reading is to run the identical logic on the available bars."}]}
+{"assumptions": [
+  {"topic": "channel indicator choice", "choice": "Implemented using Bollinger Bands (period=20, devfactor=2) only", "reason": "Spec offers BB and Donchian as alternatives ('Alternatively, use a Donchian Channel...'); only one indicator set can define the single strategy class, and BB is listed as the primary method."},
+  {"topic": "falling structure detection", "choice": "3 consecutive lower highs and lower lows checked over the 4 bars immediately preceding the breakout bar (high[-1]<high[-2]<high[-3]<high[-4], same for lows)", "reason": "Spec requires 'at least 3 consecutive lower highs and lower lows' before the breakout but gives no exact lookback window definition; this is the literal minimal reading of 3 consecutive decreases."},
+  {"topic": "volume baseline window", "choice": "Average volume computed via SMA(volume,10) evaluated one bar back (vol_sma[-1]), i.e. the 10 bars preceding the breakout bar, excluding the breakout bar's own volume", "reason": "Spec says volume must spike 'higher than the average volume of the last 10 periods'; excluding the breakout bar from its own baseline avoids self-referential bias and matches 'last 10 periods' as periods prior to the signal."},
+  {"topic": "stop loss placement", "choice": "Stop-loss trigger price set exactly at the channel lower band value at breakout time", "reason": "Spec says 'below the lower band' with no numeric buffer specified; using the lower band level itself as the closest literal stop-trigger reference."},
+  {"topic": "take profit calculation", "choice": "TP = actual filled entry price + channel height (upper-lower band width at breakout)", "reason": "Spec: 'take profit target at a distance equal to the height of the channel... above the entry price'; used the real fill price (known only after order execution) rather than the signal-bar close."},
+  {"topic": "position sizing entry price estimate", "choice": "Used the signal-bar close price as the entry price estimate for the risk/size calculation", "reason": "Actual fill price is unknown until the market order executes at the next bar's open; sizing must be computed at signal time using the best available reference price."},
+  {"topic": "risk percentage value", "choice": "risk_pct = 0.02 (2% of account equity per trade)", "reason": "Spec gives 'e.g., 1% or 2%' without mandating a single value; chose 2% and exposed it as a tunable strategy parameter."},
+  {"topic": "drawdown threshold value", "choice": "dd_threshold = 0.10 (10%), drawdown computed as (peak equity - current equity)/peak equity tracked from strategy start", "reason": "Spec gives 'e.g., 10% of the account balance' without a fixed mandated value; chose 10% and exposed it as a tunable strategy parameter."},
+  {"topic": "timeframe", "choice": "Implemented directly on the harness-provided 1h bar feed rather than an H4 chart", "reason": "infeasible: the execution environment fixes a single 1h AAPL data feed with no resampling or additional data feeds available to the strategy class."},
+  {"topic": "exit order mechanics", "choice": "After entry fill, submit a limit sell (take profit) and a stop sell (stop loss) sized to the full position, linked via OCO so one cancels the other on fill", "reason": "Spec states TP and SL levels but not order mechanics; OCO bracket-style exits are the standard way to implement simultaneous take-profit/stop-loss targets in backtrader."}
+]}
 ```

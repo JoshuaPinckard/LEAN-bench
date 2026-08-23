@@ -1,0 +1,135 @@
+```python
+import backtrader as bt
+
+
+class ScalpingStrategy(bt.Strategy):
+    params = (
+        ('symbol', 'SNAP'),
+        ('stoch_period', 5),
+        ('stoch_pfast', 3),
+        ('stoch_pslow', 3),
+        ('rsi_period', 3),
+        ('vol_sma_period', 20),
+        ('vol_mult', 1.2),
+        ('atr_period', 14),
+        ('atr_threshold', 0.03),
+        ('take_profit', 0.01),
+        ('stop_loss', 0.02),
+        ('timeout_bars', 3),
+        ('size', 100),
+        ('use_pdt_rule', False),
+        ('pdt_balance_threshold', 25000),
+        ('session_start_hour', 9),
+        ('session_start_minute', 30),
+        ('session_end_hour', 16),
+        ('session_end_minute', 0),
+        ('warmup_minutes', 3),
+        ('liquidity_threshold', 0),
+    )
+
+    def __init__(self):
+        self.stoch = bt.indicators.Stochastic(
+            self.data,
+            period=self.p.stoch_period,
+            period_dfast=self.p.stoch_pfast,
+            period_dslow=self.p.stoch_pslow,
+        )
+        self.percK = self.stoch.percK
+        self.percD = self.stoch.percD
+        self.crossover = bt.indicators.CrossOver(self.percK, self.percD)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed:
+            if not self.position:
+                self.entry_price = None
+                self.entry_bar = None
+            else:
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        t = self.data.datetime.time(0)
+        minutes_of_day = t.hour * 60 + t.minute
+        session_start = self.p.session_start_hour * 60 + self.p.session_start_minute
+        session_end = self.p.session_end_hour * 60 + self.p.session_end_minute
+        trading_start = session_start + self.p.warmup_minutes
+        in_main_session = session_start <= minutes_of_day < session_end
+        past_warmup = minutes_of_day >= trading_start
+
+        if not self.position:
+            if not (in_main_session and past_warmup):
+                return
+            if self.p.use_pdt_rule and self.broker.getvalue() <= self.p.pdt_balance_threshold:
+                return
+            if self.vol_sma[0] <= self.p.liquidity_threshold:
+                return
+
+            volume_ok = self.data.volume[0] > self.p.vol_mult * self.vol_sma[0]
+            atr_ok = self.atr[0] >= self.p.atr_threshold
+
+            long_signal = (
+                self.crossover[0] > 0
+                and self.percK[0] > 80
+                and self.rsi[0] > 55
+                and volume_ok
+                and atr_ok
+            )
+            short_signal = (
+                self.crossover[0] < 0
+                and self.percK[0] < 20
+                and self.rsi[0] < 45
+                and volume_ok
+                and atr_ok
+            )
+
+            if long_signal:
+                self.order = self.buy(size=self.p.size)
+            elif short_signal:
+                self.order = self.sell(size=self.p.size)
+            return
+
+        price = self.data.close[0]
+        bars_held = len(self) - self.entry_bar if self.entry_bar is not None else 0
+        timeout = bars_held >= self.p.timeout_bars
+
+        if self.position.size > 0:
+            tp_hit = price >= self.entry_price + self.p.take_profit
+            sl_hit = price <= self.entry_price - self.p.stop_loss
+            reversal = (self.crossover[0] < 0) or (self.percK[0] < 50)
+            if tp_hit or sl_hit or reversal or timeout:
+                self.order = self.close()
+        elif self.position.size < 0:
+            tp_hit = price <= self.entry_price - self.p.take_profit
+            sl_hit = price >= self.entry_price + self.p.stop_loss
+            reversal = (self.crossover[0] > 0) or (self.percK[0] > 50)
+            if tp_hit or sl_hit or reversal or timeout:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "symbol parameter", "choice": "Exposed self.p.symbol (default 'SNAP') but it has no operative effect since the harness fixes a single SNAP data feed.", "reason": "infeasible: the runtime data feed is set by the harness, not selectable by the strategy."},
+  {"topic": "Stochastic(5,3,3) mapping", "choice": "Used bt.indicators.Stochastic(period=5, period_dfast=3, period_dslow=3), i.e. the slow stochastic where percK is already smoothed and percD is a further smoothing.", "reason": "The three-argument Stochastic(period,%K-smoothing,%D-smoothing) notation in the spec matches backtrader's Stochastic (slow) signature exactly."},
+  {"topic": "main session hours", "choice": "Defined main session as 09:30-16:00 exchange time via integer hour/minute params, derived from self.data.datetime.time(0).", "reason": "Spec requires session filtering but gives no explicit hours; 09:30-16:00 is standard US equity RTH and matches the feed's timezone/start time. datetime module isn't in the allowed-imports list, so comparisons use .hour/.minute of the bt-provided time object instead of constructing datetime objects."},
+  {"topic": "skip first 3 minutes", "choice": "Entries blocked until minutes-of-day >= session_start + 3 (i.e. before 09:33).", "reason": "Direct reading of 'skip the first 3 minutes' of the main session."},
+  {"topic": "filters apply to entries only", "choice": "Session window, warm-up skip, PDT balance check, and liquidity threshold gate new entries only; exits (TP/SL/reversal/timeout) are evaluated unconditionally once in a position.", "reason": "Spec lists these under entry conditions/additional filters for trading; risk-management exits should not be suppressed by session/liquidity gating, which is not stated."},
+  {"topic": "liquidity threshold default", "choice": "Default liquidity_threshold = 0, effectively a no-op filter unless the user configures it.", "reason": "Spec calls it an 'adjustable threshold' without giving a numeric default, unlike the ATR threshold which is explicitly 0.03."},
+  {"topic": "PDT rule default", "choice": "use_pdt_rule defaults to False; when True, entries are blocked unless self.broker.getvalue() > 25000.", "reason": "Spec states the balance check is 'optionally' applied, implying it is a toggle rather than always-on."},
+  {"topic": "position size bounds", "choice": "Exposed self.p.size (default 100) used directly in buy()/sell(); did not add runtime clamping to enforce the 100-500 range.", "reason": "Spec presents 100-500 as the valid configuration range for the parameter with an explicit default (100), not as a computed/dynamic value requiring runtime enforcement logic."},
+  {"topic": "'accounts only for its own positions'", "choice": "No additional code added; relied on backtrader's default per-strategy position/broker isolation.", "reason": "A single-strategy, single-data backtrader setup already only sees its own position and broker state, so this rule is satisfied without extra logic."},
+  {"topic": "timeout bar counting", "choice": "entry_bar is set to len(self) at the bar the entry order fills (via notify_order); timeout triggers once len(self) - entry_bar >= 3.", "reason": "Spec states 'timeout after 3 bars' without defining bar-count semantics; counting elapsed bars since the fill bar is the most literal reading."},
+  {"topic": "exit signal check timing", "choice": "TP/SL/reversal/timeout are all evaluated together each bar with no priority order beyond first-true-wins in an if/or chain, all routed through self.close().", "reason": "Spec lists TP, SL, reversal, and timeout as alternative exit conditions without specifying precedence when multiple trigger simultaneously."}
+]}
+```

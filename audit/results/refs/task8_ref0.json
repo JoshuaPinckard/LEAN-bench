@@ -1,0 +1,67 @@
+{
+  "task_id": 8,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport math\n\n\nclass DQNTradingStrategy(bt.Strategy):\n    params = (\n        ('train_bars', 252),\n        ('n_episodes', 20),\n        ('epsilon_start', 0.8),\n        ('epsilon_decay', 0.99),\n        ('gamma', 0.95),\n        ('hidden_size', 12),\n        ('learning_rate', 0.01),\n        ('buy_amounts', (1, 5, 10, 20, 30, 50, 75, 100)),\n        ('sell_amounts', (1, 5, 10, 20, 30, 50, 75, 100)),\n        ('train_initial_cash', 1000.0),\n        ('commission', 0.001),\n        ('seed', 12345),\n    )\n\n    def __init__(self):\n        self.order = None\n        self.price_history = []\n        self.trained = False\n\n        self.buy_amounts = list(self.p.buy_amounts)\n        self.sell_amounts = list(self.p.sell_amounts)\n        self.n_actions = 1 + len(self.buy_amounts) + len(self.sell_amounts)\n\n        self.input_size = 3\n        self.hidden_size = self.p.hidden_size\n\n        self._rng_state = self.p.seed\n        self._init_network()\n\n    def _rand(self):\n        # custom LCG PRNG: `random` is not in the allowed import list\n        self._rng_state = (1664525 * self._rng_state + 1013904223) % (2 ** 32)\n        return self._rng_state / (2 ** 32)\n\n    def _randint(self, n):\n        return int(self._rand() * n)\n\n    def _randn(self, scale):\n        u = sum(self._rand() for _ in range(3)) / 3.0 - 0.5\n        return u * scale\n\n    def _init_network(self):\n        i, h, o = self.input_size, self.hidden_size, self.n_actions\n        scale1 = 1.0 / math.sqrt(i)\n        scale2 = 1.0 / math.sqrt(h)\n        self.w1 = [[self._randn(scale1) for _ in range(h)] for _ in range(i)]\n        self.b1 = [0.0] * h\n        self.w2 = [[self._randn(scale2) for _ in range(o)] for _ in range(h)]\n        self.b2 = [0.0] * o\n\n    def _forward(self, state):\n        h_in = [\n            sum(state[i] * self.w1[i][j] for i in range(self.input_size)) + self.b1[j]\n            for j in range(self.hidden_size)\n        ]\n        h_out = [math.tanh(x) for x in h_in]\n        q = [\n            sum(h_out[j] * self.w2[j][k] for j in range(self.hidden_size)) + self.b2[k]\n            for k in range(self.n_actions)\n        ]\n        return q, h_out\n\n    def _make_state(self, price, cash, shares):\n        return [price / 100.0, cash / 1000.0, shares / 100.0]\n\n    def _select_action(self, state, epsilon):\n        if self._rand() < epsilon:\n            return self._randint(self.n_actions)\n        q, _ = self._forward(state)\n        best_idx = 0\n        best_val = q[0]\n        for idx in range(1, self.n_actions):\n            if q[idx] > best_val:\n                best_val = q[idx]\n                best_idx = idx\n        return best_idx\n\n    def _decode_action(self, action_idx):\n        if action_idx == 0:\n            return ('hold', 0)\n        buy_n = len(self.buy_amounts)\n        if action_idx <= buy_n:\n            return ('buy', self.buy_amounts[action_idx - 1])\n        return ('sell', self.sell_amounts[action_idx - buy_n - 1])\n\n    def _apply_action_sim(self, action_idx, price, cash, shares):\n        kind, amount = self._decode_action(action_idx)\n        if kind == 'buy':\n            cost_per_share = price * (1.0 + self.p.commission)\n            max_affordable = int(cash // cost_per_share)\n            n = min(amount, max_affordable)\n            if n > 0:\n                cash -= n * cost_per_share\n                shares += n\n        elif kind == 'sell':\n            n = min(amount, shares)\n            if n > 0:\n                proceeds = n * price * (1.0 - self.p.commission)\n                cash += proceeds\n                shares -= n\n        return cash, shares\n\n    def _update(self, state, action_idx, reward, next_state, done):\n        q, h_out = self._forward(state)\n        if done:\n            target = reward\n        else:\n            q_next, _ = self._forward(next_state)\n            target = reward + self.p.gamma * max(q_next)\n\n        error = q[action_idx] - target\n        lr = self.p.learning_rate\n\n        grad_h = [0.0] * self.hidden_size\n        for j in range(self.hidden_size):\n            grad_h[j] = error * self.w2[j][action_idx] * (1.0 - h_out[j] ** 2)\n            self.w2[j][action_idx] -= lr * error * h_out[j]\n        self.b2[action_idx] -= lr * error\n\n        for i in range(self.input_size):\n            for j in range(self.hidden_size):\n                self.w1[i][j] -= lr * grad_h[j] * state[i]\n        for j in range(self.hidden_size):\n            self.b1[j] -= lr * grad_h[j]\n\n    def _train(self):\n        prices = self.price_history\n        epsilon = self.p.epsilon_start\n        n = len(prices)\n        for _episode in range(self.p.n_episodes):\n            cash = self.p.train_initial_cash\n            shares = 0\n            prev_value = cash\n            for t in range(n - 1):\n                price = prices[t]\n                state = self._make_state(price, cash, shares)\n                action_idx = self._select_action(state, epsilon)\n                cash, shares = self._apply_action_sim(action_idx, price, cash, shares)\n                value = cash + shares * price\n                reward = value - prev_value\n                prev_value = value\n                next_state = self._make_state(prices[t + 1], cash, shares)\n                done = (t == n - 2)\n                self._update(state, action_idx, reward, next_state, done)\n            epsilon *= self.p.epsilon_decay\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def next(self):\n        price = self.data.close[0]\n\n        if not self.trained:\n            # buffer one simulated \"year\" causally, then train offline in a single pass\n            self.price_history.append(price)\n            if len(self.price_history) >= self.p.train_bars:\n                self._train()\n                self.trained = True\n            return\n\n        if self.order:\n            return\n\n        cash = self.broker.getcash()\n        shares = int(self.position.size)\n        state = self._make_state(price, cash, shares)\n        action_idx = self._select_action(state, 0.0)\n        kind, amount = self._decode_action(action_idx)\n\n        if kind == 'buy':\n            cost_per_share = price * (1.0 + self.p.commission)\n            max_affordable = int(cash // cost_per_share)\n            n = min(amount, max_affordable)\n            if n > 0:\n                self.order = self.buy(size=n)\n        elif kind == 'sell':\n            n = min(amount, shares)\n            if n > 0:\n                self.order = self.sell(size=n)",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Real order sizing and affordability use the harness's actual broker cash (fixed at $10,000); the spec's 'initial trading capital is 1000 monetary units' is applied only inside the offline training simulation, a self-contained virtual portfolio never touching the real broker.",
+      "reason": "Cerebro's starting cash is set by the harness outside the Strategy class and cannot be overridden from within it; the environment explicitly fixes it at $10,000."
+    },
+    {
+      "topic": "training_data_source",
+      "choice": "Interpreted 'one year of historical data' as the first 252 bars (~1 trading year) of the live feed, buffered causally as they arrive; the strategy only Holds (places no orders) until that buffer is full, then trains offline on it in one pass before live trading begins.",
+      "reason": "The harness supplies a single continuous feed consumed bar-by-bar with no separate offline dataset, so buffering the first year is the closest causal reading of 'train on one year of historical data'."
+    },
+    {
+      "topic": "training_episode_count",
+      "choice": "Ran 20 training episodes (full passes) over the buffered year.",
+      "reason": "The spec fixes the per-episode epsilon decay factor (0.99) but not the number of episodes; 20 was chosen as a finite, tractable budget for a hand-rolled pure-Python network."
+    },
+    {
+      "topic": "action_space_discretization",
+      "choice": "Buy/sell share counts are drawn from the bucket {1,5,10,20,30,50,75,100} rather than every integer 1-100, plus one Hold action (17 discrete actions total); a zero-share sell is represented by Hold instead of a redundant Sell(0) action.",
+      "reason": "The spec gives 1-100 as an example range ('e.g.'); training a 200+ output raw discrete action space with no ML libraries is impractical, so a representative bucketed subset preserves variable position sizing while staying runnable."
+    },
+    {
+      "topic": "network_architecture",
+      "choice": "One hidden layer of 12 tanh units, linear Q-value output layer, trained by manually derived backprop of squared TD-error with learning rate 0.01.",
+      "reason": "The spec requires a neural network for Q-value approximation but specifies no architecture, and only backtrader/math/collections/statistics are importable, so the network and its training must be implemented from scratch."
+    },
+    {
+      "topic": "exploration_rng",
+      "choice": "Implemented a self-contained linear-congruential PRNG for epsilon-greedy random draws.",
+      "reason": "The allowed-imports list excludes Python's `random` module, so exploration randomness had to be generated manually."
+    },
+    {
+      "topic": "post_training_policy",
+      "choice": "After the offline training phase, network weights are frozen and live trading uses the greedy policy (epsilon=0); no further weight updates occur once real orders are being placed.",
+      "reason": "The spec's epsilon-greedy/episode description applies to training over 'one year of historical data'; it does not state exploration or learning continues once real capital is deployed, so exploit-only deployment is the most literal reading."
+    },
+    {
+      "topic": "pyramiding_allowed",
+      "choice": "Allowed repeated buy actions to add to an existing long position, and partial sells that trim rather than fully close it, overriding the bench's default single-position/no-re-entry rule.",
+      "reason": "The spec explicitly describes variable-size buy/sell decisions made at every time step to manage the same evolving position ('close part or all of the long position'), which requires the agent to be able to add to or trim its holding repeatedly; the instructions permit this override 'unless the spec says otherwise'."
+    },
+    {
+      "topic": "close_position_method",
+      "choice": "Used self.sell(size=n) for all sell actions, including full exits, instead of self.close().",
+      "reason": "Canonical default #2 assumes an unconditional full exit, but this spec requires a dynamically sized partial-or-full sell chosen by the network; self.sell(size=n) supports both, with a full close occurring naturally when n equals the held size."
+    },
+    {
+      "topic": "insufficient_funds_handling",
+      "choice": "Chose the 'adjust to the maximum possible number' branch explicitly permitted by the spec: buy size is capped to the max shares affordable at the current cash and the fixed 0.001 commission, rather than rejecting the order outright.",
+      "reason": "The spec offers both options ('rejected (or adjusted to the maximum possible number)'); adjusting keeps the agent active instead of silently dropping trades."
+    },
+    {
+      "topic": "state_representation",
+      "choice": "Network input state is [close_price/100, cash/1000, shares_held/100].",
+      "reason": "The spec's main idea references decisions based on 'current portfolio state and market data' even though the indicator section restricts market data to price alone; cash and share count are portfolio-state inputs (not additional technical indicators) and are scaled to keep inputs numerically small for the hand-rolled network."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

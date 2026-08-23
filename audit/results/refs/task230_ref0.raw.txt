@@ -1,0 +1,194 @@
+```python
+import backtrader as bt
+import collections
+
+
+class WeeklyMACDCrossoverMomentum(bt.Strategy):
+    params = dict(
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        sma_period=50,
+        atr_period=14,
+        vol_sma_period=50,
+        vol_mult=1.3,
+        atr_pct_max=0.04,
+        stop_loss_pct=0.08,
+        take_profit_pct=0.20,
+        time_stop_weeks=6,
+        stake=1,
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.weeks_in_position = 0
+
+        self._week_key = None
+        self._w_high = None
+        self._w_low = None
+        self._w_close = None
+        self._w_volume = 0.0
+
+        self.weekly_bar_index = 0
+
+        self.w_closes = collections.deque(maxlen=self.p.sma_period)
+        self.w_volumes = collections.deque(maxlen=self.p.vol_sma_period)
+
+        self.ema_fast = None
+        self.ema_slow = None
+        self.signal_line = None
+        self.prev_hist = None
+
+        self.tr_values = collections.deque(maxlen=self.p.atr_period)
+        self.atr = None
+        self.prev_weekly_close = None
+
+    def _start_new_week(self, h, l, c, v, key):
+        self._week_key = key
+        self._w_high = h
+        self._w_low = l
+        self._w_close = c
+        self._w_volume = v
+
+    def _update_week(self, h, l, c, v):
+        self._w_high = max(self._w_high, h)
+        self._w_low = min(self._w_low, l)
+        self._w_close = c
+        self._w_volume += v
+
+    def _on_week_close(self):
+        w_close = self._w_close
+        w_high = self._w_high
+        w_low = self._w_low
+        w_volume = self._w_volume
+
+        self.weekly_bar_index += 1
+
+        self.w_closes.append(w_close)
+        sma50 = None
+        if len(self.w_closes) == self.p.sma_period:
+            sma50 = sum(self.w_closes) / self.p.sma_period
+
+        self.w_volumes.append(w_volume)
+        vol_sma50 = None
+        if len(self.w_volumes) == self.p.vol_sma_period:
+            vol_sma50 = sum(self.w_volumes) / self.p.vol_sma_period
+
+        if self.ema_fast is None:
+            self.ema_fast = w_close
+            self.ema_slow = w_close
+        else:
+            k_fast = 2.0 / (self.p.macd_fast + 1)
+            k_slow = 2.0 / (self.p.macd_slow + 1)
+            self.ema_fast = w_close * k_fast + self.ema_fast * (1 - k_fast)
+            self.ema_slow = w_close * k_slow + self.ema_slow * (1 - k_slow)
+
+        macd = self.ema_fast - self.ema_slow
+
+        if self.signal_line is None:
+            self.signal_line = macd
+        else:
+            k_sig = 2.0 / (self.p.macd_signal + 1)
+            self.signal_line = macd * k_sig + self.signal_line * (1 - k_sig)
+
+        hist = macd - self.signal_line
+
+        if self.prev_weekly_close is None:
+            tr = w_high - w_low
+        else:
+            tr = max(
+                w_high - w_low,
+                abs(w_high - self.prev_weekly_close),
+                abs(w_low - self.prev_weekly_close),
+            )
+        self.prev_weekly_close = w_close
+
+        if self.atr is None:
+            self.tr_values.append(tr)
+            if len(self.tr_values) == self.p.atr_period:
+                self.atr = sum(self.tr_values) / self.p.atr_period
+        else:
+            self.atr = (self.atr * (self.p.atr_period - 1) + tr) / self.p.atr_period
+
+        crossover = 0
+        if self.prev_hist is not None:
+            if self.prev_hist <= 0 and hist > 0:
+                crossover = 1
+            elif self.prev_hist >= 0 and hist < 0:
+                crossover = -1
+        self.prev_hist = hist
+
+        if self.order is not None:
+            return
+
+        if self.position:
+            self.weeks_in_position += 1
+            pct = (w_close - self.entry_price) / self.entry_price
+            if crossover == -1:
+                self.order = self.close()
+            elif pct <= -self.p.stop_loss_pct:
+                self.order = self.close()
+            elif pct >= self.p.take_profit_pct:
+                self.order = self.close()
+            elif self.weeks_in_position >= self.p.time_stop_weeks:
+                self.order = self.close()
+        else:
+            warmed_up = (
+                sma50 is not None
+                and vol_sma50 is not None
+                and self.atr is not None
+                and self.weekly_bar_index >= (self.p.macd_slow + self.p.macd_signal)
+            )
+            if (
+                warmed_up
+                and crossover == 1
+                and w_close > sma50
+                and w_volume > self.p.vol_mult * vol_sma50
+                and (self.atr / w_close) < self.p.atr_pct_max
+            ):
+                self.order = self.buy(size=self.p.stake)
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        key = dt.isocalendar()[:2]
+
+        h = self.data.high[0]
+        l = self.data.low[0]
+        c = self.data.close[0]
+        v = self.data.volume[0]
+
+        is_last_bar = len(self.data) == self.data.buflen()
+
+        if self._week_key is None:
+            self._start_new_week(h, l, c, v, key)
+        elif key != self._week_key:
+            self._on_week_close()
+            self._start_new_week(h, l, c, v, key)
+        else:
+            self._update_week(h, l, c, v)
+
+        if is_last_bar:
+            self._on_week_close()
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.weeks_in_position = 0
+
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Weekly resampling is implemented by manually aggregating daily OHLCV into weekly bars (grouped by ISO calendar year/week) inside the strategy, and MACD(12,26,9)/SMA(50)/ATR(14)/SMA(volume,50) are computed manually from that weekly series (EMA recursion for MACD, Wilder/SMMA recursion for ATR, matching backtrader's own ATR default) instead of via bt.indicators on a resampled feed.", "reason": "The harness supplies only a single daily PandasData feed added to cerebro before the strategy runs; cerebro.resampledata()/replaydata() cannot be invoked from within a Strategy class after datas are already attached, so true weekly resampling via backtrader's built-in mechanism is not achievable in this environment."},
+  {"topic": "infeasible", "choice": "A week is recognized as closed only when the first daily bar of the following ISO week arrives (or on the final bar of the dataset for a trailing partial week); entry/exit orders are then submitted on that bar and fill per standard next-bar-open broker mechanics.", "reason": "Detecting 'last trading day of the week' without seeing the next day's bar would require look-ahead into unprocessed data, which is not acceptable; confirming the boundary on the following week's first bar is the causal-safe equivalent, at the cost of a small (~1 trading day) lag versus an idealized same-day weekly-close fill."},
+  {"topic": "exit timing", "choice": "The reverse MACD cross, -8%/+20% stop-loss/take-profit, and 6-week time stop are all evaluated only at weekly-close events (using the weekly close price and a count of completed weekly bars held), not checked intrabar on daily bars.", "reason": "The spec frames the entire system as weekly-signal-driven ('Signals are generated on the weekly timeframe'); evaluating all exit rules on the same weekly cadence keeps the implementation internally consistent rather than mixing a weekly signal engine with daily-granularity risk checks the spec never requests."},
+  {"topic": "time stop", "choice": "'6 weeks' is interpreted as 6 completed weekly bars held since entry (a counter incremented once per weekly close), not 6 calendar weeks measured by date arithmetic.", "reason": "The strategy operates on discrete weekly bars, so counting elapsed weekly closes is the natural unit consistent with how entries/exits are otherwise evaluated."},
+  {"topic": "indicator warm-up", "choice": "Entries are blocked until SMA(50), SMA(volume,50), and ATR(14) each have a full window of weekly data, and at least macd_slow+macd_signal (=35) weekly bars have elapsed for MACD/signal convergence.", "reason": "Because these indicators are computed manually rather than as bt.indicator objects, there is no automatic minperiod gating; an explicit warm-up guard is required so partial-window averages are never used as trading signals."}
+]}
+```

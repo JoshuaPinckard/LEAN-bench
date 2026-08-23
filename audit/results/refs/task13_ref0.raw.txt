@@ -1,0 +1,119 @@
+```python
+import backtrader as bt
+
+
+class PyramidingInTrend(bt.Strategy):
+    params = dict(
+        ema_period=50,
+        rsi_period=14,
+        max_lots=4,
+        size_pct=0.01,
+        partial_close_pct=0.25,
+        tp_close_pct=0.50,
+        tp_threshold=0.05,
+    )
+
+    def __init__(self):
+        self.ema = bt.indicators.ExponentialMovingAverage(
+            self.data.close, period=self.p.ema_period)
+        self.rsi = bt.indicators.RSI(
+            self.data.close, period=self.p.rsi_period)
+
+        self.broker.set_coc(True)
+
+        self.order = None
+        self.lot_count = 0
+
+        self.rsi_dipped_below_50 = False
+        self.rsi_reached_70 = False
+        self.rsi_above_60 = False
+
+        self.partial_exit_done = False
+        self.tp_exit_done = False
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.lot_count = 0
+            self.rsi_dipped_below_50 = False
+            self.rsi_reached_70 = False
+            self.rsi_above_60 = False
+            self.partial_exit_done = False
+            self.tp_exit_done = False
+
+    def _entry_size(self):
+        return (self.p.size_pct * self.broker.startingcash) / self.data.close[0]
+
+    def next(self):
+        if self.order is not None:
+            return
+
+        close = self.data.close[0]
+        ema = self.ema[0]
+        rsi = self.rsi[0]
+
+        if rsi < 50:
+            self.rsi_dipped_below_50 = True
+        if rsi > 60:
+            self.rsi_above_60 = True
+        if rsi >= 70:
+            self.rsi_reached_70 = True
+
+        if not self.position:
+            crossed_up = False
+            if self.rsi_dipped_below_50 and rsi > 50:
+                crossed_up = True
+                self.rsi_dipped_below_50 = False
+
+            if crossed_up and close > ema:
+                self.order = self.buy(size=self._entry_size())
+                self.lot_count = 1
+            return
+
+        exit_pullback = False
+        if self.rsi_above_60 and rsi < 40:
+            exit_pullback = True
+            self.rsi_above_60 = False
+
+        if close < ema or exit_pullback:
+            self.order = self.close()
+            return
+
+        pos_price = self.position.price
+        pos_size = self.position.size
+
+        if not self.partial_exit_done and close >= pos_price:
+            self.order = self.sell(size=pos_size * self.p.partial_close_pct)
+            self.partial_exit_done = True
+            return
+
+        if self.partial_exit_done and not self.tp_exit_done:
+            profit_pct = (close - pos_price) / pos_price
+            if profit_pct >= self.p.tp_threshold:
+                self.order = self.sell(size=pos_size * self.p.tp_close_pct)
+                self.tp_exit_done = True
+                return
+
+        pyramid_trigger = False
+        if self.rsi_reached_70 and rsi <= 60:
+            pyramid_trigger = True
+            self.rsi_reached_70 = False
+
+        if pyramid_trigger and self.lot_count < self.p.max_lots and close > ema:
+            self.order = self.buy(size=self._entry_size())
+            self.lot_count += 1
+```
+```json
+{"assumptions": [
+  {"topic": "order_execution_price", "choice": "Enabled broker cheat-on-close (self.broker.set_coc(True)) so market orders fill at the signal bar's close instead of backtrader's default next-bar open.", "reason": "Spec explicitly requires entries and exits to use the close price of the current candle; this is the standard backtrader mechanism to achieve that."},
+  {"topic": "position_sizing", "choice": "Each new entry (initial or pyramid) sizes to (1% of self.broker.startingcash) / current close price, recomputed per entry; fractional share sizes are allowed.", "reason": "Spec says 'fixed volume, e.g. 1% of initial capital' for each new position; this is dollar-fixed sizing converted to shares at the prevailing price, with no explicit instruction to round to whole shares."},
+  {"topic": "signal_consumption", "choice": "RSI cross-threshold setups (50 dip/rise, 70/60 pyramid, 60/40 pullback) are one-shot events consumed at the exact bar the second threshold is crossed; if the accompanying trend filter (close>EMA) fails on that same bar, the setup is discarded rather than left armed indefinitely.", "reason": "Spec is silent on how long a crossing signal should stay valid; treating it as a same-bar coincidence keeps entries tied to the described crossing event rather than allowing arbitrarily delayed fills."},
+  {"topic": "trend_filter_scope", "choice": "close > EMA(50) is required for both the first entry and every pyramid add-on, not just the first.", "reason": "The trend filter is listed as condition 1 under 'Conditions for entering a position' before the first-entry and pyramiding sub-conditions, implying it gates all entries."},
+  {"topic": "partial_exit_one_shot", "choice": "The 25% break-even exit and the 50%-of-remaining take-profit exit each fire at most once per position lifecycle (reset only when the position fully flattens), rather than re-triggering every bar the profit condition holds.", "reason": "Spec describes them as level-crossing management actions ('upon reaching...'), read as one-time events per open-position cycle."},
+  {"topic": "exit_priority", "choice": "Full-exit conditions (trend stop, RSI pullback) are checked and take priority over partial/take-profit exits and pyramid adds within the same bar; only one order is submitted per bar (guarded by an order-tracking attribute).", "reason": "Spec does not define priority when multiple conditions coincide; treating hard stop/reversal exits as overriding is the most conservative, literal reading of 'full exit' rules."},
+  {"topic": "profit_basis", "choice": "Total profit across open lots is computed from backtrader's native weighted-average position price (self.position.price) and current size, rather than manually tracked per-lot entries.", "reason": "This is mathematically equivalent to summing profit across all individual lots and is the natural backtrader representation of 'all open lots' profit."}
+]}
+```

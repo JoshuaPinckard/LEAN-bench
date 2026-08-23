@@ -1,0 +1,262 @@
+{
+  "task_id": 293,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass MeanReversionBBStrategy(bt.Strategy):\n    params = (\n        ('bb_period', 20),\n        ('bb_devfactor', 2.0),\n        ('bb_stop_devfactor', 3.0),\n        ('rsi_period', 14),\n        ('stoch_period', 14),\n        ('stoch_period_dfast', 3),\n        ('ema_fast_period', 5),\n        ('ema_slow_period', 10),\n        ('atr_period', 14),\n        ('vol_sma_fast', 20),\n        ('vol_sma_slow', 50),\n        ('rsi_long_entry', 35),\n        ('rsi_short_entry', 65),\n        ('stoch_long_entry', 20),\n        ('stoch_short_entry', 80),\n        ('rsi_neutral', 50),\n        ('bbwidth_min', 0.03),\n        ('bbwidth_max', 0.20),\n        ('noise_atr_mult', 3.0),\n        ('atr_stop_mult', 1.5),\n        ('risk_pct', 0.02),\n        ('dev_low', 1.5),\n        ('dev_high', 2.5),\n        ('mult_low', 0.5),\n        ('mult_high', 1.5),\n    )\n\n    def __init__(self):\n        self.sma20 = bt.indicators.SMA(self.data.close, period=self.p.bb_period)\n        self.bb2 = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor)\n        self.bb3 = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_stop_devfactor)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.stoch = bt.indicators.Stochastic(\n            self.data, period=self.p.stoch_period, period_dfast=self.p.stoch_period_dfast)\n        self.ema_fast = bt.indicators.EMA(self.data.close, period=self.p.ema_fast_period)\n        self.ema_slow = bt.indicators.EMA(self.data.close, period=self.p.ema_slow_period)\n        self.ema_cross = bt.indicators.CrossOver(self.ema_fast, self.ema_slow)\n        self.rsi_cross = bt.indicators.CrossOver(self.rsi, self.p.rsi_neutral)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.vol_sma_fast_line = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_fast)\n        self.vol_sma_slow_line = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_slow)\n\n        self.order = None\n        self.stop_price = None\n        self.pending_stop_distance = None\n\n    def notify_order(self, order):\n        if order.status == order.Completed:\n            if order.isbuy() and self.position.size > 0 and self.pending_stop_distance is not None:\n                self.stop_price = order.executed.price - self.pending_stop_distance\n                self.pending_stop_distance = None\n            elif order.issell() and self.position.size < 0 and self.pending_stop_distance is not None:\n                self.stop_price = order.executed.price + self.pending_stop_distance\n                self.pending_stop_distance = None\n            self.order = None\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n            self.pending_stop_distance = None\n\n    def next(self):\n        if self.order:\n            return\n\n        sma20 = self.sma20[0]\n        bb2_top = self.bb2.top[0]\n        bb2_bot = self.bb2.bot[0]\n        bb3_top = self.bb3.top[0]\n        bb3_bot = self.bb3.bot[0]\n        close = self.data.close[0]\n        high = self.data.high[0]\n        low = self.data.low[0]\n        atr = self.atr[0]\n\n        if not self.position:\n            if high - low > self.p.noise_atr_mult * atr:\n                return\n\n            bbwidth = (bb2_top - bb2_bot) / sma20 if sma20 else 0.0\n            if not (self.p.bbwidth_min <= bbwidth <= self.p.bbwidth_max):\n                return\n            if not (self.vol_sma_fast_line[0] > self.vol_sma_slow_line[0]):\n                return\n\n            std = (bb2_top - sma20) / self.p.bb_devfactor\n            if std <= 0:\n                return\n            deviation = abs(close - sma20) / std\n            multiplier = self.p.mult_low + (deviation - self.p.dev_low) * (\n                self.p.mult_high - self.p.mult_low) / (self.p.dev_high - self.p.dev_low)\n            multiplier = max(self.p.mult_low, min(self.p.mult_high, multiplier))\n\n            portfolio_value = self.broker.getvalue()\n            risk_amount = self.p.risk_pct * portfolio_value\n\n            long_signal = (close < bb2_bot and self.rsi[0] < self.p.rsi_long_entry\n                           and self.stoch.percK[0] < self.p.stoch_long_entry)\n            short_signal = (close > bb2_top and self.rsi[0] > self.p.rsi_short_entry\n                            and self.stoch.percK[0] > self.p.stoch_short_entry)\n\n            if long_signal:\n                stop_distance = max(close - bb3_bot, atr * self.p.atr_stop_mult)\n                if stop_distance <= 0:\n                    return\n                size = int((risk_amount / stop_distance) * multiplier)\n                if size >= 1:\n                    self.pending_stop_distance = stop_distance\n                    self.order = self.buy(size=size)\n            elif short_signal:\n                stop_distance = max(bb3_top - close, atr * self.p.atr_stop_mult)\n                if stop_distance <= 0:\n                    return\n                size = int((risk_amount / stop_distance) * multiplier)\n                if size >= 1:\n                    self.pending_stop_distance = stop_distance\n                    self.order = self.sell(size=size)\n        else:\n            if self.position.size > 0:\n                if self.stop_price is not None and low <= self.stop_price:\n                    self.order = self.close()\n                    return\n                if high >= sma20:\n                    self.order = self.close()\n                    return\n                if self.ema_cross[0] < 0 or self.rsi_cross[0] > 0:\n                    self.order = self.close()\n                    return\n            elif self.position.size < 0:\n                if self.stop_price is not None and high >= self.stop_price:\n                    self.order = self.close()\n                    return\n                if low <= sma20:\n                    self.order = self.close()\n                    return\n                if self.ema_cross[0] > 0 or self.rsi_cross[0] < 0:\n                    self.order = self.close()\n                    return",
+  "assumptions": [
+    {
+      "topic": "stochastic_parameters",
+      "choice": "Used backtrader's default Stochastic indicator with period=14, period_dfast=3 (percD/slowing left at library default) and read %K from the percK line.",
+      "reason": "Spec names 'Stochastic %K' with only the base period implied by context (14, matching RSI); it does not state smoothing/period_dfast values, so the indicator's own defaults are used."
+    },
+    {
+      "topic": "deviation_multiplier_mapping",
+      "choice": "multiplier = clip(linear map of |close-SMA20|/sigma from [1.5,2.5] to [0.5,1.5], 0.5, 1.5), where sigma = (BB2sigma.top-SMA20)/2.",
+      "reason": "Spec gives 'clip(deviation beyond 1.5sigma to 2.5sigma, 0.5-1.5)' without an explicit formula; a linear interpolation between the stated domain and range endpoints is the most literal reading."
+    },
+    {
+      "topic": "stop_distance_selection",
+      "choice": "'Take the greater of the two' stops is interpreted as the greater of the two stop DISTANCES (BB(20,3sigma) distance vs ATR(14)*1.5), i.e., the wider/more conservative stop.",
+      "reason": "Comparing distances is direction-agnostic and avoids an inconsistency that arises if comparing raw stop prices (which flips 'greater' meaning between long and short)."
+    },
+    {
+      "topic": "capital_basis_for_risk_sizing",
+      "choice": "'2% of capital' is computed against current broker portfolio value (self.broker.getvalue()), not the fixed $10,000 starting cash.",
+      "reason": "Spec does not specify whether capital is static or mark-to-market; using live equity is the standard convention for a '% risk per trade' position-sizing rule."
+    },
+    {
+      "topic": "share_size_rounding",
+      "choice": "Computed quantity is floored to an integer number of shares via int(); if the floored size is 0, no entry order is placed that bar.",
+      "reason": "Backtrader/equity orders require a share count; spec is silent on fractional shares or rounding, so whole-share truncation with a skip-if-zero guard was used."
+    },
+    {
+      "topic": "noise_filter_scope",
+      "choice": "The extreme-noise filter (High-Low > 3*ATR14) only blocks new entries for that bar; it does not suppress stop-loss or exit checks on bars where a position is already open.",
+      "reason": "The spec lists the noise filter under the 'Filters' section alongside the band-width and volume filters, which are entry-gating conditions, not exit-gating conditions."
+    },
+    {
+      "topic": "reasonable_time_for_deterioration_exit",
+      "choice": "No explicit bar-count timeout was implemented for 'reasonable time'. The middle-band target check runs before the deterioration check each bar, so the deterioration exit (EMA cross against position or RSI back to 50) only ever fires on bars where the target has not already been touched.",
+      "reason": "Spec does not define how many bars constitute 'reasonable time'; inventing an arbitrary bar-count threshold would add an unstated parameter, whereas the check ordering already satisfies the literal condition without extra state."
+    },
+    {
+      "topic": "rsi_return_to_50_definition",
+      "choice": "'RSI returns to ~50' is implemented as RSI crossing the level 50 (bt.indicators.CrossOver(RSI,50)): crossing up exits longs, crossing down exits shorts.",
+      "reason": "Spec gives an approximate target ('~50') without a tolerance band; a crossover of the exact 50 line is the most literal, unambiguous trigger."
+    },
+    {
+      "topic": "target_touch_definition",
+      "choice": "'Touching or crossing the middle band' is implemented using intrabar High (for longs) / Low (for shorts) against SMA20, not just the closing price.",
+      "reason": "Using the bar's High/Low captures an intrabar touch as well as a full crossing, which is a more literal reading of 'touching OR crossing' than a close-only comparison."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 17,
+  "tape": [
+    {
+      "dt": "2020-07-09T04:00:00",
+      "side": "SELL",
+      "size": -66.0,
+      "price": 93.20401878936576
+    },
+    {
+      "dt": "2020-07-14T04:00:00",
+      "side": "BUY",
+      "size": 66.0,
+      "price": 91.82674120591236
+    },
+    {
+      "dt": "2020-08-04T04:00:00",
+      "side": "SELL",
+      "size": -66.0,
+      "price": 105.6651273181697
+    },
+    {
+      "dt": "2020-08-07T04:00:00",
+      "side": "BUY",
+      "size": 66.0,
+      "price": 109.80587577731004
+    },
+    {
+      "dt": "2021-01-26T05:00:00",
+      "side": "SELL",
+      "size": -48.0,
+      "price": 139.52852500725305
+    },
+    {
+      "dt": "2021-02-01T05:00:00",
+      "side": "BUY",
+      "size": 48.0,
+      "price": 129.95780442586786
+    },
+    {
+      "dt": "2021-11-24T05:00:00",
+      "side": "SELL",
+      "size": -53.0,
+      "price": 157.1551520319611
+    },
+    {
+      "dt": "2021-12-01T05:00:00",
+      "side": "BUY",
+      "size": 53.0,
+      "price": 163.73466976035556
+    },
+    {
+      "dt": "2021-12-09T05:00:00",
+      "side": "SELL",
+      "size": -35.0,
+      "price": 170.9985052389604
+    },
+    {
+      "dt": "2021-12-14T05:00:00",
+      "side": "BUY",
+      "size": 35.0,
+      "price": 171.33091243496327
+    },
+    {
+      "dt": "2022-05-12T04:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 139.96043637411066
+    },
+    {
+      "dt": "2022-05-23T04:00:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 135.07841705772444
+    },
+    {
+      "dt": "2022-09-30T04:00:00",
+      "side": "BUY",
+      "size": 40.0,
+      "price": 138.69211755301987
+    },
+    {
+      "dt": "2022-10-19T04:00:00",
+      "side": "SELL",
+      "size": -40.0,
+      "price": 139.09458913180654
+    },
+    {
+      "dt": "2023-06-02T04:00:00",
+      "side": "SELL",
+      "size": -64.0,
+      "price": 178.52716847079088
+    },
+    {
+      "dt": "2023-06-16T04:00:00",
+      "side": "BUY",
+      "size": 64.0,
+      "price": 184.1483615118621
+    },
+    {
+      "dt": "2023-07-03T04:00:00",
+      "side": "SELL",
+      "size": -64.0,
+      "price": 191.10095251247643
+    },
+    {
+      "dt": "2023-07-11T04:00:00",
+      "side": "BUY",
+      "size": 64.0,
+      "price": 186.5447760995126
+    },
+    {
+      "dt": "2024-03-06T05:00:00",
+      "side": "BUY",
+      "size": 56.0,
+      "price": 169.36121186741926
+    },
+    {
+      "dt": "2024-03-19T04:00:00",
+      "side": "SELL",
+      "size": -56.0,
+      "price": 172.6086342803731
+    },
+    {
+      "dt": "2024-06-14T04:00:00",
+      "side": "SELL",
+      "size": -42.0,
+      "price": 212.01345147179217
+    },
+    {
+      "dt": "2024-07-05T04:00:00",
+      "side": "BUY",
+      "size": 42.0,
+      "price": 219.74645469045157
+    },
+    {
+      "dt": "2024-07-11T04:00:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 229.40281699319425
+    },
+    {
+      "dt": "2024-07-24T04:00:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 222.0762625279836
+    },
+    {
+      "dt": "2024-12-03T05:00:00",
+      "side": "SELL",
+      "size": -43.0,
+      "price": 238.28756099978403
+    },
+    {
+      "dt": "2024-12-10T05:00:00",
+      "side": "BUY",
+      "size": 43.0,
+      "price": 245.32260336553807
+    },
+    {
+      "dt": "2025-01-14T05:00:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 233.25971079858908
+    },
+    {
+      "dt": "2025-01-22T05:00:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 218.39466636780546
+    },
+    {
+      "dt": "2025-07-03T04:00:00",
+      "side": "SELL",
+      "size": -38.0,
+      "price": 211.31168447150716
+    },
+    {
+      "dt": "2025-07-30T04:00:00",
+      "side": "BUY",
+      "size": 38.0,
+      "price": 211.06266703997414
+    },
+    {
+      "dt": "2025-08-11T04:00:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 227.27701087414155
+    },
+    {
+      "dt": "2025-09-03T04:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 236.54080133953738
+    },
+    {
+      "dt": "2025-09-23T04:00:00",
+      "side": "SELL",
+      "size": -32.0,
+      "price": 255.15815615601056
+    },
+    {
+      "dt": "2025-10-13T04:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 248.6764678182016
+    }
+  ]
+}

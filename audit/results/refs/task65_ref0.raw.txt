@@ -1,0 +1,183 @@
+```python
+import math
+import statistics
+import backtrader as bt
+
+
+class NeuralNetSignalStrategy(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('wr_period', 14),
+        ('train_bars', 504),
+        ('horizon', 5),
+        ('label_threshold', 0.02),
+        ('hidden_size', 4),
+        ('learning_rate', 0.05),
+        ('epochs', 300),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.wr = bt.indicators.WilliamsR(self.data, period=self.p.wr_period)
+        self.order = None
+        self.trained = False
+        self.feat_mean = None
+        self.feat_std = None
+        self.w1 = None
+        self.b1 = None
+        self.w2 = None
+        self.b2 = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    @staticmethod
+    def _pseudo_rand(seed):
+        x = math.sin(seed * 12.9898) * 43758.5453
+        return x - math.floor(x)
+
+    def _init_weights(self):
+        seed = 1.0
+        n_in, n_hid, n_out = 3, self.p.hidden_size, 3
+        w1 = []
+        for i in range(n_hid):
+            row = []
+            for j in range(n_in):
+                seed += 1.0
+                row.append((self._pseudo_rand(seed) - 0.5) * 0.5)
+            w1.append(row)
+        b1 = [0.0] * n_hid
+        w2 = []
+        for i in range(n_out):
+            row = []
+            for j in range(n_hid):
+                seed += 1.0
+                row.append((self._pseudo_rand(seed) - 0.5) * 0.5)
+            w2.append(row)
+        b2 = [0.0] * n_out
+        return w1, b1, w2, b2
+
+    def _forward(self, x):
+        w1, b1, w2, b2 = self.w1, self.b1, self.w2, self.b2
+        hidden = []
+        for i in range(len(w1)):
+            s = b1[i]
+            for j in range(len(x)):
+                s += w1[i][j] * x[j]
+            hidden.append(math.tanh(s))
+        out_raw = []
+        for i in range(len(w2)):
+            s = b2[i]
+            for j in range(len(hidden)):
+                s += w2[i][j] * hidden[j]
+            out_raw.append(s)
+        m = max(out_raw)
+        exps = [math.exp(v - m) for v in out_raw]
+        total = sum(exps)
+        probs = [v / total for v in exps]
+        return hidden, probs
+
+    def _train(self, samples):
+        feats = [s[0] for s in samples]
+        means = [statistics.mean(f[k] for f in feats) for k in range(3)]
+        stds = [statistics.pstdev(f[k] for f in feats) or 1.0 for k in range(3)]
+        self.feat_mean = means
+        self.feat_std = stds
+        norm_samples = []
+        for f, lab in samples:
+            nf = [(f[k] - means[k]) / stds[k] for k in range(3)]
+            norm_samples.append((nf, lab))
+
+        self.w1, self.b1, self.w2, self.b2 = self._init_weights()
+        lr = self.p.learning_rate
+        n_hid = self.p.hidden_size
+
+        for _epoch in range(self.p.epochs):
+            for x, lab in norm_samples:
+                hidden, probs = self._forward(x)
+                target = [0.0, 0.0, 0.0]
+                target[lab] = 1.0
+                dout = [probs[k] - target[k] for k in range(3)]
+
+                grad_w2 = [[dout[i] * hidden[j] for j in range(n_hid)] for i in range(3)]
+                grad_b2 = dout[:]
+
+                dhidden = [0.0] * n_hid
+                for j in range(n_hid):
+                    s = 0.0
+                    for i in range(3):
+                        s += dout[i] * self.w2[i][j]
+                    dhidden[j] = s * (1.0 - hidden[j] * hidden[j])
+
+                grad_w1 = [[dhidden[i] * x[j] for j in range(3)] for i in range(n_hid)]
+                grad_b1 = dhidden[:]
+
+                for i in range(3):
+                    for j in range(n_hid):
+                        self.w2[i][j] -= lr * grad_w2[i][j]
+                    self.b2[i] -= lr * grad_b2[i]
+                for i in range(n_hid):
+                    for j in range(3):
+                        self.w1[i][j] -= lr * grad_w1[i][j]
+                    self.b1[i] -= lr * grad_b1[i]
+
+    def _classify(self, open_price, rsi_val, wr_val):
+        x = [rsi_val, wr_val, open_price]
+        nx = [(x[k] - self.feat_mean[k]) / self.feat_std[k] for k in range(3)]
+        _, probs = self._forward(nx)
+        idx = probs.index(max(probs))
+        return ('BUY', 'SELL', 'HOLD')[idx]
+
+    def next(self):
+        if self.order:
+            return
+
+        bar_count = len(self)
+
+        if bar_count < self.p.train_bars:
+            return
+
+        if bar_count == self.p.train_bars:
+            samples = []
+            for off in range(self.p.horizon, self.p.train_bars):
+                rsi_val = self.rsi[-off]
+                wr_val = self.wr[-off]
+                open_val = self.data.open[-off]
+                future_open = self.data.open[-(off - self.p.horizon)]
+                ret = (future_open - open_val) / open_val
+                if ret > self.p.label_threshold:
+                    label = 0
+                elif ret < -self.p.label_threshold:
+                    label = 1
+                else:
+                    label = 2
+                samples.append(([rsi_val, wr_val, open_val], label))
+            self._train(samples)
+            self.trained = True
+            return
+
+        if not self.trained:
+            return
+
+        signal = self._classify(self.data.open[0], self.rsi[0], self.wr[0])
+
+        if signal == 'BUY':
+            self.order = self.order_target_percent(target=1.0)
+        elif signal == 'SELL':
+            self.order = self.order_target_percent(target=-1.0)
+        else:
+            self.order = self.order_target_percent(target=0.0)
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Allowed imports (backtrader, math, collections, statistics) exclude numpy/sklearn/tensorflow/pytorch, so the 'neural network' is implemented as a from-scratch feedforward MLP (3 inputs -> tanh hidden layer -> softmax output) trained with manual backpropagation using plain Python lists.", "reason": "Spec requires a neural network classifier but the execution environment provides no ML library; the closest literal reading is a minimal hand-coded MLP rather than omitting the network entirely."},
+  {"topic": "infeasible", "choice": "The model is trained once, using the first ~504 bars (~2 trading years) of data, and is not retrained afterward; all subsequent bars are scored with this single trained model.", "reason": "Spec says to 'train the model on the last 2 years of historical data' but does not specify walk-forward/rolling retraining; retraining a from-scratch pure-Python MLP on every bar for the remaining ~1000 bars is computationally impractical in this environment, so a single train-once-then-infer split on the first 2 years is the closest feasible literal reading. No trading occurs during this initial training window."},
+  {"topic": "training labels", "choice": "Supervised labels for the training window are derived from forward Open-price returns: BUY if the Open price 5 bars later is >2% higher, SELL if >2% lower, otherwise HOLD.", "reason": "The spec states the model classifies BUY/SELL/HOLD from RSI, Williams %R, and Open price but never defines how ground-truth labels are generated for training; a forward-return threshold rule is the standard, minimal way to produce such labels."},
+  {"topic": "nn architecture/hyperparameters", "choice": "3 input features -> 4-unit tanh hidden layer -> 3-unit softmax output; trained via per-sample SGD, learning rate 0.05, 300 epochs over the training window.", "reason": "Spec mandates a neural network but specifies no layer sizes, activation functions, loss, or training hyperparameters; small, standard values were chosen as a reasonable minimal instantiation."},
+  {"topic": "feature scaling", "choice": "Inputs (RSI, Williams %R, Open) are z-score normalized using the training set's mean/std before being fed to the network.", "reason": "Open price is on a much larger numeric scale than the 0-100-bounded RSI/%R; without normalization the network would not train meaningfully, and the spec is silent on preprocessing."},
+  {"topic": "weight initialization", "choice": "Network weights are initialized with a deterministic sine-based pseudo-random hash instead of Python's random module.", "reason": "The allowed-imports list (backtrader, math, collections, statistics) excludes the random module, so a hash-based generator using only math is used to break symmetry."},
+  {"topic": "indicator price source", "choice": "RSI(14) is computed on Close and Williams %R(14) uses the standard High/Low/Close inputs (backtrader defaults); Open price is used only as the separate third raw input feature named explicitly in the spec.", "reason": "The spec lists 'RSI', 'Williams %R', and 'Open price' as three distinct inputs; it does not say to recompute the indicators on Open, so each indicator uses its standard default price source."},
+  {"topic": "position sizing implementation", "choice": "Signals are translated into self.order_target_percent(target=1.0/-1.0/0.0) for BUY/SELL/HOLD respectively, letting a single order both close an opposing position and open the new one (or flatten) each time.", "reason": "Spec states position size is fixed at 100% of available capital per trade and that BUY/SELL entries and long/short exits are driven by the same three signal states; order_target_percent directly encodes '100% of capital' sizing and naturally satisfies all four stated entry/exit rules with one mechanism."}
+]}
+```

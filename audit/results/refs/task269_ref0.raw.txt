@@ -1,0 +1,70 @@
+```python
+    def _manage_exit(self, position, close):
+        theta = self.theta_fixed
+        sigma = self.sigma_fixed
+        prev_close = self.data.close[-1]
+
+        if position.size > 0:
+            crossup = prev_close < theta and close >= theta
+            sigma_stop = close < (theta - self.p.m * sigma)
+            atr_stop = close < (self.entry_price - self.p.atr_stop_mult * self.entry_atr)
+            if crossup or sigma_stop or atr_stop:
+                self.order = self.close()
+        elif position.size < 0:
+            crossdown = prev_close > theta and close <= theta
+            sigma_stop = close > (theta + self.p.m * sigma)
+            atr_stop = close > (self.entry_price + self.p.atr_stop_mult * self.entry_atr)
+            if crossdown or sigma_stop or atr_stop:
+                self.order = self.close()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if self.position.size != 0:
+                self.entry_price = order.executed.price
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+
+        if self.t0 is None:
+            self.t0 = self.data.datetime.date(1 - len(self))
+            self._set_window(0)
+
+        while dt >= self.oos_end:
+            self._set_window(self.window_idx + 1)
+
+        if not self.calibrated and dt >= self.in_sample_end:
+            self.theta_fixed = self.sma252[0]
+            self.sigma_fixed = (self.bb.top[0] - self.bb.bot[0]) / (2 * self.bb.p.devfactor)
+            self.calibrated = True
+
+        if self.order:
+            return
+
+        position = self.position
+        close = self.data.close[0]
+
+        if position:
+            self._manage_exit(position, close)
+        else:
+            in_trading = self.oos_start <= dt < self.oos_end
+            if in_trading and self.theta_fixed is not None:
+                self._evaluate_entry(close)
+```
+```json
+{"assumptions": [
+  {"topic": "walk-forward shift", "choice": "Windows are sequential and non-overlapping: each cycle is 12mo in-sample + 1mo gap + 6mo OOS (19 months total), and the next cycle's in-sample begins immediately after the prior cycle's OOS ends.", "reason": "Spec states 'the window shifts' without specifying the shift size; a full-cycle shift produces a contiguous, non-contradictory timeline of calibration/trading regimes."},
+  {"topic": "window anchor date", "choice": "The first bar of the dataset is used as t0 for calendar-month window arithmetic, recovered via lookback indexing once indicators reach minperiod (since next() only fires after warm-up).", "reason": "Ensures the 12-month in-sample clock starts at the true start of data rather than at the first callable bar (~252 trading days in), which would otherwise double the initial calibration wait."},
+  {"topic": "infeasible", "choice": "Take-profit crossing of Close vs. the fixed theta is implemented as a manual sign-change check (prev bar vs current bar relative to theta) rather than bt.indicators.CrossOver.", "reason": "CrossOver requires two continuously-updating Lines objects; theta is a scalar that is snapshotted and held fixed only at calibration boundaries, and only one Strategy class may be defined, so no auxiliary indicator/line can be built to host it. The manual check reproduces CrossOver's exact sign-change semantics."},
+  {"topic": "ATR value for protective stop", "choice": "The ATR(14) value at signal/order-submission time is captured and held fixed as the entry-time reference for the 2*ATR protective stop (same value used in the sizing denominator).", "reason": "Spec doesn't state whether this stop should track ATR dynamically or use the entry-time value; fixing it at entry keeps sizing and stop-distance internally consistent."},
+  {"topic": "distance to stop (sizing formula)", "choice": "'Distance to stop' = distance from the current close (used as entry-price proxy at signal time) to the m*sigma stop-loss level.", "reason": "Spec doesn't specify which of the two stop levels this term refers to; the m*sigma stop is the primary, always-defined stop-loss level available at signal time, whereas exact fill price isn't known until after sizing."},
+  {"topic": "capital base for risk sizing", "choice": "'1% of capital' is computed against current broker portfolio value (self.broker.getvalue()) at each trade, not fixed initial cash.", "reason": "Spec is silent on this; using live equity is the more standard reading of dynamic risk-based position sizing."},
+  {"topic": "position size rounding", "choice": "Computed quantity is floored to a whole number of shares; trades with size < 1 are skipped.", "reason": "Backtrader's default broker does not support fractional shares and the spec does not state fractional sizing."},
+  {"topic": "trend filter activation", "choice": "Implemented as a strategy parameter (trend_filter, default True) applying the stated EMA(50)/EMA(200) trend condition to gate longs and shorts.", "reason": "Spec labels it 'optional trend filter'; exposing it as a toggle preserves optionality while still applying the stated rule by default, since it's spec-stated behavior rather than an invented addition."},
+  {"topic": "open positions spanning window boundaries", "choice": "Once opened, a position continues to be managed for exit (take-profit/stop-loss) even if the OOS window ends before it closes, using the theta/sigma that was fixed at entry; only new entries are restricted to the OOS trading window.", "reason": "Spec states 'gap = no trades' and defines trading only within OOS, but does not address forcibly closing or abandoning management of an open position when a window boundary is crossed."},
+  {"topic": "no new entries during in-sample", "choice": "New entries are disallowed during the entire in-sample period, not only the explicitly-stated 1-month gap.", "reason": "In-sample is described as a calibration-only period; allowing entries there before theta/sigma exist for that cycle is not supported by the spec's signal definitions."}
+]}
+```

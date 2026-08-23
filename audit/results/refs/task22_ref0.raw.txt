@@ -1,0 +1,155 @@
+```python
+import backtrader as bt
+
+
+class TrendRSIFilterHardStopStrategy(bt.Strategy):
+    params = (
+        ('rsi_period', 14),
+        ('rsi_oversold', 30.0),
+        ('rsi_overbought', 70.0),
+        ('stop_loss_pct', 0.001),
+        ('take_profit_pct', 0.01),
+        ('risk_pct', 0.01),
+        ('pip', 0.0001),
+        ('spread_pips', 1),
+    )
+
+    def __init__(self):
+        self.spread = self.p.pip * self.p.spread_pips
+
+        self.current_day = None
+        self.day_last_close = None
+        self.completed_daily_closes = []
+        self.avg_gain = None
+        self.avg_loss = None
+        self.daily_rsi = None
+        self.pending_signal = None
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+        self.entry_price = None
+        self.trade_direction = None
+
+    def _finalize_day(self, close_price):
+        self.completed_daily_closes.append(close_price)
+        n = len(self.completed_daily_closes)
+        period = self.p.rsi_period
+
+        if n < period + 1:
+            return
+        elif n == period + 1:
+            gains = []
+            losses = []
+            closes = self.completed_daily_closes
+            for i in range(1, n):
+                diff = closes[i] - closes[i - 1]
+                gains.append(diff if diff > 0 else 0.0)
+                losses.append(-diff if diff < 0 else 0.0)
+            self.avg_gain = sum(gains) / period
+            self.avg_loss = sum(losses) / period
+        else:
+            diff = close_price - self.completed_daily_closes[-2]
+            gain = diff if diff > 0 else 0.0
+            loss = -diff if diff < 0 else 0.0
+            self.avg_gain = (self.avg_gain * (period - 1) + gain) / period
+            self.avg_loss = (self.avg_loss * (period - 1) + loss) / period
+
+        if self.avg_loss == 0:
+            self.daily_rsi = 100.0
+        elif self.avg_gain == 0:
+            self.daily_rsi = 0.0
+        else:
+            rs = self.avg_gain / self.avg_loss
+            self.daily_rsi = 100.0 - (100.0 / (1.0 + rs))
+
+        if self.daily_rsi < self.p.rsi_oversold:
+            self.pending_signal = 'long'
+        elif self.daily_rsi > self.p.rsi_overbought:
+            self.pending_signal = 'short'
+        else:
+            self.pending_signal = None
+
+    def _position_size(self, reference_price):
+        capital = self.broker.getvalue()
+        risk_amount = capital * self.p.risk_pct
+        sl_distance = reference_price * self.p.stop_loss_pct
+        return risk_amount / sl_distance
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        close = self.data.close[0]
+
+        if self.current_day is None:
+            self.current_day = dt
+            self.day_last_close = close
+            return
+
+        if dt != self.current_day:
+            self._finalize_day(self.day_last_close)
+            self.current_day = dt
+            self.day_last_close = close
+
+            if (self.pending_signal is not None and not self.position
+                    and self.order is None):
+                size = self._position_size(close)
+                if self.pending_signal == 'long':
+                    self.trade_direction = 'long'
+                    self.order = self.buy(size=size)
+                elif self.pending_signal == 'short':
+                    self.trade_direction = 'short'
+                    self.order = self.sell(size=size)
+            self.pending_signal = None
+        else:
+            self.day_last_close = close
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self.entry_price = order.executed.price
+                size = abs(order.executed.size)
+                if self.trade_direction == 'long':
+                    sl_price = self.entry_price * (1 - self.p.stop_loss_pct)
+                    tp_price = self.entry_price * (1 + self.p.take_profit_pct) + self.spread
+                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=sl_price, size=size)
+                    self.limit_order = self.sell(exectype=bt.Order.Limit, price=tp_price, size=size,
+                                                  oco=self.stop_order)
+                else:
+                    sl_price = self.entry_price * (1 + self.p.stop_loss_pct)
+                    tp_price = self.entry_price * (1 - self.p.take_profit_pct) - self.spread
+                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=sl_price, size=size)
+                    self.limit_order = self.buy(exectype=bt.Order.Limit, price=tp_price, size=size,
+                                                 oco=self.stop_order)
+                self.order = None
+            elif order in (self.stop_order, self.limit_order):
+                self.stop_order = None
+                self.limit_order = None
+                self.entry_price = None
+                self.trade_direction = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.order:
+                self.order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+            elif order == self.limit_order:
+                self.limit_order = None
+```
+```json
+{"assumptions": [
+{"topic": "infeasible", "choice": "Daily RSI(14) is computed manually from the 15m feed (Wilder smoothing, matching bt.indicators.RSI's default method) by detecting calendar-day boundaries and tracking each day's last close, instead of using a bt.indicators.RSI on a resampled daily feed.", "reason": "The harness supplies exactly one 15m data feed and controls cerebro setup, so no second (daily-resampled) data feed can be added inside the strategy; manual computation in next() is the only way to obtain a true D1 RSI, as explicitly permitted by the environment rules."},
+{"topic": "entry timing", "choice": "The daily RSI value is finalized on the first 15m bar of a new calendar day (using the just-completed prior day's last close); if the filter condition is met, a market order is submitted in that same next() call, which backtrader fills at the open of the following 15m bar.", "reason": "The spec's 'next 15-minute bar after the daily RSI satisfied the filter condition' is implemented via backtrader's standard no-lookahead order timing (decide now, fill next bar) rather than adding an extra artificial delay bar."},
+{"topic": "position sizing reference price", "choice": "Position size is computed from capital*1% / (current bar close * 0.1%) at signal time, then the actual SL/TP price levels are recomputed from the real order.executed.price once the entry fills.", "reason": "The exact fill price of a market order submitted for the next bar's open is unknown at submission time, so the current close is used as the best available estimate for sizing only; SL/TP levels use the true fill price for accuracy."},
+{"topic": "total capital definition", "choice": "'Total capital' for the 1%-risk sizing rule is taken as self.broker.getvalue() (current portfolio value) at the moment of entry.", "reason": "Spec states risk must equal 1% of total capital but does not define the term precisely; portfolio value is the standard interpretation and commission is not included in the risk formula since the spec does not mention it."},
+{"topic": "pip size", "choice": "1 pip for EUR/USD is taken as 0.0001, and the 1-pip spread is added only to widen the take-profit target (long: +spread, short: -spread), not applied to the stop-loss.", "reason": "The spec only states explicitly that the spread makes the required favorable move 'take-profit size plus 1 pip'; it does not mention adjusting the stop-loss, so the SL is left as a literal 0.1% of entry price."},
+{"topic": "SL/TP order mechanism", "choice": "After entry fills, a Stop order and a Limit order are submitted as an OCO pair via backtrader's built-in oco linking, so whichever triggers first automatically cancels the other.", "reason": "This directly implements 'hard stop-loss' and take-profit exits without manual price polling, and matches the canonical default of resetting order-tracking state in notify_order."},
+{"topic": "day boundary definition", "choice": "A new trading day is detected by a change in self.data.datetime.date(0) in the feed's own timezone (UTC+01:00), with no separate broker-rollover time assumed.", "reason": "The spec does not define a specific daily rollover time/timezone convention beyond 'Daily (D1)', so the data feed's own calendar date is used as the simplest literal reading."},
+{"topic": "position sizing granularity", "choice": "Computed size is used as-is (fractional units allowed), with no rounding to a fixed lot size.", "reason": "The spec gives no lot-size convention and backtrader's default sizing/broker for a continuous instrument like FX supports fractional size; canonical default 1 only prescribes plain buy()/sell(), not rounding rules."},
+{"topic": "take-profit inclusion", "choice": "A take-profit at 1.0% of entry price is implemented (not stop-loss-only exit).", "reason": "The spec's primary instruction explicitly adds the take-profit 'for completeness'; the conditional note about SL-only exit describes an alternative not selected by the spec's own resolution."},
+{"topic": "leverage", "choice": "No leverage-related logic is implemented in the strategy.", "reason": "The spec explicitly states leverage is a broker/account-level parameter that the trading algorithm itself should not manage."},
+{"topic": "infeasible", "choice": "The final spec line ('Timeframe for trading: The strategy trades on the 15-') is truncated; interpreted as confirming trading occurs on the 15-minute bars of the supplied feed.", "reason": "No other timeframe is available in the harness's single 15m data feed, and the truncated sentence is consistent with that being its intended completion."}
+]}
+```

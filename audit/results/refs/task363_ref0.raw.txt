@@ -1,0 +1,115 @@
+```python
+import backtrader as bt
+
+
+class StochZScoreMeanReversion(bt.Strategy):
+    params = (
+        ('stoch_period', 14),
+        ('stoch_kperiod', 3),
+        ('stoch_dperiod', 3),
+        ('zscore_period', 20),
+        ('slope_period', 20),
+        ('z_entry', 2.0),
+        ('stop_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.stoch = bt.indicators.Stochastic(
+            self.data,
+            period=self.p.stoch_period,
+            period_dfast=self.p.stoch_kperiod,
+            period_dslow=self.p.stoch_dperiod,
+        )
+        self.pctk = self.stoch.percK
+        self.sma20 = bt.indicators.SMA(self.pctk, period=self.p.zscore_period)
+        self.std20 = bt.indicators.StandardDeviation(self.pctk, period=self.p.zscore_period)
+
+        self.order = None
+        self.stop_order = None
+        self.prev_slope = None
+        self.pending_direction = None
+
+    def _slope(self):
+        n = self.p.slope_period
+        if len(self.pctk) < n:
+            return None
+        ys = [self.pctk[-i] for i in range(n - 1, -1, -1)]
+        xbar = (n - 1) / 2.0
+        ybar = sum(ys) / n
+        num = 0.0
+        den = 0.0
+        for x, y in enumerate(ys):
+            dx = x - xbar
+            num += dx * (y - ybar)
+            den += dx * dx
+        if den == 0:
+            return 0.0
+        return num / den
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order is self.order and self.pending_direction is not None:
+                entry_price = order.executed.price
+                if self.pending_direction == 'long':
+                    stop_price = entry_price * (1.0 - self.p.stop_pct)
+                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price)
+                else:
+                    stop_price = entry_price * (1.0 + self.p.stop_pct)
+                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price)
+                self.pending_direction = None
+                self.order = None
+                return
+
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order is self.order:
+                self.order = None
+                self.pending_direction = None
+            if order is self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        cur_slope = self._slope()
+        if cur_slope is None:
+            return
+        prev_slope = self.prev_slope
+        self.prev_slope = cur_slope
+
+        if self.std20[0] == 0:
+            z = 0.0
+        else:
+            z = (self.pctk[0] - self.sma20[0]) / self.std20[0]
+
+        if self.order:
+            return
+
+        if not self.position:
+            if prev_slope is None:
+                return
+            if z < -self.p.z_entry and cur_slope > 0 and prev_slope <= 0:
+                self.pending_direction = 'long'
+                self.order = self.buy()
+            elif z > self.p.z_entry and cur_slope < 0 and prev_slope >= 0:
+                self.pending_direction = 'short'
+                self.order = self.sell()
+        else:
+            crossed_above_50 = self.pctk[0] > 50.0 and self.pctk[-1] <= 50.0
+            crossed_below_50 = self.pctk[0] < 50.0 and self.pctk[-1] >= 50.0
+
+            if self.position.size > 0 and (crossed_above_50 or z >= 0):
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+            elif self.position.size < 0 and (crossed_below_50 or z <= 0):
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "stochastic_parameter_mapping", "choice": "Used bt.indicators.Stochastic(period=StochPeriod, period_dfast=StochKPeriod, period_dslow=StochDPeriod) and took %K as .percK (already-smoothed 'slow' %K).", "reason": "Backtrader's built-in Stochastic applies period_dfast smoothing before exposing percK, matching the common platform convention where the displayed %K line is the smoothed K and %D is a further SMA of it; this is the standard reading of StochKPeriod/StochDPeriod."},
+  {"topic": "slope_computation", "choice": "Computed the 20-bar slope of %K manually each bar via ordinary least-squares regression (x = 0..19 bar index, y = %K value) instead of a built-in indicator.", "reason": "No dedicated linear-regression-slope indicator is available under the allowed imports (backtrader only, no talib); manual OLS over the last slope_period values is the literal, closest equivalent. Slope is undefined (returns None, bar skipped) until 20 %K values exist."},
+  {"topic": "exit_condition_logic", "choice": "Treated the exit rule as a logical OR of both stated triggers: for longs, close on (%K crosses above 50) OR (z >= 0); mirrored for shorts.", "reason": "The spec phrases the exit as '%K crosses above 50 (or z >= 0)', joined by 'or'; since the two conditions are not mathematically identical (SMA20 of %K need not equal 50), the literal reading is that either condition independently triggers the exit."},
+  {"topic": "zscore_division_by_zero", "choice": "When the 20-bar STD of %K is exactly 0, z is treated as 0 (no entry, no exit signal from z alone).", "reason": "The spec does not address this edge case; z is undefined when STD20=0, so a neutral value avoids a runtime division error while not fabricating an extra filter."},
+  {"topic": "infeasible", "choice": "Implemented the stop-loss as a separate stop order submitted immediately after the entry order fills (using the actual fill price for the 2% offset), rather than backtrader's buy_bracket() grouped order.", "reason": "buy_bracket() by default also creates a take-profit limit leg, which the spec never mentions; adding one would invent an extra order type. An attached stop order submitted right after entry fill is the literal, closest reading of the spec's own fallback phrase '(or an attached stop order)', and using the executed fill price (not the signal-bar close) keeps the 2%-from-entry offset accurate given market orders fill on the next bar."}
+]}
+```

@@ -1,0 +1,129 @@
+Let me check the spec's core requirement against what's actually available in this single-feed OHLCV environment before implementing.
+
+The spec centers on IV of ETF components (needs options data), a weighted-average IV across multiple components, and a VIX filter — none of which exist in a single AAPL 5m OHLCV feed. I'll implement the closest literal reading: a realized-volatility proxy standing in for IV (single component, weight 1.0, so the "weighted average" degenerates to that proxy), the spec's own MA(10) rule providing the smoothing needed to separate "current" from "calculated" IV, a rolling one-session volume average for the liquidity filter, and I'll drop the VIX filter as infeasible rather than fabricate a duplicate volatility series under that label.
+
+```python
+import math
+import statistics
+from collections import deque
+
+import backtrader as bt
+
+
+class ImpliedVolatilityETFStrategy(bt.Strategy):
+    params = dict(
+        iv_window=12,
+        calc_iv_ma_period=10,
+        entry_threshold_pct=15.0,
+        stability_threshold_pct=5.0,
+        exit_threshold_pct=5.0,
+        max_hold_bars=6,
+        volume_avg_period=78,
+        position_pct=0.10,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.01,
+    )
+
+    def __init__(self):
+        self.returns = deque(maxlen=self.p.iv_window)
+        self.raw_iv_history = deque(maxlen=self.p.calc_iv_ma_period)
+        self.calc_iv_history = deque(maxlen=2)
+        self.vol_avg = bt.indicators.SimpleMovingAverage(
+            self.data.volume, period=self.p.volume_avg_period
+        )
+        self.order = None
+        self.is_entry_order = False
+        self.entry_price = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed and self.is_entry_order:
+            self.entry_price = order.executed.price
+            self.entry_bar = len(self)
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            self.is_entry_order = False
+
+    def next(self):
+        if len(self.data) < 2:
+            return
+
+        ret = math.log(self.data.close[0] / self.data.close[-1])
+        self.returns.append(ret)
+        if len(self.returns) < self.p.iv_window:
+            return
+
+        raw_iv = statistics.pstdev(self.returns)
+        self.raw_iv_history.append(raw_iv)
+        if len(self.raw_iv_history) < self.p.calc_iv_ma_period:
+            return
+
+        calculated_iv = sum(self.raw_iv_history) / len(self.raw_iv_history)
+        current_iv = raw_iv
+        self.calc_iv_history.append(calculated_iv)
+        if len(self.calc_iv_history) < 2:
+            return
+        if calculated_iv == 0:
+            return
+
+        prev_calc_iv = self.calc_iv_history[-2]
+        if prev_calc_iv == 0:
+            return
+
+        deviation_pct = (current_iv - calculated_iv) / calculated_iv * 100.0
+        stability_pct = abs(calculated_iv - prev_calc_iv) / prev_calc_iv * 100.0
+
+        price = self.data.close[0]
+
+        if self.order is not None:
+            return
+
+        if not self.position:
+            high_liquidity = self.data.volume[0] > self.vol_avg[0]
+            stable = stability_pct <= self.p.stability_threshold_pct
+            if high_liquidity and stable:
+                size = math.floor(
+                    (self.broker.getvalue() * self.p.position_pct) / price
+                )
+                if size > 0:
+                    if deviation_pct <= -self.p.entry_threshold_pct:
+                        self.is_entry_order = True
+                        self.order = self.buy(size=size)
+                    elif deviation_pct >= self.p.entry_threshold_pct:
+                        self.is_entry_order = True
+                        self.order = self.sell(size=size)
+        else:
+            bars_held = len(self) - self.entry_bar
+            close_position = False
+
+            if abs(deviation_pct) < self.p.exit_threshold_pct:
+                close_position = True
+            elif bars_held >= self.p.max_hold_bars:
+                close_position = True
+
+            if self.position.size > 0:
+                if price <= self.entry_price * (1 - self.p.stop_loss_pct):
+                    close_position = True
+                elif price >= self.entry_price * (1 + self.p.take_profit_pct):
+                    close_position = True
+            else:
+                if price >= self.entry_price * (1 + self.p.stop_loss_pct):
+                    close_position = True
+                elif price <= self.entry_price * (1 - self.p.take_profit_pct):
+                    close_position = True
+
+            if close_position:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Proxy 'Implied Volatility' with the population stdev of log returns over a rolling window computed from the single available OHLCV feed.", "reason": "The spec requires historical options price data per ETF component; no options data or component feeds are available in this single-asset OHLCV environment."},
+  {"topic": "infeasible", "choice": "Treat the ETF as its own single component (weight = 1.0), so the 'weighted average IV of components' reduces to the same realized-volatility proxy; apply the spec's own required MA(10) smoothing to that proxy to form 'calculated IV', leaving the unsmoothed value as 'current IV'.", "reason": "No per-component asset data exists to build a genuine weighted average; this construction is the closest literal reading that still produces two distinct, comparable series (current vs. calculated) exactly as the spec structures them, using the spec's own stated smoothing rule as the source of divergence."},
+  {"topic": "infeasible", "choice": "Omit the 'exclude trades if VIX > 30%' filter entirely.", "reason": "VIX is an external market index not present in the single AAPL OHLCV feed; fabricating a duplicate volatility measure under the VIX label would misrepresent the rule rather than approximate it, so the gap is declared and no substitute filter is applied."},
+  {"topic": "iv_window", "choice": "Use a 12-bar (1 hour) rolling window for the realized-volatility proxy underlying both current and calculated IV.", "reason": "The spec does not specify a lookback for the underlying IV calculation itself."},
+  {"topic": "daily_average_volume", "choice": "Use SMA(volume, 78) as a rolling proxy for 'daily average' volume, where 78 is the number of 5-minute bars in one 9:30-15:55 session.", "reason": "Spec does not define how 'daily average' should be computed; a rolling one-session window is the closest literal reading without adding calendar-day bookkeeping the spec doesn't request."},
+  {"topic": "position_sizing", "choice": "Compute size as floor(0.10 * portfolio_value / entry_price) shares at entry.", "reason": "Spec explicitly states 10% of portfolio per trade, overriding the canonical default plain buy/sell sizing."}
+]}
+```

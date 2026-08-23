@@ -1,0 +1,206 @@
+```python
+import backtrader as bt
+
+
+class OnePercentPlaybookSimplified(bt.Strategy):
+    params = dict(
+        ema_period=20,
+        orb_minutes=5,
+        stop_loss_pct=0.01,
+        take_profit_pct=0.02,
+        daily_loss_limit_pct=0.005,
+        max_losing_trades=2,
+        eod_close_hour=15,
+        eod_close_minute=55,
+    )
+
+    def __init__(self):
+        self.current_date = None
+        self.bar_count_in_session = 0
+        self.session_open_price = None
+
+        self.orb_high = None
+        self.orb_low = None
+
+        self.session_ema = None
+        self.ema_seed_sum = 0.0
+        self.ema_seed_count = 0
+        self.was_below_ema = False
+        self.was_above_ema = False
+        self.prev_ema_for_cross = None
+
+        self.last_session_close = None
+        self.prev_close_price = None
+        self.gap_type = None
+
+        self.daily_pnl = 0.0
+        self.daily_losing_trades = 0
+        self.trading_halted_today = False
+
+        self.order = None
+        self.main_order = None
+        self.stop_order = None
+        self.limit_order = None
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        bar_date = dt.date()
+
+        if self.current_date != bar_date:
+            if self.current_date is not None:
+                self.prev_close_price = self.last_session_close
+            self.current_date = bar_date
+            self.bar_count_in_session = 0
+            self.orb_high = None
+            self.orb_low = None
+            self.session_ema = None
+            self.ema_seed_sum = 0.0
+            self.ema_seed_count = 0
+            self.was_below_ema = False
+            self.was_above_ema = False
+            self.prev_ema_for_cross = None
+            self.session_open_price = self.data.open[0]
+            if self.prev_close_price is None:
+                self.gap_type = None
+            elif self.session_open_price > self.prev_close_price:
+                self.gap_type = 'bullish'
+            elif self.session_open_price < self.prev_close_price:
+                self.gap_type = 'bearish'
+            else:
+                self.gap_type = 'none'
+            self.daily_pnl = 0.0
+            self.daily_losing_trades = 0
+            self.trading_halted_today = False
+
+        self.bar_count_in_session += 1
+        close_now = self.data.close[0]
+        self.last_session_close = close_now
+
+        if self.bar_count_in_session <= self.p.orb_minutes:
+            self.orb_high = self.data.high[0] if self.orb_high is None else max(self.orb_high, self.data.high[0])
+            self.orb_low = self.data.low[0] if self.orb_low is None else min(self.orb_low, self.data.low[0])
+
+        ema_long_signal = False
+        ema_short_signal = False
+        if self.ema_seed_count < self.p.ema_period:
+            self.ema_seed_sum += close_now
+            self.ema_seed_count += 1
+            if self.ema_seed_count == self.p.ema_period:
+                self.session_ema = self.ema_seed_sum / self.p.ema_period
+        else:
+            alpha = 2.0 / (self.p.ema_period + 1.0)
+            self.session_ema = (close_now - self.session_ema) * alpha + self.session_ema
+
+        if self.session_ema is not None:
+            if self.prev_ema_for_cross is not None:
+                crossover_up = self.data.close[-1] <= self.prev_ema_for_cross and close_now > self.session_ema
+                crossover_down = self.data.close[-1] >= self.prev_ema_for_cross and close_now < self.session_ema
+                if crossover_up and self.was_below_ema and close_now > self.session_ema:
+                    ema_long_signal = True
+                if crossover_down and self.was_above_ema and close_now < self.session_ema:
+                    ema_short_signal = True
+            self.was_below_ema = self.was_below_ema or (close_now < self.session_ema)
+            self.was_above_ema = self.was_above_ema or (close_now > self.session_ema)
+            self.prev_ema_for_cross = self.session_ema
+
+        if (dt.hour, dt.minute) >= (self.p.eod_close_hour, self.p.eod_close_minute):
+            if self.position:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                if self.limit_order is not None:
+                    self.cancel(self.limit_order)
+                self.close()
+                self.order = None
+                self.main_order = None
+                self.stop_order = None
+                self.limit_order = None
+            elif self.main_order is not None:
+                self.cancel(self.main_order)
+                self.order = None
+                self.main_order = None
+                self.stop_order = None
+                self.limit_order = None
+            return
+
+        if self.order is not None or self.position or self.trading_halted_today:
+            return
+
+        long_signal = False
+        short_signal = False
+
+        if self.bar_count_in_session > self.p.orb_minutes and self.orb_high is not None:
+            if self.data.close[-1] <= self.orb_high and close_now > self.orb_high:
+                long_signal = True
+            elif self.data.close[-1] >= self.orb_low and close_now < self.orb_low:
+                short_signal = True
+
+        if not long_signal and not short_signal:
+            if ema_long_signal:
+                long_signal = True
+            elif ema_short_signal:
+                short_signal = True
+
+        if not long_signal and not short_signal and self.gap_type in ('bullish', 'bearish') and self.prev_close_price is not None:
+            if self.gap_type == 'bullish' and self.data.close[-1] <= self.prev_close_price and close_now > self.prev_close_price:
+                long_signal = True
+            elif self.gap_type == 'bearish' and self.data.close[-1] >= self.prev_close_price and close_now < self.prev_close_price:
+                short_signal = True
+
+        if not long_signal and not short_signal:
+            return
+
+        entry_est = close_now
+        if long_signal:
+            sl = entry_est * (1.0 - self.p.stop_loss_pct)
+            tp = entry_est * (1.0 + self.p.take_profit_pct)
+            orders = self.buy_bracket(price=entry_est, exectype=bt.Order.Market,
+                                       stopprice=sl, limitprice=tp)
+        else:
+            sl = entry_est * (1.0 + self.p.stop_loss_pct)
+            tp = entry_est * (1.0 - self.p.take_profit_pct)
+            orders = self.sell_bracket(price=entry_est, exectype=bt.Order.Market,
+                                        stopprice=sl, limitprice=tp)
+
+        self.main_order, self.stop_order, self.limit_order = orders
+        self.order = self.main_order
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order == self.main_order:
+            if order.status == order.Completed:
+                self.order = None
+            elif order.status in (order.Canceled, order.Margin, order.Rejected):
+                self.order = None
+                self.main_order = None
+                self.stop_order = None
+                self.limit_order = None
+        elif order in (self.stop_order, self.limit_order):
+            if order.status == order.Completed:
+                self.main_order = None
+                self.stop_order = None
+                self.limit_order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.daily_pnl += trade.pnlcomm
+            if trade.pnlcomm < 0:
+                self.daily_losing_trades += 1
+            if (self.daily_pnl <= -self.p.daily_loss_limit_pct * self.broker.startingcash
+                    or self.daily_losing_trades >= self.p.max_losing_trades):
+                self.trading_halted_today = True
+```
+```json
+{"assumptions": [
+  {"topic": "crossover-implementation", "choice": "ORH/ORL/PClose and the session EMA are per-session Python scalars, not persistent Lines, so bt.indicators.CrossOver cannot be instantiated against them; crossover events are computed manually each bar using the same prev<=threshold-and-current>threshold (or mirrored) logic CrossOver itself uses.", "reason": "Backtrader indicators are wired once in __init__ against Lines objects; the spec's thresholds change daily/intraday and are not expressible as static Lines."},
+  {"topic": "session-scoped-ema", "choice": "EMA(20) is recomputed manually each session: seeded as the SMA of the first 20 closes of the session, then smoothed recursively with alpha=2/(period+1) for subsequent bars, matching backtrader's own EMA seeding convention.", "reason": "The built-in bt.indicators.EMA runs continuously across the whole multi-day feed and cannot reset at session boundaries, but the spec requires EMA 'calculated from the current day's bars'."},
+  {"topic": "bracket-entry-price", "choice": "The main leg of each bracket order uses exectype=bt.Order.Market for immediate entry; the signal bar's close is used as the reference entry price to compute the absolute 1%/2% stop and limit prices passed to buy_bracket/sell_bracket.", "reason": "Bracket child orders require explicit absolute prices before the parent fills, and the spec does not specify an entry order type, only the SL/TP offsets."},
+  {"topic": "signal-priority", "choice": "When more than one of the three independent signals fires on the same bar, ORB takes priority, then EMA Reclaim, then Gap-and-Go.", "reason": "Only one position may be held at a time (canonical default) and the spec does not state a tie-break order among the three independent signals."},
+  {"topic": "daily-loss-basis", "choice": "'0.5% of capital' is computed against the broker's fixed starting cash (self.broker.startingcash), not fluctuating current equity.", "reason": "The spec says 'capital' without defining it as mark-to-market equity; starting cash gives a stable, unambiguous daily threshold."},
+  {"topic": "stop-trading-scope", "choice": "Hitting the daily loss limit or two losing trades halts new entries for the rest of the day only; it does not force-close an already-open position, which continues to be managed by its existing bracket stop-loss/take-profit.", "reason": "The spec only says 'stop trading', not 'flatten immediately'; existing bracket protection already bounds risk on any open trade."},
+  {"topic": "infeasible", "choice": "The first session in the feed (2026-08-11) has no prior session in the data, so PClose is undefined and Gap-and-Go is inactive that day; it becomes active from the second session onward.", "reason": "PClose requires a previous day's close that does not exist for the first bar of the provided feed."},
+  {"topic": "orb-window-boundary", "choice": "The opening range is accumulated over exactly the first 5 one-minute bars of each session (09:30-09:34 timestamps); ORB entries are only evaluated from the 6th bar of the session onward (09:35 timestamp and later).", "reason": "The spec states the range is '09:30-09:35' and entries occur 'after 09:35'; five 1-minute bars exactly cover that window."},
+  {"topic": "timezone-assumption", "choice": "The feed's bar datetimes are assumed to already be expressed in US/Eastern wall-clock time as stated in the harness description, so dt.hour/dt.minute from self.data.datetime.datetime(0) are used directly for the 09:35 and 15:55 ET checks with no additional timezone conversion.", "reason": "Only backtrader/math/collections/statistics are importable, and the harness already describes the feed's range in ET wall-clock timestamps."}
+]}
+```

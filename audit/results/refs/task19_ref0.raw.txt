@@ -1,0 +1,140 @@
+```python
+import backtrader as bt
+
+
+class FibHeikenAshiStrategy(bt.Strategy):
+    params = dict(
+        fractal_left=2,
+        fractal_right=2,
+        zone_low_ratio=0.236,
+        zone_high_ratio=0.786,
+        sl_ratio=0.618,
+        tp_ratio=0.0,
+    )
+
+    def __init__(self):
+        self.swing_high_price = None
+        self.swing_high_bar = None
+        self.swing_low_price = None
+        self.swing_low_bar = None
+
+        self.ha_open_prev = None
+        self.ha_close_prev = None
+
+        self.order = None
+        self.sl_order = None
+        self.tp_order = None
+        self._pending_sl = None
+        self._pending_tp = None
+        self._pending_side = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order is self.order:
+                self.order = None
+                size = abs(order.executed.size)
+                if self._pending_side == 'long':
+                    self.sl_order = self.sell(exectype=bt.Order.Stop, price=self._pending_sl, size=size)
+                    self.tp_order = self.sell(exectype=bt.Order.Limit, price=self._pending_tp, size=size,
+                                               oco=self.sl_order)
+                elif self._pending_side == 'short':
+                    self.sl_order = self.buy(exectype=bt.Order.Stop, price=self._pending_sl, size=size)
+                    self.tp_order = self.buy(exectype=bt.Order.Limit, price=self._pending_tp, size=size,
+                                              oco=self.sl_order)
+            elif order in (self.sl_order, self.tp_order):
+                self.sl_order = None
+                self.tp_order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self.order:
+                self.order = None
+            elif order in (self.sl_order, self.tp_order):
+                self.sl_order = None
+                self.tp_order = None
+
+    def next(self):
+        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]
+        ha_close = (o + h + l + c) / 4.0
+        if self.ha_open_prev is None:
+            ha_open = (o + c) / 2.0
+        else:
+            ha_open = (self.ha_open_prev + self.ha_close_prev) / 2.0
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        self.ha_open_prev = ha_open
+        self.ha_close_prev = ha_close
+
+        n = len(self)
+        lb = self.p.fractal_left
+        rb = self.p.fractal_right
+        window = lb + rb + 1
+        if n >= window:
+            cand_off = -rb
+            hi_c = self.data.high[cand_off]
+            lo_c = self.data.low[cand_off]
+            is_high = True
+            is_low = True
+            for k in range(1, lb + 1):
+                if self.data.high[cand_off - k] > hi_c:
+                    is_high = False
+                if self.data.low[cand_off - k] < lo_c:
+                    is_low = False
+            for k in range(1, rb + 1):
+                if self.data.high[cand_off + k] > hi_c:
+                    is_high = False
+                if self.data.low[cand_off + k] < lo_c:
+                    is_low = False
+            if is_high:
+                self.swing_high_price = hi_c
+                self.swing_high_bar = n + cand_off
+            if is_low:
+                self.swing_low_price = lo_c
+                self.swing_low_bar = n + cand_off
+
+        if self.position or self.order is not None:
+            return
+
+        if self.swing_high_bar is None or self.swing_low_bar is None:
+            return
+
+        if self.swing_low_bar > self.swing_high_bar:
+            H = self.swing_high_price
+            L = self.swing_low_price
+            if H > L:
+                move = H - L
+                zone_high = H - self.p.zone_low_ratio * move
+                zone_low = H - self.p.zone_high_ratio * move
+                price_in_zone = (self.data.low[0] <= zone_high) and (self.data.high[0] >= zone_low)
+                ha_no_lower_wick = ha_low == min(ha_open, ha_close)
+                if price_in_zone and ha_no_lower_wick:
+                    self._pending_sl = H - self.p.sl_ratio * move
+                    self._pending_tp = H - self.p.tp_ratio * move
+                    self._pending_side = 'long'
+                    self.order = self.buy()
+
+        elif self.swing_high_bar > self.swing_low_bar:
+            L = self.swing_low_price
+            H = self.swing_high_price
+            if H > L:
+                move = H - L
+                zone_low = L + self.p.zone_low_ratio * move
+                zone_high = L + self.p.zone_high_ratio * move
+                price_in_zone = (self.data.low[0] <= zone_high) and (self.data.high[0] >= zone_low)
+                ha_no_upper_wick = ha_high == max(ha_open, ha_close)
+                if price_in_zone and ha_no_upper_wick:
+                    self._pending_sl = L + self.p.sl_ratio * move
+                    self._pending_tp = L + self.p.tp_ratio * move
+                    self._pending_side = 'short'
+                    self.order = self.sell()
+```
+```json
+{"assumptions": [
+  {"topic": "swing/pivot detection", "choice": "Swing highs/lows (the endpoints of the 'downward move'/'upward move') are identified with a 5-bar fractal (2 bars left, 2 bars right) on raw High/Low, confirmed with a 2-bar lag; the most recent confirmed high/low pair defines the active move. The structure stays valid until a newer fractal supersedes it, with no explicit expiry after a trade.", "reason": "The spec never defines how the swing high/low of the correction move is identified; a causal fractal method is the standard, non-repainting way to do 'price structure analysis' without lookahead."},
+  {"topic": "fibonacci reference mapping", "choice": "For the long setup, 0.0 = swing high H (start of the down move) and levels are measured toward L as H - ratio*(H-L); for the short setup, 0.0 = swing low L (start of the up move) and levels are measured toward H as L + ratio*(H-L).", "reason": "The spec states the 0.0 level is 'the start of the initial move', and explicitly says the long move is plotted high-to-low while the short move is plotted low-to-high, which fixes this mapping."},
+  {"topic": "price entering the fib zone", "choice": "'Price enters the Fibonacci zone' is checked as the current bar's High/Low range overlapping [0.236, 0.786], not just the close.", "reason": "The spec says 'price enters' the zone generically; using the bar's full range is a more literal reading of price touching a zone than requiring the close specifically."},
+  {"topic": "Break of Structure (BOS) confirmation", "choice": "Not implemented as a required entry filter.", "reason": "The spec explicitly frames BOS as optional ('may also be accompanied ... additional condition to improve signal quality'), so making it mandatory would invent an extra unstated filter."},
+  {"topic": "infeasible", "choice": "The economic-news time filter (excluding 30 minutes around NFP/CPI/rate decisions) is not implemented.", "reason": "No news/economic-calendar data source is available in this OHLCV-only backtrader environment (only backtrader/math/collections/statistics imports are allowed), and hardcoding guessed release dates/times spanning 2023-2026 would be unreliable and is not derivable from the given feed."}
+]}
+```

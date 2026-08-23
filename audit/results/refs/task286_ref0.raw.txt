@@ -1,0 +1,136 @@
+```python
+import backtrader as bt
+
+
+class RollingCoveredCallsStrategy(bt.Strategy):
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data, period=20, devfactor=2)
+        self.rsi = bt.indicators.RSI(self.data, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=20)
+        self.cross_up = bt.indicators.CrossOver(self.data.close, self.bb.top)
+
+        self.order = None
+        self.core_bought = False
+        self.core_qty = 0
+        self.assigned_flat = False
+        self.tranches = []  # each: {'qty', 'strike', 'expire_bar'}
+        self.last_tranche_bar = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _core_size(self):
+        cash = self.broker.getcash()
+        price = self.data.close[0]
+        return int(cash / price // 100) * 100
+
+    def _active_sold_qty(self):
+        return sum(t['qty'] for t in self.tranches)
+
+    def next(self):
+        if self.order:
+            return
+
+        bar = len(self)
+        close = self.data.close[0]
+        upper = self.bb.top[0]
+        mid = self.bb.mid[0]
+        rsi = self.rsi[0]
+        atr = self.atr[0]
+        vol = self.data.volume[0]
+        vol_sma = self.vol_sma[0]
+
+        if not self.core_bought:
+            size = self._core_size()
+            if size > 0:
+                self.order = self.buy(size=size)
+                self.core_qty = size
+            self.core_bought = True
+            return
+
+        if self.assigned_flat:
+            if close < mid and rsi < 50:
+                size = self._core_size()
+                if size > 0:
+                    self.order = self.buy(size=size)
+                    self.core_qty = size
+                    self.tranches = []
+                    self.last_tranche_bar = None
+                    self.assigned_flat = False
+            return
+
+        if self.tranches and close > (upper + atr):
+            self.order = self.close()
+            self.tranches = []
+            self.assigned_flat = True
+            return
+
+        if self.tranches and (close < mid or rsi < 45):
+            qty = self._active_sold_qty()
+            if qty > 0:
+                self.order = self.buy(size=qty)
+            self.tranches = []
+            return
+
+        order_placed = False
+        for t in list(self.tranches):
+            if bar >= t['expire_bar']:
+                if close > upper:
+                    t['strike'] = upper
+                    t['expire_bar'] = bar + 7
+                    if (rsi > 60 and self.last_tranche_bar != bar
+                            and self.position.size > 0):
+                        remaining_cap = self.core_qty - self._active_sold_qty()
+                        if remaining_cap > 0:
+                            add_qty = max(int(round(0.20 * self.position.size)), 100)
+                            add_qty = min(add_qty, self.position.size, remaining_cap)
+                            if add_qty > 0:
+                                self.order = self.sell(size=add_qty)
+                                self.tranches.append({
+                                    'qty': add_qty,
+                                    'strike': upper,
+                                    'expire_bar': bar + 7,
+                                })
+                                self.last_tranche_bar = bar
+                                order_placed = True
+                else:
+                    self.order = self.buy(size=t['qty'])
+                    self.tranches.remove(t)
+                    order_placed = True
+                if order_placed:
+                    break
+        if order_placed:
+            return
+
+        if (self.cross_up[0] > 0 and rsi > 60 and vol > vol_sma
+                and self.last_tranche_bar != bar
+                and self.position.size > 0):
+            remaining_cap = self.core_qty - self._active_sold_qty()
+            if remaining_cap > 0:
+                tranche_qty = max(int(round(0.20 * self.position.size)), 100)
+                tranche_qty = min(tranche_qty, self.position.size, remaining_cap)
+                if tranche_qty > 0:
+                    self.order = self.sell(size=tranche_qty)
+                    self.tranches.append({
+                        'qty': tranche_qty,
+                        'strike': upper,
+                        'expire_bar': bar + 7,
+                    })
+                    self.last_tranche_bar = bar
+```
+```json
+{"assumptions": [
+  {"topic": "core sizing", "choice": "Core position = entire available cash divided by close price, floored to the nearest 100 shares; the same formula is reused when re-entering the core long after forced assignment.", "reason": "Spec offers 'entire capital or a fixed quantity, a multiple of 100' as an example; entire-capital sizing rounded to round lots is the most literal single choice covering both clauses."},
+  {"topic": "entry timing", "choice": "Core position is bought on the first bar next() executes (after backtrader's automatic indicator warm-up), not at bar 1.", "reason": "Canonical default #6 relies on automatic minperiod; price/indicator data is not reliably available inside __init__."},
+  {"topic": "tranche sizing basis", "choice": "'20% of the current position' is computed off the live self.position.size at signal time, with a floor of 100 shares if position.size >= 100 else all available.", "reason": "Literal reading of 'current position' plus the 'min 100 if available' qualifier."},
+  {"topic": "100% total cap tracking", "choice": "Tracked as sum of currently active (not yet bought back) tranche quantities versus core_qty recorded at the most recent core entry; buybacks free up room.", "reason": "Spec ties the cap to cumulative sold amount but also says buybacks 'restore the core position', implying capacity is regained."},
+  {"topic": "1 tranche per day", "choice": "Applied globally to any tranche-selling action (initial call-sale trigger and rolling add-on), not just the rolling clause.", "reason": "Data is daily bars, so 'per day' naturally bounds all sell actions to avoid two conflicting sells on one bar; spec states it only under Rolling but the intent (rate-limiting sales) is general."},
+  {"topic": "expiration without exercise scope", "choice": "The mid-band/RSI<45 buyback trigger closes ALL currently active tranches at once, fully restoring the core position.", "reason": "Spec explicitly says this action results in 'restoring the core position' (singular full outcome), not a partial buyback of one tranche."},
+  {"topic": "non-rolled expiration outcome", "choice": "If a tranche reaches its own 7-bar expiry and price is not above the upper band (roll condition fails), only that individual tranche is bought back, distinct from the broader mid-band/RSI<45 buyback-all trigger.", "reason": "Spec only defines the roll branch explicitly for 'still above'; the implicit else (term ends, not ITM) most naturally closes just that expiring tranche."},
+  {"topic": "forced assignment gating", "choice": "'After the sale' is read as: at least one tranche currently active/outstanding (self.tranches non-empty).", "reason": "The clause only makes sense relative to a 'remaining position' that exists because shares were sold via a tranche."},
+  {"topic": "one action per bar", "choice": "At most one order-generating branch executes per bar (guarded by early returns and the pending-order tracker), even though multiple rule branches are evaluated in priority order each bar.", "reason": "Prevents conflicting simultaneous buy/sell orders on the same bar given the spec describes several independent triggers with no defined precedence for simultaneous firing."},
+  {"topic": "crosses above wording", "choice": "'Close crosses above the upper band' implemented via CrossOver(close, bb.top), requiring the prior bar to be at/below the band.", "reason": "Literal reading of 'crosses' as a transition event rather than a static 'is above' condition."}
+]}
+```

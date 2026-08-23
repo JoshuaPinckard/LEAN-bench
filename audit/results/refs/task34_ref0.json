@@ -1,0 +1,139 @@
+{
+  "task_id": 34,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass WyckoffRangeBreakoutStrategy(bt.Strategy):\n    params = (\n        ('sma_period', 20),\n        ('vol_period', 20),\n        ('vol_mult', 1.2),\n        ('range_min_pct', 0.02),\n        ('stop_pct', 0.005),\n        ('reentry_bars', 5),\n        ('risk_pct', 0.01),\n        ('range_lookback', 30),\n        ('swing_order', 2),\n        ('touch_tolerance', 0.005),\n    )\n\n    def __init__(self):\n        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.sma_period)\n        self.vol_sma = bt.indicators.SimpleMovingAverage(self.data.volume, period=self.p.vol_period)\n\n        self.order = None\n        self.stop_order = None\n        self.tp_order = None\n        self.close_order = None\n\n        self.last_entry_bar = None\n        self.active_support = None\n        self.active_resistance = None\n\n        self.pending_stop = None\n        self.pending_tp = None\n        self.pending_support = None\n        self.pending_resistance = None\n\n    def _find_swings(self):\n        n = len(self)\n        so = self.p.swing_order\n        max_k = min(self.p.range_lookback, n - 1 - so)\n        highs = []\n        lows = []\n        if max_k < so:\n            return highs, lows\n        for k in range(so, max_k + 1):\n            window_high = [self.data.high[-(k + j)] for j in range(-so, so + 1)]\n            if self.data.high[-k] >= max(window_high):\n                highs.append(self.data.high[-k])\n            window_low = [self.data.low[-(k + j)] for j in range(-so, so + 1)]\n            if self.data.low[-k] <= min(window_low):\n                lows.append(self.data.low[-k])\n        return highs, lows\n\n    def _cluster_level(self, values, want_max):\n        tol = self.p.touch_tolerance\n        best = None\n        for v in values:\n            count = sum(1 for other in values if abs(other - v) <= tol * v)\n            if count >= 2:\n                if best is None or (want_max and v > best) or (not want_max and v < best):\n                    best = v\n        return best\n\n    def _find_range(self):\n        highs, lows = self._find_swings()\n        resistance = self._cluster_level(highs, want_max=True)\n        support = self._cluster_level(lows, want_max=False)\n        return support, resistance\n\n    def _manage_exit(self):\n        if self.close_order:\n            return\n        if self.active_support is None or self.active_resistance is None:\n            return\n        price = self.data.close[0]\n        if self.active_support <= price <= self.active_resistance:\n            if self.stop_order:\n                self.cancel(self.stop_order)\n            if self.tp_order:\n                self.cancel(self.tp_order)\n            self.close_order = self.close()\n\n    def next(self):\n        if self.order:\n            return\n\n        if self.position:\n            self._manage_exit()\n            return\n\n        support, resistance = self._find_range()\n        if support is None or resistance is None:\n            return\n\n        price = self.data.close[0]\n        if price <= 0 or (resistance - support) / price < self.p.range_min_pct:\n            return\n\n        if price < self.sma[0]:\n            return\n\n        if self.last_entry_bar is not None and (len(self) - self.last_entry_bar) < self.p.reentry_bars:\n            return\n\n        if self.data.volume[0] < self.p.vol_mult * self.vol_sma[0]:\n            return\n\n        range_height = resistance - support\n\n        if price > resistance:\n            stop_price = support * (1 - self.p.stop_pct)\n            tp_price = resistance + range_height\n            risk_per_share = price - stop_price\n            if risk_per_share <= 0:\n                return\n            size = int((self.p.risk_pct * self.broker.getvalue()) / risk_per_share)\n            if size <= 0:\n                return\n            self.pending_stop = stop_price\n            self.pending_tp = tp_price\n            self.pending_support = support\n            self.pending_resistance = resistance\n            self.order = self.buy(size=size)\n\n        elif price < support:\n            stop_price = resistance * (1 + self.p.stop_pct)\n            tp_price = support - range_height\n            risk_per_share = stop_price - price\n            if risk_per_share <= 0:\n                return\n            size = int((self.p.risk_pct * self.broker.getvalue()) / risk_per_share)\n            if size <= 0:\n                return\n            self.pending_stop = stop_price\n            self.pending_tp = tp_price\n            self.pending_support = support\n            self.pending_resistance = resistance\n            self.order = self.sell(size=size)\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order.status == order.Completed:\n            if self.order is not None and order.ref == self.order.ref:\n                self.order = None\n                self.last_entry_bar = len(self)\n                self.active_support = self.pending_support\n                self.active_resistance = self.pending_resistance\n                sz = abs(order.executed.size)\n                if order.isbuy():\n                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=self.pending_stop, size=sz)\n                    self.tp_order = self.sell(exectype=bt.Order.Limit, price=self.pending_tp, size=sz,\n                                               oco=self.stop_order)\n                else:\n                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=self.pending_stop, size=sz)\n                    self.tp_order = self.buy(exectype=bt.Order.Limit, price=self.pending_tp, size=sz,\n                                              oco=self.stop_order)\n            elif self.stop_order is not None and order.ref == self.stop_order.ref:\n                self.stop_order = None\n                self.tp_order = None\n                self.active_support = None\n                self.active_resistance = None\n            elif self.tp_order is not None and order.ref == self.tp_order.ref:\n                self.stop_order = None\n                self.tp_order = None\n                self.active_support = None\n                self.active_resistance = None\n            elif self.close_order is not None and order.ref == self.close_order.ref:\n                self.close_order = None\n                self.stop_order = None\n                self.tp_order = None\n                self.active_support = None\n                self.active_resistance = None\n\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            if self.order is not None and order.ref == self.order.ref:\n                self.order = None\n            if self.stop_order is not None and order.ref == self.stop_order.ref:\n                self.stop_order = None\n            if self.tp_order is not None and order.ref == self.tp_order.ref:\n                self.tp_order = None\n            if self.close_order is not None and order.ref == self.close_order.ref:\n                self.close_order = None",
+  "assumptions": [
+    {
+      "topic": "range/level detection algorithm",
+      "choice": "Support/resistance levels are found via 2-bar fractal swing-point detection over a 30-bar lookback window, then clustering swing values within 0.5% of each other; a level qualifies (>=2 touches) if its cluster has >=2 members, resistance = highest qualifying swing-high cluster, support = lowest qualifying swing-low cluster.",
+      "reason": "Spec requires levels 'defined by at least two price touches' but specifies no concrete lookback window, swing-detection method, or touch tolerance; this is a reasonable, fully causal, explicit procedure to operationalize the requirement."
+    },
+    {
+      "topic": "entry execution timing",
+      "choice": "Breakout entries are submitted as plain market orders in next() on the breakout bar, which backtrader fills at the next bar's open.",
+      "reason": "Spec offers 'close of breakout candle OR open of next candle' as two acceptable alternatives; using backtrader's native next-bar-open market order fill matches one literal option without requiring cheat-on-close configuration."
+    },
+    {
+      "topic": "trend filter scope",
+      "choice": "The SMA(20) trend filter (price must be above SMA) is always active and blocks both long and short entries when price < SMA(20).",
+      "reason": "The section is labeled '(optional)' but the spec gives an unconditional rule ('the strategy does not open positions'); since no toggle mechanism is specified, the literal rule is implemented as stated for all entries."
+    },
+    {
+      "topic": "position sizing entry-price estimate",
+      "choice": "Risk-per-share for the 1%-risk sizing formula is computed using the breakout bar's close price as an estimate of entry price, while the stop/take-profit levels themselves stay fixed at the spec-defined support/resistance-based prices.",
+      "reason": "Order size must be specified when the entry order is submitted, before the actual next-bar-open fill price is known; the breakout close is the best available estimate at that time."
+    },
+    {
+      "topic": "definition of 'total capital'",
+      "choice": "The 1%-of-capital risk cap uses current portfolio value (self.broker.getvalue()) at the time of each signal, not the fixed initial cash.",
+      "reason": "Spec says 'total capital' without specifying static vs. mark-to-market; using live equity is the standard reading for ongoing risk-based sizing."
+    },
+    {
+      "topic": "stop-loss/take-profit/forced-close mechanics",
+      "choice": "Stop-loss and take-profit are implemented as real broker Stop and Limit orders (OCO pair) placed immediately after entry fill so they can execute intrabar at their exact levels; the 'return into range' rule is checked once per bar on the close price and, if triggered, cancels the Stop/Limit pair and issues a market close().",
+      "reason": "This most faithfully realizes 'stop-loss placed at price X' / 'take-profit at price Y' as resting orders, while the range-return rule is explicitly close-based and forced at market per the spec text."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 8,
+  "tape": [
+    {
+      "dt": "2021-06-15T04:00:00",
+      "side": "BUY",
+      "size": 11.0,
+      "price": 126.6592421533219
+    },
+    {
+      "dt": "2021-06-28T04:00:00",
+      "side": "SELL",
+      "size": -11.0,
+      "price": 131.26985994929123
+    },
+    {
+      "dt": "2021-11-18T05:00:00",
+      "side": "BUY",
+      "size": 15.0,
+      "price": 150.2726099643279
+    },
+    {
+      "dt": "2021-11-19T05:00:00",
+      "side": "SELL",
+      "size": -15.0,
+      "price": 154.9443381708155
+    },
+    {
+      "dt": "2021-12-01T05:00:00",
+      "side": "BUY",
+      "size": 5.0,
+      "price": 163.73466976035556
+    },
+    {
+      "dt": "2021-12-02T05:00:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 155.1901268526862
+    },
+    {
+      "dt": "2023-06-01T04:00:00",
+      "side": "BUY",
+      "size": 13.0,
+      "price": 175.24320228346932
+    },
+    {
+      "dt": "2023-06-02T04:00:00",
+      "side": "SELL",
+      "size": -13.0,
+      "price": 178.52716847079088
+    },
+    {
+      "dt": "2023-06-20T04:00:00",
+      "side": "BUY",
+      "size": 6.0,
+      "price": 181.86046794433722
+    },
+    {
+      "dt": "2023-06-21T04:00:00",
+      "side": "SELL",
+      "size": -6.0,
+      "price": 182.34367850052172
+    },
+    {
+      "dt": "2024-04-12T04:00:00",
+      "side": "BUY",
+      "size": 13.0,
+      "price": 172.52942533467058
+    },
+    {
+      "dt": "2024-04-16T04:00:00",
+      "side": "SELL",
+      "size": -13.0,
+      "price": 170.0443499195711
+    },
+    {
+      "dt": "2025-08-08T04:00:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 219.95738825778145
+    },
+    {
+      "dt": "2025-08-11T04:00:00",
+      "side": "SELL",
+      "size": -7.0,
+      "price": 227.27701087414155
+    },
+    {
+      "dt": "2025-09-22T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 247.5995237986898
+    },
+    {
+      "dt": "2025-10-03T04:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 258.1297485680002
+    }
+  ]
+}

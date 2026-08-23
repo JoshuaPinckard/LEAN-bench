@@ -1,0 +1,105 @@
+```python
+import math
+import backtrader as bt
+
+
+class PseudoProtectivePutATR(bt.Strategy):
+    params = (
+        ('base_price', 100.0),
+        ('main_shares', 100),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.order = None
+        self.in_position = False
+        self.entry_price = None
+        self.entry_bar = None
+        self.stop_price = None
+        self.expiration_bars = None
+        self.next_expiration = 90
+        self.pending_roll = False
+        self.highest_k = 0
+
+    def _submit_open(self, expiration):
+        close = self.data.close[0]
+        atr = self.atr[0]
+        qty = math.floor(0.02 * (self.p.main_shares * close) / atr)
+        if qty < 1:
+            return
+        self.next_expiration = expiration
+        self.order = self.sell(size=qty)
+
+    def _submit_close(self, roll):
+        self.pending_roll = roll
+        self.order = self.close()
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+        atr = self.atr[0]
+        base_price = self.p.base_price
+
+        k_current = max(0, math.floor((close - base_price) / (0.10 * base_price)))
+        new_breach = k_current > self.highest_k
+
+        if self.in_position:
+            bars_held = len(self) - self.entry_bar
+            if close >= self.stop_price:
+                self._submit_close(roll=False)
+            elif close <= self.entry_price * 0.85:
+                self._submit_close(roll=False)
+            elif bars_held >= self.expiration_bars:
+                self._submit_close(roll=False)
+            elif new_breach and (atr / close) <= 0.04:
+                self._submit_close(roll=True)
+            if new_breach:
+                self.highest_k = k_current
+        else:
+            if new_breach:
+                self.highest_k = k_current
+            if close >= 3 * base_price and (atr / close) <= 0.04:
+                self._submit_open(90)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order.issell():
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+                self.stop_price = self.entry_price + self.atr[0]
+                self.expiration_bars = self.next_expiration
+                self.in_position = True
+                self.order = None
+            else:
+                self.in_position = False
+                self.entry_price = None
+                self.entry_bar = None
+                self.stop_price = None
+                self.expiration_bars = None
+                self.order = None
+                if self.pending_roll:
+                    self.pending_roll = False
+                    close = self.data.close[0]
+                    atr = self.atr[0]
+                    if atr / close <= 0.04:
+                        self._submit_open(180)
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.pending_roll = False
+            self.order = None
+```
+```json
+{"assumptions": [
+  {"topic": "parameter defaults", "choice": "base_price defaults to 100.0 and main_shares defaults to 100 as placeholder bt.Strategy params", "reason": "spec states these are passed in as parameters but gives no numeric default; placeholders avoid a crash if the harness omits them, and are expected to be overridden via addstrategy kwargs"},
+  {"topic": "underlying core position", "choice": "the core long position is never bought/sold by this strategy; base_price and main_shares are used only as inputs to the hedge sizing and threshold formulas", "reason": "spec explicitly states the hedge is modeled as a separate account/strategy that does not touch the underlying long"},
+  {"topic": "stop/take-profit/threshold evaluation basis", "choice": "price_stop breach and roll-threshold breaches are evaluated against bar Close, matching the explicitly stated Close-based take-profit rule", "reason": "spec only gives an explicit Close-based formula for the take-profit; applying the same Close-based convention to the stop and to threshold breaches keeps evaluation consistent since no intrabar (High/Low) rule is stated"},
+  {"topic": "single order-in-flight / roll timing", "choice": "a roll is executed as a close order followed, once that close is Completed (in notify_order), by a fresh sell order; the two fills land on different bars", "reason": "canonical default requires guarding pending orders one at a time, so a true same-bar close+reopen is not possible; this is the closest literal execution under that constraint"},
+  {"topic": "zero/negative hedge size", "choice": "if floor(0.02*main_shares*Close/ATR) < 1, no open or roll-reopen order is submitted that bar", "reason": "spec gives no minimum size rule, but an order of size 0 or less is not meaningful in backtrader"},
+  {"topic": "multiple threshold levels crossed in one bar", "choice": "a gap that crosses several 0.10*k increments in a single bar is treated as one new-breach/roll event up to the highest k reached, tracked via a running highest_k counter", "reason": "only one order can be actioned per bar under the pending-order guard, and the spec's 'has not been reached before' wording is naturally satisfied by tracking the maximum threshold ever reached"},
+  {"topic": "exit condition priority", "choice": "when multiple exit conditions coincide on the same bar for an open hedge, priority is stop-loss, then take-profit, then expiry, then roll-breach", "reason": "spec lists these rules independently without stating precedence for simultaneous triggers"}
+]}
+```

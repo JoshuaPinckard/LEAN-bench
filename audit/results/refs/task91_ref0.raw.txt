@@ -1,0 +1,116 @@
+Implementing the significant-move breakout/trend strategy with ATR-based sizing and the same-direction re-entry lock.
+
+```python
+import backtrader as bt
+
+
+class SignificantMoveStrategy(bt.Strategy):
+    params = dict(
+        atr_period=14,
+        ema_period=50,
+        move_mult=1.5,
+        tp_mult=2.0,
+        sl_mult=1.0,
+        risk_pct=0.01,
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema = bt.indicators.EMA(self.data, period=self.p.ema_period)
+
+        self.order = None
+        self.pending_direction = None
+        self.pending_atr = None
+
+        self.entry_price = None
+        self.entry_atr = None
+
+        self.last_entry_direction = None
+        self.direction_unlocked = True
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.pending_direction is not None:
+                self.entry_price = order.executed.price
+                self.entry_atr = self.pending_atr
+                self.last_entry_direction = self.pending_direction
+                self.direction_unlocked = False
+
+        self.order = None
+        self.pending_direction = None
+        self.pending_atr = None
+
+    def next(self):
+        atr = self.atr[0]
+        ema = self.ema[0]
+        close = self.data.close[0]
+        prev_close = self.data.close[-1]
+
+        if self.last_entry_direction == 'long' and close < ema:
+            self.direction_unlocked = True
+        elif self.last_entry_direction == 'short' and close > ema:
+            self.direction_unlocked = True
+
+        if self.order:
+            return
+
+        if not self.position:
+            up_move = (close - prev_close) >= self.p.move_mult * atr
+            down_move = (prev_close - close) >= self.p.move_mult * atr
+
+            long_signal = up_move and close > ema
+            short_signal = down_move and close < ema
+
+            long_allowed = self.last_entry_direction != 'long' or self.direction_unlocked
+            short_allowed = self.last_entry_direction != 'short' or self.direction_unlocked
+
+            risk_amount = self.p.risk_pct * self.broker.getvalue()
+            stop_distance = self.p.sl_mult * atr
+
+            if long_signal and long_allowed:
+                size = int(risk_amount / stop_distance)
+                if size > 0:
+                    self.pending_direction = 'long'
+                    self.pending_atr = atr
+                    self.order = self.buy(size=size)
+            elif short_signal and short_allowed:
+                size = int(risk_amount / stop_distance)
+                if size > 0:
+                    self.pending_direction = 'short'
+                    self.pending_atr = atr
+                    self.order = self.sell(size=size)
+        else:
+            if self.position.size > 0:
+                profit = close - self.entry_price
+                loss = self.entry_price - close
+                if profit >= self.p.tp_mult * self.entry_atr:
+                    self.order = self.close()
+                elif loss >= self.p.sl_mult * self.entry_atr:
+                    self.order = self.close()
+                elif close < ema:
+                    self.order = self.close()
+            elif self.position.size < 0:
+                profit = self.entry_price - close
+                loss = close - self.entry_price
+                if profit >= self.p.tp_mult * self.entry_atr:
+                    self.order = self.close()
+                elif loss >= self.p.sl_mult * self.entry_atr:
+                    self.order = self.close()
+                elif close > ema:
+                    self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "price reference", "choice": "Use daily close as 'current price' and the prior bar's close as 'previous close' for the significant-move filter and for the trend-alignment/reversal comparisons against the EMA.", "reason": "Only OHLCV daily bars are available; close-to-close is the natural bar-level reading of 'moved from the previous close.'"},
+  {"topic": "ATR used for stop/target/sizing", "choice": "Freeze the ATR(14) value observed on the signal bar as the trade's 'entry ATR', and use that fixed value for the take-profit (2.0x), stop-loss (1.0x), and position-sizing calculations for the life of the trade rather than recomputing ATR each bar.", "reason": "The spec describes the initial stop/target/size as fixed 'at entry' distances from the entry price, implying a single ATR snapshot rather than a trailing/recalculated stop."},
+  {"topic": "profit/loss evaluation basis", "choice": "Evaluate take-profit and stop-loss thresholds using the daily close price versus the recorded entry (fill) price.", "reason": "No intrabar price data is available in the OHLCV feed, so exits are checked once per bar at the close."},
+  {"topic": "position size rounding", "choice": "Truncate the computed share count to an integer via int().", "reason": "The default backtrader sizer/order requires whole shares; the spec does not address fractional shares."},
+  {"topic": "same-direction re-entry lock", "choice": "Track the direction of the last entered trade and a flag that unlocks when price closes on the opposite side of the 50 EMA; block a new entry in the same direction until that flag is set. No restriction applies before the very first trade.", "reason": "Implements 'not enter... until the price has moved back to the other side of the 50 EMA' as a state that must be observed at least once (via daily close) before repeating the same-direction entry."},
+  {"topic": "equity for risk sizing", "choice": "Use self.broker.getvalue() (cash + position value) as 'total account equity' when computing the 1% risk amount.", "reason": "Spec's own $10,000 example equates equity with account value; getvalue() is the standard broker-reported equity in backtrader."},
+  {"topic": "simultaneous exit signals", "choice": "When multiple exit conditions are true on the same bar, check take-profit first, then stop-loss, then trend-reversal, and act on the first true condition.", "reason": "The spec lists exits in that order and does not specify a priority when several trigger simultaneously; only one self.close() should be issued per bar."},
+  {"topic": "zero/near-zero size guard", "choice": "Skip placing an entry order if the computed integer size is 0.", "reason": "Technical necessity to avoid submitting an invalid zero-size order; not a strategy rule."}
+]}
+```

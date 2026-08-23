@@ -1,0 +1,111 @@
+```python
+import backtrader as bt
+
+
+class KalmanTrendFlipStrategy(bt.Strategy):
+    params = (
+        ('kf_q', 1e-5),
+        ('kf_r', 1e-2),
+        ('kf_p0', 1.0),
+        ('atr_period', 14),
+        ('atr_mult', 2.0),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.order = None
+        self.pending_direction = None
+        self.entry_price = None
+        self.stop_price = None
+        self.kf_initialized = False
+        self.kf_estimate = None
+        self.kf_covariance = None
+        self.prev_above = None
+
+    def next(self):
+        close = self.data.close[0]
+
+        if not self.kf_initialized:
+            self.kf_estimate = close
+            self.kf_covariance = self.p.kf_p0
+            self.kf_initialized = True
+        else:
+            pred_estimate = self.kf_estimate
+            pred_covariance = self.kf_covariance + self.p.kf_q
+            kalman_gain = pred_covariance / (pred_covariance + self.p.kf_r)
+            self.kf_estimate = pred_estimate + kalman_gain * (close - pred_estimate)
+            self.kf_covariance = (1 - kalman_gain) * pred_covariance
+
+        current_above = close > self.kf_estimate
+
+        if self.order:
+            self.prev_above = current_above
+            return
+
+        if self.position:
+            if self.position.size > 0 and self.stop_price is not None and self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+                self.prev_above = current_above
+                return
+            elif self.position.size < 0 and self.stop_price is not None and self.data.high[0] >= self.stop_price:
+                self.order = self.close()
+                self.prev_above = current_above
+                return
+
+        if self.prev_above is not None:
+            if current_above and not self.prev_above:
+                if self.position.size < 0:
+                    self.pending_direction = 'long'
+                    self.order = self.close()
+                elif self.position.size == 0:
+                    self.order = self.buy()
+            elif not current_above and self.prev_above:
+                if self.position.size > 0:
+                    self.pending_direction = 'short'
+                    self.order = self.close()
+                elif self.position.size == 0:
+                    self.order = self.sell()
+
+        self.prev_above = current_above
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.position.size == 0:
+                if self.pending_direction == 'long':
+                    self.pending_direction = None
+                    self.order = self.buy()
+                    return
+                elif self.pending_direction == 'short':
+                    self.pending_direction = None
+                    self.order = self.sell()
+                    return
+                self.entry_price = None
+                self.stop_price = None
+            else:
+                self.entry_price = order.executed.price
+                atr_val = self.atr[0]
+                if self.position.size > 0:
+                    self.stop_price = self.entry_price - self.p.atr_mult * atr_val
+                else:
+                    self.stop_price = self.entry_price + self.p.atr_mult * atr_val
+
+        if order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.pending_direction = None
+
+        self.order = None
+```
+```json
+{"assumptions": [
+  {"topic": "kalman_filter_parameters", "choice": "Custom scalar Kalman filter with process noise Q=1e-5, measurement noise R=1e-2, initial error covariance P0=1.0, initial state = first available close", "reason": "Spec names a custom Kalman filter for smoothing but states no tuning parameters; these are conventional starting values for a slow, trend-preserving price filter."},
+  {"topic": "atr_period", "choice": "ATR period = 14 (backtrader ATR indicator's own default)", "reason": "Spec requires an ATR-based stop but does not state a lookback period; the indicator's built-in default is used unmodified."},
+  {"topic": "atr_stop_multiplier", "choice": "Stop distance = 2.0 x ATR from entry price", "reason": "Spec requires an ATR-based protective stop but gives no multiplier; 2x ATR is a common convention for volatility-based stops."},
+  {"topic": "stop_type", "choice": "Static stop fixed at entry price +/- ATR*mult (not trailing), computed once when the entry order fills using ATR at fill time", "reason": "Spec says 'protective stop to manage risk' without specifying trailing behavior; a fixed stop is the simplest literal reading."},
+  {"topic": "stop_trigger_price", "choice": "Stop breach checked against intrabar High/Low rather than Close", "reason": "Protective stops conventionally trigger on intrabar price extremes rather than waiting for the bar close."},
+  {"topic": "position_flip_execution", "choice": "A flip (long<->short) is executed as two sequential market orders: close the existing position first, then submit the opposite entry once the close order is confirmed filled (via notify_order), rather than a single netting order", "reason": "Canonical default requires plain self.buy()/self.sell() with default sizing and a single pending-order guard, so a same-bar netting reversal order is not used; the flip spans the close fill and the subsequent entry."},
+  {"topic": "stop_exit_reentry", "choice": "After an ATR-stop exit, the strategy stays flat until the next genuine crossover of close vs. the Kalman estimate; it does not immediately re-enter in the direction of the prevailing trend", "reason": "Spec ties entries explicitly to crossing events, not to price state, so a stopped-out position should not re-open until a new cross occurs."},
+  {"topic": "kalman_warmup", "choice": "Kalman filter initializes at the first bar on which next() is called (i.e., after backtrader's automatic minperiod driven by the ATR indicator), not the first bar of the dataset", "reason": "Canonical default #6 requires relying on backtrader's automatic minperiod without manual bar-skipping; since ATR imposes minperiod=14 on the strategy, filter initialization naturally begins there."}
+]}
+```

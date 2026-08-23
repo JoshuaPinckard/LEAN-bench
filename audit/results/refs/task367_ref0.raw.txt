@@ -1,0 +1,95 @@
+```python
+import backtrader as bt
+
+
+class SessionVWAP(bt.Indicator):
+    lines = ('vwap',)
+    plotinfo = dict(subplot=False)
+
+    def __init__(self):
+        self._cum_pv = 0.0
+        self._cum_vol = 0.0
+        self._last_date = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        if current_date != self._last_date:
+            self._cum_pv = 0.0
+            self._cum_vol = 0.0
+            self._last_date = current_date
+
+        typical_price = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0
+        vol = self.data.volume[0]
+        self._cum_pv += typical_price * vol
+        self._cum_vol += vol
+
+        self.lines.vwap[0] = self._cum_pv / self._cum_vol if self._cum_vol > 0 else typical_price
+
+
+class VWAPRSIStrategy(bt.Strategy):
+    params = dict(
+        vwap_threshold_pct=0.003,
+        rsi_oversold=30,
+        rsi_overbought=70,
+        stop_loss_pct=0.02,
+    )
+
+    def __init__(self):
+        self.vwap = SessionVWAP(self.data)
+        self.rsi = bt.indicators.RSI(self.data, period=14)
+        self.order = None
+        self.entry_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed:
+            if self.position:
+                self.entry_price = order.executed.price
+            else:
+                self.entry_price = None
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        vwap = self.vwap[0]
+        close = self.data.close[0]
+        rsi = self.rsi[0]
+
+        long_signal = (close < vwap * (1 - self.p.vwap_threshold_pct)) and (rsi < self.p.rsi_oversold)
+        short_signal = (close > vwap * (1 + self.p.vwap_threshold_pct)) and (rsi > self.p.rsi_overbought)
+
+        if self.position:
+            if self.position.size > 0:
+                stop_price = self.entry_price * (1 - self.p.stop_loss_pct)
+                if self.data.low[0] <= stop_price:
+                    self.order = self.close()
+                    return
+                if short_signal:
+                    self.order = self.close()
+                    return
+            elif self.position.size < 0:
+                stop_price = self.entry_price * (1 + self.p.stop_loss_pct)
+                if self.data.high[0] >= stop_price:
+                    self.order = self.close()
+                    return
+                if long_signal:
+                    self.order = self.close()
+                    return
+        else:
+            if long_signal:
+                self.order = self.buy()
+            elif short_signal:
+                self.order = self.sell()
+```
+```json
+{"assumptions": [
+  {"topic": "vwap_implementation", "choice": "No native session-resetting VWAP indicator exists in stock backtrader, so a custom bt.Indicator (SessionVWAP) was implemented that accumulates volume-weighted typical price and resets its cumulative sums whenever the bar's calendar date changes.", "reason": "Spec allows a custom implementation when a built-in is not available."},
+  {"topic": "vwap_typical_price", "choice": "Used typical price (High+Low+Close)/3 as the price input to the VWAP calculation.", "reason": "Spec did not specify the exact price component; (H+L+C)/3 is the standard VWAP formula input."},
+  {"topic": "stop_loss_trigger", "choice": "Stop-loss is checked once per bar using intrabar Low (longs) / High (shorts) crossing the stop level, then closed via self.close(); no separate native stop order is submitted.", "reason": "Spec states a stop-loss percentage but not the order mechanism; checking intrabar low/high most closely emulates a real stop trigger given only OHLCV bars."},
+  {"topic": "reversal_timing", "choice": "When an opposite-side signal closes an open position, no new position is opened in the same bar; a new entry only occurs on a later bar (once flat) if the entry condition is still true then.", "reason": "Entry rules explicitly require 'no open position', and the closing order has not executed yet within the same bar, so literal simultaneous reversal isn't supported by the stated conditions."},
+  {"topic": "priority_order", "choice": "When both a stop-loss breach and an opposite-side signal occur on the same bar for an open position, the stop-loss is evaluated and executed first.", "reason": "Spec does not state a priority between the two exit conditions; stop-loss is treated as the primary risk control."}
+]}
+```

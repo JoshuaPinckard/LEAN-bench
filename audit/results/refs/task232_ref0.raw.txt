@@ -1,0 +1,92 @@
+```python
+import collections
+import statistics
+
+import backtrader as bt
+
+
+class MeanReversionBollingerStrategy(bt.Strategy):
+    params = dict(
+        bb_period=20,
+        bb_devfactor=1.5,
+        sma_period=200,
+        atr_period=14,
+        atr_lookback=252,
+        atr_percentile_n=5,   # n=5 -> quantile cut points at 20/40/60/80
+        exit_bars=5,
+        position_value=1000.0,
+        max_loss_pct=0.02,
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.cross_lower = bt.indicators.CrossOver(self.data.close, self.bb.bot)
+        self.cross_upper = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.cross_mid = bt.indicators.CrossOver(self.data.close, self.bb.mid)
+
+        self.atr_history = collections.deque(maxlen=self.p.atr_lookback)
+
+        self.order = None
+        self.bar_executed = None
+        self.initial_capital = self.broker.getvalue()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if self.position:
+                self.bar_executed = len(self)
+            else:
+                self.bar_executed = None
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        self.atr_history.append(self.atr[0])
+
+        if self.position:
+            floating_pnl = (self.data.close[0] - self.position.price) * self.position.size
+            if floating_pnl < -self.p.max_loss_pct * self.initial_capital:
+                self.order = self.close()
+                return
+
+            bars_in_trade = len(self) - self.bar_executed
+            if self.cross_mid[0] != 0 or bars_in_trade >= self.p.exit_bars:
+                self.order = self.close()
+            return
+
+        if len(self.atr_history) < self.p.atr_lookback:
+            return
+
+        atr_p20 = statistics.quantiles(list(self.atr_history), n=self.p.atr_percentile_n)[0]
+        if self.atr[0] < atr_p20:
+            return
+
+        price = self.data.close[0]
+        size = self.p.position_value / price
+
+        if self.cross_lower[0] < 0 and price <= self.sma200[0]:
+            self.order = self.buy(size=size)
+        elif self.cross_upper[0] > 0 and price >= self.sma200[0]:
+            self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "atr_percentile_method", "choice": "Computed the 20th-percentile cutoff of the trailing 252-bar ATR window (current bar included) via statistics.quantiles(data, n=5)[0], and required current ATR >= that cutoff to pass the filter.", "reason": "Spec states a percentile-rank filter but does not name a computation method; this is a standard, literal reading of 'bottom 20th percentile over the last 252 bars.'"},
+  {"topic": "atr_percentile_warmup", "choice": "No entries are taken until a full 252-bar ATR history has accumulated inside the strategy (in addition to backtrader's automatic ~200-bar indicator minperiod from SMA(200)).", "reason": "The 252-bar percentile lookback is a manual statistic, not a built-in indicator, so it has no automatic minperiod; entries can only start once the window is genuinely full, which is the closest literal implementation of the stated lookback."},
+  {"topic": "capital_definition", "choice": "'Capital' in the 2% floating-loss rule is the initial starting portfolio value, captured once via self.broker.getvalue() in __init__ (i.e., the $10,000 starting cash), not fluctuating current equity.", "reason": "Spec doesn't define 'capital'; a fixed reference is the more standard reading for a per-trade risk cap and avoids the threshold drifting with unrelated equity changes."},
+  {"topic": "risk_stop_priority", "choice": "The 2%-floating-loss check is evaluated before the crossover/time-stop exit check each bar, so it can trigger a close even on a bar where the exit condition hasn't fired.", "reason": "Spec presents it under a separate 'Risk management' heading rather than as part of 'Exit,' implying it's an independent circuit breaker rather than a third exit condition to be ranked with the others."},
+  {"topic": "time_stop_boundary", "choice": "Time stop triggers once 5 bars have elapsed since the entry order's completion bar (bars_in_trade >= 5).", "reason": "Spec says 'a time stop after 5 bars' without specifying the exact boundary; exiting on reaching the 5th bar is the natural reading of 'after 5 bars.'"},
+  {"topic": "position_sizing_price_reference", "choice": "Share size for the fixed $1000 position is computed as 1000 / self.data.close[0] at the bar the signal fires.", "reason": "Spec states a fixed dollar position size but not a reference price; the current bar's close is the only price available for sizing at signal time under canonical default #1 (plain buy/sell, no custom sizer)."},
+  {"topic": "crossover_price_reference", "choice": "All band/mid-line crossovers and the SMA(200) comparisons use the close price (self.data.close).", "reason": "Spec refers generically to 'price' and 'price crosses'; close is the canonical OHLCV field for such comparisons absent any stated intrabar rule."}
+]}
+```

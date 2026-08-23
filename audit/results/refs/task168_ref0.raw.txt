@@ -1,0 +1,107 @@
+```python
+import backtrader as bt
+
+
+class LeapCallProxyStrategy(bt.Strategy):
+    params = (
+        ('take_profit_pct', 0.10),
+        ('bars_in_trade_limit', 380),
+        ('vol_spike_threshold', 0.10),
+        ('event_price_increase_pct', 0.05),
+        ('event_volume_mult', 1.5),
+        ('event_stoch_threshold', 80),
+        ('roll_wait_bars', 10),
+        ('roll_price_tolerance', 0.03),
+        ('position_pct', 0.25),
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200)
+        self.atr14 = bt.indicators.ATR(self.data, period=14)
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.volsma20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.sma14 = bt.indicators.SMA(self.data.close, period=14)
+        self.stoch = bt.indicators.Stochastic(self.data)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_bar = None
+        self.last_exit_price = None
+        self.exit_bar = None
+        self.waiting_for_reentry = False
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order.status == order.Completed:
+                if order.isbuy():
+                    self.entry_price = order.executed.price
+                    self.entry_bar = len(self)
+                elif order.issell():
+                    self.last_exit_price = order.executed.price
+                    self.exit_bar = len(self)
+                    self.waiting_for_reentry = True
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            if self.entry_price is None and self.entry_bar is None and not self.waiting_for_reentry:
+                self._enter_position()
+                return
+
+            if self.waiting_for_reentry:
+                bars_since_exit = len(self) - self.exit_bar
+                if bars_since_exit >= self.p.roll_wait_bars:
+                    price_diff_pct = abs(self.data.close[0] - self.last_exit_price) / self.last_exit_price
+                    if price_diff_pct <= self.p.roll_price_tolerance and self.sma50[0] > self.sma200[0]:
+                        self.waiting_for_reentry = False
+                        self._enter_position()
+            return
+
+        close = self.data.close[0]
+
+        if close >= self.entry_price * (1 + self.p.take_profit_pct):
+            self._exit_position()
+            return
+
+        bars_in_trade = len(self) - self.entry_bar
+        if bars_in_trade >= self.p.bars_in_trade_limit:
+            self._exit_position()
+            return
+
+        bb_width_pct = (self.bb.top[0] - self.bb.bot[0]) / self.bb.mid[0]
+        atr_pct = self.atr14[0] / self.sma14[0]
+        if (bb_width_pct - atr_pct) > self.p.vol_spike_threshold:
+            self._exit_position()
+            return
+
+        price_increase = (close - self.entry_price) / self.entry_price
+        if (price_increase > self.p.event_price_increase_pct
+                and self.data.volume[0] > self.p.event_volume_mult * self.volsma20[0]
+                and self.stoch.percK[0] > self.p.event_stoch_threshold):
+            self._exit_position()
+            return
+
+    def _enter_position(self):
+        value = self.broker.getvalue()
+        price = self.data.close[0]
+        size = int((value * self.p.position_pct) / price)
+        if size > 0:
+            self.order = self.buy(size=size)
+
+    def _exit_position(self):
+        self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Backtrader cannot start a strategy with a pre-existing position at cerebro time 0. The 'already open' initial long is instead opened on the first bar the strategy's next() executes (i.e., once every indicator's automatic minperiod, dominated by SMA(200), is satisfied), sized at 25% of portfolio value, with that fill treated as the unmodeled entry.", "reason": "Spec says entry is not modeled/assumed already open, but the harness provides no mechanism to inject a pre-existing position or entry price before bar 0."},
+  {"topic": "position sizing", "choice": "size = floor(0.25 * portfolio_value / close_price) via integer division", "reason": "Spec caps the long's value at 25% of the portfolio but does not address fractional shares; backtrader's default sizer requires an integer size, so flooring guarantees the cap is never exceeded."},
+  {"topic": "roll re-entry sizing", "choice": "'Same size' is interpreted as re-applying the identical 25%-of-portfolio sizing rule at the moment of re-entry (recomputed against then-current portfolio value/price), not reusing the literal share count from the prior entry.", "reason": "Portfolio value changes between exit and roll re-entry, so preserving the literal quantity could violate the stated 25% cap; the rule, not the number, is what the spec seems to intend by 'same size'."},
+  {"topic": "roll wait-window checking", "choice": "After the 10-bar wait elapses, the roll condition (price proximity + SMA50>SMA200) is checked on every subsequent bar while flat, until satisfied.", "reason": "Spec states 'wait 10 bars; if ... open a new long' but does not give an expiration for how long the condition may be awaited, so continuous checking after the wait is the most literal reading."},
+  {"topic": "Stochastic parameters/line", "choice": "Used backtrader's default Stochastic(period=14, period_dfast=3, period_dslow=3) and compared the %K line against the 80 threshold.", "reason": "Spec only says 'Stochastic > 80' without specifying period or which line (%K vs %D), so backtrader's standard defaults were used."},
+  {"topic": "SMA(14) on price", "choice": "Added SMA(14) on Close specifically to compute ATR% = ATR(14)/SMA(14) as named in the volatility-spike formula.", "reason": "The general indicator list only mentions SMA(20) on volume, but the exit condition 3 formula explicitly requires 'SMA(14) of price' for the ATR% term, so it must be instantiated even though not listed among the headline indicators."}
+]}
+```

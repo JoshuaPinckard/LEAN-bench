@@ -1,197 +1,233 @@
 ```python
-# complete strategy class
 import backtrader as bt
 
 
-class SPTRsiDivergenceBreakout(bt.Strategy):
+class RsiDivergenceBreakoutStrategy(bt.Strategy):
     params = dict(
         rsi_period=14,
-        breakout_period=20,     # resistance lookback (prior bars)
-        exit_low_period=10,     # breakdown exit lookback (prior bars)
-        vol_period=20,          # volume SMA
-        pivot=2,                # bars on each side for a local high/low
-        sl_pct=0.02,            # stop-loss 2% below entry
-        tp_pct=0.06,            # take-profit 6% above entry
-        risk_pct=0.01,          # risk 1% of capital per trade
-        bars_per_4h=4,          # aggregate 4 one-hour bars into one 4H bar
+        vol_sma_period=20,
+        breakout_lookback=20,
+        exit_lookback=10,
+        pivot_width=2,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.06,
+        risk_pct=0.01,
+        agg_bars=4,
     )
 
     def __init__(self):
-        # pending-order guard
-        self.order = None
+        # --- synthetic 4H bar aggregation state (built from the 1h feed) ---
+        self._agg_count = 0
+        self._agg_high = None
+        self._agg_low = None
+        self._agg_close = None
+        self._agg_volume = 0.0
 
-        # 1h -> 4H aggregation buffers
-        self._bo, self._bh, self._bl, self._bc, self._bv = [], [], [], [], []
+        # --- confirmed 4H series ---
+        self.h4_close = []
+        self.h4_high = []
+        self.h4_low = []
+        self.h4_volume = []
+        self.h4_rsi = []
 
-        # completed 4H series
-        self.o4, self.h4, self.l4, self.c4, self.v4 = [], [], [], [], []
-        self.dt4 = []
-        self.rsi4 = []
+        # --- Wilder RSI(14) state ---
+        self._prev_close = None
+        self._gains = []
+        self._losses = []
+        self._avg_gain = None
+        self._avg_loss = None
 
-        # Wilder RSI state (computed on the 4H close series)
-        self._rsi_prev_close = None
-        self._rsi_avg_gain = None
-        self._rsi_avg_loss = None
-        self._rsi_seed_g = []
-        self._rsi_seed_l = []
+        # --- pivot / divergence state ---
+        self._confirmed_lows = []
+        self._confirmed_highs = []
+        self.bullish_div_active = False
+        self.bearish_div_active = False
 
-        # divergence / pivot state
-        self.last_piv_low = None    # (price, rsi)
-        self.last_piv_high = None   # (price, rsi)
-        self.bull_div_active = False
-        self.bear_div_now = False
-
-        # trade levels
+        # --- order tracking (canonical guard) ---
+        self.entry_order = None
+        self.stop_order = None
+        self.limit_order = None
+        self.exit_order = None
         self.entry_price = None
-        self.stop_price = None
-        self.tp_price = None
 
-    # ---- Wilder RSI on the synthetic 4H close series (backtrader default) ----
-    def _update_rsi(self, c):
-        period = self.p.rsi_period
-        if self._rsi_prev_close is None:
-            self._rsi_prev_close = c
-            return None
-        change = c - self._rsi_prev_close
-        self._rsi_prev_close = c
+    def _update_rsi(self, close):
+        if self._prev_close is None:
+            self._prev_close = close
+            self.h4_rsi.append(None)
+            return
+        change = close - self._prev_close
+        self._prev_close = close
         gain = change if change > 0 else 0.0
         loss = -change if change < 0 else 0.0
-        if self._rsi_avg_gain is None:
-            self._rsi_seed_g.append(gain)
-            self._rsi_seed_l.append(loss)
-            if len(self._rsi_seed_g) == period:
-                self._rsi_avg_gain = sum(self._rsi_seed_g) / period
-                self._rsi_avg_loss = sum(self._rsi_seed_l) / period
-                return self._compute_rsi()
-            return None
-        self._rsi_avg_gain = (self._rsi_avg_gain * (period - 1) + gain) / period
-        self._rsi_avg_loss = (self._rsi_avg_loss * (period - 1) + loss) / period
-        return self._compute_rsi()
+        n = self.p.rsi_period
 
-    def _compute_rsi(self):
-        if self._rsi_avg_loss == 0:
-            return 100.0
-        rs = self._rsi_avg_gain / self._rsi_avg_loss
-        return 100.0 - 100.0 / (1.0 + rs)
-
-    # -------------------------------- main loop -------------------------------
-    def next(self):
-        self._bo.append(self.data.open[0])
-        self._bh.append(self.data.high[0])
-        self._bl.append(self.data.low[0])
-        self._bc.append(self.data.close[0])
-        self._bv.append(self.data.volume[0])
-
-        if len(self._bc) < self.p.bars_per_4h:
-            return
-
-        # form one completed 4H bar from the 4 accumulated 1h bars
-        self.o4.append(self._bo[0])
-        self.h4.append(max(self._bh))
-        self.l4.append(min(self._bl))
-        self.c4.append(self._bc[-1])
-        self.v4.append(sum(self._bv))
-        self.dt4.append(self.data.datetime.datetime(0))
-        self.rsi4.append(self._update_rsi(self._bc[-1]))
-
-        self._bo, self._bh, self._bl, self._bc, self._bv = [], [], [], [], []
-
-        self._process_h4()
-
-    def _process_h4(self):
-        n = len(self.c4) - 1
-        self.bear_div_now = False
-
-        # confirm a pivot (2 bars each side) at the center bar n-2
-        p = self.p.pivot
-        c = n - p
-        if c - p >= 0:
-            self._check_pivot_low(c, p)
-            self._check_pivot_high(c, p)
-
-        if self.order:
-            return
-
-        if self.position:
-            self._check_exit(n)
+        if self._avg_gain is None:
+            self._gains.append(gain)
+            self._losses.append(loss)
+            if len(self._gains) < n:
+                self.h4_rsi.append(None)
+                return
+            self._avg_gain = sum(self._gains) / n
+            self._avg_loss = sum(self._losses) / n
         else:
-            self._check_entry(n)
+            self._avg_gain = (self._avg_gain * (n - 1) + gain) / n
+            self._avg_loss = (self._avg_loss * (n - 1) + loss) / n
 
-    def _check_pivot_low(self, c, p):
-        lc = self.l4[c]
-        for k in range(1, p + 1):
-            if not (lc < self.l4[c - k] and lc < self.l4[c + k]):
-                return
-        price, rsi = lc, self.rsi4[c]
-        if (self.last_piv_low is not None and rsi is not None
-                and self.last_piv_low[1] is not None):
-            if price < self.last_piv_low[0] and rsi > self.last_piv_low[1]:
-                self.bull_div_active = True   # price lower low, RSI higher low
-        self.last_piv_low = (price, rsi)
+        if self._avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = self._avg_gain / self._avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+        self.h4_rsi.append(rsi)
 
-    def _check_pivot_high(self, c, p):
-        hc = self.h4[c]
-        for k in range(1, p + 1):
-            if not (hc > self.h4[c - k] and hc > self.h4[c + k]):
-                return
-        price, rsi = hc, self.rsi4[c]
-        if (self.last_piv_high is not None and rsi is not None
-                and self.last_piv_high[1] is not None):
-            if price > self.last_piv_high[0] and rsi < self.last_piv_high[1]:
-                self.bear_div_now = True      # price higher high, RSI lower high
-        self.last_piv_high = (price, rsi)
+    def _finalize_h4_bar(self):
+        self.h4_close.append(self._agg_close)
+        self.h4_high.append(self._agg_high)
+        self.h4_low.append(self._agg_low)
+        self.h4_volume.append(self._agg_volume)
+        self._update_rsi(self._agg_close)
+        self._agg_volume = 0.0
 
-    def _check_entry(self, n):
-        dt = self.dt4[n]
-        if not (dt.year == 2025 and dt.month in (11, 12)):  # Nov-Dec 2025 only
-            return
-        if not self.bull_div_active:
-            return
-        if n < self.p.breakout_period:
-            return
+    def _process_new_h4_bar(self):
+        n = len(self.h4_close)
+        w = self.p.pivot_width
+        candidate = n - 1 - w
 
-        resistance = max(self.h4[n - self.p.breakout_period:n])
-        if self.c4[n] <= resistance:                        # close above 20-bar high
-            return
+        if candidate >= w:
+            lows = self.h4_low
+            highs = self.h4_high
 
-        sma_vol = sum(self.v4[n - self.p.vol_period + 1:n + 1]) / self.p.vol_period
-        if self.v4[n] <= sma_vol:                           # volume above average
-            return
+            is_low = all(lows[candidate] < lows[candidate - k] for k in range(1, w + 1)) and \
+                     all(lows[candidate] < lows[candidate + k] for k in range(1, w + 1))
+            if is_low:
+                rsi_val = self.h4_rsi[candidate]
+                self._confirmed_lows.append((candidate, lows[candidate], rsi_val))
+                if len(self._confirmed_lows) >= 2:
+                    prev_pt = self._confirmed_lows[-2]
+                    curr_pt = self._confirmed_lows[-1]
+                    if prev_pt[2] is not None and curr_pt[2] is not None and \
+                       curr_pt[1] < prev_pt[1] and curr_pt[2] > prev_pt[2]:
+                        self.bullish_div_active = True
+                    else:
+                        self.bullish_div_active = False
 
-        value = self.broker.getvalue()
-        price = self.c4[n]
-        size = (self.p.risk_pct * value) / (self.p.sl_pct * price)
-        if size <= 0:
-            return
+            is_high = all(highs[candidate] > highs[candidate - k] for k in range(1, w + 1)) and \
+                      all(highs[candidate] > highs[candidate + k] for k in range(1, w + 1))
+            if is_high:
+                rsi_val = self.h4_rsi[candidate]
+                self._confirmed_highs.append((candidate, highs[candidate], rsi_val))
+                if len(self._confirmed_highs) >= 2:
+                    prev_pt = self._confirmed_highs[-2]
+                    curr_pt = self._confirmed_highs[-1]
+                    if prev_pt[2] is not None and curr_pt[2] is not None and \
+                       curr_pt[1] > prev_pt[1] and curr_pt[2] < prev_pt[2]:
+                        self.bearish_div_active = True
+                    else:
+                        self.bearish_div_active = False
 
-        self.order = self.buy(size=size)
-        self.bull_div_active = False
+        # --- alternative exits (checked on 4H closes) ---
+        if self.position and self.exit_order is None:
+            breakdown = False
+            if n > self.p.exit_lookback:
+                support = min(self.h4_low[-(self.p.exit_lookback + 1):-1])
+                breakdown = self.h4_close[-1] < support
+            if self.bearish_div_active or breakdown:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                if self.limit_order is not None:
+                    self.cancel(self.limit_order)
+                self.exit_order = self.close()
+                self.bearish_div_active = False
 
-    def _check_exit(self, n):
-        low, high, close = self.l4[n], self.h4[n], self.c4[n]
-        if low <= self.stop_price:                          # stop-loss
-            self.order = self.close()
-            return
-        if high >= self.tp_price:                           # take-profit
-            self.order = self.close()
-            return
-        if self.bear_div_now:                               # bearish divergence
-            self.order = self.close()
-            return
-        if n >= self.p.exit_low_period:
-            recent_low = min(self.l4[n - self.p.exit_low_period:n])
-            if close < recent_low:                          # close below 10-bar low
-                self.order = self.close()
+        # --- entry: divergence + breakout + volume confirmation ---
+        if not self.position and self.entry_order is None and self.exit_order is None:
+            if self.bullish_div_active and n > self.p.breakout_lookback and \
+               len(self.h4_volume) >= self.p.vol_sma_period:
+                current_close = self.h4_close[-1]
+                resistance = max(self.h4_high[-(self.p.breakout_lookback + 1):-1])
+                vol_avg = sum(self.h4_volume[-self.p.vol_sma_period:]) / self.p.vol_sma_period
+                current_vol = self.h4_volume[-1]
+                if current_close > resistance and current_vol > vol_avg:
+                    dt = self.data.datetime.date(0)
+                    if dt.year == 2025 and dt.month in (11, 12):
+                        entry_price_est = current_close
+                        risk_amount = self.broker.getvalue() * self.p.risk_pct
+                        risk_per_share = self.p.stop_loss_pct * entry_price_est
+                        size = risk_amount / risk_per_share
+                        if size > 0:
+                            self.entry_order = self.buy(size=size)
+                            self.bullish_div_active = False
+
+    def next(self):
+        o = self.data.open[0]
+        h = self.data.high[0]
+        l = self.data.low[0]
+        c = self.data.close[0]
+        v = self.data.volume[0]
+
+        if self._agg_count == 0:
+            self._agg_high = h
+            self._agg_low = l
+        else:
+            self._agg_high = max(self._agg_high, h)
+            self._agg_low = min(self._agg_low, l)
+        self._agg_close = c
+        self._agg_volume += v
+        self._agg_count += 1
+
+        if self._agg_count == self.p.agg_bars:
+            self._finalize_h4_bar()
+            self._agg_count = 0
+            self._process_new_h4_bar()
 
     def notify_order(self, order):
         if order.status in (order.Submitted, order.Accepted):
             return
-        if order.status == order.Completed and order.isbuy():
-            self.entry_price = order.executed.price
-            self.stop_price = self.entry_price * (1.0 - self.p.sl_pct)
-            self.tp_price = self.entry_price * (1.0 + self.p.tp_pct)
-        self.order = None
+
+        if order.status == order.Completed:
+            if order == self.entry_order:
+                self.entry_price = order.executed.price
+                self.entry_order = None
+                stop_price = self.entry_price * (1 - self.p.stop_loss_pct)
+                limit_price = self.entry_price * (1 + self.p.take_profit_pct)
+                self.stop_order = self.sell(
+                    exectype=bt.Order.Stop, price=stop_price, size=self.position.size
+                )
+                self.limit_order = self.sell(
+                    exectype=bt.Order.Limit, price=limit_price, size=self.position.size,
+                    oco=self.stop_order
+                )
+            elif order in (self.stop_order, self.limit_order):
+                self.stop_order = None
+                self.limit_order = None
+                self.exit_order = None
+                self.entry_price = None
+            elif order == self.exit_order:
+                self.exit_order = None
+                self.stop_order = None
+                self.limit_order = None
+                self.entry_price = None
+
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.entry_order:
+                self.entry_order = None
+            if order == self.stop_order:
+                self.stop_order = None
+            if order == self.limit_order:
+                self.limit_order = None
+            if order == self.exit_order:
+                self.exit_order = None
 ```
 ```json
-{"assumptions": [{"topic": "infeasible", "choice": "Aggregate every 4 consecutive 1h bars into one 4H bar (Open=first, High=max, Low=min, Close=last, Volume=sum) inside the strategy; all logic runs on this synthetic 4H series.", "reason": "The spec is a 4H strategy but the harness supplies only a 1h feed and the strategy cannot add cerebro resampling. Regular-session hourly bars have no unambiguous calendar 4H clock, so consecutive 4-bar grouping is the closest literal reading."}, {"topic": "local-extreme-definition", "choice": "A local (pivot) low/high is a 4H bar whose low/high is strictly below/above the 2 bars on each side; divergence is confirmed 2 bars after the pivot.", "reason": "The spec references 'local low/high' but does not define detection; a symmetric 2-bar fractal is the standard divergence pivot and introduces a fixed 2-bar confirmation lag."}, {"topic": "signal-sequencing", "choice": "A confirmed bullish divergence sets a persistent flag; the first subsequent 4H bar satisfying breakout+volume triggers entry and clears the flag (no expiry window).", "reason": "The word 'then' implies the breakout follows the divergence; the spec gives no expiry, so the flag persists until used."}, {"topic": "breakout-window", "choice": "'High of the last 20 bars' = highest high of the 20 4H bars preceding the current bar (current bar excluded).", "reason": "A bar's close cannot exceed its own high, so the resistance level must reference prior bars for a breakout to be possible."}, {"topic": "volume-sma", "choice": "SMA(volume,20) is the mean of the last 20 4H volumes including the current bar.", "reason": "Standard simple moving average evaluated at the current bar."}, {"topic": "capital-basis", "choice": "'Capital' = current account value via broker.getvalue().", "reason": "The risk/sizing formula is naturally applied to current account equity."}, {"topic": "entry-price-for-sizing", "choice": "Position size uses the current 4H close as the entry-price estimate; stop-loss (2%) and take-profit (6%) are computed from the actual executed fill price.", "reason": "Orders fill at the next bar's open, so the true entry price is unknown at order-submission time; the close is the best available proxy for sizing while SL/TP use the realized fill."}, {"topic": "position-size-rounding", "choice": "The computed position size is passed unrounded (fractional shares permitted).", "reason": "Preserves exact fidelity to the stated formula size = 1%*capital / (0.02*entry price)."}, {"topic": "exit-evaluation-granularity", "choice": "All entry and exit checks (including stop-loss/take-profit via the 4H bar's low/high) are evaluated only on completed 4H bars, not intrabar on 1h bars.", "reason": "The strategy is defined on the 4H chart; evaluating everything on 4H bar completion keeps the reference consistent with the stated timeframe."}, {"topic": "time-filter-scope", "choice": "The Nov-Dec 2025 filter gates entries only; exits/risk management are allowed at any time.", "reason": "The spec restricts 'signals' (entries) to that window; exits are protective and not described as signals."}, {"topic": "rsi-method", "choice": "RSI(14) uses Wilder's smoothing (SMA-seeded SMMA), matching backtrader's default RSI, computed manually on the 4H close series.", "reason": "The spec names RSI(14); backtrader's default RSI uses Wilder smoothing, and it must be computed on the synthetic 4H series rather than the raw 1h feed."}]}
+{"assumptions": [
+  {"topic": "infeasible", "choice": "The harness supplies only a 1h data feed (self.data), not a 4H feed, and no cerebro access is available to resample. I manually aggregate every 4 consecutive 1h bars into a synthetic 4H OHLCV bar and run all 4H-timeframe logic (RSI(14), SMA(20) volume, 20-bar high, 10-bar low, divergence pivots) against that synthetic series.", "reason": "The spec is explicitly a 4H strategy but the fixed environment only provides 1h bars; this is the closest literal reading without adding external data or top-level resampling code."},
+  {"topic": "RSI computation", "choice": "RSI(14) is computed manually on the synthetic 4H close series using Wilder's smoothing (simple average seed over the first 14 changes, then recursive smoothing), matching backtrader's own RSI convention.", "reason": "A bt.indicators.RSI cannot be attached to a manually-built series inside next(); Wilder smoothing is the standard/backtrader-default RSI method."},
+  {"topic": "local low/high pivot definition", "choice": "A 4H bar is a confirmed local low (high) if its low (high) is strictly lower (higher) than the 2 bars immediately before and after it; confirmation is thus delayed 2 bars after the pivot bar. Pivots are identified on the low/high price series (not close).", "reason": "The spec requires 'local low'/'local high' points for divergence but does not define how to detect them; a symmetric 2-bar fractal is a standard, deterministic swing-point definition, and 'lower low'/'higher high' terminology conventionally refers to price extremes rather than closes."},
+  {"topic": "divergence signal persistence", "choice": "Once a bullish (bearish) divergence is confirmed at a pivot, a flag stays active until consumed by an entry (exit) or superseded by the next pivot comparison; there is no additional expiry window.", "reason": "The spec describes divergence, then breakout, as sequential events ('then') without stating an expiration, so no extra time-based filter was invented."},
+  {"topic": "breakout/support window alignment", "choice": "'High of the last 20 bars' and 'low of the last 10 bars' are computed on the synthetic 4H series, excluding the current bar (i.e., the prior 20/10 bars), while the volume SMA(20) includes the current bar.", "reason": "This matches the strategy's overall 4H framing and standard breakout convention (breaking above a resistance established by prior bars) versus the standard inclusive convention for a moving-average indicator like SMA."},
+  {"topic": "alternative exit timeframe", "choice": "The RSI bearish divergence and 'close below the low of the last 10 bars' alternative exits are evaluated on 4H bar closes (same cadence as entry logic), not every 1h bar.", "reason": "Spec frames the whole strategy on the 4H chart; applying exit lookbacks on the same synthetic 4H series keeps the timeframe consistent with the entry rules."},
+  {"topic": "stop-loss/take-profit execution", "choice": "Stop-loss and take-profit are implemented as live OCO broker orders (bt.Order.Stop / bt.Order.Limit at entry_price*0.98 and entry_price*1.06) checked by the broker each 1h bar, rather than manually evaluated only on 4H closes.", "reason": "This gives the finest-grained, most faithful execution available given the 1h feed and is standard, idiomatic backtrader practice for stop/target exits."},
+  {"topic": "position sizing", "choice": "size = (risk_pct * broker.getvalue()) / (stop_loss_pct * entry_price_estimate), where entry_price_estimate is the current 4H close at signal time (actual fill price is unknown until the order executes) and 'capital' is total portfolio value (broker.getvalue()).", "reason": "The spec gives this exact formula; entry price must be estimated before order submission since backtrader orders fill on a subsequent bar, and 'capital' is not otherwise defined so total equity was used as the standard reading."},
+  {"topic": "time filter scope", "choice": "The November–December 2025 time filter gates new entries only; once a position is opened it may exit (stop, target, or alternative exit) even if that occurs after December 2025.", "reason": "The spec says 'signals are accepted only in' that window, which most literally refers to entry signal generation, not to open-position management."}
+]}
 ```

@@ -1,0 +1,78 @@
+```python
+import backtrader as bt
+from collections import deque
+
+
+class VWAPBreakoutStrategy(bt.Strategy):
+    params = dict(
+        n=3,
+        stop_pct=0.005,
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_price = None
+        self.cum_pv = 0.0
+        self.cum_vol = 0.0
+        self.current_date = None
+        self.hist = deque(maxlen=self.p.n)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed:
+            if self.entry_price is None:
+                self.entry_price = order.executed.price
+            else:
+                self.entry_price = None
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        bar_date = self.data.datetime.datetime(0).date()
+        if self.current_date != bar_date:
+            self.current_date = bar_date
+            self.cum_pv = 0.0
+            self.cum_vol = 0.0
+            self.hist.clear()
+
+        typical_price = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0
+        vol = self.data.volume[0]
+        self.cum_pv += typical_price * vol
+        self.cum_vol += vol
+        vwap = self.cum_pv / self.cum_vol if self.cum_vol else typical_price
+
+        close = self.data.close[0]
+
+        if self.position:
+            if not self.order:
+                if self.position.size > 0:
+                    stop_price = self.entry_price * (1.0 - self.p.stop_pct)
+                    if self.data.low[0] <= stop_price:
+                        self.order = self.close()
+                    elif close < vwap:
+                        self.order = self.close()
+                elif self.position.size < 0:
+                    stop_price = self.entry_price * (1.0 + self.p.stop_pct)
+                    if self.data.high[0] >= stop_price:
+                        self.order = self.close()
+                    elif close > vwap:
+                        self.order = self.close()
+        elif not self.order:
+            if len(self.hist) == self.p.n:
+                if close > vwap and all(c < v for c, v in self.hist):
+                    self.order = self.buy()
+                elif close < vwap and all(c > v for c, v in self.hist):
+                    self.order = self.sell()
+
+        self.hist.append((close, vwap))
+```
+```json
+{"assumptions": [
+  {"topic": "vwap_price_input", "choice": "VWAP uses typical price (High+Low+Close)/3 weighted by Volume, cumulative from session start", "reason": "Spec says 'compute an intraday VWAP' but does not specify which price feeds the volume-weighting; typical price is the standard VWAP convention"},
+  {"topic": "session_reset_detection", "choice": "VWAP accumulators (cum_pv, cum_vol) and the N-bar close/vwap history reset whenever the bar's calendar date differs from the previous bar's date", "reason": "The feed is described as containing only regular-session 09:30-15:55 5m bars per day, so a date change is equivalent to a 09:30 session start; no separate time-of-day check is needed"},
+  {"topic": "stop_loss_mechanism", "choice": "Stop-loss is checked intra-bar against the bar's high/low (long: low<=entry*(1-stop_pct); short: high>=entry*(1+stop_pct)) rather than submitted as a native broker stop order", "reason": "Spec explicitly offers 'implemented via stop orders (or checked intra-bar using high/low)' as an either/or; the high/low check is simpler and equally literal"},
+  {"topic": "n_bar_warmup_per_session", "choice": "No entries are evaluated until N prior same-session bars (post-reset) have been recorded, since the deque history is cleared at each session boundary", "reason": "'the previous N bars' implicitly requires N bars of same-session VWAP history; spec is silent on cross-session lookback so within-session-only is the literal reading"},
+  {"topic": "exit_priority_tie_break", "choice": "If both the stop-loss condition and the VWAP-cross exit condition are true on the same bar, the stop-loss check is evaluated first and takes priority (single close() order per bar)", "reason": "Spec lists the two exit conditions with 'or' but does not state which governs if both occur simultaneously; only one exit order can be placed per bar"}
+]}
+```

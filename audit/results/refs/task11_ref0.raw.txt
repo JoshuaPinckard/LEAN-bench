@@ -1,0 +1,119 @@
+```python
+import backtrader as bt
+
+
+class CurrentPriceCrossoverStrategy(bt.Strategy):
+    params = dict(
+        stop_loss_pct=0.01,
+        take_profit_pct=0.02,
+        cash_buffer=0.999,
+        session_start_min=600,   # 10:00 local
+        session_end_min=960,     # 16:00 local
+        open_time_min=570,       # 09:30 local (session open)
+        open_buffer_min=5,       # ignore signals in first 5 minutes after open
+    )
+
+    def __init__(self):
+        self.prevclose = self.data.close(-1)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.prevclose)
+
+        self.order = None
+        self.entry_order = None
+        self.stop_order = None
+        self.limit_order = None
+
+        self.broker.set_coc(True)
+
+    def _tradable(self):
+        dt = self.data.datetime.datetime(0)
+        minute_of_day = dt.hour * 60 + dt.minute
+        in_liquid_window = self.p.session_start_min <= minute_of_day < self.p.session_end_min
+        past_open_buffer = minute_of_day >= (self.p.open_time_min + self.p.open_buffer_min)
+        return in_liquid_window and past_open_buffer
+
+    def _calc_size(self, price):
+        cash = self.broker.getcash() * self.p.cash_buffer
+        return int(cash / price)
+
+    def _enter_long(self):
+        price = self.data.close[0]
+        size = self._calc_size(price)
+        if size <= 0:
+            return
+        stop_price = price * (1 - self.p.stop_loss_pct)
+        limit_price = price * (1 + self.p.take_profit_pct)
+        entry, stop, limit = self.buy_bracket(
+            size=size, price=price, exectype=bt.Order.Market,
+            stopprice=stop_price, limitprice=limit_price,
+        )
+        self.entry_order, self.stop_order, self.limit_order = entry, stop, limit
+        self.order = entry
+
+    def _enter_short(self):
+        price = self.data.close[0]
+        size = self._calc_size(price)
+        if size <= 0:
+            return
+        stop_price = price * (1 + self.p.stop_loss_pct)
+        limit_price = price * (1 - self.p.take_profit_pct)
+        entry, stop, limit = self.sell_bracket(
+            size=size, price=price, exectype=bt.Order.Market,
+            stopprice=stop_price, limitprice=limit_price,
+        )
+        self.entry_order, self.stop_order, self.limit_order = entry, stop, limit
+        self.order = entry
+
+    def _signal_exit(self):
+        if self.stop_order is not None and self.stop_order.status in [
+            self.stop_order.Submitted, self.stop_order.Accepted, self.stop_order.Partial
+        ]:
+            self.cancel(self.stop_order)
+        if self.limit_order is not None and self.limit_order.status in [
+            self.limit_order.Submitted, self.limit_order.Accepted, self.limit_order.Partial
+        ]:
+            self.cancel(self.limit_order)
+        self.order = self.close()
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted, order.Partial]:
+            return
+
+        if order is self.entry_order:
+            self.entry_order = None
+            self.order = None
+        elif order is self.stop_order:
+            self.stop_order = None
+        elif order is self.limit_order:
+            self.limit_order = None
+        else:
+            self.order = None
+
+    def next(self):
+        if not self.position:
+            if self.order is not None:
+                return
+            if not self._tradable():
+                return
+            if self.crossover[0] > 0:
+                self._enter_long()
+            elif self.crossover[0] < 0:
+                self._enter_short()
+        else:
+            if not self._tradable():
+                return
+            if self.position.size > 0 and self.crossover[0] < 0:
+                self._signal_exit()
+            elif self.position.size < 0 and self.crossover[0] > 0:
+                self._signal_exit()
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "current price at each bar is approximated by that bar's Close (self.data.close[0])", "reason": "the 1-minute OHLCV feed carries no sub-bar tick/quote data, so a literal instantaneous 'current price' does not exist; the bar's close is the closest available reading at evaluation time."},
+  {"topic": "same-bar order execution", "choice": "call self.broker.set_coc(True) in __init__ so market entry orders fill at the current bar's close instead of the next bar's open", "reason": "the spec requires opening positions on the current candle 'rather than waiting for the bar to close'; backtrader's default next-bar-open fill would contradict that, and cheat-on-close is the closest literal mechanism available from within the strategy."},
+  {"topic": "crossover construction", "choice": "bt.indicators.CrossOver(self.data.close, self.data.close(-1)) compares each bar's close (current-price proxy) against the immediately preceding bar's close (previous candle's close) as two aligned series", "reason": "detecting a 'cross' requires two time series; this is the direct construction from the stated inputs (current price vs. previous candle's close)."},
+  {"topic": "position sizing", "choice": "size = int(cash * 0.999 / price) at entry, i.e. essentially all available cash minus a small commission buffer", "reason": "spec explicitly states fixed 100% of capital per trade; the 0.1% buffer avoids a cash/margin rejection from the stated commission."},
+  {"topic": "stop-loss/take-profit mechanism", "choice": "implemented as native OCO Stop/Limit orders via buy_bracket/sell_bracket at entry time, which check every subsequent bar's High/Low, and remain live independent of the liquidity-window/open-buffer filters", "reason": "SL/TP are risk controls meant to trigger the instant price touches the threshold, which native stop/limit order types capture more faithfully than only checking bar closes; the time filters are read as gating new trading signals, not withdrawing existing risk protection."},
+  {"topic": "trading window boundaries", "choice": "liquidity window fixed to 10:00-16:00 local (start inclusive, end exclusive) and session open fixed to 09:30 local for the 5-minute buffer, computed via integer minute-of-day arithmetic on self.data.datetime.datetime(0)", "reason": "spec leaves exact boundary semantics unstated; these are the conventional US market-hours reading, and integer arithmetic avoids importing a module (datetime) outside the allowed import list."},
+  {"topic": "signal-exit interaction with brackets", "choice": "on an opposite crossover while a position is open, explicitly cancel any still-pending stop/limit sibling order, then self.close()", "reason": "the spec calls for closing the position on the opposite crossover signal, which must coexist cleanly with the standing SL/TP bracket without leaving orphaned pending orders."}
+]}
+```

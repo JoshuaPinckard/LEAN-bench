@@ -1,0 +1,149 @@
+```python
+import backtrader as bt
+import collections
+
+
+class CheapVolatilityStrategy(bt.Strategy):
+    params = (
+        ('bb1_period', 20),
+        ('bb2_period', 100),
+        ('ema_period', 20),
+        ('sma_period', 50),
+        ('rsi_period', 14),
+        ('atr_period', 14),
+        ('vol_sma_short', 20),
+        ('vol_sma_long', 100),
+        ('ratio_lookback', 252),
+        ('ratio_percentile', 0.20),
+        ('width_lookback', 21),
+        ('vol_breakout_mult', 1.5),
+        ('stop_atr_mult', 1.5),
+        ('target_atr_mult', 3.0),
+        ('trail_atr_mult', 1.0),
+    )
+
+    def __init__(self):
+        self.bb20 = bt.indicators.BollingerBands(self.data, period=self.p.bb1_period)
+        self.bb100 = bt.indicators.BollingerBands(self.data, period=self.p.bb2_period)
+        self.ema20 = bt.indicators.EMA(self.data, period=self.p.ema_period)
+        self.sma50 = bt.indicators.SMA(self.data, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(self.data)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_short)
+        self.vol_sma100 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_long)
+
+        self.bb20_width = self.bb20.top - self.bb20.bot
+        self.bb100_width = self.bb100.top - self.bb100.bot
+
+        self.ratio_hist = collections.deque(maxlen=self.p.ratio_lookback)
+        self.width_hist = collections.deque(maxlen=self.p.width_lookback)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.stop_price = None
+        self.target_price = None
+        self.trail_extreme = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        bb100w = self.bb100_width[0]
+        ratio = self.bb20_width[0] / bb100w if bb100w != 0 else None
+        if ratio is not None:
+            self.ratio_hist.append(ratio)
+        self.width_hist.append(self.bb20_width[0])
+
+        if self.order:
+            return
+
+        if self.position:
+            self._manage_exit()
+            return
+
+        liquidity_ok = self.vol_sma20[0] > self.vol_sma100[0]
+        if not liquidity_ok:
+            return
+
+        bullish = (self.ema20[0] > self.sma50[0]) and (self.rsi[0] > 55) and (self.macd.macd[0] > 0)
+        bearish = (self.ema20[0] < self.sma50[0]) and (self.rsi[0] < 45) and (self.macd.macd[0] < 0)
+
+        cheap_vol = False
+        if ratio is not None and len(self.ratio_hist) == self.p.ratio_lookback:
+            sorted_vals = sorted(self.ratio_hist)
+            idx = int(self.p.ratio_percentile * (len(sorted_vals) - 1))
+            threshold = sorted_vals[idx]
+            cheap_vol = ratio <= threshold
+
+        if cheap_vol and bullish:
+            self.order = self.buy()
+            return
+        if cheap_vol and bearish:
+            self.order = self.sell()
+            return
+
+        width_is_min = (len(self.width_hist) == self.p.width_lookback
+                         and self.bb20_width[0] == min(self.width_hist))
+        vol_breakout = self.data.volume[0] > self.p.vol_breakout_mult * self.vol_sma20[0]
+
+        if width_is_min and vol_breakout:
+            if self.data.close[0] > self.bb20.top[0]:
+                self.order = self.buy()
+            elif self.data.close[0] < self.bb20.bot[0]:
+                self.order = self.sell()
+
+    def _manage_exit(self):
+        is_long = self.position.size > 0
+
+        if self.entry_price is None:
+            self.entry_price = self.position.price
+            self.entry_atr = self.atr[0]
+            if is_long:
+                self.stop_price = self.entry_price - self.p.stop_atr_mult * self.entry_atr
+                self.target_price = self.entry_price + self.p.target_atr_mult * self.entry_atr
+            else:
+                self.stop_price = self.entry_price + self.p.stop_atr_mult * self.entry_atr
+                self.target_price = self.entry_price - self.p.target_atr_mult * self.entry_atr
+            self.trail_extreme = self.entry_price
+
+        close = self.data.close[0]
+
+        if is_long:
+            self.trail_extreme = max(self.trail_extreme, close)
+            trail_stop = self.trail_extreme - self.p.trail_atr_mult * self.atr[0]
+            reverse = self.ema20[0] < self.sma50[0]
+            exit_now = (close <= self.stop_price or close >= self.target_price
+                        or close <= trail_stop or reverse)
+        else:
+            self.trail_extreme = min(self.trail_extreme, close)
+            trail_stop = self.trail_extreme + self.p.trail_atr_mult * self.atr[0]
+            reverse = self.ema20[0] > self.sma50[0]
+            exit_now = (close >= self.stop_price or close <= self.target_price
+                        or close >= trail_stop or reverse)
+
+        if exit_now:
+            self.order = self.close()
+            self.entry_price = None
+            self.entry_atr = None
+            self.stop_price = None
+            self.target_price = None
+            self.trail_extreme = None
+```
+```json
+{"assumptions": [
+  {"topic": "macd_params", "choice": "Use backtrader default MACD(12,26,9); compare the MACD line itself (fast EMA - slow EMA), not the signal line or histogram, against 0.", "reason": "Spec states 'MACD > 0' without giving periods; defaults are the conventional MACD settings and 'MACD' conventionally denotes the MACD line."},
+  {"topic": "bollinger_devfactor", "choice": "devfactor=2.0 (backtrader default) for both BB(20) and BB(100).", "reason": "Spec gives only the period for each Bollinger Band, not the standard-deviation multiplier."},
+  {"topic": "percentile_method", "choice": "Nearest-rank on the sorted trailing 252-bar window (including current bar): threshold = sorted[floor(0.20*(n-1))]; cheap-vol = ratio <= threshold. Flag is False until 252 ratio observations have accumulated.", "reason": "Spec says 'lowest 20% over 252 bars' but does not specify the percentile/interpolation method or warm-up behavior."},
+  {"topic": "width_min_check", "choice": "Exact equality of current BB(20) width against min() of the trailing 21-bar window (including current bar); False until 21 observations exist.", "reason": "Spec literally states 'width = the minimum over 21 days', implemented as a direct equality check on the rolling window."},
+  {"topic": "liquidity_filter_scope", "choice": "Apply SMA(volume,20) > SMA(volume,100) as a gate on all three entry rules (Cheap Calls, Cheap Puts, Earnings-analog breakout).", "reason": "Spec lists the liquidity filter as a standalone bullet, not scoped to one specific entry rule."},
+  {"topic": "exit_price_basis", "choice": "Evaluate stop, target, and trailing-stop levels against each bar's Close price rather than intrabar High/Low.", "reason": "Spec does not specify an order type or intrabar trigger mechanism; Close-based checks keep the reference deterministic and avoid inventing broker order semantics."},
+  {"topic": "entry_reference_levels", "choice": "Fixed stop/target prices are computed once, on the first bar the position is confirmed open, using position.price and ATR(14) on that bar; they remain constant thereafter (aside from the trailing stop).", "reason": "Spec does not state whether ATR is sampled at entry or re-evaluated continuously for the fixed stop/target; entry-time sampling is the standard reading of a fixed stop/target."},
+  {"topic": "optional_trailing_stop", "choice": "Implement the 1xATR(14) trailing stop as an always-active exit condition running alongside the fixed stop/target/crossover exits, using the running favorable-close extreme since entry and the current bar's ATR(14).", "reason": "Spec supplies an explicit parameter for the trailing stop despite calling it 'optional'; read as a supplementary exit rather than an omitted one, since fidelity requires implementing every stated parameter."},
+  {"topic": "signal_priority", "choice": "When Cheap Calls/Cheap Puts (regime+bias) and the Earnings-analog breakout both qualify on the same bar, the regime+bias rule is evaluated first and takes the trade.", "reason": "At most one position may be held at a time (canonical default) and the spec does not state a priority order between its three entry rules."}
+]}
+```

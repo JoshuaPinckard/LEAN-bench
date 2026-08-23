@@ -1,0 +1,112 @@
+```python
+import math
+import backtrader as bt
+
+
+class HurstExponent(bt.Indicator):
+    lines = ('hurst',)
+    params = (('period', 100),)
+
+    def __init__(self):
+        self.addminperiod(self.p.period)
+
+    def next(self):
+        n = self.p.period
+        prices = self.data.get(size=n)
+        mean_price = sum(prices) / n
+        deviations = [p - mean_price for p in prices]
+
+        cumulative = []
+        running = 0.0
+        for d in deviations:
+            running += d
+            cumulative.append(running)
+        r = max(cumulative) - min(cumulative)
+
+        variance = sum(d * d for d in deviations) / n
+        s = math.sqrt(variance)
+
+        if s == 0.0 or r == 0.0:
+            self.lines.hurst[0] = 0.5
+        else:
+            self.lines.hurst[0] = math.log(r / s) / math.log(n)
+
+
+class HurstMeanReversion(bt.Strategy):
+    params = (
+        ('hurst_period', 100),
+        ('sma_period', 20),
+        ('stop_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.hurst = HurstExponent(self.data.close, period=self.p.hurst_period)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.entry_order = None
+        self.exit_order = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order == self.entry_order:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                if order.isbuy():
+                    stop_price = entry_price * (1.0 - self.p.stop_pct)
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=size)
+                else:
+                    stop_price = entry_price * (1.0 + self.p.stop_pct)
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=size)
+                self.entry_order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+                self.exit_order = None
+            elif order == self.exit_order:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.exit_order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.entry_order:
+                self.entry_order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+            elif order == self.exit_order:
+                self.exit_order = None
+
+    def next(self):
+        if self.entry_order or self.exit_order:
+            return
+
+        if not self.position:
+            if self.hurst[0] < 0.5 and self.data.close[0] < self.sma[0]:
+                self.entry_order = self.buy()
+            elif self.hurst[0] < 0.5 and self.data.close[0] > self.sma[0]:
+                self.entry_order = self.sell()
+        else:
+            if self.position.size > 0:
+                if self.crossover[0] > 0 or self.hurst[0] >= 0.5:
+                    if self.stop_order is not None:
+                        self.cancel(self.stop_order)
+                    self.exit_order = self.close()
+            elif self.position.size < 0:
+                if self.crossover[0] < 0 or self.hurst[0] >= 0.5:
+                    if self.stop_order is not None:
+                        self.cancel(self.stop_order)
+                    self.exit_order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "hurst_period", "choice": "N=100 bars", "reason": "Spec parameterizes HurstExponent(period=N) but never states N; chose 100 5-minute bars (~8.3 trading hours) as a reasonable single-window R/S lookback for intraday mean-reversion, long enough for a stable estimate while still short enough to warm up early in the 4680-bar series."},
+  {"topic": "hurst_formula", "choice": "Single-window classic R/S: demean the window, cumulative-sum the deviations, R = max-min of that cumulative series, S = population standard deviation of the window, H = ln(R/S) / ln(N).", "reason": "Spec explicitly names 'classic R/S rescaled range' and asks for the Hurst value 'over the last N bars' (one value per bar), so the textbook single-window formulation was used rather than a multi-scale log-log regression across several window sizes."},
+  {"topic": "hurst_degenerate_case", "choice": "If S==0 or R==0 (flat price window), set Hurst=0.5.", "reason": "log(R/S) is undefined when R or S is zero; 0.5 is the 'no memory' neutral value, keeping the indicator numerically defined without adding a filter the spec doesn't mention."},
+  {"topic": "stop_order_mechanism", "choice": "A standalone bt.Order.Stop sell/buy order is submitted from notify_order once the entry order fills, sized to match the filled entry, and is canceled if a signal exit fires first.", "reason": "Spec says 'using stop orders or bracket orders' without specifying which; a standalone Stop order composes cleanly with the signal-based exits and the required order-tracking guard, rather than the coupled buy_bracket/sell_bracket helper."},
+  {"topic": "order_execution_timing", "choice": "Signals are evaluated in next() using the bar's close values; resulting orders fill at the next bar's open per backtrader's default.", "reason": "Spec says 'process signals on bar close'; this matches backtrader's default order-execution timing with no cheat-on-close override implied, so no extra execution-timing configuration was added."}
+]}
+```

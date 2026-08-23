@@ -1,0 +1,86 @@
+```python
+import backtrader as bt
+
+
+class VolBalancedMonoAssetStrategy(bt.Strategy):
+    params = dict(
+        atr_period=20,
+        sma_period=20,
+        boll_period=20,
+        boll_devfactor=2,
+        risk_pct=0.01,
+        stop_atr_mult=2.0,
+        tp_atr_mult=4.0,
+        min_size=0.01,
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.boll = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.boll_period, devfactor=self.p.boll_devfactor
+        )
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.order = None
+        self.stop_price = None
+        self.tp_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+        if not self.position:
+            self.stop_price = None
+            self.tp_price = None
+
+    def next(self):
+        if self.order:
+            return
+
+        atr = self.atr[0]
+        close = self.data.close[0]
+        capital = self.broker.getvalue()
+
+        raw_size = min((capital * self.p.risk_pct) / (self.p.stop_atr_mult * atr), capital / close)
+        size = max(raw_size, self.p.min_size)
+
+        if self.position:
+            if self.position.size > 0:
+                if close <= self.stop_price or close >= self.tp_price:
+                    self.order = self.close()
+                    return
+            else:
+                if close >= self.stop_price or close <= self.tp_price:
+                    self.order = self.close()
+                    return
+
+            if close > self.boll.top[0] or close < self.boll.bot[0]:
+                self.order = self.close()
+                return
+
+            target = size if self.position.size > 0 else -size
+            if abs(target - self.position.size) > 1e-9:
+                self.order = self.order_target_size(target=target)
+            return
+
+        if self.crossover[0] > 0:
+            self.stop_price = close - self.p.stop_atr_mult * atr
+            self.tp_price = close + self.p.tp_atr_mult * atr
+            self.order = self.buy(size=size)
+        elif self.crossover[0] < 0:
+            self.stop_price = close + self.p.stop_atr_mult * atr
+            self.tp_price = close - self.p.tp_atr_mult * atr
+            self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "capital definition", "choice": "Use self.broker.getvalue() (current total portfolio value) as 'Capital' in the sizing formula, recomputed fresh at every bar (entry and daily recalibration).", "reason": "Spec says 'Capital' but does not define it; current portfolio value is the standard live interpretation of trading capital for a risk-based sizing formula."},
+  {"topic": "risk coefficient", "choice": "No risk coefficient is applied (multiplier = 1.0); size uses exactly min((Capital*0.01)/(2*ATR), Capital/Close).", "reason": "Spec states the coefficient is 'optional' and only gives an example value (0.5) rather than mandating one, so the base formula is used unmodified."},
+  {"topic": "stop-loss/take-profit reference price", "choice": "Stop and take-profit levels are fixed at the entry signal bar's Close ± ATR multiples and held constant for the life of the trade; only position size is recalibrated daily.", "reason": "Spec explicitly assigns 'daily recalibration' to size only, not to the SL/TP levels, so SL/TP are treated as fixed at entry."},
+  {"topic": "exit trigger price basis", "choice": "Stop-loss, take-profit, and Bollinger-band alternative-exit checks all compare against the daily Close, not intrabar High/Low.", "reason": "Every other rule in the spec (entries, alternative exit) is defined in terms of Close; no intrabar execution/order-book data is specified, so Close is used uniformly for consistency."},
+  {"topic": "exit priority", "choice": "When both trigger on the same bar, stop-loss/take-profit is evaluated before the Bollinger-band alternative exit.", "reason": "This matches the order in which the two rules are presented in the 'Position management' section of the spec."},
+  {"topic": "daily size recalibration mechanism", "choice": "Implemented via order_target_size() toward the newly computed target size (same sign/direction as the existing position), issued once per bar when in a position and no exit fired that bar.", "reason": "Backtrader's order_target_size is the direct built-in mechanism for adjusting an existing position toward a new target size, matching the spec's 'daily recalibration of size based on the current ATR'."}
+]}
+```

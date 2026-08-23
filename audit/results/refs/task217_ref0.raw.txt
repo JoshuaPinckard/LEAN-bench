@@ -1,0 +1,122 @@
+```python
+import backtrader as bt
+
+
+class MomentumVolumeEmaStrategy(bt.Strategy):
+    def __init__(self):
+        self.ema9 = bt.indicators.EMA(self.data.close, period=9)
+        self.ema21 = bt.indicators.EMA(self.data.close, period=21)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=50)
+        self.ema200 = bt.indicators.EMA(self.data.close, period=200)
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.macd = bt.indicators.MACD(self.data.close, period_me1=12, period_me2=26, period_signal=9)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.cross_bb_upper = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.cross_macd = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.cross_close_ema9 = bt.indicators.CrossOver(self.data.close, self.ema9)
+        self.cross_ema21_close = bt.indicators.CrossOver(self.ema21, self.data.close)
+        self.cross_signal_macd = bt.indicators.CrossOver(self.macd.signal, self.macd.macd)
+
+        self.order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.tp_price = None
+        self.breakeven_triggered = False
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+            if order.status == order.Completed and order.issell():
+                self.entry_price = None
+                self.stop_price = None
+                self.tp_price = None
+                self.breakeven_triggered = False
+
+    def next(self):
+        if self.order:
+            return
+        if not self.position:
+            self._try_enter()
+        else:
+            self._manage_position()
+
+    def _try_enter(self):
+        close = self.data.close[0]
+
+        price_ok = 0.75 <= close <= 10.00
+        rvol = self.data.volume[0] / self.vol_sma[0]
+        rvol_ok = rvol >= 1.5
+        trend_ok = (close > self.ema9[0] > self.ema21[0] > self.ema50[0]) and (close > self.ema200[0])
+        if not (price_ok and rvol_ok and trend_ok):
+            return
+
+        macd_cross_recent = (
+            self.cross_macd[0] > 0 or self.cross_macd[-1] > 0 or self.cross_macd[-2] > 0
+        )
+        scenario_a = (self.cross_bb_upper[0] > 0) and macd_cross_recent
+
+        touch_recent = any(
+            (self.data.low[-i] <= self.ema21[-i]) or (self.data.close[-i] <= self.bb.mid[-i])
+            for i in range(3)
+        )
+        near_upper = (self.bb.top[0] - close) <= 0.5 * self.atr[0]
+        scenario_b = touch_recent and (self.cross_close_ema9[0] > 0) and near_upper
+
+        if not (scenario_a or scenario_b):
+            return
+
+        entry = close
+        sl = min(self.ema21[0], entry - max(0.02, self.atr[0]))
+        tp_offset = max(0.10, min(self.atr[0], 0.20))
+        tp = entry + tp_offset
+
+        risk_per_share = entry - sl
+        capital = self.broker.getvalue()
+        risk_amount = 0.01 * capital
+        size = int(risk_amount / risk_per_share)
+        if size < 1:
+            return
+
+        self.entry_price = entry
+        self.stop_price = sl
+        self.tp_price = tp
+        self.breakeven_triggered = False
+        self.order = self.buy(size=size)
+
+    def _manage_position(self):
+        close = self.data.close[0]
+
+        if not self.breakeven_triggered and (close - self.entry_price) >= 0.10:
+            self.breakeven_triggered = True
+
+        if self.breakeven_triggered:
+            candidate = max(self.entry_price, self.ema9[0])
+            if candidate > self.stop_price:
+                self.stop_price = candidate
+
+        if close <= self.stop_price:
+            self.order = self.close()
+            return
+        if close >= self.tp_price:
+            self.order = self.close()
+            return
+        if self.cross_ema21_close[0] > 0 or self.cross_signal_macd[0] > 0:
+            self.order = self.close()
+            return
+```
+```json
+{"assumptions": [
+  {"topic": "scenario A lookback scope", "choice": "The 'current bar or previous 2 bars' window applies only to the MACD cross confirmation; the BB upper-band breakout cross must occur on the current bar.", "reason": "Spec sentence structure attaches the lookback qualifier to the clause immediately preceding it (the MACD cross)."},
+  {"topic": "scenario B touch window", "choice": "The 'last 3 bars' pullback-touch check covers the current bar and the two preceding bars (indices 0, -1, -2), independent of whether it coincides with the EMA9 cross bar.", "reason": "Most natural reading of 'within the last 3 bars' as a 3-bar window ending at the present bar."},
+  {"topic": "entry price reference", "choice": "SL, TP, and position size are computed from the signal bar's close (the bar where entry conditions are met), and this same value is retained as the trade's 'entry' for the life of the position (e.g. breakeven check), rather than the actual next-bar market-order fill price.", "reason": "The formulas require an 'entry' value before the order is even submitted (for sizing), and the real fill price is unknown at that point since orders execute on the next bar's open; using one consistent value avoids mixing two different entry references."},
+  {"topic": "unrealized profit unit for breakeven trigger", "choice": "'unrealized profit reaches >= 0.10' is treated as an absolute price-per-share amount, not 10%.", "reason": "Consistent with the TP clamp bounds (0.10-0.20) and the 0.02 constant in the SL formula, all of which read as small absolute dollar amounts appropriate to the spec's own 0.75-10.00 price filter."},
+  {"topic": "risk R definition", "choice": "R = 1% of current portfolio value (self.broker.getvalue()).", "reason": "Spec explicitly gives '1% of capital' as its example, and total portfolio value is the standard reading of 'capital' for per-trade risk sizing."},
+  {"topic": "share size rounding", "choice": "Position size (R / (entry-SL)) is floored to a whole number of shares; if it rounds below 1 share the entry is skipped.", "reason": "Fractional share orders are not meaningful for a real equity strategy, and the spec does not address rounding."},
+  {"topic": "exit priority", "choice": "When multiple exit conditions trigger on the same bar, the (trailing) stop-loss is checked first, then take-profit, then the alternative indicator-based exit.", "reason": "Spec lists these as parallel exit rules without stating precedence for simultaneous triggers."},
+  {"topic": "infeasible", "choice": "Implemented the 0.75-10.00 price filter literally.", "reason": "This filter targets low-priced stocks; since the supplied AAPL feed trades well above $10 across the entire 2020-2025 window, the filter will never pass and the strategy will not open any position on this dataset. This is a consequence of exact fidelity to the spec on this instrument, not a simplification."}
+]}
+```

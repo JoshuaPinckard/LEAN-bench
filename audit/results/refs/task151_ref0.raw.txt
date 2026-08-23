@@ -1,0 +1,155 @@
+```python
+import backtrader as bt
+
+
+class TickAnomalyStrategy(bt.Strategy):
+    params = dict(
+        sma_period=10,
+        rsi_period=14,
+        vol_avg_period=50,
+        price_dev_pct=0.001,
+        rsi_entry_lower=40,
+        rsi_entry_upper=60,
+        vol_surge_pct=0.20,
+        stop_loss_pct=0.005,
+        take_profit_pct=0.008,
+        rsi_exit_lower=30,
+        rsi_exit_upper=70,
+        position_pct=0.01,
+        max_positions=3,
+        min_tick_interval=3,
+        opening_minutes_ignore=5,
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.avg_volume = bt.indicators.SMA(self.data.volume, period=self.p.vol_avg_period)
+
+        # Manual bookkeeping of up to max_positions independent "positions" (with
+        # their own entry price/size) since the broker only tracks one net
+        # position per data feed.
+        self.open_positions = []
+        self.next_pos_id = 0
+        self.last_open_bar = None
+        self.entry_order_pending = False
+        self.session_date = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        info = order.info
+        if order.status == order.Completed:
+            if info.get('action') == 'entry':
+                self.open_positions.append({
+                    'id': info['pos_id'],
+                    'direction': info['direction'],
+                    'entry_price': order.executed.price,
+                    'size': abs(order.executed.size),
+                    'exit_pending': False,
+                })
+                self.last_open_bar = len(self)
+                self.entry_order_pending = False
+            elif info.get('action') == 'exit':
+                pos_id = info.get('pos_id')
+                self.open_positions = [p for p in self.open_positions if p['id'] != pos_id]
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if info.get('action') == 'entry':
+                self.entry_order_pending = False
+            elif info.get('action') == 'exit':
+                pos_id = info.get('pos_id')
+                for p in self.open_positions:
+                    if p['id'] == pos_id:
+                        p['exit_pending'] = False
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        if self.session_date is None or dt.date() != self.session_date:
+            self.session_date = dt.date()
+            self.session_start_dt = dt
+        minutes_since_open = (dt - self.session_start_dt).total_seconds() / 60.0
+        in_opening_window = minutes_since_open < self.p.opening_minutes_ignore
+
+        price = self.data.close[0]
+        sma_val = self.sma[0]
+        rsi_val = self.rsi[0]
+        vol = self.data.volume[0]
+        avg_vol = self.avg_volume[0]
+
+        for pos in list(self.open_positions):
+            if pos['exit_pending']:
+                continue
+            direction = pos['direction']
+            entry_price = pos['entry_price']
+            exit_signal = False
+            if direction == 'long':
+                if price <= entry_price * (1 - self.p.stop_loss_pct):
+                    exit_signal = True
+                elif price >= entry_price * (1 + self.p.take_profit_pct):
+                    exit_signal = True
+                elif price < sma_val:
+                    exit_signal = True
+                elif rsi_val < self.p.rsi_exit_lower or rsi_val > self.p.rsi_exit_upper:
+                    exit_signal = True
+            else:
+                if price >= entry_price * (1 + self.p.stop_loss_pct):
+                    exit_signal = True
+                elif price <= entry_price * (1 - self.p.take_profit_pct):
+                    exit_signal = True
+                elif price > sma_val:
+                    exit_signal = True
+                elif rsi_val < self.p.rsi_exit_lower or rsi_val > self.p.rsi_exit_upper:
+                    exit_signal = True
+
+            if exit_signal:
+                pos['exit_pending'] = True
+                if direction == 'long':
+                    self.sell(size=pos['size'], action='exit', pos_id=pos['id'])
+                else:
+                    self.buy(size=pos['size'], action='exit', pos_id=pos['id'])
+
+        if in_opening_window:
+            return
+        if self.entry_order_pending:
+            return
+        if len(self.open_positions) >= self.p.max_positions:
+            return
+        if self.last_open_bar is not None and (len(self) - self.last_open_bar) < self.p.min_tick_interval:
+            return
+
+        long_signal = (
+            price > sma_val * (1 + self.p.price_dev_pct)
+            and self.p.rsi_entry_lower <= rsi_val <= self.p.rsi_entry_upper
+            and vol > avg_vol * (1 + self.p.vol_surge_pct)
+        )
+        short_signal = (
+            price < sma_val * (1 - self.p.price_dev_pct)
+            and self.p.rsi_entry_lower <= rsi_val <= self.p.rsi_entry_upper
+            and vol > avg_vol * (1 + self.p.vol_surge_pct)
+        )
+
+        has_long = any(p['direction'] == 'long' for p in self.open_positions)
+        has_short = any(p['direction'] == 'short' for p in self.open_positions)
+
+        if long_signal and not has_short:
+            size = (self.broker.getvalue() * self.p.position_pct) / price
+            self.next_pos_id += 1
+            self.entry_order_pending = True
+            self.buy(size=size, action='entry', direction='long', pos_id=self.next_pos_id)
+        elif short_signal and not has_long:
+            size = (self.broker.getvalue() * self.p.position_pct) / price
+            self.next_pos_id += 1
+            self.entry_order_pending = True
+            self.sell(size=size, action='entry', direction='short', pos_id=self.next_pos_id)
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Treat each 1-minute bar as one 'tick': 'last tick price' = bar Close, 'last tick volume' = bar Volume.", "reason": "The harness only supplies 1-minute OHLCV bars, not true tick data; this is the closest literal reading achievable in this environment."},
+  {"topic": "infeasible", "choice": "Only allow pyramiding entries in the same direction as any currently open position(s); block an opposite-direction entry signal while positions are open in the other direction.", "reason": "Backtrader with a single data feed uses a standard netting broker, not independent long/short hedged sub-positions (as the spec's 'up to 3 simultaneous positions' model implies). Allowing an opposite-direction buy/sell would net against and incorrectly reduce/close existing tracked positions instead of opening an independent one."},
+  {"topic": "position sizing", "choice": "Size (shares) = (0.01 * current broker portfolio value) / current close price, recomputed at each new entry; fractional share sizes are allowed.", "reason": "Spec states position size must be 1% of total trading capital but does not define whether capital means cash or total equity, nor whether shares must be integer; used total broker equity via getvalue() and left size unrounded since the spec is silent."},
+  {"topic": "signal reversal exit", "choice": "Implemented as a direct comparison (price below SMA for long, above SMA for short) rather than a strict cross-detection.", "reason": "Once the condition first triggers the position is closed and removed, so a plain directional comparison is functionally equivalent to a 'cross' for exit purposes."},
+  {"topic": "opening-window scope", "choice": "The first-5-minutes-of-day suppression applies only to new entry signals; existing exit checks (stop-loss, take-profit, signal reversal, RSI exit) still run during that window.", "reason": "The spec calls these 'trading signals' to ignore at the open, which most naturally refers to new-position entry signals, not risk exits on already-open positions."},
+  {"topic": "session-open detection", "choice": "Start of each trading session is detected by comparing the current bar's date to the previous bar's date (first bar of a new date = session start).", "reason": "The feed has no explicit session-open marker; this is the standard way to infer session start from bar timestamps alone."}
+]}
+```

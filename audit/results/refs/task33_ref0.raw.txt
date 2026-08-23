@@ -1,0 +1,120 @@
+```python
+import backtrader as bt
+
+
+class BullishReversalOffSellingClimax(bt.Strategy):
+    params = dict(
+        sma_period=200,
+        atr_period=14,
+        vol_avg_period=50,
+        vol_spike_mult=1.5,
+        climax_lookback=10,
+        stop_atr_mult=1.5,
+        reward_risk_mult=2.0,
+        risk_pct=0.01,
+        body_atr_mult=1.0,
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_avg50 = bt.indicators.SMA(self.data.volume, period=self.p.vol_avg_period)
+
+        self.order = None
+        self.stop_price = None
+        self.target_price = None
+        self.entry_atr = None
+
+    def _find_climax_ago(self):
+        best_ago = None
+        best_low = None
+        for ago in range(1, self.p.climax_lookback + 1):
+            down_day = self.data.close[-ago] < self.data.close[-ago - 1]
+            vol_spike = self.data.volume[-ago] >= self.p.vol_spike_mult * self.vol_avg50[-ago]
+            if down_day and vol_spike:
+                low = self.data.low[-ago]
+                if best_low is None or low < best_low:
+                    best_low = low
+                    best_ago = ago
+        return best_ago
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.stop_price is not None and self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+            elif self.target_price is not None and self.data.high[0] >= self.target_price:
+                self.order = self.close()
+            elif self.data.close[0] < self.sma200[0]:
+                self.order = self.close()
+            return
+
+        if self.data.close[0] <= self.sma200[0]:
+            return
+
+        climax_ago = self._find_climax_ago()
+        if climax_ago is None:
+            return
+
+        climax_high = self.data.high[-climax_ago]
+        if self.data.close[0] <= climax_high:
+            return
+
+        bullish_candle = self.data.close[0] > self.data.open[0]
+        if not bullish_candle:
+            return
+
+        big_body = (self.data.close[0] - self.data.open[0]) >= self.p.body_atr_mult * self.atr[0]
+        prior_bearish = self.data.close[-1] < self.data.open[-1]
+        engulfing = (
+            prior_bearish
+            and self.data.open[0] <= self.data.close[-1]
+            and self.data.close[0] >= self.data.open[-1]
+        )
+        if not (big_body or engulfing):
+            return
+
+        per_share_risk = self.p.stop_atr_mult * self.atr[0]
+        if per_share_risk <= 0:
+            return
+        risk_amount = self.p.risk_pct * self.broker.getvalue()
+        size = int(risk_amount / per_share_risk)
+        if size <= 0:
+            return
+
+        self.entry_atr = self.atr[0]
+        self.order = self.buy(size=size)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed and order.isbuy():
+            entry_price = order.executed.price
+            atr_val = self.entry_atr if self.entry_atr else self.atr[0]
+            self.stop_price = entry_price - self.p.stop_atr_mult * atr_val
+            risk = entry_price - self.stop_price
+            self.target_price = entry_price + self.p.reward_risk_mult * risk
+
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+            if not self.position:
+                self.stop_price = None
+                self.target_price = None
+                self.entry_atr = None
+```
+```json
+{"assumptions": [
+  {"topic": "climax lookback window", "choice": "Fixed the 'last 5-10 trading days' search window at 10 bars", "reason": "Spec gives a range, not a single number; chose the upper bound for a deterministic, wider search."},
+  {"topic": "selling climax day selection", "choice": "Among days in the lookback window that are down days with volume >= 1.5x the 50-day average volume, pick the one with the lowest low as the climax day", "reason": "Spec requires a 'sharp' drop but gives no magnitude threshold; using the most extreme low among qualifying volume-spike days operationalizes 'sharp' without inventing an unstated percentage cutoff."},
+  {"topic": "stop-loss method", "choice": "Used the ATR-based option (1.5x ATR14 below entry price) rather than 'a few points below the low of the entry day'", "reason": "Spec offers the two as alternatives ('or'); the ATR version is precisely quantifiable while 'a few points' is not, and 1.5 is the lower bound of the stated 1.5-2 ATR range."},
+  {"topic": "take-profit reward:risk ratio", "choice": "Used 2x the stop-loss distance (lower bound of the stated 1:2 to 1:3 range)", "reason": "Spec gives a range without a single preferred value."},
+  {"topic": "risk per trade", "choice": "Used 1% of current portfolio value (lower bound of the stated 1-2% range) to size positions via risk_amount / (1.5*ATR)", "reason": "Spec gives a range without a single preferred value; picked the more conservative bound."},
+  {"topic": "position sizing entry-price estimate", "choice": "Size is computed at signal time using the signal bar's close and ATR as a stand-in for entry price/risk; stop and target are then recomputed from the actual fill price once the market order completes", "reason": "Backtrader market orders fill at the next bar's open, which is unknown when size must be submitted alongside the order."},
+  {"topic": "price confirmation thresholds", "choice": "'Large body' defined as candle body (close-open) >= 1x ATR14; bullish engulfing defined as a bullish candle whose body contains the prior (bearish) candle's body", "reason": "Spec names these patterns qualitatively without numeric thresholds; ATR14 (already in the spec) provides a scale-appropriate, non-invented yardstick for 'large'."},
+  {"topic": "range filter (avoid strong sustained uptrends)", "choice": "Not implemented as a separate numeric filter or indicator", "reason": "Spec gives no quantifiable threshold for this qualitative guidance and adding one would mean inventing an indicator/filter the spec doesn't state; the requirement is treated as inherently satisfied because the Selling Climax condition already mandates a preceding sharp price drop, which precludes a strong sustained uptrend context."},
+  {"topic": "time filter (avoid major economic news days)", "choice": "Not implemented", "reason": "infeasible - the only data available is AAPL daily OHLCV; no economic news/calendar data exists in this environment to test against."}
+]}
+```

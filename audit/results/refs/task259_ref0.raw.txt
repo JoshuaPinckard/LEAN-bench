@@ -1,0 +1,134 @@
+```python
+import backtrader as bt
+
+
+class BBLowerTouchVolSellStrategy(bt.Strategy):
+    params = dict(
+        bb_period=20,
+        bb_devfactor=2.0,
+        ema_period=50,
+        sma_period=200,
+        rsi_period=14,
+        rsi_threshold=35.0,
+        bb_width_low=0.02,
+        bb_width_high=0.08,
+        atr_period=14,
+        atr_stop_mult=1.5,
+        risk_pct=0.01,
+        tp_r=0.5,
+        soft_stop_r=0.8,
+        hard_stop_r=1.0,
+        vol_exit_growth=0.20,
+        timebox_bars=60,
+        dd_limit=0.10,
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data, period=self.p.bb_period, devfactor=self.p.bb_devfactor)
+        self.ema50 = bt.indicators.EMA(self.data, period=self.p.ema_period)
+        self.sma200 = bt.indicators.SMA(self.data, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_bar = None
+        self.stop_price = None
+        self.soft_stop_price = None
+        self.take_profit_price = None
+        self.bb_width_entry = None
+        self._pending_atr = None
+        self._pending_bb_width = None
+        self.equity_peak = self.broker.getvalue()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_price = order.executed.price
+            self.entry_bar = len(self)
+            stop_distance = self.p.atr_stop_mult * self._pending_atr
+            self.stop_price = self.entry_price - self.p.hard_stop_r * stop_distance
+            self.soft_stop_price = self.entry_price - self.p.soft_stop_r * stop_distance
+            self.take_profit_price = self.entry_price + self.p.tp_r * stop_distance
+            self.bb_width_entry = self._pending_bb_width
+        self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.entry_price = None
+            self.entry_bar = None
+            self.stop_price = None
+            self.soft_stop_price = None
+            self.take_profit_price = None
+            self.bb_width_entry = None
+
+    def next(self):
+        value = self.broker.getvalue()
+        if value > self.equity_peak:
+            self.equity_peak = value
+        drawdown = (self.equity_peak - value) / self.equity_peak if self.equity_peak > 0 else 0.0
+
+        if self.order is not None:
+            return
+
+        if self.position:
+            if self.stop_price is not None and self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+                return
+            if self.soft_stop_price is not None and self.data.close[0] <= self.soft_stop_price:
+                self.order = self.close()
+                return
+            if self.take_profit_price is not None and self.data.high[0] >= self.take_profit_price:
+                self.order = self.close()
+                return
+            if self.bb_width_entry is not None:
+                bb_width_now = (self.bb.lines.top[0] - self.bb.lines.bot[0]) / self.bb.lines.mid[0]
+                if bb_width_now >= (1.0 + self.p.vol_exit_growth) * self.bb_width_entry:
+                    self.order = self.close()
+                    return
+            if self.entry_bar is not None and (len(self) - self.entry_bar) >= self.p.timebox_bars:
+                self.order = self.close()
+                return
+            return
+
+        if drawdown >= self.p.dd_limit:
+            return
+        if self.data.close[0] < self.sma200[0]:
+            return
+        if not (self.ema50[0] > self.sma200[0]):
+            return
+        if not (self.rsi[0] < self.p.rsi_threshold):
+            return
+        if not (self.data.low[0] <= self.bb.lines.bot[0]):
+            return
+
+        bb_width = (self.bb.lines.top[0] - self.bb.lines.bot[0]) / self.bb.lines.mid[0]
+        if not (self.p.bb_width_low <= bb_width <= self.p.bb_width_high):
+            return
+
+        stop_distance = self.p.atr_stop_mult * self.atr[0]
+        if stop_distance <= 0:
+            return
+        risk_amount = value * self.p.risk_pct
+        size = int(risk_amount / stop_distance)
+        if size < 1:
+            return
+
+        self._pending_atr = self.atr[0]
+        self._pending_bb_width = bb_width
+        self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "risk sizing", "choice": "risk_pct fixed at 1% of current broker portfolio value (low end of the stated 1-2% range); size = int((value*risk_pct) / (1.5*ATR14))", "reason": "spec states a 1-2% range but no rule for choosing a specific value within it; 'capital' is read as total account equity"},
+  {"topic": "touch/break detection", "choice": "use intrabar low/high (data.low[0] <= BB.bot for entry, data.high[0] >= take-profit) rather than close-only, checked once per bar in next()", "reason": "spec says 'touch/break' which implies intrabar price contact; no bt stop/limit broker orders are used since the spec describes level-based logic, not order types"},
+  {"topic": "soft vs hard stop distinction", "choice": "hard stop (-1.0R) triggers on any intrabar low touch of the level (guaranteed protection); soft stop (-0.8R) triggers only if the bar CLOSES at/below its level (confirmation-based)", "reason": "spec names two distinct stop tiers but gives no differentiated action (e.g. partial close); this intrabar-vs-close distinction gives both levels genuine separate meaning without inventing a partial-close percentage"},
+  {"topic": "DTE/timebox forced exit", "choice": "every trade opens at DTE=60 (the base duration named in the '60/30/10/0-bar timebox') and is force-closed at DTE=0, i.e. 60 bars held", "reason": "spec explicitly labels DTE=0 as '(timebox expiration day)'; DTE=30/10 are decay checkpoints along the same timebox with no distinct action specified, so implementing separate unconditional forced closes at 30/10 bars would prevent any trade from ever reaching its stated 60-bar timebox and isn't supported by additional spec detail"},
+  {"topic": "share sizing", "choice": "position size floored to whole shares (int()); if computed size < 1, the setup is skipped for that bar", "reason": "spec doesn't state fractional-share trading; whole-share sizing is the standard equity convention"},
+  {"topic": "exit-check priority", "choice": "when multiple exit conditions are true on the same bar, checked in order: hard stop, soft stop, take-profit, volatility-width exit, time-based exit", "reason": "spec states no priority among simultaneous exit triggers; capital-protection checks are ordered first as the conservative default"},
+  {"topic": "infeasible", "choice": "approximate the 'credit put spread' / 'VIX/IV analog' options structure with a directional long-equity position sized via the spec's own R-based risk formula, using the spec's literal (BB.top-BB.bot)/BB.mid formula as the volatility proxy", "reason": "the harness provides only a single AAPL OHLCV equity feed with no options chain or VIX/IV data, so the options-spread mechanics and external volatility index cannot be implemented; the spec itself already supplies a concrete OHLCV-computable volatility proxy, so the literal band-width rule is used as given"},
+  {"topic": "'price' comparisons", "choice": "'price is below SMA(200)' and other bare 'price' references use the bar close", "reason": "spec doesn't specify which price component; close is the conventional default for trend/level comparisons"}
+]}
+```

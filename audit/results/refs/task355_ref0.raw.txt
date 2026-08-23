@@ -1,0 +1,110 @@
+```python
+import math
+import backtrader as bt
+
+
+class OutsideBarReversalStrategy(bt.Strategy):
+    params = dict(
+        lookback=6,
+        risk_pct=0.01,
+        tick_size=0.01,
+    )
+
+    def __init__(self):
+        self.order = None
+        self.stop_order = None
+        self.stop_price = None
+        self.trigger_level = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order is self.stop_order:
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+            return
+
+        if order is self.order:
+            if order.status == order.Completed:
+                self.order = None
+                if self.position:
+                    if order.isbuy():
+                        self.stop_order = self.sell(
+                            exectype=bt.Order.Stop,
+                            price=self.stop_price,
+                            size=order.executed.size,
+                        )
+                    else:
+                        self.stop_order = self.buy(
+                            exectype=bt.Order.Stop,
+                            price=self.stop_price,
+                            size=abs(order.executed.size),
+                        )
+            else:
+                self.order = None
+
+    def next(self):
+        if len(self.data) <= self.p.lookback:
+            return
+
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0 and self.data.close[0] < self.trigger_level:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+            elif self.position.size < 0 and self.data.close[0] > self.trigger_level:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+            return
+
+        is_outside_bar = (
+            self.data.high[0] > self.data.high[-1]
+            and self.data.low[0] < self.data.low[-1]
+        )
+        if not is_outside_bar:
+            return
+
+        bullish = self.data.close[0] > self.data.open[0]
+        bearish = self.data.close[0] < self.data.open[0]
+        after_decline = self.data.close[0] < self.data.close[-self.p.lookback]
+        after_rally = self.data.close[0] > self.data.close[-self.p.lookback]
+
+        entry_price = self.data.close[0]
+        risk_budget = self.p.risk_pct * self.broker.getvalue()
+
+        if bullish and after_decline:
+            stop_price = self.data.low[0] - self.p.tick_size
+            risk_per_share = abs(entry_price - stop_price)
+            if risk_per_share > 0:
+                size = int(math.floor(risk_budget / risk_per_share))
+                if size > 0:
+                    self.trigger_level = self.data.low[0]
+                    self.stop_price = stop_price
+                    self.order = self.buy(size=size)
+        elif bearish and after_rally:
+            stop_price = self.data.high[0] + self.p.tick_size
+            risk_per_share = abs(entry_price - stop_price)
+            if risk_per_share > 0:
+                size = int(math.floor(risk_budget / risk_per_share))
+                if size > 0:
+                    self.trigger_level = self.data.high[0]
+                    self.stop_price = stop_price
+                    self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "tick size", "choice": "1 tick = $0.01", "reason": "spec references '1 tick' for stop offsets but does not define the tick size for this instrument; $0.01 is the standard US equity minimum price increment"},
+  {"topic": "risk formula sign for shorts", "choice": "use abs(entry_price - stop_price) as risk-per-share for both long and short sizing", "reason": "the literal formula (entry_price - stop_price) is negative for shorts since the stop is above entry, which would make the <=1% constraint meaningless; absolute value preserves the intended risk-based sizing purpose for both directions"},
+  {"topic": "share size rounding", "choice": "floor to whole shares via math.floor", "reason": "spec gives a sizing inequality but not a rounding rule; whole-share floor is the standard convention that also guarantees the risk constraint is satisfied, not exceeded"},
+  {"topic": "bracket order implementation", "choice": "submit the entry as a market order, then on its Completed notification submit a separate opposite-side Stop order at the stored stop price (a manual 2-leg entry+stop bracket)", "reason": "backtrader's native buy_bracket/sell_bracket always creates a 3rd take-profit leg requiring a limit price, which the spec never defines; the manual 2-leg chain implements exactly 'entry + stop' as stated without inventing a take-profit level"},
+  {"topic": "stop-loss vs close-based exit overlap", "choice": "when the manual close-price exit condition fires, cancel any still-pending protective stop order before submitting the market close", "reason": "spec requires only one open trade/exit at a time; canceling avoids a conflicting duplicate exit order when both exit conditions could otherwise fire"},
+  {"topic": "end-of-day flattening", "choice": "no forced end-of-day close was added; positions may be held across sessions until the exit condition or stop-loss triggers", "reason": "spec describes an intraday reversal signal but never states an explicit end-of-day flatten rule, and canonical defaults prohibit inventing extra exit conditions"},
+  {"topic": "market-hours filtering", "choice": "no additional time-of-day filter was added", "reason": "the harness's single data feed already consists solely of regular-session 5-minute AAPL bars, so the spec's 'ignore signals outside market hours' instruction is satisfied by the feed itself"},
+  {"topic": "infeasible: exact close-price fill", "choice": "entry orders are submitted as standard market orders in next(), which backtrader fills at the following bar's open, not the signal bar's close", "reason": "the harness provides a standard (non cheat-on-close) Cerebro/broker setup, so an order placed after evaluating the close of bar N cannot literally execute at that same close price; this is the closest achievable literal implementation in this environment"}
+]}
+```

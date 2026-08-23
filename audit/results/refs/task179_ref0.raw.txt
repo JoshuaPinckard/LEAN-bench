@@ -1,0 +1,74 @@
+```python
+import backtrader as bt
+
+
+class BuyingSpikeMomentum(bt.Strategy):
+    def __init__(self):
+        self.sma_price = bt.indicators.SMA(self.data.close, period=20)
+        self.sma_vol5 = bt.indicators.SMA(self.data.volume, period=5)
+        self.sma_vol20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.stoch = bt.indicators.Stochastic(
+            self.data, period=14, period_dfast=3, period_dslow=3
+        )
+        self.crossover = bt.indicators.CrossOver(self.stoch.percK, self.stoch.percD)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+
+        self.order = None
+        self.stop_order = None
+        self.entry_price = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.stop_order:
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+                stop_price = self.entry_price * 0.98
+                self.stop_order = self.sell(
+                    exectype=bt.Order.Stop, price=stop_price, size=order.executed.size
+                )
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            price_trend = self.data.close[0] > self.sma_price[0]
+            volume_spike = self.sma_vol5[0] >= 3 * self.sma_vol20[0]
+            stoch_confirm = (self.stoch.percK[0] > 80) and (
+                (self.crossover[0] > 0) or (self.data.close[0] > self.data.close[-1])
+            )
+            atr_filter = (self.atr[0] / self.data.close[0]) > 0.015
+            liquidity_filter = (self.sma_vol20[0] * self.sma_price[0]) >= 10_000_000
+
+            if price_trend and volume_spike and stoch_confirm and atr_filter and liquidity_filter:
+                size = int((self.broker.getvalue() * 0.02) / self.data.close[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
+        else:
+            bars_held = len(self) - self.entry_bar
+            exit_signal = (self.data.close[0] < self.sma_price[0]) or (bars_held >= 10)
+            if exit_signal:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "position_sizing_base", "choice": "2% of capital is computed against current portfolio value (self.broker.getvalue()) at the time of entry, not the fixed initial cash", "reason": "Spec says 'fixed 2% of capital per trade' without specifying whether capital is static starting cash or current equity; using live portfolio value is the standard reading of 'capital' in position-sizing formulas."},
+  {"topic": "share_rounding", "choice": "Size is floored to whole shares (2% of capital / entry-bar close price); entry is skipped if size rounds to 0", "reason": "Spec does not state fractional-share handling; backtrader's default sizing is share-count based, so whole-share flooring is the natural implementation."},
+  {"topic": "stop_loss_mechanism", "choice": "Implemented the stop-loss as a live bt.Order.Stop resting sell order at 2% below the recorded entry fill price, canceled whenever another exit condition fires first", "reason": "The spec calls it a 'stop-loss', which conventionally is a resting order that can trigger intrabar via High/Low, distinct from the close-based SMA/holding-period exits."},
+  {"topic": "exit_order_timing", "choice": "SMA-based and holding-period exits are submitted as market close() orders in next() (filling at the next bar's open per backtrader's standard order timing), matching the same next-bar-at-market timing explicitly specified for entries", "reason": "Spec states entries execute 'on the next bar at market' but is silent on exit timing; applying the same standard order-execution convention to exits keeps behavior consistent without inventing a different rule."},
+  {"topic": "liquidity_filter_reuse", "choice": "Reused the SMA(20) on close computed for the trend filter as the 'SMA(20, close)' term in the liquidity filter", "reason": "Both refer to the identical 20-period simple moving average of close; no separate indicator instance is needed."}
+]}
+```

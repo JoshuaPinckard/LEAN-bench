@@ -1,0 +1,127 @@
+```python
+import backtrader as bt
+
+
+class SwingMomentumStrategy(bt.Strategy):
+    params = dict(
+        sma_trend_period=200,
+        ema_fast_period=20,
+        ema_slow_period=50,
+        rsi_period=14,
+        rsi_level=50,
+        atr_period=14,
+        volume_sma_period=20,
+        require_volume_confirmation=False,
+        take_profit_pct=0.18,
+        initial_stop_pct=0.08,
+        initial_stop_atr_mult=2.0,
+        trail_atr_mult=3.0,
+        reserve_pct=0.20,
+        initial_entry_pct=0.60,
+        addon_pct=0.20,
+        max_position_pct=0.80,
+        pullback_min_pct=0.10,
+        pullback_max_pct=0.15,
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_trend_period)
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_fast_period)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=self.p.ema_slow_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_sma_period)
+        self.ema_cross = bt.indicators.CrossOver(self.ema20, self.ema50)
+
+        self.order = None
+        self.entry_price = None
+        self.initial_stop = None
+        self.highest_close = None
+        self.added = False
+
+    def _rsi_cross_up(self):
+        return self.rsi[-1] < self.p.rsi_level and self.rsi[0] > self.p.rsi_level
+
+    def _rsi_cross_down(self):
+        return self.rsi[-1] > self.p.rsi_level and self.rsi[0] < self.p.rsi_level
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if order.isbuy():
+                if self.entry_price is None:
+                    self.entry_price = order.executed.price
+                    self.initial_stop = self.entry_price - max(
+                        self.p.initial_stop_pct * self.entry_price,
+                        self.p.initial_stop_atr_mult * self.atr[0],
+                    )
+            elif order.issell():
+                self.entry_price = None
+                self.initial_stop = None
+                self.highest_close = None
+                self.added = False
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+
+        if not self.position:
+            if close <= self.sma200[0]:
+                return
+            ema_up = self.ema_cross[0] > 0
+            rsi_up = self._rsi_cross_up()
+            if not (ema_up or rsi_up):
+                return
+            if self.p.require_volume_confirmation and not (self.data.volume[0] > self.vol_sma[0]):
+                return
+            value = self.broker.getvalue() * self.p.initial_entry_pct
+            size = int(value / close)
+            if size > 0:
+                self.order = self.buy(size=size)
+            return
+
+        if self.highest_close is None:
+            self.highest_close = close
+        else:
+            self.highest_close = max(self.highest_close, close)
+
+        trailing_stop = max(self.initial_stop, self.highest_close - self.p.trail_atr_mult * self.atr[0])
+        take_profit_price = self.position.price * (1.0 + self.p.take_profit_pct)
+        trend_reversal = (self.ema_cross[0] < 0) or self._rsi_cross_down()
+
+        if close <= trailing_stop or close >= take_profit_price or trend_reversal:
+            self.order = self.close()
+            return
+
+        if not self.added:
+            pullback = (self.highest_close - close) / self.highest_close
+            trend_ok = close > self.sma200[0] and self.ema20[0] > self.ema50[0]
+            if self.p.pullback_min_pct <= pullback <= self.p.pullback_max_pct and trend_ok:
+                portfolio_value = self.broker.getvalue()
+                current_position_value = self.position.size * close
+                max_value = portfolio_value * self.p.max_position_pct
+                addon_budget = min(portfolio_value * self.p.addon_pct, max_value - current_position_value)
+                if addon_budget > 0:
+                    size = int(addon_budget / close)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+                        self.added = True
+```
+```json
+{"assumptions": [
+  {"topic": "volume confirmation default", "choice": "Volume confirmation logic is implemented and gated behind a params flag require_volume_confirmation, defaulting to False", "reason": "Spec marks it '(optional)', implying it is not a mandatory filter; the check is coded but disabled by default rather than omitted, so the stated rule is present without being forced onto entries"},
+  {"topic": "capital basis", "choice": "'Capital' for all sizing percentages (60%, 20% add-on, 80% max) is interpreted as current total portfolio value (self.broker.getvalue()), recomputed at each sizing decision rather than fixed at strategy start", "reason": "Spec does not define 'capital'; total equity is the standard reading and recomputing dynamically keeps the 80% cap meaningful as the account value changes"},
+  {"topic": "share sizing", "choice": "Order sizes are computed as floor(dollar_budget / current_close) to get whole shares", "reason": "Backtrader's default broker does not support fractional shares; spec gives percentage budgets, not share counts"},
+  {"topic": "stop/target trigger price", "choice": "Take-profit, trailing-stop, and add-on pullback comparisons all use the daily Close price rather than intrabar High/Low", "reason": "Spec repeatedly references 'close' (close > SMA200, highest_close_since_entry) and gives no intrabar execution rule, so Close is used uniformly for consistency"},
+  {"topic": "initial stop price basis", "choice": "'8% of price' in the initial-stop formula is read as 8% of the (original) entry_price, and the initial stop is computed once at the first entry fill using ATR at that fill bar", "reason": "The formula is defined in terms of 'entry_price', which is most naturally the original entry, and is not restated at add-on time"},
+  {"topic": "initial stop not recalculated on add-on", "choice": "The add-on purchase does not recompute initial_stop; it only adds shares to the position at the existing stop/trail framework", "reason": "Spec's stop formula is expressed once against 'entry_price' with no instruction to reset on averaging"},
+  {"topic": "post-entry high definition", "choice": "'post-entry high' used for the add-on pullback trigger is the same highest_close_since_entry variable used for the trailing stop", "reason": "Spec does not define a second high-water-mark series; reusing the one explicitly defined for the trailing stop avoids inventing an additional indicator"},
+  {"topic": "max position enforcement", "choice": "The add-on order size is explicitly capped so that current_position_value + addon_value does not exceed 80% of portfolio value, rather than relying on 60%+20%=80% holding by coincidence", "reason": "Spec states an explicit maximum position size rule, so it is enforced directly in the sizing logic"},
+  {"topic": "capital reserve implementation", "choice": "The 20% capital reserve is realized implicitly as the complement of the 80% maximum position cap; no separate cash-lock mechanism is implemented", "reason": "Spec gives no distinct mechanics for 'reserve' beyond the 60/20/80 percentages, which already sum to leave 20% undeployed"},
+  {"topic": "crossover semantics", "choice": "EMA20/EMA50 crosses use bt.indicators.CrossOver (strict prior-below/now-above and vice versa); RSI(14) crossing the 50 level is implemented manually with the same strict inequality convention (rsi[-1] vs 50 and rsi[0] vs 50)", "reason": "Spec names 'crosses' as an event; strict inequality on consecutive bars is the standard backtrader crossover definition and is applied consistently to both signals"}
+]}
+```

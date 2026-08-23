@@ -1,0 +1,103 @@
+```python
+import backtrader as bt
+
+
+class MacdVolumeCrossStrategy(bt.Strategy):
+    params = dict(
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        vol_period=20,
+        vol_mult=2.0,
+        atr_period=14,
+        atr_mult=2.0,
+    )
+
+    def __init__(self):
+        self.macd = bt.indicators.MACD(
+            self.data,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.crossover = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.vol_avg = bt.indicators.SMA(self.data.volume, period=self.p.vol_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted, order.Partial):
+            return
+
+        if order.status == order.Completed:
+            if order == self.order:
+                self.order = None
+                entry_price = order.executed.price
+                atr_val = self.atr[0]
+                if order.isbuy():
+                    size = order.executed.size
+                    stop_price = entry_price - self.p.atr_mult * atr_val
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=size
+                    )
+                else:
+                    size = abs(order.executed.size)
+                    stop_price = entry_price + self.p.atr_mult * atr_val
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=size
+                    )
+            elif order == self.stop_order:
+                self.stop_order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.order:
+                self.order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        volume_spike = self.data.volume[0] >= self.p.vol_mult * self.vol_avg[0]
+        bullish_signal = self.crossover[0] > 0 and volume_spike
+        bearish_signal = self.crossover[0] < 0 and volume_spike
+
+        if not bullish_signal and not bearish_signal:
+            return
+
+        pos_size = self.position.size
+
+        if bullish_signal:
+            if pos_size < 0:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.close()
+                self.order = self.buy()
+            elif pos_size == 0:
+                self.order = self.buy()
+        elif bearish_signal:
+            if pos_size > 0:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.close()
+                self.order = self.sell()
+            elif pos_size == 0:
+                self.order = self.sell()
+```
+```json
+{"assumptions": [
+  {"topic": "volume average window", "choice": "Used a 20-bar SMA of volume including the current bar (backtrader's standard SMA computation) as the '20-bar average volume' baseline, compared against the current bar's own volume.", "reason": "Spec states 'current bar's volume is at least twice the 20-bar average volume' without specifying whether the current bar is included in the average; the standard trailing SMA reading is the most literal interpretation."},
+  {"topic": "stop-loss mechanism", "choice": "Implemented the ATR stop as an actual bt.Order.Stop order (opposite side, sized to fully close the position) submitted immediately after the entry order fills, priced at entry_fill_price -+ 2*ATR(14) evaluated at the fill bar.", "reason": "Spec says stops are 'placed... at approximately 2x ATR from entry', implying a resting stop order rather than a mental/manual exit check; this is not covered by the canonical defaults so a concrete mechanism was chosen and declared."},
+  {"topic": "ATR value used for stop distance", "choice": "Used the ATR(14) value at the bar on which the entry order is filled (approximation of 'at entry') rather than the ATR at signal time.", "reason": "The entry order fills one bar after the signal bar under the default broker; ATR at fill time is the closest available reading to 'from entry'."},
+  {"topic": "reverse-on-opposite-signal mechanics", "choice": "On an opposite confirmed signal while a position is open, cancel any pending stop order, submit self.close() and then a new entry order (self.buy()/self.sell()) in the same next() call so both execute on the next bar's open.", "reason": "Spec explicitly requires 'exit or reverse' on the opposite signal; this is the standard backtrader reversal pattern and is not covered by the canonical defaults, so it is declared explicitly."},
+  {"topic": "no pyramiding on same-direction repeat signals", "choice": "If already long (or short) and the same-direction confirmed signal recurs, no additional order is submitted.", "reason": "Canonical default: hold at most one position at a time, no pyramiding, since the spec does not call for adding to winners."},
+  {"topic": "take-profit", "choice": "No take-profit order was added; the only stated exit mechanisms are the ATR stop and the opposite-signal reverse/exit.", "reason": "Spec only mentions ATR-based stops and opposite-signal exits/reversals; adding a take-profit would be an unstated extra rule."},
+  {"topic": "stop order re-pricing", "choice": "The stop order price is fixed at entry (not trailed or recalculated) for the life of the position.", "reason": "Spec says stops are placed 'at approximately 2x ATR from entry', with no mention of trailing, so the stop is static."},
+  {"topic": "position sizing", "choice": "Entries use plain self.buy()/self.sell() with no size argument (default sizer); the stop order is explicitly sized to the filled entry size to ensure full closure.", "reason": "Canonical default 1 for entries; the stop order's size is a mechanical necessity to fully exit the position, not a sizing policy choice."},
+  {"topic": "order guarding", "choice": "New entry orders are blocked while self.order (the entry order) is pending, per canonical default 5; the close() order fired for a reversal is not separately tracked/guarded since it always accompanies a concurrently-submitted new entry order.", "reason": "Follows the canonical order-guard convention while still allowing the close+reverse pattern the spec requires."}
+]}
+```

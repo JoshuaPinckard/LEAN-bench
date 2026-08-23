@@ -1,0 +1,57 @@
+{
+  "task_id": 111,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nfrom collections import deque\n\n\nclass CupAndHandleQuarterlyStrategy(bt.Strategy):\n    params = dict(\n        quarter_sma_period=200,\n        weekly_sma_period=20,\n        cup_min_depth=0.10,\n        rim_tolerance=0.07,\n        handle_max_retrace=0.50,\n        risk_pct=0.02,\n    )\n\n    def __init__(self):\n        self.order = None\n\n        self.q_key = None\n        self.q_high = None\n        self.q_low = None\n        self.q_close = None\n        self.q_bars = []\n\n        self.w_key = None\n        self.w_high = None\n        self.w_low = None\n        self.w_close = None\n        self.w_closes = deque(maxlen=self.p.weekly_sma_period)\n\n        self.cup_resistance = None\n        self.cup_height = None\n        self.handle_low = None\n        self.breakout_pending = False\n        self.entry_ref_price = None\n        self.target_price = None\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def _finalize_week(self):\n        self.w_closes.append(self.w_close)\n        if self.position and self.handle_low is not None and self.w_close < self.handle_low:\n            if not self.order:\n                self.order = self.close()\n\n    def _weekly_sma20(self):\n        if len(self.w_closes) < self.p.weekly_sma_period:\n            return None\n        return sum(self.w_closes) / self.p.weekly_sma_period\n\n    def _finalize_quarter(self):\n        self.q_bars.append((self.q_high, self.q_low, self.q_close))\n        self._detect_pattern_and_breakout()\n\n    def _detect_pattern_and_breakout(self):\n        n = len(self.q_bars)\n        if n < 5:\n            return\n\n        highs = [b[0] for b in self.q_bars]\n        lows = [b[1] for b in self.q_bars]\n        closes = [b[2] for b in self.q_bars]\n\n        pivot_highs = []\n        pivot_lows = []\n        for i in range(1, n - 1):\n            if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:\n                pivot_highs.append(i)\n            if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:\n                pivot_lows.append(i)\n\n        if len(pivot_highs) < 2 or not pivot_lows:\n            return\n\n        p2 = pivot_highs[-1]\n        troughs_before_p2 = [t for t in pivot_lows if t < p2]\n        if not troughs_before_p2:\n            return\n        t_cup = troughs_before_p2[-1]\n        peaks_before_t = [p for p in pivot_highs if p < t_cup]\n        if not peaks_before_t:\n            return\n        p1 = peaks_before_t[-1]\n\n        rim = min(highs[p1], highs[p2])\n        if rim <= 0:\n            return\n        depth = (rim - lows[t_cup]) / rim\n        symmetry = abs(highs[p1] - highs[p2]) / rim\n        if depth < self.p.cup_min_depth or symmetry > self.p.rim_tolerance:\n            return\n\n        cup_resistance = max(highs[p1], highs[p2])\n        cup_height = cup_resistance - lows[t_cup]\n\n        handle_troughs = [t for t in pivot_lows if t > p2]\n        if not handle_troughs:\n            return\n        t_handle = handle_troughs[-1]\n        handle_low = lows[t_handle]\n\n        if handle_low <= lows[t_cup]:\n            return\n        if (cup_resistance - handle_low) > self.p.handle_max_retrace * cup_height:\n            return\n\n        self.cup_resistance = cup_resistance\n        self.cup_height = cup_height\n        self.handle_low = handle_low\n\n        last_close = closes[-1]\n        all_time_high_close = max(closes[:-1])\n        quarter_sma200 = None\n        if n >= self.p.quarter_sma_period:\n            quarter_sma200 = sum(closes[-self.p.quarter_sma_period:]) / self.p.quarter_sma_period\n\n        if (last_close > self.cup_resistance\n                and last_close > all_time_high_close\n                and quarter_sma200 is not None\n                and last_close > quarter_sma200):\n            self.breakout_pending = True\n            self.entry_ref_price = last_close\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        q_key = (dt.year, (dt.month - 1) // 3 + 1)\n        w_key = dt.isocalendar()[:2]\n\n        if self.w_key is None:\n            self.w_key = w_key\n            self.w_high = self.data.high[0]\n            self.w_low = self.data.low[0]\n            self.w_close = self.data.close[0]\n        elif w_key != self.w_key:\n            self._finalize_week()\n            self.w_key = w_key\n            self.w_high = self.data.high[0]\n            self.w_low = self.data.low[0]\n            self.w_close = self.data.close[0]\n        else:\n            self.w_high = max(self.w_high, self.data.high[0])\n            self.w_low = min(self.w_low, self.data.low[0])\n            self.w_close = self.data.close[0]\n\n        if self.q_key is None:\n            self.q_key = q_key\n            self.q_high = self.data.high[0]\n            self.q_low = self.data.low[0]\n            self.q_close = self.data.close[0]\n        elif q_key != self.q_key:\n            self._finalize_quarter()\n            self.q_key = q_key\n            self.q_high = self.data.high[0]\n            self.q_low = self.data.low[0]\n            self.q_close = self.data.close[0]\n        else:\n            self.q_high = max(self.q_high, self.data.high[0])\n            self.q_low = min(self.q_low, self.data.low[0])\n            self.q_close = self.data.close[0]\n\n        if self.order:\n            return\n\n        if self.position:\n            if self.target_price is not None and self.data.high[0] >= self.target_price:\n                self.order = self.close()\n            return\n\n        if self.breakout_pending:\n            self.breakout_pending = False\n            weekly_sma20 = self._weekly_sma20()\n            if weekly_sma20 is not None and self.data.close[0] > weekly_sma20:\n                risk_per_share = self.entry_ref_price - self.handle_low\n                if risk_per_share > 0:\n                    risk_amount = self.p.risk_pct * self.broker.getvalue()\n                    size = risk_amount / risk_per_share\n                    if size > 0:\n                        self.target_price = self.entry_ref_price + self.cup_height\n                        self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "multi-timeframe construction",
+      "choice": "Weekly and quarterly OHLC bars are manually aggregated inside next() from the single daily feed (calendar quarters Jan-Mar/Apr-Jun/Jul-Sep/Oct-Dec, ISO calendar weeks); each period is finalized on the first bar of the following period since forward look-ahead is not available.",
+      "reason": "The harness supplies only one daily PandasData feed; no separate weekly/quarterly resampled feeds are added by cerebro."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Quarterly SMA(200) is computed literally as the mean of the last 200 completed quarterly closes.",
+      "reason": "The feed spans 2020-2025 (~24 calendar quarters), far short of the 200 quarters (50 years) required, so this condition can never be satisfied and the strategy will not open any position over this backtest window; implemented literally per spec rather than shortening the lookback."
+    },
+    {
+      "topic": "pattern detection algorithm",
+      "choice": "Peaks/troughs on the quarterly series use 3-bar local pivots (a quarter's high/low exceeding both immediate neighbors); a valid cup requires the two flanking peaks within 7% of each other and a trough at least 10% below the rim; a valid handle requires a later pivot low above the cup trough that retraces less than 50% of the cup's depth.",
+      "reason": "Spec calls for an 'algorithmic search for a sequence of peaks and troughs' but gives no concrete thresholds, so reasonable numeric defaults were declared."
+    },
+    {
+      "topic": "entry timing",
+      "choice": "All entry conditions (weekly SMA20, breakout, ATH, quarterly SMA200) are evaluated once on the bar where the breakout quarter is finalized; self.buy() is submitted there and fills at the next bar's open under backtrader's default execution, realizing the spec's 'open of the next week' alternative. If the weekly-SMA condition fails at that moment the setup is dropped rather than retried later.",
+      "reason": "Spec offers two alternative entry moments; standard next-bar-open fills implement the second one without needing cheat-on-close."
+    },
+    {
+      "topic": "weekly SMA20 basis",
+      "choice": "Weekly SMA20 uses the last 20 completed (fully closed) ISO weeks, not the still-forming current week.",
+      "reason": "Spec does not state whether the in-progress week counts; using only closed weeks matches standard indicator semantics and avoids a constantly-shifting average."
+    },
+    {
+      "topic": "stop-loss definition",
+      "choice": "The spec's two stop-loss descriptions ('lower boundary of the handle' and 'local low formed during handle formation') are treated as one price level (the pivot low identified as the handle trough), and the stop is evaluated only at weekly close.",
+      "reason": "Literal reading of the two clauses as describing the same boundary; weekly-close timing is stated explicitly in the spec ('closes the week below')."
+    },
+    {
+      "topic": "take-profit trigger",
+      "choice": "Take-profit is checked intrabar using the daily high against the target (entry price + cup height), exiting via self.close().",
+      "reason": "Spec says 'the price reaches the target level' without restricting to close-only; the daily high is the closest available proxy for an intrabar touch."
+    },
+    {
+      "topic": "all-time-high filter",
+      "choice": "The ATH condition compares the breakout quarter's close only against quarterly closes recorded since the start of the supplied feed (2020-01-02).",
+      "reason": "No earlier price history exists in this environment to establish a true all-time high."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "size = (2% of current broker.getvalue()) / (breakout quarter's closing price - handle low); the breakout close is used as the entry reference price since the true fill price is unknown in advance.",
+      "reason": "Spec requires stop-loss risk capped at 2% of capital but does not specify which price to use for the entry side of that calculation."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

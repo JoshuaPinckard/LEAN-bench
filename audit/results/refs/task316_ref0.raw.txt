@@ -1,0 +1,81 @@
+```python
+import backtrader as bt
+
+
+class VolatilityTrendBandStrategy(bt.Strategy):
+    params = dict(
+        atr_period=10,
+        atr_multiplier=3,
+        ma_period=20,
+        band_period=20,
+        band_mult=2.0,
+        expansion_mult=1.0,
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ma = bt.indicators.EMA(self.data.close, period=self.p.ma_period)
+        self.signal = self.data.close - self.ma
+        self.signal_mean = bt.indicators.SMA(self.signal, period=self.p.band_period)
+        self.signal_std = bt.indicators.StdDev(self.signal, period=self.p.band_period)
+        self.upper_band = self.signal_mean + self.p.band_mult * self.signal_std
+        self.lower_band = self.signal_mean - self.p.band_mult * self.signal_std
+
+        self.cross_upper = bt.indicators.CrossOver(self.signal, self.upper_band)
+        self.cross_lower = bt.indicators.CrossOver(self.signal, self.lower_band)
+        self.cross_mean = bt.indicators.CrossOver(self.signal, self.signal_mean)
+
+        self.order = None
+        self.stop_order = None
+        self.entry_atr = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order == self.order:
+            if order.status == order.Completed:
+                if order.isbuy():
+                    stop_price = order.executed.price - self.p.atr_multiplier * self.entry_atr
+                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price)
+                else:
+                    stop_price = order.executed.price + self.p.atr_multiplier * self.entry_atr
+                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price)
+            self.order = None
+
+        elif order == self.stop_order:
+            if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+                self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            expansion = abs(self.signal[0] - self.signal[-1]) > self.p.expansion_mult * self.signal_std[0]
+
+            if self.cross_upper[0] > 0 and expansion:
+                self.entry_atr = self.atr[0]
+                self.order = self.buy()
+            elif self.cross_lower[0] < 0 and expansion:
+                self.entry_atr = self.atr[0]
+                self.order = self.sell()
+
+        else:
+            if self.position.size > 0 and self.cross_mean[0] < 0:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+            elif self.position.size < 0 and self.cross_mean[0] > 0:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "stop order mechanism", "choice": "Submit entry via self.buy()/self.sell(); upon notify_order Completed for the entry order, submit a separate protective order with exectype=bt.Order.Stop at order.executed.price -/+ 3*ATR (rather than using buy_bracket/sell_bracket).", "reason": "Bracket orders require the stop price to be fixed at submission time, but the spec's 'entry_price' is the actual fill price, which is only known once the entry order completes; a manually-submitted stop order after fill is the literal reading of 'entry_price - 3*ATR'."},
+  {"topic": "ATR sampling time for stop", "choice": "Capture ATR as self.atr[0] on the bar the entry signal fires (order submission bar), and use that captured value to compute the stop price once the entry order fills.", "reason": "Spec does not specify whether ATR should be sampled at signal time or fill time; signal-bar ATR is the value available when the trade decision is made."},
+  {"topic": "expansion filter signal_std indexing", "choice": "Use the current bar's signal_std (self.signal_std[0]) in 'abs(signal - signal[-1]) > 1.0*signal_std'.", "reason": "Spec gives no explicit index for signal_std in this comparison; current-bar value is the literal reading."},
+  {"topic": "stop order cancellation on signal exit", "choice": "When the mean-cross exit condition triggers, cancel any pending protective stop order before submitting self.close().", "reason": "The protective stop only makes sense while the position is open; canceling it prevents a stray stop order from acting on a position already being closed by the signal-driven exit."}
+]}
+```

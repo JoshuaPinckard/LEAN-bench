@@ -1,0 +1,42 @@
+{
+  "task_id": 95,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport math\nimport statistics\nfrom collections import deque\n\n\nclass VaROverlappingIntervalsStrategy(bt.Strategy):\n    params = (\n        ('vol_period', 250),\n        ('confidence_level', 0.95),\n        ('horizon', 1),\n        ('black_swan_z', 5.0),\n    )\n\n    def __init__(self):\n        self.returns = deque(maxlen=self.p.vol_period + 1)\n        self.z = statistics.NormalDist().inv_cdf(self.p.confidence_level)\n\n        self.hits = []\n        self.total_observations = 0\n        self.total_exceedances = 0\n        self.total_excluded_black_swan = 0\n        self.current_run = 0\n        self.max_run = 0\n        self.num_clusters = 0\n        self.exceedance_indices = []\n\n    def next(self):\n        if len(self.data) < 2:\n            return\n\n        ret = (self.data.close[0] - self.data.close[-1]) / self.data.close[-1]\n        self.returns.append(ret)\n\n        if len(self.returns) <= self.p.vol_period:\n            return\n\n        hist = list(self.returns)[-self.p.vol_period - 1:-1]\n        n = len(hist)\n        mean = sum(hist) / n\n        variance = sum((r - mean) ** 2 for r in hist) / (n - 1)\n        sigma = math.sqrt(variance)\n\n        var_pct = self.z * sigma * math.sqrt(self.p.horizon)\n        portfolio_value = self.broker.getvalue()\n        var_dollar = var_pct * portfolio_value\n        loss = -ret * portfolio_value\n\n        is_black_swan = abs(ret) > self.p.black_swan_z * sigma\n\n        self.total_observations += 1\n\n        if is_black_swan:\n            self.total_excluded_black_swan += 1\n            self.current_run = 0\n            self.hits.append({'excluded': True, 'exceedance': False})\n            return\n\n        is_exceedance = loss > var_dollar\n        self.hits.append({'excluded': False, 'exceedance': is_exceedance})\n\n        if is_exceedance:\n            self.total_exceedances += 1\n            self.exceedance_indices.append(len(self.hits) - 1)\n            self.current_run += 1\n            if self.current_run == 2:\n                self.num_clusters += 1\n            self.max_run = max(self.max_run, self.current_run)\n        else:\n            self.current_run = 0\n\n    def stop(self):\n        n = self.total_observations - self.total_excluded_black_swan\n        p_hat = self.total_exceedances / n if n > 0 else 0.0\n        expected_p = 1.0 - self.p.confidence_level\n\n        gaps = []\n        for i in range(1, len(self.exceedance_indices)):\n            gaps.append(self.exceedance_indices[i] - self.exceedance_indices[i - 1])\n        avg_gap = sum(gaps) / len(gaps) if gaps else None\n\n        conditional_hits = 0\n        conditional_total = 0\n        for i in range(1, len(self.hits)):\n            prev = self.hits[i - 1]\n            cur = self.hits[i]\n            if prev['excluded'] or cur['excluded']:\n                continue\n            if prev['exceedance']:\n                conditional_total += 1\n                if cur['exceedance']:\n                    conditional_hits += 1\n        p_conditional = conditional_hits / conditional_total if conditional_total > 0 else None\n\n        print('=== VaR Overlapping-Interval Exceedance Report ===')\n        print('Observations analyzed (excl. black swans): %d' % n)\n        print('Black-swan periods excluded: %d' % self.total_excluded_black_swan)\n        print('Total VaR exceedances: %d' % self.total_exceedances)\n        print('Empirical exceedance rate: %.4f (model-implied rate: %.4f)' % (p_hat, expected_p))\n        print('Max consecutive-exceedance run length: %d' % self.max_run)\n        print('Number of exceedance clusters (runs >= 2): %d' % self.num_clusters)\n        if avg_gap is not None:\n            print('Average gap between exceedances (bars): %.2f' % avg_gap)\n        if p_conditional is not None:\n            print('P(exceedance | previous bar exceedance) = %.4f vs unconditional rate = %.4f' % (p_conditional, p_hat))\n\n        if p_hat > expected_p * 1.5:\n            print('Conclusion: empirical exceedance rate materially exceeds the model-implied rate; VaR model appears to understate risk.')\n        elif p_hat < expected_p * 0.5:\n            print('Conclusion: empirical exceedance rate is materially below the model-implied rate; VaR model appears conservative.')\n        else:\n            print('Conclusion: empirical exceedance rate is broadly consistent with the model-implied rate.')\n\n        if p_conditional is not None and p_conditional > p_hat * 1.5:\n            print('Conclusion: exceedances cluster well beyond what independence would predict, indicating dependence introduced by overlapping intervals and likely VaR model misspecification.')\n        elif self.num_clusters == 0 and self.total_exceedances > 1:\n            print('Conclusion: exceedances are isolated rather than clustered, consistent with the independence assumption holding despite overlapping intervals.')\n        else:\n            print('Conclusion: insufficient evidence to distinguish clustering from randomness given the observed exceedance count.')",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "The spec's sub-daily overlapping-window step (e.g., 0.5 day/12h) for the 1-day VaR forecast horizon cannot be realized because the feed provides only one bar per trading day (no intraday/overnight prices). The VaR check is instead evaluated once per available bar (step = 1 trading day, the feed's finest granularity), and the mandated overlap between successive VaR windows is realized through the 250-day historical-volatility window, which rolls forward one bar at a time so consecutive estimation windows share 249 of 250 observations.",
+      "reason": "Environment supplies only daily OHLCV bars; sub-daily sampling of returns is not available from the data feed."
+    },
+    {
+      "topic": "var_methodology",
+      "choice": "Daily VaR is computed parametrically as VaR = z(confidence_level) * sigma_250 * sqrt(horizon) * portfolio_value, where sigma_250 is the sample standard deviation of the trailing 250 simple daily returns strictly prior to the current bar (no look-ahead), portfolio_value = self.broker.getvalue(), and z is the exact normal quantile via statistics.NormalDist().inv_cdf(confidence_level).",
+      "reason": "Spec specifies 'historical volatility' as the VaR basis but does not give the exact formula; this is the standard parametric (variance-covariance) historical-volatility VaR construction."
+    },
+    {
+      "topic": "trading_logic",
+      "choice": "No buy/sell/close orders are ever placed; the strategy only records VaR exceedances and their clustering statistics.",
+      "reason": "Spec explicitly states entering and exiting a position are 'not the main purpose' of the strategy and gives no entry/exit rule, so adding one would invent behavior the spec does not state."
+    },
+    {
+      "topic": "black_swan_threshold",
+      "choice": "A day is filtered out as a 'black swan' / high-volatility period, and excluded from the exceedance analysis, when abs(daily return) > 5 * sigma_250.",
+      "reason": "Spec calls for a black-swan filter but gives no numeric threshold; 5 standard deviations is a conventional extreme-outlier cutoff distinct from the 95% VaR confidence z-score."
+    },
+    {
+      "topic": "cluster_definition",
+      "choice": "A 'cluster' of exceedances is counted whenever a run of 2 or more consecutive (non-excluded) bars each register an exceedance; the report also tracks the longest run and the gaps between exceedances, and compares P(exceedance | previous bar exceedance) to the unconditional exceedance rate.",
+      "reason": "Spec requires analyzing clustering/dependence but does not define the statistic; this is a standard, self-contained way to detect dependence, consistent with the independence-testing idea the spec alludes to."
+    },
+    {
+      "topic": "reporting_mechanism",
+      "choice": "The end-of-backtest report (exceedance count, distribution/clustering statistics, and conclusions) is emitted via print() inside stop().",
+      "reason": "backtrader Strategy objects have no other built-in channel for a free-text summary report; stop() is the standard place for end-of-run output and this is not top-level module code."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

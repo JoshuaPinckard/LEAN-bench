@@ -1,0 +1,142 @@
+{
+  "task_id": 157,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport collections\n\n\nclass CheapVolatilityStrategy(bt.Strategy):\n    params = (\n        ('bb1_period', 20),\n        ('bb2_period', 100),\n        ('ema_period', 20),\n        ('sma_period', 50),\n        ('rsi_period', 14),\n        ('atr_period', 14),\n        ('vol_sma_short', 20),\n        ('vol_sma_long', 100),\n        ('ratio_lookback', 252),\n        ('ratio_percentile', 0.20),\n        ('width_lookback', 21),\n        ('vol_breakout_mult', 1.5),\n        ('stop_atr_mult', 1.5),\n        ('target_atr_mult', 3.0),\n        ('trail_atr_mult', 1.0),\n    )\n\n    def __init__(self):\n        self.bb20 = bt.indicators.BollingerBands(self.data, period=self.p.bb1_period)\n        self.bb100 = bt.indicators.BollingerBands(self.data, period=self.p.bb2_period)\n        self.ema20 = bt.indicators.EMA(self.data, period=self.p.ema_period)\n        self.sma50 = bt.indicators.SMA(self.data, period=self.p.sma_period)\n        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)\n        self.macd = bt.indicators.MACD(self.data)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_short)\n        self.vol_sma100 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_long)\n\n        self.bb20_width = self.bb20.top - self.bb20.bot\n        self.bb100_width = self.bb100.top - self.bb100.bot\n\n        self.ratio_hist = collections.deque(maxlen=self.p.ratio_lookback)\n        self.width_hist = collections.deque(maxlen=self.p.width_lookback)\n\n        self.order = None\n        self.entry_price = None\n        self.entry_atr = None\n        self.stop_price = None\n        self.target_price = None\n        self.trail_extreme = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def next(self):\n        bb100w = self.bb100_width[0]\n        ratio = self.bb20_width[0] / bb100w if bb100w != 0 else None\n        if ratio is not None:\n            self.ratio_hist.append(ratio)\n        self.width_hist.append(self.bb20_width[0])\n\n        if self.order:\n            return\n\n        if self.position:\n            self._manage_exit()\n            return\n\n        liquidity_ok = self.vol_sma20[0] > self.vol_sma100[0]\n        if not liquidity_ok:\n            return\n\n        bullish = (self.ema20[0] > self.sma50[0]) and (self.rsi[0] > 55) and (self.macd.macd[0] > 0)\n        bearish = (self.ema20[0] < self.sma50[0]) and (self.rsi[0] < 45) and (self.macd.macd[0] < 0)\n\n        cheap_vol = False\n        if ratio is not None and len(self.ratio_hist) == self.p.ratio_lookback:\n            sorted_vals = sorted(self.ratio_hist)\n            idx = int(self.p.ratio_percentile * (len(sorted_vals) - 1))\n            threshold = sorted_vals[idx]\n            cheap_vol = ratio <= threshold\n\n        if cheap_vol and bullish:\n            self.order = self.buy()\n            return\n        if cheap_vol and bearish:\n            self.order = self.sell()\n            return\n\n        width_is_min = (len(self.width_hist) == self.p.width_lookback\n                         and self.bb20_width[0] == min(self.width_hist))\n        vol_breakout = self.data.volume[0] > self.p.vol_breakout_mult * self.vol_sma20[0]\n\n        if width_is_min and vol_breakout:\n            if self.data.close[0] > self.bb20.top[0]:\n                self.order = self.buy()\n            elif self.data.close[0] < self.bb20.bot[0]:\n                self.order = self.sell()\n\n    def _manage_exit(self):\n        is_long = self.position.size > 0\n\n        if self.entry_price is None:\n            self.entry_price = self.position.price\n            self.entry_atr = self.atr[0]\n            if is_long:\n                self.stop_price = self.entry_price - self.p.stop_atr_mult * self.entry_atr\n                self.target_price = self.entry_price + self.p.target_atr_mult * self.entry_atr\n            else:\n                self.stop_price = self.entry_price + self.p.stop_atr_mult * self.entry_atr\n                self.target_price = self.entry_price - self.p.target_atr_mult * self.entry_atr\n            self.trail_extreme = self.entry_price\n\n        close = self.data.close[0]\n\n        if is_long:\n            self.trail_extreme = max(self.trail_extreme, close)\n            trail_stop = self.trail_extreme - self.p.trail_atr_mult * self.atr[0]\n            reverse = self.ema20[0] < self.sma50[0]\n            exit_now = (close <= self.stop_price or close >= self.target_price\n                        or close <= trail_stop or reverse)\n        else:\n            self.trail_extreme = min(self.trail_extreme, close)\n            trail_stop = self.trail_extreme + self.p.trail_atr_mult * self.atr[0]\n            reverse = self.ema20[0] > self.sma50[0]\n            exit_now = (close >= self.stop_price or close <= self.target_price\n                        or close >= trail_stop or reverse)\n\n        if exit_now:\n            self.order = self.close()\n            self.entry_price = None\n            self.entry_atr = None\n            self.stop_price = None\n            self.target_price = None\n            self.trail_extreme = None",
+  "assumptions": [
+    {
+      "topic": "macd_params",
+      "choice": "Use backtrader default MACD(12,26,9); compare the MACD line itself (fast EMA - slow EMA), not the signal line or histogram, against 0.",
+      "reason": "Spec states 'MACD > 0' without giving periods; defaults are the conventional MACD settings and 'MACD' conventionally denotes the MACD line."
+    },
+    {
+      "topic": "bollinger_devfactor",
+      "choice": "devfactor=2.0 (backtrader default) for both BB(20) and BB(100).",
+      "reason": "Spec gives only the period for each Bollinger Band, not the standard-deviation multiplier."
+    },
+    {
+      "topic": "percentile_method",
+      "choice": "Nearest-rank on the sorted trailing 252-bar window (including current bar): threshold = sorted[floor(0.20*(n-1))]; cheap-vol = ratio <= threshold. Flag is False until 252 ratio observations have accumulated.",
+      "reason": "Spec says 'lowest 20% over 252 bars' but does not specify the percentile/interpolation method or warm-up behavior."
+    },
+    {
+      "topic": "width_min_check",
+      "choice": "Exact equality of current BB(20) width against min() of the trailing 21-bar window (including current bar); False until 21 observations exist.",
+      "reason": "Spec literally states 'width = the minimum over 21 days', implemented as a direct equality check on the rolling window."
+    },
+    {
+      "topic": "liquidity_filter_scope",
+      "choice": "Apply SMA(volume,20) > SMA(volume,100) as a gate on all three entry rules (Cheap Calls, Cheap Puts, Earnings-analog breakout).",
+      "reason": "Spec lists the liquidity filter as a standalone bullet, not scoped to one specific entry rule."
+    },
+    {
+      "topic": "exit_price_basis",
+      "choice": "Evaluate stop, target, and trailing-stop levels against each bar's Close price rather than intrabar High/Low.",
+      "reason": "Spec does not specify an order type or intrabar trigger mechanism; Close-based checks keep the reference deterministic and avoid inventing broker order semantics."
+    },
+    {
+      "topic": "entry_reference_levels",
+      "choice": "Fixed stop/target prices are computed once, on the first bar the position is confirmed open, using position.price and ATR(14) on that bar; they remain constant thereafter (aside from the trailing stop).",
+      "reason": "Spec does not state whether ATR is sampled at entry or re-evaluated continuously for the fixed stop/target; entry-time sampling is the standard reading of a fixed stop/target."
+    },
+    {
+      "topic": "optional_trailing_stop",
+      "choice": "Implement the 1xATR(14) trailing stop as an always-active exit condition running alongside the fixed stop/target/crossover exits, using the running favorable-close extreme since entry and the current bar's ATR(14).",
+      "reason": "Spec supplies an explicit parameter for the trailing stop despite calling it 'optional'; read as a supplementary exit rather than an omitted one, since fidelity requires implementing every stated parameter."
+    },
+    {
+      "topic": "signal_priority",
+      "choice": "When Cheap Calls/Cheap Puts (regime+bias) and the Earnings-analog breakout both qualify on the same bar, the regime+bias rule is evaluated first and takes the trade.",
+      "reason": "At most one position may be held at a time (canonical default) and the spec does not state a priority order between its three entry rules."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 7,
+  "tape": [
+    {
+      "dt": "2021-08-02T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 142.66467417357075
+    },
+    {
+      "dt": "2021-08-19T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 141.5800696426097
+    },
+    {
+      "dt": "2021-10-14T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 138.72954178771872
+    },
+    {
+      "dt": "2021-10-19T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 143.51295730034732
+    },
+    {
+      "dt": "2022-01-05T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 175.59342173117227
+    },
+    {
+      "dt": "2022-01-06T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 168.83792269234627
+    },
+    {
+      "dt": "2022-09-26T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 146.91864756165486
+    },
+    {
+      "dt": "2022-10-05T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 141.43101553965928
+    },
+    {
+      "dt": "2023-06-26T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 184.24700235631448
+    },
+    {
+      "dt": "2023-07-10T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 186.6433878022031
+    },
+    {
+      "dt": "2024-04-19T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 164.55939469854349
+    },
+    {
+      "dt": "2024-04-25T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 167.84640961058278
+    },
+    {
+      "dt": "2024-09-27T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 226.76013618443497
+    },
+    {
+      "dt": "2024-10-02T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 224.20925878310885
+    }
+  ]
+}

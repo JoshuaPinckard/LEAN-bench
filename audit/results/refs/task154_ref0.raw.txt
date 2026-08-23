@@ -1,0 +1,162 @@
+```python
+import backtrader as bt
+
+
+class ScalpVolAtrStrategy(bt.Strategy):
+    params = dict(
+        rsi_period=14,
+        atr_period=14,
+        vol_sma_period=5,
+        vol_mult=1.2,
+        atr_close_ratio=0.002,
+        tp_atr_mult=1.5,
+        risk_pct=0.01,
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.state = 'flat'
+        self.order = None
+        self.tp_order = None
+        self.sl_order = None
+        self.close_order = None
+        self.direction = None
+        self.signal_open = None
+        self.signal_atr = None
+        self.exit_deadline_bar = None
+
+    def _reset_signal(self):
+        self.direction = None
+        self.signal_open = None
+        self.signal_atr = None
+        self.exit_deadline_bar = None
+        self.state = 'flat'
+
+    def _trade_closed(self):
+        self.tp_order = None
+        self.sl_order = None
+        self.close_order = None
+        self.direction = None
+        self.signal_open = None
+        self.signal_atr = None
+        self.exit_deadline_bar = None
+        self.state = 'flat'
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if self.order is not None and order == self.order:
+            self.order = None
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                if self.direction == 'long':
+                    tp_price = entry_price + self.p.tp_atr_mult * self.signal_atr
+                    self.tp_order = self.sell(exectype=bt.Order.Limit, price=tp_price, size=size)
+                    self.sl_order = self.sell(exectype=bt.Order.Stop, price=self.signal_open,
+                                               size=size, oco=self.tp_order)
+                else:
+                    tp_price = entry_price - self.p.tp_atr_mult * self.signal_atr
+                    self.tp_order = self.buy(exectype=bt.Order.Limit, price=tp_price, size=size)
+                    self.sl_order = self.buy(exectype=bt.Order.Stop, price=self.signal_open,
+                                              size=size, oco=self.tp_order)
+                self.exit_deadline_bar = len(self) + 1
+                self.state = 'in_trade'
+            else:
+                self._reset_signal()
+            return
+
+        if self.tp_order is not None and order == self.tp_order:
+            completed = order.status == order.Completed
+            self.tp_order = None
+            if completed:
+                self._trade_closed()
+            return
+
+        if self.sl_order is not None and order == self.sl_order:
+            completed = order.status == order.Completed
+            self.sl_order = None
+            if completed:
+                self._trade_closed()
+            return
+
+        if self.close_order is not None and order == self.close_order:
+            self.close_order = None
+            self._trade_closed()
+            return
+
+    def next(self):
+        if self.state == 'in_trade' and len(self) >= self.exit_deadline_bar:
+            if self.tp_order is not None:
+                self.cancel(self.tp_order)
+                self.tp_order = None
+            if self.sl_order is not None:
+                self.cancel(self.sl_order)
+                self.sl_order = None
+            self.close_order = self.close()
+            self.state = 'closing'
+            return
+
+        if self.state != 'flat':
+            return
+
+        t = self.data.datetime.time(0)
+        in_session = (9, 30) <= (t.hour, t.minute) <= (16, 0)
+        if not in_session:
+            return
+
+        open_ = self.data.open[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        close = self.data.close[0]
+        volume = self.data.volume[0]
+
+        atr = self.atr[0]
+        rsi = self.rsi[0]
+        vol_sma = self.vol_sma[0]
+
+        volume_filter = volume >= self.p.vol_mult * vol_sma
+        range_filter = (high - low) >= atr
+        vol_regime_filter = (atr / close) >= self.p.atr_close_ratio if close else False
+
+        long_signal = (close > open_) and (rsi > 50) and volume_filter and range_filter and vol_regime_filter
+        short_signal = (close < open_) and (rsi < 50) and volume_filter and range_filter and vol_regime_filter
+
+        if not (long_signal or short_signal):
+            return
+
+        risk_per_share = abs(close - open_)
+        if risk_per_share <= 0:
+            return
+
+        risk_amount = self.p.risk_pct * self.broker.getvalue()
+        size = int(risk_amount / risk_per_share)
+        if size < 1:
+            return
+
+        self.signal_open = open_
+        self.signal_atr = atr
+
+        if long_signal:
+            self.direction = 'long'
+            self.order = self.buy(size=size)
+        else:
+            self.direction = 'short'
+            self.order = self.sell(size=size)
+
+        self.state = 'pending_entry'
+```
+```json
+{"assumptions": [
+  {"topic": "next_bar_definition", "choice": "'The next 1-minute bar' for the TP/SL fallback close is the bar immediately following the entry-fill bar. TP/SL bracket orders (Limit/Stop, OCO-linked) become live on that bar; if neither triggers by its close, the position is closed at market on that same bar.", "reason": "backtrader queues newly submitted orders for evaluation starting the following bar, so this is the earliest bar at which TP/SL can be checked after a market-order entry without look-ahead; it is the closest literal reading of the fallback rule given the simulation engine."},
+  {"topic": "position_sizing_reference_price", "choice": "The estimated entry price used for the 1%-risk sizing calculation is the signal bar's Close, so risk-per-share = |Close - Open| of the signal candle (matching the stop level = signal-candle Open).", "reason": "the actual fill price is unknown until the entry order executes at the next bar's open, so the last known reference price (signal-bar Close) is used to size the position in advance."},
+  {"topic": "capital_definition", "choice": "'Capital' for the 1%-risk cap is the current portfolio value (broker.getvalue()) at the moment of signal, not the fixed starting cash.", "reason": "the spec does not define 'capital'; live portfolio value is the standard convention, and is equal to cash here since sizing only occurs while flat."},
+  {"topic": "share_rounding", "choice": "Position size is floored to a whole number of shares; if the computed size is 0, the signal is skipped entirely (no partial/fractional entry).", "reason": "backtrader's default sizing is whole shares and the spec does not address fractional or zero-size outcomes."},
+  {"topic": "session_filter_scope", "choice": "The 09:30-16:00 session filter is applied only to new entry signals, not to exit management (TP/SL orders or the forced market close), so an open trade is always allowed to exit.", "reason": "the spec ties the session restriction to trading/entries; blocking exits outside the window could leave a position open indefinitely, which the spec does not intend."},
+  {"topic": "tp_sl_same_bar_priority", "choice": "infeasible: if both the take-profit and stop-loss levels would be touched within the same bar, which fills first is resolved by backtrader's broker/OCO order-processing sequence (the take-profit Limit order is submitted/queued ahead of the Stop order).", "reason": "OHLC bar data alone cannot recover the true intrabar sequence of price touches, so the exact real-market fill priority between TP and SL cannot be determined; this is the closest literal approximation available in the simulation engine."}
+]}
+```

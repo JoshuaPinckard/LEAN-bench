@@ -1,0 +1,109 @@
+```python
+import math
+import backtrader as bt
+
+
+class SyntheticHedgeStrategy(bt.Strategy):
+    params = dict(
+        sma_period=50,
+        atr_period=14,
+        bb_long_period=50,
+        bb_short_period=20,
+        bb_devfactor=2.0,
+        macd_me1=12,
+        macd_me2=26,
+        macd_signal=9,
+        atr_vol_threshold=0.005,
+        hedge_min=0.0,
+        hedge_max=1.5,
+        notional=100000.0,
+        sigma_eps=1e-9,
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.bb_long = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_long_period, devfactor=self.p.bb_devfactor
+        )
+        self.bb_short = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_short_period, devfactor=self.p.bb_devfactor
+        )
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_me1,
+            period_me2=self.p.macd_me2,
+            period_signal=self.p.macd_signal,
+        )
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _hedge_coefficient(self):
+        sigma_long = (self.bb_long.top[0] - self.bb_long.mid[0]) / 2.0
+        sigma_short = (self.bb_short.top[0] - self.bb_short.mid[0]) / 2.0
+        if abs(sigma_short) < self.p.sigma_eps:
+            return 0.0
+        ratio = sigma_long / sigma_short
+        return max(self.p.hedge_min, min(self.p.hedge_max, ratio))
+
+    def _target_units_net(self):
+        close = self.data.close[0]
+        units_main = math.floor(self.p.notional / close)
+        h = self._hedge_coefficient()
+        units_hedge = math.floor(units_main * h)
+        return units_main - units_hedge
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+        atr_ratio = self.atr[0] / close
+        macd_val = self.macd.macd[0]
+        signal_val = self.macd.signal[0]
+
+        vol_ok = atr_ratio >= self.p.atr_vol_threshold
+        long_trend_ok = macd_val > signal_val > 0
+        short_trend_ok = macd_val < signal_val < 0
+
+        pos_size = self.position.size
+
+        if pos_size > 0:
+            if self.crossover[0] < 0:
+                self.order = self.close()
+                return
+            if long_trend_ok and vol_ok:
+                target = self._target_units_net()
+                self.order = self.order_target_size(target=target)
+        elif pos_size < 0:
+            if self.crossover[0] > 0:
+                self.order = self.close()
+                return
+            if short_trend_ok and vol_ok:
+                target = -self._target_units_net()
+                self.order = self.order_target_size(target=target)
+        else:
+            if self.crossover[0] > 0 and long_trend_ok and vol_ok:
+                target = self._target_units_net()
+                self.order = self.order_target_size(target=target)
+            elif self.crossover[0] < 0 and short_trend_ok and vol_ok:
+                target = -self._target_units_net()
+                self.order = self.order_target_size(target=target)
+```
+```json
+{"assumptions": [
+  {"topic": "signal validity for hedge updates", "choice": "Interpreted 'while the signal remains valid' (for the dynamic hedge rebalancing) as the trend filter (MACD>Signal>0 for long / MACD<Signal<0 for short) AND the volatility filter (ATR(14)/close>=0.005) still holding, excluding the CrossOver term since CrossOver is a one-bar transient trigger and cannot 'remain valid' across bars.", "reason": "Spec is silent on which part of the entry condition constitutes the persisting 'signal'; the crossover is by construction only true on the crossing bar."},
+  {"topic": "CrossOver indicator scope", "choice": "Used CrossOver(close, SMA(50)) as the sole CrossOver indicator, driving both entry trigger and exit trigger (opposite crossover); MACD>Signal comparisons are direct inequalities, not a MACD/Signal crossover.", "reason": "The 'Entry' section explicitly specifies CrossOver(close, SMA(50)) and a plain MACD>Signal>0 inequality, so the listed 'MACD + CrossOver' pairing is read as two separate indicators used together, not a MACD-signal crossover."},
+  {"topic": "sigma_short approx-zero threshold", "choice": "Used abs(sigma_short) < 1e-9 as the 'sigma_short is approximately 0' test.", "reason": "Spec states 'if sigma_short is approx 0' without a numeric tolerance; a small absolute epsilon was chosen since no relative scale was specified."},
+  {"topic": "hedge rebalancing mechanism", "choice": "Implemented the per-bar 'pull toward new units_net' via order_target_size(target=units_net) each bar the position is open and the signal remains valid.", "reason": "order_target_size is the direct backtrader primitive for adjusting an existing position to a new target size, matching the spec's description of dynamically pulling the position toward a recalculated target."},
+  {"topic": "position sizing rounding", "choice": "Used math.floor for both units_main and units_hedge exactly as specified by the spec's floor(...) notation.", "reason": "Spec explicitly states floor(100000/close) and floor(units_main*h)."},
+  {"topic": "pending-order guard", "choice": "Added an order-tracking attribute reset in notify_order on Completed/Canceled/Margin/Rejected, blocking new order submissions while one is pending.", "reason": "Canonical default; spec is silent on order-collision handling."}
+]}
+```

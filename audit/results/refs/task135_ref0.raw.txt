@@ -1,0 +1,126 @@
+I'll implement this as a literal filter layer around a minimal placeholder trading signal, with a self-contained algorithmic NYSE/NASDAQ holiday calendar (since external calendar libraries aren't importable here).
+
+```python
+import backtrader as bt
+
+
+class ExchangeScheduleFilterStrategy(bt.Strategy):
+
+    def __init__(self):
+        self.order = None
+        self.entry_date = None
+
+    def _observed(self, date):
+        if date.weekday() == 5:
+            return type(date).fromordinal(date.toordinal() - 1)
+        if date.weekday() == 6:
+            return type(date).fromordinal(date.toordinal() + 1)
+        return date
+
+    def _nth_weekday(self, template, year, month, weekday, n):
+        first = template.replace(year=year, month=month, day=1)
+        days_ahead = (weekday - first.weekday()) % 7
+        day = 1 + days_ahead + (n - 1) * 7
+        return template.replace(year=year, month=month, day=day)
+
+    def _last_weekday(self, template, year, month, weekday):
+        if month == 12:
+            next_month_first = template.replace(year=year + 1, month=1, day=1)
+        else:
+            next_month_first = template.replace(year=year, month=month + 1, day=1)
+        last_day = type(template).fromordinal(next_month_first.toordinal() - 1)
+        days_back = (last_day.weekday() - weekday) % 7
+        return type(template).fromordinal(last_day.toordinal() - days_back)
+
+    def _good_friday(self, template, year):
+        # Meeus/Jones/Butcher Gregorian Easter algorithm; Good Friday = Easter Sunday - 2 days
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        ll = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * ll) // 451
+        month = (h + ll - 7 * m + 114) // 31
+        day = ((h + ll - 7 * m + 114) % 31) + 1
+        easter = template.replace(year=year, month=month, day=day)
+        return type(template).fromordinal(easter.toordinal() - 2)
+
+    def _year_holidays(self, template, year):
+        holidays = set()
+        holidays.add(self._observed(template.replace(year=year, month=1, day=1)))
+        holidays.add(self._nth_weekday(template, year, 1, 0, 3))
+        holidays.add(self._nth_weekday(template, year, 2, 0, 3))
+        holidays.add(self._good_friday(template, year))
+        holidays.add(self._last_weekday(template, year, 5, 0))
+        if year >= 2022:
+            holidays.add(self._observed(template.replace(year=year, month=6, day=19)))
+        holidays.add(self._observed(template.replace(year=year, month=7, day=4)))
+        holidays.add(self._nth_weekday(template, year, 9, 0, 1))
+        holidays.add(self._nth_weekday(template, year, 11, 3, 4))
+        holidays.add(self._observed(template.replace(year=year, month=12, day=25)))
+        return holidays
+
+    def _is_business_day(self, date):
+        if date.weekday() >= 5:
+            return False
+        holidays = set()
+        for y in (date.year - 1, date.year, date.year + 1):
+            holidays |= self._year_holidays(date, y)
+        return date not in holidays
+
+    def _last_business_day_of_week(self, date):
+        friday_ordinal = date.toordinal() + (4 - date.weekday())
+        for offset in range(5):
+            candidate = type(date).fromordinal(friday_ordinal - offset)
+            if self._is_business_day(candidate):
+                return candidate
+        return type(date).fromordinal(friday_ordinal)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_date = self.data.datetime.date(0)
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+        if len(self) < 2:
+            return
+
+        today = self.data.datetime.date(0)
+        business_day = self._is_business_day(today)
+
+        if self.position:
+            exit_signal = self.data.close[0] < self.data.close[-1]
+            force_close = (self.entry_date == today and
+                           today == self._last_business_day_of_week(today))
+            if exit_signal or force_close:
+                self.order = self.close()
+            return
+
+        if not business_day:
+            return
+
+        if self.data.close[0] > self.data.close[-1]:
+            self.order = self.buy()
+```
+```json
+{"assumptions": [
+  {"topic": "entry/exit signal source", "choice": "Use a minimal price-comparison rule as the unstated 'core strategy' signal: enter long when close[0] > close[-1], exit when close[0] < close[-1]; not a named technical indicator.", "reason": "The spec delegates buy/sell signal generation to an external, unspecified core trading system and explicitly states no indicators are used; a minimal literal comparison isolates the exchange-schedule filter that is the actual subject of the spec."},
+  {"topic": "holiday calendar source", "choice": "Compute NYSE/NASDAQ full-closure holidays algorithmically (New Year's Day, MLK Day, Presidents Day, Good Friday via the Meeus/Jones/Butcher Easter algorithm, Memorial Day, Juneteenth from 2022 onward, Independence Day, Labor Day, Thanksgiving, Christmas, with weekend observed-day shifts) instead of an external market-calendar library.", "reason": "Only backtrader/math/collections/statistics imports are permitted, so pandas_market_calendars-style libraries are unavailable; an algorithmic calendar correctly generalizes to arbitrary past/future dates as the spec requires."},
+  {"topic": "half-day / early-close sessions", "choice": "Treat early-close sessions (e.g., day after Thanksgiving, Christmas Eve) as ordinary business days, not holidays.", "reason": "The filter concerns days the exchange is fully closed; early closes are still open trading days, so excluding them would be an unstated addition."},
+  {"topic": "forced Friday close scope", "choice": "Only force-close a position if it was opened (filled) on the same calendar day that is the last business day of that week; positions opened earlier in the week and still held are not force-closed by this rule.", "reason": "Literal spec wording is 'if a position is opened on the last business day of the week, it must be forcibly closed at the end of that day' -- a same-day condition, not a general end-of-week flatten of all open positions."},
+  {"topic": "'opened' timing for forced close", "choice": "Treat a position as 'opened' on the bar its buy order is actually filled (backtrader's default next-bar-open execution), not the bar the entry signal was generated on.", "reason": "Backtrader fills market orders at the next bar's open by default; notify_order reports the actual fill bar, which is the natural reading of 'opened'."},
+  {"topic": "exit-vs-risk-management business-day wording", "choice": "Evaluate exit/close signals every bar regardless of business-day status, per the explicit 'Conditions for exiting a position' section.", "reason": "That section states exits execute on any day, while the later 'risk management' section says rule activation is business-day only -- a direct contradiction; since the AAPL feed only contains bars on actual trading days, both readings are behaviorally identical, so the more specific exit-conditions wording was followed."},
+  {"topic": "warm-up guard", "choice": "Skip signal evaluation until at least 2 bars are available (len(self) >= 2).", "reason": "The chosen placeholder entry/exit rule compares close[0] to close[-1] and needs one prior bar to avoid an out-of-range reference; this is bounds safety for the assumed signal, not indicator warm-up."}
+]}
+```

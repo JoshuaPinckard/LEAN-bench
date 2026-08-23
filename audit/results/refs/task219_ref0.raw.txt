@@ -1,0 +1,202 @@
+```python
+import backtrader as bt
+
+
+class CapitulationShortSqueezeStrategy(bt.Strategy):
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=126, devfactor=2)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.ema200 = bt.indicators.EMA(self.data.close, period=200)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.volsma = bt.indicators.SMA(self.data.volume, period=20)
+        self.cross_lower = bt.indicators.CrossOver(self.data.close, self.bb.bot)
+        self.cross_upper = bt.indicators.CrossOver(self.data.close, self.bb.top)
+
+        self.order = None
+        self.pending_action = None
+        self.position_type = None
+        self.entry_price = None
+        self.entry_size = None
+        self.stop_price = None
+        self.stage = 0
+        self.trail_stop = None
+        self.max_line_at_entry = None
+
+        self.cap_signal_bar = None
+        self.cap_sig_low = None
+        self.ob_signal_bar = None
+        self.ob_sig_high = None
+
+    def _reset_state(self):
+        self.position_type = None
+        self.entry_price = None
+        self.entry_size = None
+        self.stop_price = None
+        self.stage = 0
+        self.trail_stop = None
+        self.max_line_at_entry = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed:
+            if self.pending_action == 'enter_long':
+                self.entry_price = order.executed.price
+                self.entry_size = abs(order.executed.size)
+                self.stage = 0
+                if self.position_type == 'breakout_long':
+                    cand1 = self.max_line_at_entry
+                    cand2 = self.entry_price - 1.0 * self.atr[0]
+                    self.stop_price = max(cand1, cand2)
+            elif self.pending_action == 'enter_short':
+                self.entry_price = order.executed.price
+                self.entry_size = abs(order.executed.size)
+                self.stage = 0
+            elif self.pending_action == 'tp1':
+                self.stage = 1
+                self.stop_price = self.entry_price
+            elif self.pending_action == 'tp2':
+                self.stage = 2
+                self.trail_stop = self.stop_price
+            elif self.pending_action in ('tp3', 'stop_exit', 'full_exit'):
+                self._reset_state()
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if self.pending_action in ('enter_long', 'enter_short'):
+                self._reset_state()
+        self.order = None
+        self.pending_action = None
+
+    def _manage_long(self):
+        close = self.data.close[0]
+        low = self.data.low[0]
+        if close >= self.ema200[0] + 1.5 * self.atr[0]:
+            self.pending_action = 'full_exit'
+            self.order = self.close()
+            return
+        if self.stage == 0:
+            if low <= self.stop_price:
+                self.pending_action = 'stop_exit'
+                self.order = self.close()
+            elif close >= self.bb.mid[0]:
+                self.pending_action = 'tp1'
+                self.order = self.sell(size=self.entry_size * 0.5)
+        elif self.stage == 1:
+            if low <= self.stop_price:
+                self.pending_action = 'stop_exit'
+                self.order = self.close()
+            elif close >= self.bb.top[0]:
+                self.pending_action = 'tp2'
+                self.order = self.sell(size=self.entry_size * 0.3)
+        elif self.stage == 2:
+            self.trail_stop = max(self.trail_stop, close - 2 * self.atr[0])
+            target = self.bb.top[0] + 0.5 * self.atr[0]
+            if close >= target or low <= self.trail_stop:
+                self.pending_action = 'tp3'
+                self.order = self.close()
+
+    def _manage_short(self):
+        close = self.data.close[0]
+        high = self.data.high[0]
+        if self.stage == 0:
+            if high >= self.stop_price:
+                self.pending_action = 'stop_exit'
+                self.order = self.close()
+            elif close <= self.bb.mid[0]:
+                self.pending_action = 'tp1'
+                self.order = self.buy(size=self.entry_size * 0.5)
+        elif self.stage == 1:
+            if high >= self.stop_price:
+                self.pending_action = 'stop_exit'
+                self.order = self.close()
+            elif close <= self.bb.bot[0]:
+                self.pending_action = 'tp2'
+                self.order = self.buy(size=self.entry_size * 0.3)
+        elif self.stage == 2:
+            self.trail_stop = min(self.trail_stop, close + 2 * self.atr[0])
+            if high >= self.trail_stop:
+                self.pending_action = 'tp3'
+                self.order = self.close()
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.position_type in ('cap_long', 'breakout_long'):
+                self._manage_long()
+            elif self.position_type == 'short':
+                self._manage_short()
+            return
+
+        order_submitted = False
+
+        if self.cap_signal_bar is not None and len(self) - self.cap_signal_bar == 1:
+            confirmed = (self.cross_lower[0] == 1) or (
+                (self.data.high[0] - self.data.low[0]) >= 1.2 * self.atr[0]
+                and self.data.close[0] > self.data.open[0]
+            )
+            if confirmed:
+                self.stop_price = self.cap_sig_low - 1.0 * self.atr[0]
+                self.position_type = 'cap_long'
+                self.pending_action = 'enter_long'
+                self.order = self.buy()
+                order_submitted = True
+            self.cap_signal_bar = None
+            self.cap_sig_low = None
+
+        if not order_submitted and self.ob_signal_bar is not None and len(self) - self.ob_signal_bar == 1:
+            confirmed = (self.cross_upper[0] == -1) or (
+                (self.data.high[0] - self.data.low[0]) >= 1.2 * self.atr[0]
+                and self.data.close[0] < self.data.open[0]
+            )
+            if confirmed:
+                self.stop_price = self.ob_sig_high + 1.0 * self.atr[0]
+                self.position_type = 'short'
+                self.pending_action = 'enter_short'
+                self.order = self.sell()
+                order_submitted = True
+            self.ob_signal_bar = None
+            self.ob_sig_high = None
+
+        if not order_submitted:
+            max_prev = max(self.bb.mid[-1], self.ema200[-1])
+            max_curr = max(self.bb.mid[0], self.ema200[0])
+            breakout_up = self.data.close[-1] <= max_prev and self.data.close[0] > max_curr
+            if breakout_up and self.data.volume[0] >= 1.5 * self.volsma[0] and self.rsi[0] > 50:
+                self.max_line_at_entry = max_curr
+                self.position_type = 'breakout_long'
+                self.pending_action = 'enter_long'
+                self.order = self.buy()
+                order_submitted = True
+
+        if not order_submitted and self.cap_signal_bar is None:
+            if (self.data.close[0] < self.bb.bot[0] and self.rsi[0] < 30
+                    and self.data.volume[0] >= 1.8 * self.volsma[0]):
+                self.cap_signal_bar = len(self)
+                lows = self.data.low.get(size=5)
+                self.cap_sig_low = min(lows) if lows else self.data.low[0]
+
+        if not order_submitted and self.ob_signal_bar is None:
+            if (self.data.close[0] > self.bb.top[0] and self.rsi[0] > 70
+                    and self.data.volume[0] >= 1.8 * self.volsma[0]):
+                self.ob_signal_bar = len(self)
+                self.ob_sig_high = self.data.high[0]
+```
+```json
+{"assumptions": [
+  {"topic": "parameter naming", "choice": "Treated spec's 'periode=126' as period=126 for BollingerBands(period=126, devfactor=2)", "reason": "backtrader's parameter is named 'period'; clearly a spelling variant, not a distinct rule"},
+  {"topic": "capitulation stop lookback window", "choice": "Used the low of the last 5 bars (including the signal candle) for the min(low) term", "reason": "spec gives a '3-5 bars' range without a single value; 5 was chosen as a concrete, declared point in that range"},
+  {"topic": "ATR timing for capitulation/breakout stops", "choice": "ATR(14) sampled at the confirmation/entry bar rather than the original signal bar", "reason": "spec doesn't specify which bar's ATR to use for the stop; using the ATR at trade entry is the most natural reading of 'setting the stop'"},
+  {"topic": "breakout stop 'whichever is closer'", "choice": "Interpreted as the higher (tighter) of {max(BB mid, EMA200) at breakout bar, entry_price - 1*ATR}, computed once the entry fills", "reason": "both candidates sit below the entry price on a breakout; the higher of the two is the one 'closer' to price, i.e. the tighter stop"},
+  {"topic": "stop-loss trigger basis", "choice": "Stop-loss and breakeven-stop checks use intrabar low (long) / high (short) touch, while all take-profit levels (BB mid/top/bot, EMA impulsive exit) use the closing price", "reason": "spec is silent on touch-vs-close basis; this mirrors common convention (stops are hit intrabar, profit targets are typically confirmed on close) and is applied consistently"},
+  {"topic": "volatility filter", "choice": "Not implemented", "reason": "spec explicitly frames it as optional ('You can add a volatility filter'), not a stated rule of the strategy"},
+  {"topic": "hedging short section", "choice": "Implemented as a standalone short entry, mutually exclusive with the long position (never held simultaneously)", "reason": "spec explicitly gives full short mechanics so it is implemented, but labels it '(optional)'/'symmetrical' without describing simultaneous long+short exposure; the one-position-at-a-time canonical default is preserved instead of inventing hedged/net-position logic"},
+  {"topic": "short TP2/TP3 sizing", "choice": "Mirrored the long side's 50%/30%/remaining-20% split: TP1=50% at BB mid, TP2=30% at BB lower band, remaining 20% closed only via the trailing stop (close + 2*ATR), no separate price target for the short's TP3", "reason": "spec only states TP1/TP2 levels and a trailing stop for the short, without percentages or a third target; the long section's explicit split is applied by the stated 'symmetrical' relationship"},
+  {"topic": "bearish candle definition", "choice": "Defined as (high-low) >= 1.2*ATR(14) and close < open", "reason": "spec states the bullish-candle confirmation as 'close above the open' but only says 'bearish candle' for the short side without restating the close/open relation; close<open is the direct symmetric counterpart"},
+  {"topic": "breakeven stop after TP1 for shorts", "choice": "Applied the same 'move stop to breakeven' rule stated for the long TP1 to the short TP1", "reason": "the short setup is explicitly described as symmetrical to the long, and no contrary instruction is given"},
+  {"topic": "signal priority on overlapping bars", "choice": "Checked in fixed order each bar: pending capitulation confirmation, then pending overbought confirmation, then breakout entry, then new capitulation/overbought signal detection; only one order can be submitted per bar", "reason": "spec never addresses what happens if multiple entry conditions coincide on the same bar; a deterministic, declared order was needed since only one position/order is allowed at a time"},
+  {"topic": "'CrossOver(upper BB band, close) downward' wording", "choice": "Implemented as CrossOver(close, BB top) == -1 (close crossing down through the upper band)", "reason": "this is the literal mirror of the long confirmation's CrossOver(close, lower BB) upward, and describes the same crossing event regardless of argument order"},
+  {"topic": "alternative full exit (EMA200+1.5*ATR)", "choice": "Applied only to long positions", "reason": "the spec states this rule only within the long-side 'Exit from position' section as a bullish impulsive-move signal; it has no stated analogue for the short side and isn't logically symmetric (an upside impulsive move is not a short profit-taking signal)"},
+  {"topic": "'6-month low' note", "choice": "No additional code added", "reason": "the note explicitly states this condition is already replaced by the close-below-lower-BB(126,2)-plus-volume-spike rule, which is already implemented as the oversold/capitulation signal"}
+]}
+```

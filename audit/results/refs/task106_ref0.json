@@ -1,0 +1,91 @@
+{
+  "task_id": 106,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport collections\n\n\nclass LevelRetestEntryStrategy(bt.Strategy):\n    params = dict(\n        level_lookback=20,\n        rsi_period=14,\n        atr_period=14,\n        tp_atr_mult=2.0,\n        risk_pct=0.01,\n        htf_multiple=4,\n        htf_trend_sma_period=20,\n        candle_lower_shadow_mult=2.0,\n        candle_upper_shadow_max_mult=1.0,\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        # level = extreme of the 20 bars strictly before the current one, so the\n        # current bar can \"touch\" it rather than always defining it\n        self.support_level = bt.indicators.Lowest(self.data.low(-1), period=self.p.level_lookback)\n        self.resistance_level = bt.indicators.Highest(self.data.high(-1), period=self.p.level_lookback)\n\n        self.order = None\n        self.entry_level = None\n        self.tp_price = None\n\n        # manual 4x aggregation of the 1H feed into synthetic 4H bars, since only\n        # a single 1H data feed is available (no resampled feed provided)\n        self.htf_count = 0\n        self.htf_close_history = collections.deque(maxlen=self.p.htf_trend_sma_period)\n        self.htf_trend = 0\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def _is_bullish_engulfing(self):\n        o0, c0 = self.data.open[0], self.data.close[0]\n        o1, c1 = self.data.open[-1], self.data.close[-1]\n        return (c1 < o1) and (c0 > o0) and (o0 <= c1) and (c0 >= o1)\n\n    def _is_bearish_engulfing(self):\n        o0, c0 = self.data.open[0], self.data.close[0]\n        o1, c1 = self.data.open[-1], self.data.close[-1]\n        return (c1 > o1) and (c0 < o0) and (o0 >= c1) and (c0 <= o1)\n\n    def _is_small_body_long_lower_shadow(self):\n        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]\n        body = abs(c - o)\n        if body <= 0:\n            return False\n        lower_shadow = min(o, c) - l\n        upper_shadow = h - max(o, c)\n        return (lower_shadow >= self.p.candle_lower_shadow_mult * body and\n                upper_shadow <= self.p.candle_upper_shadow_max_mult * body)\n\n    def _update_htf_trend(self):\n        if self.htf_count == 0:\n            pass\n        self.htf_count += 1\n        if self.htf_count == self.p.htf_multiple:\n            htf_close = self.data.close[0]\n            self.htf_close_history.append(htf_close)\n            if len(self.htf_close_history) == self.htf_close_history.maxlen:\n                htf_sma = sum(self.htf_close_history) / len(self.htf_close_history)\n                if htf_close > htf_sma:\n                    self.htf_trend = 1\n                elif htf_close < htf_sma:\n                    self.htf_trend = -1\n                else:\n                    self.htf_trend = 0\n            self.htf_count = 0\n\n    def _manage_open_position(self):\n        if self.position.size > 0:\n            if self.data.high[0] >= self.tp_price:\n                self.order = self.close()\n            elif self.data.close[0] < self.entry_level:\n                self.order = self.close()\n        elif self.position.size < 0:\n            if self.data.low[0] <= self.tp_price:\n                self.order = self.close()\n            elif self.data.close[0] > self.entry_level:\n                self.order = self.close()\n\n    def _check_entries(self):\n        support = self.support_level[0]\n        resistance = self.resistance_level[0]\n\n        touches_support = self.data.low[0] <= support\n        touches_resistance = self.data.high[0] >= resistance\n\n        bullish_pattern = self._is_small_body_long_lower_shadow() or self._is_bullish_engulfing()\n        bearish_pattern = self._is_small_body_long_lower_shadow() or self._is_bearish_engulfing()\n\n        if touches_support and bullish_pattern and self.rsi[0] > 50 and self.htf_trend == 1:\n            entry_price = self.data.close[0]\n            risk_per_share = entry_price - support\n            if risk_per_share > 0:\n                risk_amount = self.p.risk_pct * self.broker.getvalue()\n                size = risk_amount / risk_per_share\n                if size > 0:\n                    self.entry_level = support\n                    self.tp_price = entry_price + self.p.tp_atr_mult * self.atr[0]\n                    self.order = self.buy(size=size)\n        elif touches_resistance and bearish_pattern and self.rsi[0] < 50 and self.htf_trend == -1:\n            entry_price = self.data.close[0]\n            risk_per_share = resistance - entry_price\n            if risk_per_share > 0:\n                risk_amount = self.p.risk_pct * self.broker.getvalue()\n                size = risk_amount / risk_per_share\n                if size > 0:\n                    self.entry_level = resistance\n                    self.tp_price = entry_price - self.p.tp_atr_mult * self.atr[0]\n                    self.order = self.sell(size=size)\n\n    def next(self):\n        self._update_htf_trend()\n\n        if self.order:\n            return\n\n        if self.position:\n            self._manage_open_position()\n            return\n\n        self._check_entries()",
+  "assumptions": [
+    {
+      "topic": "level definition",
+      "choice": "Support = lowest low, resistance = highest high, over the 20 bars strictly preceding the current bar (bt.indicators.Lowest/Highest applied to low(-1)/high(-1))",
+      "reason": "Spec says 'local lows/highs over the last 20 bars'; excluding the current bar from the extremum calculation is necessary so the current bar can meaningfully 'touch or break' a pre-existing level rather than always defining it by construction."
+    },
+    {
+      "topic": "candlestick pattern thresholds",
+      "choice": "Engulfing = current body fully contains prior opposite-colored body (open/close cross); hammer/hanging-man = same shape check (lower shadow >= 2x body, upper shadow <= 1x body), reused for both bullish (at support) and bearish (at resistance) context since hammer and hanging man are visually identical candles distinguished only by context",
+      "reason": "Spec names these patterns as examples but gives no numeric thresholds; standard technical-analysis definitions were used."
+    },
+    {
+      "topic": "entry price proxy for TP/sizing",
+      "choice": "Use the signal bar's close price as the assumed entry price when computing the take-profit target and the risk-based position size",
+      "reason": "Orders submitted in next() fill at the next bar's open under the default broker, so the true fill price is unknown at submission time; the signal bar's close is the closest available literal proxy."
+    },
+    {
+      "topic": "risk percentage",
+      "choice": "1% of current portfolio value risked per trade",
+      "reason": "Spec states a range of '1-2%' without pinning an exact value; 1% was chosen as the conservative bound of the stated range."
+    },
+    {
+      "topic": "take-profit trigger price",
+      "choice": "Take-profit checked via intrabar high (long) / low (short) touching the target; stop-loss checked via bar close, per the spec's explicit 'closes a bar below/above' wording",
+      "reason": "Spec explicitly ties the stop-loss to a bar close but is silent on how the take-profit distance is detected; intrabar touch is the standard reading of 'price moves a distance ... from the entry point'."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "4H trend filter approximated by manually aggregating the single provided 1H feed into synthetic 4H closes (every 4 bars) inside the strategy, then comparing the latest synthetic close to a 20-period SMA of synthetic closes to classify bullish/bearish",
+      "reason": "The harness supplies only one 1H PandasData feed with cerebro setup fixed externally; a genuine resampled 4H data feed cannot be added by the strategy itself, so an in-strategy manual aggregation is the closest literal implementation of a 'higher timeframe trend' check."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 4,
+  "tape": [
+    {
+      "dt": "2024-01-11T15:30:00",
+      "side": "SELL",
+      "size": -49.261113366105924,
+      "price": 184.36500549316406
+    },
+    {
+      "dt": "2024-01-16T15:30:00",
+      "side": "BUY",
+      "size": 49.261113366105924,
+      "price": 182.77000427246094
+    },
+    {
+      "dt": "2024-03-08T20:30:00",
+      "side": "SELL",
+      "size": -47.90693722162578,
+      "price": 171.41000366210938
+    },
+    {
+      "dt": "2024-03-12T18:30:00",
+      "side": "BUY",
+      "size": 47.90693722162578,
+      "price": 173.7949981689453
+    },
+    {
+      "dt": "2024-05-20T14:30:00",
+      "side": "BUY",
+      "size": 41.6340185761033,
+      "price": 191.60000610351562
+    },
+    {
+      "dt": "2024-05-23T14:30:00",
+      "side": "SELL",
+      "size": -41.6340185761033,
+      "price": 189.05999755859375
+    },
+    {
+      "dt": "2025-12-15T15:30:00",
+      "side": "SELL",
+      "size": -17.49879066333486,
+      "price": 274.1700134277344
+    },
+    {
+      "dt": "2025-12-18T15:30:00",
+      "side": "BUY",
+      "size": 17.49879066333486,
+      "price": 270.86199951171875
+    }
+  ]
+}

@@ -1,0 +1,162 @@
+```python
+import math
+import backtrader as bt
+
+
+class ShortVolatilityBBATR(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_dev', 2),
+        ('atr_period', 14),
+        ('bw_sma_period', 100),
+        ('vol_sma_period', 20),
+        ('time_stop_bars', 45),
+        ('emergency_pct', 0.05),
+        ('risk_pct', 0.01),
+        ('target_pct', 0.005),
+        ('vol_liquidity_mult', 1.5),
+        ('bw_upper_mult', 1.5),
+        ('tp_retrace', 0.5),
+        ('sl_atr_mult', 1.5),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.bw = (self.bb.top - self.bb.bot) / self.bb.mid
+        self.sma_bw = bt.indicators.SMA(self.bw, period=self.p.bw_sma_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+        self.cross_top = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.cross_bot = bt.indicators.CrossOver(self.data.close, self.bb.bot)
+
+        self.order_parent = None
+        self.stop_order = None
+        self.limit_order = None
+        self.close_order = None
+        self.entry_price = None
+        self.entry_bar = None
+        self.trade_dir = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.order_parent:
+            if order.status == order.Completed:
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+                self.order_parent = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.order_parent = None
+                self.stop_order = None
+                self.limit_order = None
+                self.trade_dir = None
+        elif order in (self.stop_order, self.limit_order):
+            if order.status == order.Completed:
+                self.stop_order = None
+                self.limit_order = None
+                self.entry_price = None
+                self.entry_bar = None
+                self.trade_dir = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                if order == self.stop_order:
+                    self.stop_order = None
+                if order == self.limit_order:
+                    self.limit_order = None
+        elif order == self.close_order:
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                self.close_order = None
+                self.entry_price = None
+                self.entry_bar = None
+                self.trade_dir = None
+                self.stop_order = None
+                self.limit_order = None
+
+    def _place_bracket(self, direction):
+        entry_est = self.data.close[0]
+        mid0 = self.bb.mid[0]
+        atr0 = self.atr[0]
+
+        if direction == 'long':
+            tp = entry_est + self.p.tp_retrace * (mid0 - entry_est)
+            sl = entry_est - self.p.sl_atr_mult * atr0
+        else:
+            tp = entry_est - self.p.tp_retrace * (entry_est - mid0)
+            sl = entry_est + self.p.sl_atr_mult * atr0
+
+        risk_dist = abs(entry_est - sl)
+        target_dist = abs(tp - entry_est)
+        if risk_dist <= 0 or target_dist <= 0:
+            return
+
+        equity = self.broker.getvalue()
+        size_risk = math.floor((equity * self.p.risk_pct) / risk_dist)
+        size_target = math.floor((equity * self.p.target_pct) / target_dist)
+        size = min(size_risk, size_target)
+        if size <= 0:
+            return
+
+        self.trade_dir = direction
+        if direction == 'long':
+            orders = self.buy_bracket(
+                size=size, price=None, exectype=bt.Order.Market,
+                stopprice=sl, limitprice=tp)
+        else:
+            orders = self.sell_bracket(
+                size=size, price=None, exectype=bt.Order.Market,
+                stopprice=sl, limitprice=tp)
+
+        self.order_parent, self.stop_order, self.limit_order = orders
+
+    def _manage_open_position(self):
+        if self.close_order is not None:
+            return
+        if self.entry_bar is None:
+            return
+
+        bars_held = len(self) - self.entry_bar
+        price_now = self.data.close[0]
+        if self.trade_dir == 'long':
+            pnl_pct = (price_now - self.entry_price) / self.entry_price
+        else:
+            pnl_pct = (self.entry_price - price_now) / self.entry_price
+
+        if bars_held >= self.p.time_stop_bars or pnl_pct <= -self.p.emergency_pct:
+            if self.stop_order is not None:
+                self.cancel(self.stop_order)
+            if self.limit_order is not None:
+                self.cancel(self.limit_order)
+            self.close_order = self.close()
+
+    def next(self):
+        if self.position:
+            self._manage_open_position()
+            return
+
+        if self.order_parent is not None:
+            return
+
+        bw0 = self.bw[0]
+        smabw0 = self.sma_bw[0]
+
+        vola_filter = (bw0 > smabw0) and (bw0 < self.p.bw_upper_mult * smabw0)
+        extreme_vol = bw0 >= self.p.bw_upper_mult * smabw0
+        liquidity_filter = self.data.volume[0] < self.p.vol_liquidity_mult * self.vol_sma[0]
+
+        if vola_filter and liquidity_filter and not extreme_vol:
+            if self.cross_top[0] < 0:
+                self._place_bracket('short')
+            elif self.cross_bot[0] > 0:
+                self._place_bracket('long')
+```
+```json
+{"assumptions": [
+  {"topic": "entry_price_proxy", "choice": "Use the signal bar's close (data.close[0]) as the proxy entry price when computing TP, SL, and position size for the bracket order.", "reason": "The spec requires the bracket (entry+stop+target, sized by risk/target percentages) to be placed immediately at the signal, while actual execution happens at the following bar's open; the true fill price is unknown at submission time, so the last close is the closest available estimate for the entry-price-dependent formulas."},
+  {"topic": "equity_definition", "choice": "equity = self.broker.getvalue() (total portfolio value), evaluated at signal time.", "reason": "The spec uses 'equity'/'capital' for sizing without further definition; broker.getvalue() is backtrader's standard current-account-value measure and must be read at signal time since sizing is computed before the bracket is submitted."},
+  {"topic": "middle_band_source", "choice": "Reuse BollingerBands' own mid line (bb.mid, which is SMA(close,20) by construction) as the spec's separately-named 'SMA(20) (middle band)' indicator instead of instantiating a second, identical SMA(20).", "reason": "bb.mid is mathematically identical to SMA(close,20); a duplicate indicator would be redundant computation of the same values."},
+  {"topic": "bracket_order_mechanism", "choice": "Implemented via bt.Strategy.buy_bracket()/sell_bracket() with the main leg as a Market order (fills at next open) and the stop/limit legs as Stop/Limit child orders at SL/TP, all submitted together at signal time.", "reason": "This is backtrader's native primitive for a simultaneous entry+stop+target order group, matching 'place a bracket immediately' plus the 'execution at next open' requirement for the entry leg."},
+  {"topic": "time_and_emergency_exit_handling", "choice": "The 45-bar time-stop and the +/-5% emergency exit are checked manually each bar while in a position (using the actual fill price recorded on entry completion); when triggered, any still-open bracket stop/limit orders are cancelled and self.close() is issued.", "reason": "These are path-dependent exits that cannot be expressed as static prices at bracket-submission time, so they must be monitored live and override the bracket when triggered."},
+  {"topic": "extreme_volatility_check", "choice": "Implemented 'do not trade under extreme volatility (BW >= 1.5*SMA(BW,100))' as an explicit standalone check alongside the volatility filter's stated upper bound (BW < 1.5*SMA(BW,100)).", "reason": "The two conditions are mathematically equivalent, but both are stated explicitly in the spec, so both are implemented literally for fidelity even though the second is redundant."}
+]}
+```

@@ -1,0 +1,171 @@
+```python
+import backtrader as bt
+
+
+class ShortVolatilityProxyStrategy(bt.Strategy):
+    params = dict(
+        bb_period=20,
+        bb_devfactor=2.0,
+        bbw_ema_period=100,
+        atr_period=14,
+        atr_ema_period=100,
+        rsi_period=14,
+        vol_sma_period=20,
+        vol_spike_bbw_mult=1.5,
+        vol_spike_atr_mult=1.2,
+        vol_spike_vol_mult=1.2,
+        entry_window_min=5,
+        entry_window_max=21,
+        rsi_short_thresh=60,
+        rsi_long_thresh=40,
+        event_gap_atr_mult=1.5,
+        event_vol_mult=1.5,
+        event_atr_mult=1.3,
+        max_hold_bars=21,
+        stop_atr_mult=1.5,
+        risk_pct=0.015,
+        liquidity_threshold=5_000_000,
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor)
+        self.bbw = (self.bb.top - self.bb.bot) / self.bb.mid
+        self.ema_bbw = bt.indicators.EMA(self.bbw, period=self.p.bbw_ema_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.ema_atr = bt.indicators.EMA(self.atr, period=self.p.atr_ema_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.bars_since_vol_spike = None
+        self.vol_spike_prev = False
+
+        self.entry_order = None
+        self.exit_order = None
+        self.stop_order = None
+        self.entry_bar = None
+        self.direction = None
+        self.pending_atr = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order == self.entry_order:
+                self.entry_bar = len(self)
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                stop_dist = self.p.stop_atr_mult * self.pending_atr
+                if self.direction == 'long':
+                    stop_price = entry_price - stop_dist
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=size)
+                else:
+                    stop_price = entry_price + stop_dist
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=size)
+                self.entry_order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+                self.exit_order = None
+                self.entry_order = None
+                self.entry_bar = None
+                self.direction = None
+            elif order == self.exit_order:
+                self.exit_order = None
+                self.stop_order = None
+                self.entry_order = None
+                self.entry_bar = None
+                self.direction = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.entry_order:
+                self.entry_order = None
+                self.direction = None
+            elif order == self.stop_order:
+                self.stop_order = None
+            elif order == self.exit_order:
+                self.exit_order = None
+
+    def next(self):
+        vol_spike_now = (
+            self.bbw[0] > self.p.vol_spike_bbw_mult * self.ema_bbw[0]
+            and self.atr[0] > self.p.vol_spike_atr_mult * self.ema_atr[0]
+            and self.data.volume[0] > self.p.vol_spike_vol_mult * self.vol_sma[0]
+        )
+        if vol_spike_now and not self.vol_spike_prev:
+            self.bars_since_vol_spike = 0
+        elif self.bars_since_vol_spike is not None:
+            self.bars_since_vol_spike += 1
+        self.vol_spike_prev = vol_spike_now
+
+        if self.entry_order or self.exit_order:
+            return
+
+        if self.position:
+            event = (
+                abs(self.data.open[0] - self.data.close[-1]) > self.p.event_gap_atr_mult * self.atr[0]
+                and self.data.volume[0] > self.p.event_vol_mult * self.vol_sma[0]
+                and self.atr[0] > self.p.event_atr_mult * self.ema_atr[0]
+            )
+            if self.direction == 'long':
+                mid_reversion = self.data.close[0] >= self.bb.mid[0]
+            else:
+                mid_reversion = self.data.close[0] <= self.bb.mid[0]
+            bbw_crash = self.bbw[0] < self.ema_bbw[0]
+            bars_held = len(self) - self.entry_bar if self.entry_bar is not None else 0
+            timeout = bars_held >= self.p.max_hold_bars
+
+            # self.close() fills at next bar's open by backtrader's default
+            # market-order timing, giving the "event -> close at next open" rule for free.
+            if event or mid_reversion or bbw_crash or timeout:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.exit_order = self.close()
+            return
+
+        if self.bars_since_vol_spike is None:
+            return
+        if not (self.p.entry_window_min <= self.bars_since_vol_spike <= self.p.entry_window_max):
+            return
+        if self.vol_sma[0] <= self.p.liquidity_threshold:
+            return
+
+        if self.data.close[0] > self.bb.top[0] and self.rsi[0] > self.p.rsi_short_thresh:
+            direction = 'short'
+        elif self.data.close[0] < self.bb.bot[0] and self.rsi[0] < self.p.rsi_long_thresh:
+            direction = 'long'
+        else:
+            return
+
+        atr_val = self.atr[0]
+        if atr_val <= 0:
+            return
+        equity = self.broker.getvalue()
+        risk_dollars = equity * self.p.risk_pct
+        stop_dist = self.p.stop_atr_mult * atr_val
+        size = int(risk_dollars / stop_dist)
+        if size < 1:
+            return
+
+        self.direction = direction
+        self.pending_atr = atr_val
+        if direction == 'short':
+            self.entry_order = self.sell(size=size)
+        else:
+            self.entry_order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "risk_pct", "choice": "Used 1.5% of equity as risk-per-trade (midpoint of the stated 1-2% range).", "reason": "Spec gives a range, not a single value; formula qty = risk_in_$/(1.5*ATR) requires one concrete percentage."},
+  {"topic": "liquidity_threshold", "choice": "SMA(volume,20) must exceed 5,000,000 shares for a trade to be allowed.", "reason": "Spec says 'above a specified threshold' but never gives the number; picked a concrete round value to make the stated filter operable."},
+  {"topic": "atr_trailing", "choice": "Not implemented; only the fixed initial stop-loss (1.5*ATR from entry) is used.", "reason": "Spec explicitly marks ATR trailing as 'optional', so per the no-extra-features rule it is omitted rather than invented."},
+  {"topic": "infeasible", "choice": "Left broker commission at the harness-configured 0.001 percentage scheme; did not set a fixed per-share commission.", "reason": "Cerebro/broker setup is added by the harness and is not to be overridden by the strategy; a fixed per-share commission scheme cannot be applied without changing that setup."},
+  {"topic": "vol_spike_first_crossing", "choice": "Interpreted 'the first crossing' as an edge-triggered event: the counter resets to 0 each time the joint BBW/ATR/volume condition transitions from false to true (recurring, not a one-time lifetime trigger).", "reason": "The strategy is meant to repeatedly react to volatility spikes across a multi-year backtest, so each new spike restarts the pre-event window rather than only the very first spike ever observed."},
+  {"topic": "mid_reversion_direction", "choice": "For long positions, exit when close >= mid; for short positions, exit when close <= mid.", "reason": "Spec says 'reversion to mid' without specifying direction; this is the literal reading of price reverting back toward the mean from whichever side it entered on."},
+  {"topic": "timeout_bar_count", "choice": "The 21-bar timeout is counted from the entry fill bar; exit triggers once bars held >= 21.", "reason": "Spec states 'after 21 bars' without defining the exact start/boundary; counting from the fill bar with an inclusive threshold is the most literal reading."},
+  {"topic": "position_sizing_rounding", "choice": "qty = floor(risk_in_$ / (1.5*ATR)) as a whole share count; no trade is taken if this rounds to 0.", "reason": "Backtrader's default sizing/order mechanics require an integer share size; spec's formula does not address fractional shares."},
+  {"topic": "stop_order_mechanics", "choice": "Stop-loss implemented as a resting bt.Order.Stop order submitted at entry fill, using the same ATR reading as the sizing formula, rather than a manual close-based check.", "reason": "Gives realistic intrabar (High/Low) stop execution consistent with 'stop-loss 1.5*ATR from the entry price' and keeps the stop distance consistent with the sizing formula's ATR value."},
+  {"topic": "crossover_indicator_usage", "choice": "Did not instantiate bt.indicators.CrossOver directly; the vol-spike 'crossing' is a 3-way AND condition (BBW, ATR, volume) implemented via edge-detection of the combined boolean instead.", "reason": "bt.indicators.CrossOver compares exactly two lines and cannot natively express a 3-condition joint crossing; edge-detecting the AND-combined boolean is the closest literal, functionally equivalent implementation."}
+]}
+```

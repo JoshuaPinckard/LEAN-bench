@@ -1,0 +1,111 @@
+```python
+import backtrader as bt
+
+
+class CSPMeanReversionProxyStrategy(bt.Strategy):
+    params = (
+        ('ema_period', 20),
+        ('rsi_period', 14),
+        ('atr_period', 14),
+        ('rsi_entry_threshold', 40),
+        ('atr_close_ratio_max', 0.04),
+        ('anti_change_pct', 0.01),
+        ('profit_atr_mult', 0.5),
+        ('stop_atr_mult', 1.0),
+        ('stop_entry_pct', 0.02),
+        ('time_stop_bars', 5),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.target_price = None
+        self.stop_price = None
+        self.bars_in_trade = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                # Stop/target levels are fixed off the ATR observed at signal time,
+                # not recomputed bar-by-bar while the trade is open.
+                self.stop_price = self.entry_price - min(
+                    self.p.stop_atr_mult * self.entry_atr,
+                    self.p.stop_entry_pct * self.entry_price,
+                )
+                self.target_price = self.entry_price + self.p.profit_atr_mult * self.entry_atr
+                self.bars_in_trade = 0
+            else:
+                self.entry_price = None
+                self.entry_atr = None
+                self.target_price = None
+                self.stop_price = None
+                self.bars_in_trade = 0
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order.isbuy():
+                self.entry_atr = None
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self.bars_in_trade += 1
+            close = self.data.close[0]
+
+            if close >= self.target_price or close >= self.ema[0]:
+                self.order = self.close()
+            elif close <= self.stop_price:
+                self.order = self.close()
+            elif self.bars_in_trade >= self.p.time_stop_bars:
+                self.order = self.close()
+            return
+
+        close = self.data.close[0]
+        prev_close = self.data.close[-1]
+
+        cond_below_ema = close < self.ema[0]
+        cond_rsi = self.rsi[0] < self.p.rsi_entry_threshold
+        cond_vol = (self.atr[0] / close) < self.p.atr_close_ratio_max
+        cond_anti_change = close >= prev_close * (1.0 - self.p.anti_change_pct)
+
+        if cond_below_ema and cond_rsi and cond_vol and cond_anti_change:
+            atr_now = self.atr[0]
+            stop_distance = min(
+                self.p.stop_atr_mult * atr_now,
+                self.p.stop_entry_pct * close,
+            )
+            if stop_distance <= 0:
+                return
+
+            capital = self.broker.getvalue()
+            risk_amount = self.p.risk_pct * capital
+            size = int(risk_amount / stop_distance)
+
+            if size < 1:
+                return
+
+            self.entry_atr = atr_now
+            self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "capital reference for risk sizing", "choice": "Use self.broker.getvalue() (total portfolio equity) at the signal bar as \"capital\" for the 1% risk calculation.", "reason": "Spec says risk must be no more than 1% of capital but does not define the base; portfolio equity is the standard live-updating basis, and the position is always flat when sizing occurs."},
+  {"topic": "entry price proxy for stop-distance sizing", "choice": "Use the signal bar's Close as a proxy for the anticipated entry price when computing the 0.02*Entry term of the stop distance used for sizing.", "reason": "Order size must be fixed before the order is submitted, but the actual fill price is only known after the next bar's open; Close is the closest available proxy."},
+  {"topic": "ATR(14) reference value for stop/target", "choice": "Capture ATR(14) at the entry signal bar and hold that single value fixed for both position sizing and the profit-target/stop-loss price levels for the life of the trade.", "reason": "The spec expresses stop/target as static offsets from Entry; the most literal fixed reference is the ATR observed at the moment the trade was signaled, not a value recomputed every bar."},
+  {"topic": "trading-day counting for time stop", "choice": "Count the entry fill bar as day 1 of the holding period; force-close via self.close() once bars_in_trade reaches 5 if neither target nor stop has fired.", "reason": "Spec says \"close the position after 5 trading days\" without defining the day-zero convention; this is the most literal reading of the position having existed for 5 trading days."},
+  {"topic": "minimum tradable size", "choice": "Skip a signaled entry (no order placed) if the risk-based size computation rounds down to fewer than 1 share.", "reason": "Fractional shares are not available on this feed/broker and the spec does not address this edge case."},
+  {"topic": "exit order execution timing", "choice": "Profit-target, stop-loss, and time-stop conditions are all evaluated against the current bar's Close inside next() and submitted as market close() orders, which (per the harness's default broker) fill at the following bar's open.", "reason": "The environment exposes only daily OHLCV with no intrabar fill mechanism, so a level touch cannot be executed intrabar; next-bar-open execution is the only feasible reading and mirrors how the entry itself is specified to work."}
+]}
+```

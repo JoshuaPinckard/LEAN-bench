@@ -1,0 +1,96 @@
+```python
+import math
+import backtrader as bt
+
+
+class DonchianBreakoutStrategy(bt.Strategy):
+    params = (
+        ('donchian_period', 20),
+        ('adx_period', 14),
+        ('atr_period', 14),
+        ('adx_threshold', 25),
+        ('risk_pct', 0.01),
+        ('stop_atr_mult', 2.0),
+        ('stop_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.donchian_top = bt.indicators.Highest(self.data.high, period=self.p.donchian_period)
+        self.donchian_bottom = bt.indicators.Lowest(self.data.low, period=self.p.donchian_period)
+        self.adx = bt.indicators.ADX(self.data, period=self.p.adx_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.entry_pending = False
+        self.stop_dist = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order is self.stop_order:
+                self.stop_order = None
+                self.order = None
+                return
+            if self.entry_pending:
+                self.entry_pending = False
+                entry_price = order.executed.price
+                size = abs(order.executed.size)
+                if order.isbuy():
+                    stop_price = entry_price - self.stop_dist
+                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price, size=size)
+                else:
+                    stop_price = entry_price + self.stop_dist
+                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price, size=size)
+                self.order = None
+                return
+            self.order = None
+            return
+
+        if order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self.stop_order:
+                self.stop_order = None
+            if order is self.order:
+                self.order = None
+                self.entry_pending = False
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+
+        if not self.position:
+            long_signal = close > self.donchian_top[0] and self.adx[0] > self.p.adx_threshold
+            short_signal = close < self.donchian_bottom[0] and self.adx[0] > self.p.adx_threshold
+
+            if long_signal or short_signal:
+                stop_dist = max(self.p.stop_atr_mult * self.atr[0], self.p.stop_pct * close)
+                equity = self.broker.getvalue()
+                size = math.floor((equity * self.p.risk_pct) / stop_dist)
+                if size > 0:
+                    self.stop_dist = stop_dist
+                    self.entry_pending = True
+                    if long_signal:
+                        self.order = self.buy(size=size)
+                    else:
+                        self.order = self.sell(size=size)
+        else:
+            exit_signal = False
+            if self.position.size > 0 and close < self.donchian_bottom[0]:
+                exit_signal = True
+            elif self.position.size < 0 and close > self.donchian_top[0]:
+                exit_signal = True
+
+            if exit_signal:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "DonchianChannel indicator", "choice": "Computed top/bottom lines directly as bt.indicators.Highest(high, period=20) and bt.indicators.Lowest(low, period=20) instead of defining a separate DonchianChannel indicator class.", "reason": "Backtrader has no built-in DonchianChannel indicator, and the harness requires exactly one module-level class (the Strategy); defining a second top-level indicator class would violate that constraint, so the channel is computed with the standard Highest/Lowest building blocks that define a Donchian channel."},
+  {"topic": "entry_price/ATR timing for stop_dist", "choice": "stop_dist = max(2*ATR[0], 0.02*close[0]) is computed once on the signal bar (using that bar's ATR and close as the entry_price proxy) and reused unchanged both for position sizing and, anchored to the actual fill price, for the stop level once the market order executes.", "reason": "The true fill price of a market order is not known until execution (fills at the next bar's open by default), so the entry_price/ATR terms in the spec's stop_dist formula must be taken from the signal bar; reusing the same stop_dist value keeps the size and stop-distance formulas mutually consistent as the spec implies by sharing one stop_dist variable."},
+  {"topic": "protective stop mechanism", "choice": "Implemented the protective stop as a native backtrader Stop order (exectype=bt.Order.Stop) submitted immediately after the entry order fills, rather than via buy_bracket/sell_bracket.", "reason": "The spec only calls for a single fixed initial stop with no take-profit leg, so a standalone stop order issued right after entry-fill confirmation is the most literal reading of 'issue bracket/stop orders accordingly' without adding an unstated take-profit component that the bracket helper would otherwise require."}
+]}
+```

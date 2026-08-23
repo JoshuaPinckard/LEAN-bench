@@ -1,0 +1,280 @@
+_bbwidth100 = bt.indicators.SMA(self.bb_width, period=100)
+        self.sma_atr100 = bt.indicators.SMA(self.atr14, period=100)
+        self.sma_vol20 = bt.indicators.SMA(self.data.volume, period=20)
+        self.cross_close_bbtop = bt.indicators.CrossOver(self.data.close, self.bb20.top)
+        self.cross_close_bbbot = bt.indicators.CrossOver(self.data.close, self.bb20.bot)
+        self.stoch = bt.indicators.Stochastic(self.data, period=14, period_dfast=3, period_dslow=3)
+        self.stoch_cross = bt.indicators.CrossOver(self.stoch.percK, self.stoch.percD)
+
+        # --- state tracking ---
+        self.order = None
+        self.pending_action = None
+        self.active_slot = None
+        self.active_direction = None
+        self.entry_price = None
+        self.entry_bar = None
+        self.stop_price = None
+        self.target_price = None
+
+        self.panic_history = collections.deque(maxlen=5)
+        self.bars_since_panic = None
+
+        self.prev_bar_date = None
+        self.prev_bar_close = None
+        self.prev_bar_atr = None
+        self.prev_bar_bbtop = None
+        self.prev_bar_bbbot = None
+        self.gap_direction = None
+        self.gap_armed_date = None
+
+        self._pending_slot = None
+        self._pending_direction = None
+        self._pending_stop_mult = None
+        self._pending_target_mult = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        new_day = self.prev_bar_date is not None and dt != self.prev_bar_date
+
+        if new_day:
+            today_open = self.data.open[0]
+            gap_up = (today_open >= self.prev_bar_close + 1.5 * self.prev_bar_atr and
+                      self.prev_bar_close > self.prev_bar_bbtop)
+            gap_down = (today_open <= self.prev_bar_close - 1.5 * self.prev_bar_atr and
+                        self.prev_bar_close < self.prev_bar_bbbot)
+            if gap_up:
+                self.gap_direction = 'up'
+                self.gap_armed_date = dt
+            elif gap_down:
+                self.gap_direction = 'down'
+                self.gap_armed_date = dt
+            else:
+                self.gap_direction = None
+                self.gap_armed_date = None
+
+        self.prev_bar_close = self.data.close[0]
+        self.prev_bar_atr = self.atr14[0]
+        self.prev_bar_bbtop = self.bb20.top[0]
+        self.prev_bar_bbbot = self.bb20.bot[0]
+        self.prev_bar_date = dt
+
+        conditions_met = 0
+        if self.atr14[0] > self.sma_atr126[0] * 1.5:
+            conditions_met += 1
+        if self.data.close[0] < self.bb20.bot[0]:
+            conditions_met += 1
+        if self.rsi14[0] < 30:
+            conditions_met += 1
+        if self.data.volume[0] > self.sma_vol50[0] * 1.3:
+            conditions_met += 1
+        panic_today = conditions_met >= 3
+        self.panic_history.append(panic_today)
+        panic_detected = any(self.panic_history)
+        if panic_detected:
+            self.bars_since_panic = 0
+        elif self.bars_since_panic is not None:
+            self.bars_since_panic += 1
+        entry_window_open = self.bars_since_panic is not None and self.bars_since_panic <= 10
+
+        if self.order:
+            return
+
+        if self.active_slot is not None:
+            self._manage_exit()
+            return
+
+        self._check_entries(entry_window_open)
+
+    def _manage_exit(self):
+        close = self.data.close[0]
+        bars_held = len(self) - self.entry_bar
+
+        if self.active_slot == 'primary':
+            if close > self.entry_price:
+                self.stop_price = max(self.stop_price, close - 2 * self.atr14[0])
+            if close <= self.stop_price:
+                self._submit_exit()
+                return
+            take_profit_hit = close >= self.target_price or (self.rsi14[0] > 70 and close > self.bb20.top[0])
+            if take_profit_hit:
+                self._submit_exit()
+                return
+            protective = self.cross_ema20_50[0] > 0 or close < self.ema50[0]
+            if protective:
+                self._submit_exit()
+                return
+            return
+
+        direction = self.active_direction
+        stop_hit = close <= self.stop_price if direction == 'long' else close >= self.stop_price
+        if stop_hit:
+            self._submit_exit()
+            return
+
+        if self.active_slot == 'aux1':
+            if direction == 'long':
+                target_hit = close >= self.target_price
+                revert_hit = close <= self.bb20.mid[0]
+            else:
+                target_hit = close <= self.target_price
+                revert_hit = close >= self.bb20.mid[0]
+            if target_hit or revert_hit or bars_held >= 3:
+                self._submit_exit()
+                return
+
+        elif self.active_slot == 'aux2':
+            if direction == 'long':
+                target_hit = close >= self.target_price
+                trend_exit = close < self.ema20[0]
+            else:
+                target_hit = close <= self.target_price
+                trend_exit = close > self.ema20[0]
+            if target_hit or trend_exit or bars_held >= 10:
+                self._submit_exit()
+                return
+
+        elif self.active_slot == 'aux3':
+            if direction == 'long':
+                target_hit = close >= self.target_price
+                band_hit = close >= self.bb20.top[0]
+            else:
+                target_hit = close <= self.target_price
+                band_hit = close <= self.bb20.bot[0]
+            if target_hit or band_hit or bars_held >= 8:
+                self._submit_exit()
+                return
+
+    def _submit_exit(self):
+        self.pending_action = 'exit'
+        self.order = self.close()
+
+    def _check_entries(self, entry_window_open):
+        if self._check_primary_entry(entry_window_open):
+            return
+        if self._check_aux1_entry():
+            return
+        if self._check_aux2_entry():
+            return
+        self._check_aux3_entry()
+
+    def _check_primary_entry(self, entry_window_open):
+        if not entry_window_open or not self.trend_quality[0]:
+            return False
+        if self.cross_close_bbmid[0] > 0 and self.cross_ema20_50[0] > 0:
+            size = int((self.broker.getvalue() * 0.9) / self.data.close[0])
+            if size <= 0:
+                return False
+            self.pending_action = 'primary_entry'
+            self.order = self.buy(size=size)
+            return True
+        return False
+
+    def _check_aux1_entry(self):
+        squeeze = (self.bb_width[0] < self.sma_bbwidth100[0] * 0.8 and
+                   self.atr14[0] < self.sma_atr100[0])
+        if not squeeze:
+            return False
+        if self.data.volume[0] <= self.sma_vol20[0] * 1.2:
+            return False
+        if self.cross_close_bbtop[0] > 0:
+            return self._submit_aux_entry('aux1', 'long', 1.0, 1.5)
+        if self.cross_close_bbbot[0] < 0:
+            return self._submit_aux_entry('aux1', 'short', 1.0, 1.5)
+        return False
+
+    def _check_aux2_entry(self):
+        if self.gap_direction == 'up':
+            pullback = self.data.close[0] <= self.ema20[0] or self.data.close[0] <= self.bb20.mid[0]
+            cross_up = self.stoch_cross[0] > 0 and self.stoch.percK[-1] < 20
+            if pullback and cross_up:
+                return self._submit_aux_entry('aux2', 'long', 1.0, 2.0)
+        elif self.gap_direction == 'down':
+            pullback = self.data.close[0] >= self.ema20[0] or self.data.close[0] >= self.bb20.mid[0]
+            cross_down = self.stoch_cross[0] < 0 and self.stoch.percK[-1] > 80
+            if pullback and cross_down:
+                return self._submit_aux_entry('aux2', 'short', 1.0, 2.0)
+        return False
+
+    def _check_aux3_entry(self):
+        e20, e50, e100, e200 = self.ema20[0], self.ema50[0], self.ema100[0], self.ema200[0]
+        close = self.data.close[0]
+        if e20 > e50 > e100 > e200:
+            pullback = close <= self.bb20.mid[0]
+            cross_up = self.stoch_cross[0] > 0 and self.stoch.percK[-1] < 30
+            if pullback and cross_up:
+                return self._submit_aux_entry('aux3', 'long', 1.0, 1.2)
+        elif e20 < e50 < e100 < e200:
+            pullback = close >= self.bb20.mid[0]
+            cross_down = self.stoch_cross[0] < 0 and self.stoch.percK[-1] > 70
+            if pullback and cross_down:
+                return self._submit_aux_entry('aux3', 'short', 1.0, 1.2)
+        return False
+
+    def _submit_aux_entry(self, slot, direction, stop_mult, target_mult):
+        price = self.data.close[0]
+        atr = self.atr14[0]
+        if atr <= 0:
+            return False
+        risk_shares = int((self.broker.getvalue() * 0.01) / (stop_mult * atr))
+        cap_shares = int((self.broker.getvalue() * 0.10) / price)
+        size = min(risk_shares, cap_shares)
+        if size <= 0:
+            return False
+        self._pending_slot = slot
+        self._pending_direction = direction
+        self._pending_stop_mult = stop_mult
+        self._pending_target_mult = target_mult
+        self.pending_action = 'aux_entry'
+        self.order = self.buy(size=size) if direction == 'long' else self.sell(size=size)
+        return True
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.pending_action == 'primary_entry':
+                self.active_slot = 'primary'
+                self.active_direction = 'long'
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+                atr = self.atr14[0]
+                self.stop_price = self.entry_price - 1.5 * atr
+                self.target_price = self.entry_price + 3 * atr
+            elif self.pending_action == 'aux_entry':
+                self.active_slot = self._pending_slot
+                self.active_direction = self._pending_direction
+                self.entry_price = order.executed.price
+                self.entry_bar = len(self)
+                atr = self.atr14[0]
+                if self.active_direction == 'long':
+                    self.stop_price = self.entry_price - self._pending_stop_mult * atr
+                    self.target_price = self.entry_price + self._pending_target_mult * atr
+                else:
+                    self.stop_price = self.entry_price + self._pending_stop_mult * atr
+                    self.target_price = self.entry_price - self._pending_target_mult * atr
+            elif self.pending_action == 'exit':
+                self.active_slot = None
+                self.active_direction = None
+                self.entry_price = None
+                self.entry_bar = None
+                self.stop_price = None
+                self.target_price = None
+
+        self.order = None
+        self.pending_action = None
+```
+```json
+{"assumptions": [
+{"topic": "infeasible", "choice": "Only one trade (primary or one auxiliary sub-strategy) may be open at a time, priority order primary > squeeze-breakout > gap-continuation > trend-scalp; auxiliary sub-strategies never run concurrently.", "reason": "backtrader maintains a single net broker position per data feed, so independent simultaneous primary+auxiliary (or multi-auxiliary) positions on the same single AAPL feed cannot be represented; this also trivially satisfies the '<=10% total auxiliary exposure' rule."},
+{"topic": "ambiguous-spec", "choice": "Entry-trigger window implemented as: whenever the rolling 5-bar panic condition is true, a 10-bar countdown (re)starts; the crossover entry trigger is only accepted while that countdown is <=10.", "reason": "spec states panic is checked over 'any of the last 5 bars' and the entry trigger must fire 'within 10 bars after' the detector, but doesn't define how the two rolling windows compose; this is the most literal chaining of the two stated windows."},
+{"topic": "literal-reading", "choice": "Protective exit condition 'CrossOver(EMA(50),EMA(20)) down' implemented with the same crossover indicator/sign used for the entry's 'CrossOver(EMA(20),EMA(50)) up' (CrossOver(a,b) down and CrossOver(b,a) up are the same event).", "reason": "the two conditions are mathematically identical events under backtrader's CrossOver semantics; implemented exactly as written rather than substituting the (more conventional) death-cross reading."},
+{"topic": "infeasible", "choice": "Daily gap detection (Strategy 2) derived from the 5m feed via trading-day boundary detection: 'yesterday' close/ATR/BB values are the last 5m bar's values before the date changes, 'today' open is the first 5m bar's open of the new date.", "reason": "the feed is 5-minute bars, not daily bars; no separate daily data source is available, so session-boundary aggregation on the existing feed is the closest literal reading."},
+{"topic": "ambiguous-spec", "choice": "A detected gap stays 'armed' only for the trading day on which it triggers; it is cleared (and re-evaluated) at the next day boundary.", "reason": "spec gives no explicit expiry for the gap-continuation setup prior to entry."},
+{"topic": "ambiguous-spec", "choice": "Squeeze compression filter (Strategy 1) is required to hold on the same bar as the breakout crossover.", "reason": "spec does not state a separate lag/lookback between the compression state and the breakout bar."},
+{"topic": "ambiguous-spec", "choice": "Pullback 'touch' of EMA20/Bollinger-mid (Strategies 2 and 3) implemented as Close <= level for longs / Close >= level for shorts, rather than an exact-touch tolerance.", "reason": "spec doesn't define a tolerance band for the pullback touch."},
+{"topic": "ambiguous-spec", "choice": "Strategy 2 short-side stochastic zone mirrored as %K > 80 (long side uses < 20).", "reason": "spec states the long threshold explicitly and says the short side is 'mirrored' without giving a number; 80 is the symmetric mirror of 20."},
+{"topic": "ambiguous-spec", "choice": "Strategy 3 time-stop implemented literally as 8 bars, per the explicit numeric rule, rather than converted from the descriptive '120-180 minutes' framing text.", "reason": "the explicit stated parameter (8 bars) is the concrete rule; the minute range is background/title description."},
+{"topic": "implementation-choice", "choice": "All stop-loss, take-profit, trailing-stop, and time-stop checks are evaluated against bar Close and executed via self.close()/self.buy()/self.sell() market orders each bar, rather than backtrader Stop/Limit/StopTrail order types.", "reason": "the spec's stop/target levels are recomputed from ATR/EMA/Bollinger values that change bar to bar (especially the trailing stop), which does not map onto backtrader's built-in fixed-parameter stop-order types; manual per-bar evaluation lets every stated formula be applied exactly."}
+]}
+```

@@ -1,0 +1,120 @@
+```python
+class WeeklyORBStrategy(bt.Strategy):
+    params = dict(
+        ema_period=21,
+        bb_period=20,
+        bb_devfactor=2.0,
+        stoch_period=14,
+        stoch_pfast=3,
+        stoch_pslow=3,
+        atr_period=14,
+        vol_sma_period=20,
+        fib_low_mult=0.618,
+        fib_high_mult=0.382,
+        tp_mult=1.5,
+        sl_atr_mult=0.25,
+        risk_pct=0.01,
+    )
+
+    def __init__(self):
+        self.ema21 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+        self.stoch = bt.indicators.Stochastic(
+            self.data,
+            period=self.p.stoch_period,
+            period_dfast=self.p.stoch_pfast,
+            period_dslow=self.p.stoch_pslow,
+        )
+        self.crossover = bt.indicators.CrossOver(self.stoch.percK, self.stoch.percD)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.order = None
+
+        self.current_week = None
+        self.wor_high = None
+        self.wor_low = None
+        self.wor_range = None
+        self.breakout_confirmed = False
+
+        self.entry_price = None
+        self.tp_level = None
+        self.sl_level = None
+        self.entry_wor_low = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order.status == order.Completed:
+                if order.isbuy():
+                    self.entry_price = order.executed.price
+                    self.tp_level = self.entry_price + self.p.tp_mult * self.wor_range
+                    self.sl_level = self.wor_low - self.p.sl_atr_mult * self.atr[0]
+                    self.entry_wor_low = self.wor_low
+                else:
+                    self.entry_price = None
+                    self.tp_level = None
+                    self.sl_level = None
+                    self.entry_wor_low = None
+            self.order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        iso_year, iso_week, _ = dt.isocalendar()
+        week_id = (iso_year, iso_week)
+
+        if week_id != self.current_week:
+            self.current_week = week_id
+            self.wor_high = self.data.high[0]
+            self.wor_low = self.data.low[0]
+            self.wor_range = self.wor_high - self.wor_low
+            self.breakout_confirmed = False
+
+        if self.order:
+            return
+
+        close = self.data.close[0]
+
+        if self.position:
+            high = self.data.high[0]
+            low = self.data.low[0]
+            sl_hit = self.sl_level is not None and (
+                low <= self.sl_level or close < self.entry_wor_low
+            )
+            tp_hit = self.tp_level is not None and high >= self.tp_level
+            if sl_hit:
+                self.order = self.close()
+            elif tp_hit:
+                self.order = self.close()
+        else:
+            if self.breakout_confirmed and self.wor_range is not None and self.wor_range > 0:
+                low = self.data.low[0]
+                fib_lower = self.wor_high - self.p.fib_low_mult * self.wor_range
+                fib_upper = self.wor_high - self.p.fib_high_mult * self.wor_range
+                pullback = (fib_lower <= low <= fib_upper) or (fib_lower <= close <= fib_upper)
+                trend = close > self.ema21[0] and close > self.bb.mid[0]
+                reversal = self.crossover[0] > 0
+
+                if pullback and trend and reversal:
+                    equity = self.broker.getvalue()
+                    size = (self.p.risk_pct * equity) / close
+                    if size > 0:
+                        self.order = self.buy(size=size)
+
+        if close > self.wor_high:
+            self.breakout_confirmed = True
+```
+```json
+{"assumptions": [
+  {"topic": "WOR day selection", "choice": "The opening-range day for each week is whichever bar is the first to appear in the feed for that ISO calendar week (detected via a week-id change), not literally weekday==Monday.", "reason": "The feed contains only actual trading days, so if Monday is a holiday it is simply absent and the next available day becomes the first bar of the new week-id, satisfying the spec's fallback rule without needing an external holiday calendar."},
+  {"topic": "Breakout 'already been' timing", "choice": "The breakout-confirmed flag is updated at the end of each bar's processing (after entry logic runs), so a given day's own close is only reflected in the flag starting the following bar.", "reason": "The spec says a breakout day has 'already' occurred, implying prior days, not the current signal day; since the range day's own close cannot exceed its own high this rarely changes outcomes but keeps the logic literal."},
+  {"topic": "TP/SL level freeze at entry", "choice": "Take-profit and stop-loss levels are computed once at trade entry (fill time) from that week's WOR_high/WOR_low/WOR_range and the ATR(14) value on the fill bar, then held fixed for the life of the trade even if the WOR rolls to a new week while the position is open.", "reason": "The spec describes TP/SL as levels tied to the entry and the entry week's range; a per-bar recompute against a possibly newer week's WOR/ATR would not match 'Entry + 1.5*WOR_range' as a single trade-defining level."},
+  {"topic": "Volume SMA(20) confirmation", "choice": "Computed as an indicator but not required to gate entries.", "reason": "Spec explicitly labels it 'Optional strengthening', distinguishing it from the four numbered mandatory long-entry conditions."},
+  {"topic": "TP/SL same-bar tie-break", "choice": "If both the stop-loss and take-profit conditions are true on the same bar, the stop-loss exit takes priority.", "reason": "Spec is silent on simultaneous triggers; prioritizing the stop is the conservative, capital-preservation-first reading and is consistent with the spec's own stop-loss clause 'whichever occurs first'."},
+  {"topic": "Intrabar TP/SL touch detection", "choice": "Take-profit is checked against the bar's High reaching the TP level; the ATR-based stop is checked against the bar's Low reaching the stop level; the close-below-WOR_low stop uses the bar's Close. All exits are submitted as a plain self.close() market order.", "reason": "Spec says price 'reaches' the TP/SL levels, which on daily OHLC bars is most literally represented by intrabar High/Low touches; no specific order type (stop/limit) is specified, so a market close triggered by the detected touch was used instead of native broker stop/limit orders to keep execution transparent and directly traceable to the stated conditions."},
+  {"topic": "Position sizing rounding", "choice": "size = 0.01*Equity/Close is used as-is (fractional shares allowed), with no floor/rounding to whole shares.", "reason": "The spec gives an exact formula with no mention of lot-size or integer-share rounding, so the literal formula was implemented unmodified."},
+  {"topic": "Equity definition for sizing", "choice": "Equity = self.broker.getvalue() (total portfolio value) evaluated at the moment of the entry signal.", "reason": "Spec says '1% of capital' / 'Equity' without further definition; broker.getvalue() is the standard backtrader measure of total account equity, and since only one position is ever held and none is open at signal time here, it is equivalent to available cash plus zero position value."},
+  {"topic": "First partial week at dataset start", "choice": "The very first bar of the dataset is treated as that week's opening-range day even if it is not a Monday.", "reason": "No prior-week data exists before the feed starts, so there is no way to obtain an earlier Monday/first-trading-day bar; this is the closest literal reading given the fixed data window."}
+]}
+```

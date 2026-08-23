@@ -1,0 +1,184 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionFalseBreakout(bt.Strategy):
+    params = dict(
+        upper_level=450.00,
+        lower_level=445.00,
+        atr_period=14,
+        atr_sma_period=50,
+        rsi_period=14,
+        bb_period=20,
+        bb_devfactor=2.0,
+        trade_size=2,
+        short_sl_price=450.25,
+        short_tp_zone=447.5,
+        short_tp_close=446.0,
+        long_sl_price=444.75,
+        long_tp_high=449.5,
+        long_tp_close=449.0,
+        trail_trigger_mult=0.75,
+        trail_step_mult=0.5,
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_avg = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+
+        self.entry_order = None
+        self.stop_order = None
+        self.stale_stop_refs = set()
+
+        self.direction = None
+        self.entry_price = None
+        self.stop_price = None
+        self.bars_in_trade = 0
+        self.last_entry_date = None
+
+    def _reset_trade_state(self):
+        self.direction = None
+        self.entry_price = None
+        self.stop_price = None
+        self.stop_order = None
+        self.bars_in_trade = 0
+
+    def _replace_stop(self, new_price, is_long):
+        if self.stop_order is not None:
+            self.stale_stop_refs.add(self.stop_order.ref)
+            self.cancel(self.stop_order)
+        self.stop_price = new_price
+        if is_long:
+            self.stop_order = self.sell(
+                size=self.p.trade_size, exectype=bt.Order.Stop, price=new_price
+            )
+        else:
+            self.stop_order = self.buy(
+                size=self.p.trade_size, exectype=bt.Order.Stop, price=new_price
+            )
+
+    def _close_position(self):
+        if self.stop_order is not None:
+            self.stale_stop_refs.add(self.stop_order.ref)
+            self.cancel(self.stop_order)
+        self.close()
+        self._reset_trade_state()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.ref in self.stale_stop_refs:
+            self.stale_stop_refs.discard(order.ref)
+            return
+
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                self.entry_price = order.executed.price
+                is_long = self.direction == 'long'
+                initial_stop = (
+                    self.p.long_sl_price if is_long else self.p.short_sl_price
+                )
+                self.stop_price = initial_stop
+                if is_long:
+                    self.stop_order = self.sell(
+                        size=self.p.trade_size,
+                        exectype=bt.Order.Stop,
+                        price=initial_stop,
+                    )
+                else:
+                    self.stop_order = self.buy(
+                        size=self.p.trade_size,
+                        exectype=bt.Order.Stop,
+                        price=initial_stop,
+                    )
+                self.bars_in_trade = 0
+            else:
+                self._reset_trade_state()
+            self.entry_order = None
+            return
+
+        if order is self.stop_order:
+            if order.status == order.Completed:
+                self._reset_trade_state()
+            elif order.status in (order.Canceled, order.Margin, order.Rejected):
+                self.stop_order = None
+            return
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        high = self.data.high[0]
+        low = self.data.low[0]
+        close = self.data.close[0]
+
+        if self.position:
+            if self.direction == 'long':
+                profit = close - self.entry_price
+                if profit >= self.p.trail_trigger_mult * self.atr[0]:
+                    candidate = close - self.p.trail_step_mult * self.atr[0]
+                    if candidate > self.stop_price:
+                        self._replace_stop(candidate, is_long=True)
+
+                tp_hit = high >= self.p.long_tp_high or close >= self.p.long_tp_close
+            else:
+                profit = self.entry_price - close
+                if profit >= self.p.trail_trigger_mult * self.atr[0]:
+                    candidate = close + self.p.trail_step_mult * self.atr[0]
+                    if candidate < self.stop_price:
+                        self._replace_stop(candidate, is_long=False)
+
+                tp_hit = (
+                    low <= self.p.short_tp_zone
+                    or close <= self.p.short_tp_close
+                    or low <= self.bb.mid[0]
+                )
+
+            if tp_hit:
+                self._close_position()
+                return
+
+            if self.bars_in_trade >= 1:
+                self._close_position()
+                return
+
+            self.bars_in_trade += 1
+            return
+
+        if self.entry_order is not None:
+            return
+
+        if self.last_entry_date == dt:
+            return
+
+        if self.atr[0] <= self.atr_avg[0]:
+            return
+
+        if high > self.p.upper_level and close < self.p.upper_level:
+            if self.rsi[0] > 60 and high >= self.bb.top[0]:
+                self.direction = 'short'
+                self.last_entry_date = dt
+                self.entry_order = self.sell(size=self.p.trade_size)
+                return
+
+        if low < self.p.lower_level and close > self.p.lower_level:
+            if self.rsi[0] < 40 and low <= self.bb.bot[0]:
+                self.direction = 'long'
+                self.last_entry_date = dt
+                self.entry_order = self.buy(size=self.p.trade_size)
+                return
+```
+```json
+{"assumptions": [
+  {"topic": "long stop-loss order type", "choice": "Implemented the 444.75 long stop-loss as a bt.Order.Stop (same mechanism explicitly requested for the short side's 450.25 level).", "reason": "Spec only says 'stop order' explicitly for the short side but gives a bare price for the long side; using the same order type on both sides is the most consistent literal reading and matches canonical default of not inventing asymmetric mechanics."},
+  {"topic": "Bollinger 'touch' definition", "choice": "Entry touch = bar's High >= upper band (short) / Low <= lower band (long); TP touch of the middle line for the short = bar's Low <= mid band.", "reason": "Spec says 'touch of / being at' a band; using the bar's extreme (High/Low) rather than Close captures both a touch and a close-at-band condition since High/Low bound Close."},
+  {"topic": "forced end-of-session exit timing", "choice": "Tracked bars_in_trade and force self.close() on the first full bar after the fill bar if neither TP condition nor the stop order has triggered by then.", "reason": "infeasible: the feed is daily bars with no intraday session, and the harness-configured broker fills market orders at the next bar's open (not the referenced bar's close), so an exact 'exit at the very next close' cannot be reproduced; this is the closest literal approximation without altering broker settings the harness owns."},
+  {"topic": "trailing stop direction", "choice": "For longs the stop is raised (close - 0.5*ATR, only if higher than current stop); for shorts the stop is lowered (close + 0.5*ATR, only if lower than current stop).", "reason": "The spec's single 'move up a trailing stop by 0.5xATR' sentence is written generically for both the call-selling (short) and put-selling (long) analogs; tightening in the direction that locks in profit is the literal intent of a trailing stop and requires direction-aware handling for the short side."},
+  {"topic": "ATR value used for trailing calculations", "choice": "Used the live ATR(14) value on each bar (not frozen at entry) for both the 0.75x profit trigger and the 0.5x step.", "reason": "Spec references 'ATR(14)' generically without stating it should be fixed at entry; using the current indicator value is the plain reading of an indicator-based rule evaluated bar by bar."},
+  {"topic": "simultaneous short/long signal on one bar", "choice": "If both the short and long entry conditions are satisfied on the same bar, the short setup is evaluated first and takes priority.", "reason": "Spec does not address this edge case (High>450 and Low<445 on the same bar is rare); an explicit, deterministic tie-break was needed and no ordering is implied by the spec, so short-first was chosen arbitrarily and declared here."},
+  {"topic": "'one new trade per day' tracking", "choice": "Tracked via the bar's calendar date (self.data.datetime.date(0)) compared against the date of the last entry signal.", "reason": "Spec states the daily-trade cap in calendar terms; with one bar per day this is a direct literal mapping and requires no additional inference."}
+]}
+```

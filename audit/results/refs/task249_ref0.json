@@ -1,23 +1,28 @@
 {
   "task_id": 249,
   "ref_idx": 0,
-  "model": "opus",
-  "code": "import backtrader as bt\n\n\nclass IchimokuStyleSMAMomentum(bt.Strategy):\n    params = dict(\n        tenkan_period=9,   # SMA analogue of Tenkan\n        kijun_period=26,   # SMA analogue of Kijun\n        senkou_period=52,  # SMA analogue of long-term cloud support\n    )\n\n    def __init__(self):\n        # Indicators named by the spec: SMA(9), SMA(26), SMA(52), CrossOver\n        self.sma9 = bt.indicators.SMA(self.data.close, period=self.p.tenkan_period)\n        self.sma26 = bt.indicators.SMA(self.data.close, period=self.p.kijun_period)\n        self.sma52 = bt.indicators.SMA(self.data.close, period=self.p.senkou_period)\n        # CrossOver of SMA(9) vs SMA(26): +1 = 9 crosses above 26, -1 = 9 crosses below 26\n        self.crossover = bt.indicators.CrossOver(self.sma9, self.sma26)\n\n        self.order = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def _full_capital_size(self):\n        # 100% of available capital per trade, sized off the confirmed close,\n        # leaving room for commission so the next-open fill is not margin-rejected.\n        price = self.data.close[0]\n        if price <= 0:\n            return 0\n        cash = self.broker.get_cash()\n        comm = self.broker.getcommissioninfo(self.data).p.commission\n        return int(cash / (price * (1.0 + comm)))\n\n    def next(self):\n        if self.order:\n            return\n\n        close = self.data.close[0]\n        sma26 = self.sma26[0]\n        sma52 = self.sma52[0]\n        cross = self.crossover[0]\n\n        if self.position:\n            if self.position.size > 0:\n                # Exit long: reverse cross (9 below 26) OR close below lower of SMA26/SMA52\n                if cross < 0 or close < min(sma26, sma52):\n                    self.order = self.close()\n            elif self.position.size < 0:\n                # Exit short: reverse cross (9 above 26) OR close above higher of SMA26/SMA52\n                if cross > 0 or close > max(sma26, sma52):\n                    self.order = self.close()\n        else:\n            # Enter long: 9 crosses above 26, close above both SMA26 & SMA52, SMA26 > SMA52\n            if cross > 0 and close > sma26 and close > sma52 and sma26 > sma52:\n                size = self._full_capital_size()\n                if size > 0:\n                    self.order = self.buy(size=size)\n            # Enter short: 9 crosses below 26, close below both SMA26 & SMA52, SMA26 < SMA52\n            elif cross < 0 and close < sma26 and close < sma52 and sma26 < sma52:\n                size = self._full_capital_size()\n                if size > 0:\n                    self.order = self.sell(size=size)",
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass MomentumIchimokuSMAStrategy(bt.Strategy):\n    def __init__(self):\n        self.tenkan = bt.indicators.SMA(self.data.close, period=9)\n        self.kijun = bt.indicators.SMA(self.data.close, period=26)\n        self.senkou = bt.indicators.SMA(self.data.close, period=52)\n        self.crossover = bt.indicators.CrossOver(self.tenkan, self.kijun)\n        self.order = None\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        close = self.data.close[0]\n        kijun = self.kijun[0]\n        senkou = self.senkou[0]\n\n        if not self.position:\n            if (self.crossover[0] > 0 and close > kijun and close > senkou\n                    and kijun > senkou):\n                cash = self.broker.getcash()\n                size = int(cash / close)\n                if size > 0:\n                    self.order = self.buy(size=size)\n            elif (self.crossover[0] < 0 and close < kijun and close < senkou\n                    and kijun < senkou):\n                cash = self.broker.getcash()\n                size = int(cash / close)\n                if size > 0:\n                    self.order = self.sell(size=size)\n        elif self.position.size > 0:\n            if self.crossover[0] < 0 or close < min(kijun, senkou):\n                self.order = self.close()\n        elif self.position.size < 0:\n            if self.crossover[0] > 0 or close > max(kijun, senkou):\n                self.order = self.close()",
   "assumptions": [
     {
       "topic": "position sizing",
-      "choice": "Compute size = int(cash / (close * (1 + commission))) each entry using current available cash and the confirmed close as reference price.",
-      "reason": "Spec states '100% of available capital per trade'; integer share count derived from the close is the closest literal all-in size, with the (1+commission) factor reserving the 0.001 fee so the next-bar-open fill is not margin-rejected."
+      "choice": "size = int(available_cash / current_close_price) at the signal bar, applied on every new long/short entry",
+      "reason": "spec states '100% of available capital per trade' but gives no exact formula; using cash divided by the confirming close price is the most literal reading, with no extra margin buffer since none is specified"
     },
     {
-      "topic": "execution timing",
-      "choice": "Signals are evaluated in next() on the closed bar; the resulting order fills at the next bar's open (backtrader default).",
-      "reason": "Spec says all signals are confirmed at the bar close but is silent on fill mechanics; the harness's default next-open execution is used."
+      "topic": "same-bar exit-then-reverse-entry",
+      "choice": "on a reverse cross that closes an open position, do not also open the opposite position on the same bar; a new entry can only be evaluated once the position is flat",
+      "reason": "canonical default requires holding at most one position at a time with no pyramiding/re-entry while a position is open; the spec does not explicitly request an immediate flip, so the guarded, sequential exit-then-entry check is applied"
     },
     {
-      "topic": "exit vs. re-entry",
-      "choice": "When a position is open only exit rules are checked; no immediate reversal on the same bar an exit fires. A new (long or short) entry is possible only once flat.",
-      "reason": "Canonical default: hold at most one position, no re-entry/pyramiding while a position is open; the spec does not specify same-bar reversal."
+      "topic": "order guard",
+      "choice": "single self.order attribute reset on Completed/Canceled/Margin/Rejected in notify_order, blocking new signal evaluation while an order is pending",
+      "reason": "canonical default for this environment"
+    },
+    {
+      "topic": "indicator warm-up",
+      "choice": "rely on backtrader's automatic minperiod (effectively 52 bars) with no manual bar-skipping",
+      "reason": "spec is silent on warm-up handling; canonical default applies"
     }
   ],
   "success": true,
@@ -99,14 +104,14 @@
     {
       "dt": "2023-10-27T04:00:00",
       "side": "SELL",
-      "size": -51.0,
-      "price": 164.8246554843009
+      "size": -52.0,
+      "price": 164.82465548430088
     },
     {
       "dt": "2023-11-03T04:00:00",
       "side": "BUY",
-      "size": 51.0,
-      "price": 172.06311427874402
+      "size": 52.0,
+      "price": 172.06311427874405
     },
     {
       "dt": "2024-08-21T04:00:00",

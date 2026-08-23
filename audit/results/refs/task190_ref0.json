@@ -1,0 +1,403 @@
+{
+  "task_id": 190,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\nimport backtrader as bt\n\n\nclass ShortVolatilityBBATR(bt.Strategy):\n    params = (\n        ('bb_period', 20),\n        ('bb_dev', 2),\n        ('atr_period', 14),\n        ('bw_sma_period', 100),\n        ('vol_sma_period', 20),\n        ('time_stop_bars', 45),\n        ('emergency_pct', 0.05),\n        ('risk_pct', 0.01),\n        ('target_pct', 0.005),\n        ('vol_liquidity_mult', 1.5),\n        ('bw_upper_mult', 1.5),\n        ('tp_retrace', 0.5),\n        ('sl_atr_mult', 1.5),\n    )\n\n    def __init__(self):\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.bw = (self.bb.top - self.bb.bot) / self.bb.mid\n        self.sma_bw = bt.indicators.SMA(self.bw, period=self.p.bw_sma_period)\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)\n        self.cross_top = bt.indicators.CrossOver(self.data.close, self.bb.top)\n        self.cross_bot = bt.indicators.CrossOver(self.data.close, self.bb.bot)\n\n        self.order_parent = None\n        self.stop_order = None\n        self.limit_order = None\n        self.close_order = None\n        self.entry_price = None\n        self.entry_bar = None\n        self.trade_dir = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order == self.order_parent:\n            if order.status == order.Completed:\n                self.entry_price = order.executed.price\n                self.entry_bar = len(self)\n                self.order_parent = None\n            elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n                self.order_parent = None\n                self.stop_order = None\n                self.limit_order = None\n                self.trade_dir = None\n        elif order in (self.stop_order, self.limit_order):\n            if order.status == order.Completed:\n                self.stop_order = None\n                self.limit_order = None\n                self.entry_price = None\n                self.entry_bar = None\n                self.trade_dir = None\n            elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n                if order == self.stop_order:\n                    self.stop_order = None\n                if order == self.limit_order:\n                    self.limit_order = None\n        elif order == self.close_order:\n            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n                self.close_order = None\n                self.entry_price = None\n                self.entry_bar = None\n                self.trade_dir = None\n                self.stop_order = None\n                self.limit_order = None\n\n    def _place_bracket(self, direction):\n        entry_est = self.data.close[0]\n        mid0 = self.bb.mid[0]\n        atr0 = self.atr[0]\n\n        if direction == 'long':\n            tp = entry_est + self.p.tp_retrace * (mid0 - entry_est)\n            sl = entry_est - self.p.sl_atr_mult * atr0\n        else:\n            tp = entry_est - self.p.tp_retrace * (entry_est - mid0)\n            sl = entry_est + self.p.sl_atr_mult * atr0\n\n        risk_dist = abs(entry_est - sl)\n        target_dist = abs(tp - entry_est)\n        if risk_dist <= 0 or target_dist <= 0:\n            return\n\n        equity = self.broker.getvalue()\n        size_risk = math.floor((equity * self.p.risk_pct) / risk_dist)\n        size_target = math.floor((equity * self.p.target_pct) / target_dist)\n        size = min(size_risk, size_target)\n        if size <= 0:\n            return\n\n        self.trade_dir = direction\n        if direction == 'long':\n            orders = self.buy_bracket(\n                size=size, price=None, exectype=bt.Order.Market,\n                stopprice=sl, limitprice=tp)\n        else:\n            orders = self.sell_bracket(\n                size=size, price=None, exectype=bt.Order.Market,\n                stopprice=sl, limitprice=tp)\n\n        self.order_parent, self.stop_order, self.limit_order = orders\n\n    def _manage_open_position(self):\n        if self.close_order is not None:\n            return\n        if self.entry_bar is None:\n            return\n\n        bars_held = len(self) - self.entry_bar\n        price_now = self.data.close[0]\n        if self.trade_dir == 'long':\n            pnl_pct = (price_now - self.entry_price) / self.entry_price\n        else:\n            pnl_pct = (self.entry_price - price_now) / self.entry_price\n\n        if bars_held >= self.p.time_stop_bars or pnl_pct <= -self.p.emergency_pct:\n            if self.stop_order is not None:\n                self.cancel(self.stop_order)\n            if self.limit_order is not None:\n                self.cancel(self.limit_order)\n            self.close_order = self.close()\n\n    def next(self):\n        if self.position:\n            self._manage_open_position()\n            return\n\n        if self.order_parent is not None:\n            return\n\n        bw0 = self.bw[0]\n        smabw0 = self.sma_bw[0]\n\n        vola_filter = (bw0 > smabw0) and (bw0 < self.p.bw_upper_mult * smabw0)\n        extreme_vol = bw0 >= self.p.bw_upper_mult * smabw0\n        liquidity_filter = self.data.volume[0] < self.p.vol_liquidity_mult * self.vol_sma[0]\n\n        if vola_filter and liquidity_filter and not extreme_vol:\n            if self.cross_top[0] < 0:\n                self._place_bracket('short')\n            elif self.cross_bot[0] > 0:\n                self._place_bracket('long')",
+  "assumptions": [
+    {
+      "topic": "entry_price_proxy",
+      "choice": "Use the signal bar's close (data.close[0]) as the proxy entry price when computing TP, SL, and position size for the bracket order.",
+      "reason": "The spec requires the bracket (entry+stop+target, sized by risk/target percentages) to be placed immediately at the signal, while actual execution happens at the following bar's open; the true fill price is unknown at submission time, so the last close is the closest available estimate for the entry-price-dependent formulas."
+    },
+    {
+      "topic": "equity_definition",
+      "choice": "equity = self.broker.getvalue() (total portfolio value), evaluated at signal time.",
+      "reason": "The spec uses 'equity'/'capital' for sizing without further definition; broker.getvalue() is backtrader's standard current-account-value measure and must be read at signal time since sizing is computed before the bracket is submitted."
+    },
+    {
+      "topic": "middle_band_source",
+      "choice": "Reuse BollingerBands' own mid line (bb.mid, which is SMA(close,20) by construction) as the spec's separately-named 'SMA(20) (middle band)' indicator instead of instantiating a second, identical SMA(20).",
+      "reason": "bb.mid is mathematically identical to SMA(close,20); a duplicate indicator would be redundant computation of the same values."
+    },
+    {
+      "topic": "bracket_order_mechanism",
+      "choice": "Implemented via bt.Strategy.buy_bracket()/sell_bracket() with the main leg as a Market order (fills at next open) and the stop/limit legs as Stop/Limit child orders at SL/TP, all submitted together at signal time.",
+      "reason": "This is backtrader's native primitive for a simultaneous entry+stop+target order group, matching 'place a bracket immediately' plus the 'execution at next open' requirement for the entry leg."
+    },
+    {
+      "topic": "time_and_emergency_exit_handling",
+      "choice": "The 45-bar time-stop and the +/-5% emergency exit are checked manually each bar while in a position (using the actual fill price recorded on entry completion); when triggered, any still-open bracket stop/limit orders are cancelled and self.close() is issued.",
+      "reason": "These are path-dependent exits that cannot be expressed as static prices at bracket-submission time, so they must be monitored live and override the bracket when triggered."
+    },
+    {
+      "topic": "extreme_volatility_check",
+      "choice": "Implemented 'do not trade under extreme volatility (BW >= 1.5*SMA(BW,100))' as an explicit standalone check alongside the volatility filter's stated upper bound (BW < 1.5*SMA(BW,100)).",
+      "reason": "The two conditions are mathematically equivalent, but both are stated explicitly in the spec, so both are implemented literally for fidelity even though the second is redundant."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 30,
+  "tape": [
+    {
+      "dt": "2020-09-03T04:00:00",
+      "side": "SELL",
+      "size": -9.0,
+      "price": 123.09935129507487
+    },
+    {
+      "dt": "2020-09-04T04:00:00",
+      "side": "BUY",
+      "size": 9.0,
+      "price": 116.46472703859587
+    },
+    {
+      "dt": "2021-01-28T05:00:00",
+      "side": "SELL",
+      "size": -11.0,
+      "price": 135.56417353512813
+    },
+    {
+      "dt": "2021-01-29T05:00:00",
+      "side": "BUY",
+      "size": 11.0,
+      "price": 131.97885239900157
+    },
+    {
+      "dt": "2021-03-02T05:00:00",
+      "side": "BUY",
+      "size": 17.0,
+      "price": 124.95564701355688
+    },
+    {
+      "dt": "2021-03-04T05:00:00",
+      "side": "SELL",
+      "size": -17.0,
+      "price": 118.45899209208316
+    },
+    {
+      "dt": "2021-04-13T04:00:00",
+      "side": "SELL",
+      "size": -14.0,
+      "price": 128.87723269707828
+    },
+    {
+      "dt": "2021-04-29T04:00:00",
+      "side": "BUY",
+      "size": 14.0,
+      "price": 132.79882309453924
+    },
+    {
+      "dt": "2021-07-09T04:00:00",
+      "side": "SELL",
+      "size": -11.0,
+      "price": 139.1458132863032
+    },
+    {
+      "dt": "2021-07-13T04:00:00",
+      "side": "BUY",
+      "size": 11.0,
+      "price": 143.02599306920766
+    },
+    {
+      "dt": "2021-09-22T04:00:00",
+      "side": "BUY",
+      "size": 15.0,
+      "price": 141.0138330802469
+    },
+    {
+      "dt": "2021-09-23T04:00:00",
+      "side": "SELL",
+      "size": -15.0,
+      "price": 143.28087043762207
+    },
+    {
+      "dt": "2021-11-26T05:00:00",
+      "side": "SELL",
+      "size": -11.0,
+      "price": 156.00157185337474
+    },
+    {
+      "dt": "2021-12-01T05:00:00",
+      "side": "BUY",
+      "size": 11.0,
+      "price": 163.73466976035556
+    },
+    {
+      "dt": "2022-01-26T05:00:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 159.84369205931444
+    },
+    {
+      "dt": "2022-01-28T05:00:00",
+      "side": "SELL",
+      "size": -7.0,
+      "price": 162.36717224121094
+    },
+    {
+      "dt": "2022-03-16T04:00:00",
+      "side": "BUY",
+      "size": 12.0,
+      "price": 153.73355381345266
+    },
+    {
+      "dt": "2022-03-17T04:00:00",
+      "side": "SELL",
+      "size": -12.0,
+      "price": 155.59904365539552
+    },
+    {
+      "dt": "2022-03-28T04:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 168.53420969754978
+    },
+    {
+      "dt": "2022-04-11T04:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 165.14726983208973
+    },
+    {
+      "dt": "2022-04-28T04:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 155.88706244158715
+    },
+    {
+      "dt": "2022-04-29T04:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 159.04175262451173
+    },
+    {
+      "dt": "2022-05-16T04:00:00",
+      "side": "BUY",
+      "size": 9.0,
+      "price": 142.68571610317943
+    },
+    {
+      "dt": "2022-05-19T04:00:00",
+      "side": "SELL",
+      "size": -9.0,
+      "price": 135.54026560822064
+    },
+    {
+      "dt": "2022-06-15T04:00:00",
+      "side": "BUY",
+      "size": 9.0,
+      "price": 131.64729675078482
+    },
+    {
+      "dt": "2022-06-23T04:00:00",
+      "side": "SELL",
+      "size": -9.0,
+      "price": 135.25903129577637
+    },
+    {
+      "dt": "2022-08-05T04:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 160.2204579317327
+    },
+    {
+      "dt": "2022-08-12T04:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 168.43092086686002
+    },
+    {
+      "dt": "2022-12-21T05:00:00",
+      "side": "BUY",
+      "size": 9.0,
+      "price": 130.76068907847488
+    },
+    {
+      "dt": "2022-12-29T05:00:00",
+      "side": "SELL",
+      "size": -9.0,
+      "price": 125.85400119829052
+    },
+    {
+      "dt": "2023-01-26T05:00:00",
+      "side": "SELL",
+      "size": -10.0,
+      "price": 140.78064047196506
+    },
+    {
+      "dt": "2023-02-02T05:00:00",
+      "side": "BUY",
+      "size": 10.0,
+      "price": 146.4149779827907
+    },
+    {
+      "dt": "2023-02-07T05:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 148.12598902287087
+    },
+    {
+      "dt": "2023-02-24T05:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 143.72541675567626
+    },
+    {
+      "dt": "2023-07-05T04:00:00",
+      "side": "SELL",
+      "size": -13.0,
+      "price": 188.92145597370774
+    },
+    {
+      "dt": "2023-07-10T04:00:00",
+      "side": "BUY",
+      "size": 13.0,
+      "price": 186.1545322418213
+    },
+    {
+      "dt": "2023-09-06T04:00:00",
+      "side": "SELL",
+      "size": -10.0,
+      "price": 186.0462022000218
+    },
+    {
+      "dt": "2023-09-07T04:00:00",
+      "side": "BUY",
+      "size": 10.0,
+      "price": 172.9913289322691
+    },
+    {
+      "dt": "2023-11-14T05:00:00",
+      "side": "SELL",
+      "size": -11.0,
+      "price": 185.59912547957174
+    },
+    {
+      "dt": "2023-11-16T05:00:00",
+      "side": "BUY",
+      "size": 11.0,
+      "price": 187.4865538122481
+    },
+    {
+      "dt": "2024-01-09T05:00:00",
+      "side": "BUY",
+      "size": 15.0,
+      "price": 181.8614486084712
+    },
+    {
+      "dt": "2024-01-16T05:00:00",
+      "side": "SELL",
+      "size": -15.0,
+      "price": 178.92633892354704
+    },
+    {
+      "dt": "2024-03-11T04:00:00",
+      "side": "BUY",
+      "size": 10.0,
+      "price": 171.22253935977105
+    },
+    {
+      "dt": "2024-03-18T04:00:00",
+      "side": "SELL",
+      "size": -10.0,
+      "price": 173.82643054023092
+    },
+    {
+      "dt": "2024-07-12T04:00:00",
+      "side": "SELL",
+      "size": -9.0,
+      "price": 226.9540066999144
+    },
+    {
+      "dt": "2024-07-15T04:00:00",
+      "side": "BUY",
+      "size": 9.0,
+      "price": 234.4491016317173
+    },
+    {
+      "dt": "2024-08-08T04:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 211.27982425167653
+    },
+    {
+      "dt": "2024-08-09T04:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 213.84062232971192
+    },
+    {
+      "dt": "2024-12-06T05:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 241.36790273028285
+    },
+    {
+      "dt": "2024-12-11T05:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 246.79390618215962
+    },
+    {
+      "dt": "2025-01-15T05:00:00",
+      "side": "BUY",
+      "size": 6.0,
+      "price": 233.1503884256181
+    },
+    {
+      "dt": "2025-01-21T05:00:00",
+      "side": "SELL",
+      "size": -6.0,
+      "price": 222.57792910461185
+    },
+    {
+      "dt": "2025-02-19T05:00:00",
+      "side": "SELL",
+      "size": -8.0,
+      "price": 243.37405904734027
+    },
+    {
+      "dt": "2025-02-27T05:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 237.28884162902833
+    },
+    {
+      "dt": "2025-08-15T04:00:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 233.3398810158365
+    },
+    {
+      "dt": "2025-08-21T04:00:00",
+      "side": "BUY",
+      "size": 5.0,
+      "price": 223.5616142272949
+    },
+    {
+      "dt": "2025-09-25T04:00:00",
+      "side": "SELL",
+      "size": -6.0,
+      "price": 252.4956917858775
+    },
+    {
+      "dt": "2025-10-10T04:00:00",
+      "side": "BUY",
+      "size": 6.0,
+      "price": 244.61321678161622
+    },
+    {
+      "dt": "2025-10-29T04:00:00",
+      "side": "SELL",
+      "size": -7.0,
+      "price": 268.5203194424725
+    },
+    {
+      "dt": "2025-10-31T04:00:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 276.2085578376442
+    }
+  ]
+}

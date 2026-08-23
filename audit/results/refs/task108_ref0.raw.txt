@@ -1,0 +1,129 @@
+```python
+import backtrader as bt
+
+
+class CorrectionOrReversalStrategy(bt.Strategy):
+    params = dict(
+        sma_period=50,
+        range_period=20,
+        range_lag=5,
+        vol_avg_period=20,
+        rebound_pct=0.06,
+        signal_window=15,
+        key_level_short=175.0,
+        target_long=250.0,
+        target_short_1=3350.0,
+        target_short_2=2700.0,
+        stop_buffer=0.01,
+        risk_pct=0.02,
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.range_high = bt.indicators.Highest(self.data.high, period=self.p.range_period)
+        self.range_low = bt.indicators.Lowest(self.data.low, period=self.p.range_period)
+        self.vol_avg = bt.indicators.SMA(self.data.volume, period=self.p.vol_avg_period)
+
+        self.order = None
+        self.stop_price = None
+
+        self.breakdown_price = None
+        self.breakdown_bar = None
+        self.breakdown_volume = None
+        self.anchor_confirmed = False
+        self.support_level = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        # indicator[-lag] needs lag extra bars beyond the indicator's own minperiod;
+        # backtrader's automatic minperiod tracking does not see this dynamic offset.
+        if len(self) <= self.p.range_period + self.p.range_lag:
+            return
+
+        est_high = self.range_high[-self.p.range_lag]
+        est_low = self.range_low[-self.p.range_lag]
+
+        if self.data.low[0] < est_low and self.data.volume[0] > self.vol_avg[0]:
+            self.breakdown_price = self.data.low[0]
+            self.breakdown_bar = len(self)
+            self.breakdown_volume = self.data.volume[0]
+            self.anchor_confirmed = False
+
+        if (self.breakdown_price is not None and not self.anchor_confirmed
+                and self.data.close[0] >= self.breakdown_price * (1 + self.p.rebound_pct)):
+            self.anchor_confirmed = True
+            self.support_level = self.breakdown_price
+
+        if self.order:
+            return
+
+        if not self.position:
+            if self._long_signal(est_high, est_low):
+                value = self.broker.getvalue()
+                size = (value * self.p.risk_pct) / self.data.close[0]
+                self.stop_price = min(self.data.low[-1], self.support_level) * (1 - self.p.stop_buffer)
+                self.order = self.buy(size=size)
+            elif self._short_signal(est_high, est_low):
+                value = self.broker.getvalue()
+                size = (value * self.p.risk_pct) / self.data.close[0]
+                self.stop_price = max(self.p.key_level_short, est_high) * (1 + self.p.stop_buffer)
+                self.order = self.sell(size=size)
+
+        elif self.position.size > 0:
+            if (self.data.low[0] <= self.stop_price
+                    or self.data.close[0] >= self.p.target_long
+                    or self.data.close[0] < self.sma[0]
+                    or self.data.close[0] < self.data.low[-1]):
+                self.order = self.close()
+
+        elif self.position.size < 0:
+            if (self.data.high[0] >= self.stop_price
+                    or self.data.close[0] >= self.p.target_short_2
+                    or self.data.close[0] >= self.p.target_short_1
+                    or self.data.close[0] > est_high):
+                self.order = self.close()
+
+    def _long_signal(self, est_high, est_low):
+        if self.support_level is None or not self.anchor_confirmed:
+            return False
+        if len(self) - self.breakdown_bar > self.p.signal_window:
+            return False
+        in_range = est_low <= self.data.close[0] <= est_high
+        trend_intact = self.data.close[0] > self.sma[0]
+        bounced = self.data.close[0] > self.support_level
+        buying_vol_rising = self.data.volume[0] > self.data.volume[-1]
+        sell_vol_declining = self.data.volume[0] < self.breakdown_volume
+        return in_range and trend_intact and bounced and buying_vol_rising and sell_vol_declining
+
+    def _short_signal(self, est_high, est_low):
+        returned_to_range = est_low <= self.data.close[0] <= est_high
+        selling_resumed = (self.data.volume[0] > self.vol_avg[0]
+                            and self.data.close[0] < self.data.open[0])
+        support_broken = self.data.close[0] < self.data.low[-1]
+        below_key_level = (self.data.close[0] < self.p.key_level_short
+                            and self.data.close[-1] < self.p.key_level_short)
+        return returned_to_range and selling_resumed and support_broken and below_key_level
+```
+```json
+{"assumptions": [
+  {"topic": "consolidation range definition", "choice": "Rolling 20-bar Highest(High)/Lowest(Low), read with a 5-bar lag (range_period=20, range_lag=5) so the 'established' range excludes the very bars where a breakdown/return is being evaluated", "reason": "Spec never defines how to compute the accumulation range; a non-lagged rolling range would be tautologically pierced by its own current bar, making a 'breakdown below the range' impossible to detect"},
+  {"topic": "anchor bar = false-breakdown bar", "choice": "Unified the 'false breakdown low' and the 'anchor bar' into one event: the bar whose Low pierces below the established range on above-average volume becomes the anchor bar; its Low becomes the support level once price closes >=6% above it", "reason": "Both are described identically in the spec ('the bar after which a rebound occurred' / false breakdown followed by bounce), so treating them as the same event avoids inventing a second, undefined detection mechanism"},
+  {"topic": "'increased/above-average volume'", "choice": "20-period SMA of volume (vol_avg_period=20); 'increased volume' = current volume > this average", "reason": "Spec references volume increases repeatedly but states no lookback or threshold"},
+  {"topic": "signal recency window", "choice": "A confirmed false-breakdown/anchor is only valid for long entry within 15 bars of the breakdown bar (signal_window=15)", "reason": "Spec implies the bounce/entry follows soon after the breakdown but gives no explicit window; without one, an old anchor could trigger entries indefinitely"},
+  {"topic": "'buying volume starts to rise after the bounce'", "choice": "volume[0] > volume[-1] (day-over-day increase)", "reason": "Simplest literal reading of a rising-volume condition with no stated period"},
+  {"topic": "'weak selling pressure / declining sell-off volume' filter", "choice": "Required today's volume < the volume recorded on the breakdown bar itself", "reason": "This is an explicit additional filter in the spec distinct from the day-over-day rise; comparing to the breakdown spike captures 'sell-off volume declining' overall while still allowing a short-term uptick"},
+  {"topic": "short entry 'strong resumption of selling'", "choice": "volume[0] > 20-day average volume AND close[0] < open[0] (bearish bar)", "reason": "Spec requires a volume-confirmed selling resumption but does not define a bearish-bar criterion; added the down-bar check as the minimal operational definition of 'selling'"},
+  {"topic": "'consolidates below $175'", "choice": "Required close[0] and close[-1] both below 175", "reason": "'Consolidates' implies persistence beyond a single close; used a 2-bar minimum as the simplest proxy since no duration is specified"},
+  {"topic": "stop-loss buffer ('a few points')", "choice": "1% (stop_buffer=0.01) below min(prev day's Low, anchor/support level) for longs, and 1% above max($175, established range high) for shorts", "reason": "Spec says 'a few points' without a number; 1% is a small, declared buffer consistent with that language"},
+  {"topic": "stop-loss and exit mechanics", "choice": "Checked once per bar in next() (stop uses intrabar High/Low touch, other exits use Close) and closed via self.close(); OR'd together so any single trigger exits", "reason": "Canonical default #2 maps 'exit/close position' to self.close(); no resting broker stop order is specified, so evaluating in next() keeps the stop and the stated exit rules on one consistent mechanism"},
+  {"topic": "position size", "choice": "2% of current broker.getvalue() converted to shares at the current Close (risk_pct=0.02)", "reason": "Spec explicitly states 'a fixed percentage of capital per trade, for example, 2%', overriding the canonical default plain-buy() sizing"},
+  {"topic": "'active only if within range or after breakout' filter", "choice": "No additional code added", "reason": "Every close is by construction within, above, or below the range, so this condition is logically exhaustive and always satisfied; it adds no operational constraint"},
+  {"topic": "manual minperiod guard", "choice": "Added `if len(self) <= range_period + range_lag: return` at the top of next()", "reason": "Backtrader's automatic minperiod tracking does not account for the manual negative-offset indexing (indicator[-lag]) used inside next(); this guard is a technical necessity to avoid index errors, not a business-rule warm-up"},
+  {"topic": "long vs short signal precedence", "choice": "Long entry is checked before short entry each bar; only one can be taken since at most one position is held", "reason": "Mirrors the spec's ordering (Long/Buy section precedes Short/Sell section); in practice the two conditions are close to mutually exclusive given the data"},
+  {"topic": "infeasible: ETH-specific absolute price levels", "choice": "Implemented $175 (key level), $250 (long target), and $3,350/$2,700 (short targets) literally as stated, applied directly to AAPL's Close", "reason": "These levels are calibrated to ETH/USDT, not AAPL equity, and the fixed feed provides no way to rescale them faithfully; $2,700/$3,350 are outside AAPL's entire historical range and will effectively never trigger, while $175/$250 are only incidentally relevant to AAPL prices"},
+  {"topic": "short exit 'reaches target level' direction", "choice": "Interpreted as close[0] >= target for both $2,700 and $3,350", "reason": "Both short-exit targets sit far above the sub-$175 entry zone, so they can only ever be approached by price rising, not by price falling toward a short's profit direction; 'reaches' was read as a close touching/exceeding the stated level, tied to the same infeasibility noted above"}
+]}
+```

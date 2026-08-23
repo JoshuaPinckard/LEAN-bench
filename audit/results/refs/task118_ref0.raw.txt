@@ -1,0 +1,122 @@
+```python
+import backtrader as bt
+
+
+class EnhancedDCAStrategy(bt.Strategy):
+    params = dict(
+        rsi_period=14,
+        sma_period=50,
+        bb_period=20,
+        bb_dev=2.0,
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        atr_period=14,
+        rsi_oversold=30,
+        rsi_overbought=70,
+        stop_atr_mult=2.0,
+        consensus_threshold=3.0,
+        regime_weight_high=1.5,
+        regime_weight_low=0.5,
+        regime_lookback=10,
+        regime_slope_threshold=0.5,
+        max_trade_pct=0.05,
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.macd_cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.entry_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_price = order.executed.price
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _detect_regime(self):
+        lookback = self.p.regime_lookback
+        if len(self.data) < self.p.sma_period + lookback:
+            return 'neutral'
+        atr_val = self.atr[0]
+        if atr_val <= 0:
+            return 'neutral'
+        slope = (self.sma[0] - self.sma[-lookback]) / lookback
+        if abs(slope) / atr_val > self.p.regime_slope_threshold:
+            return 'trending'
+        return 'ranging'
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            stop_price = self.entry_price - self.p.stop_atr_mult * self.atr[0]
+            exit_signal = (
+                self.rsi[0] > self.p.rsi_overbought
+                or self.macd_cross[0] < 0
+                or self.data.close[0] < stop_price
+            )
+            if exit_signal:
+                self.order = self.close()
+            return
+
+        rsi_signal = self.rsi[0] < self.p.rsi_oversold
+        sma_signal = self.data.close[0] > self.sma[0]
+        bb_signal = self.data.close[0] < self.bb.lines.bot[0]
+        macd_signal = self.macd_cross[0] > 0
+
+        regime = self._detect_regime()
+        w_high, w_low = self.p.regime_weight_high, self.p.regime_weight_low
+        if regime == 'trending':
+            w_rsi, w_sma, w_bb, w_macd = w_low, w_high, w_low, w_high
+        elif regime == 'ranging':
+            w_rsi, w_sma, w_bb, w_macd = w_high, w_low, w_high, w_low
+        else:
+            w_rsi = w_sma = w_bb = w_macd = 1.0
+
+        weighted_sum = (
+            rsi_signal * w_rsi
+            + sma_signal * w_sma
+            + bb_signal * w_bb
+            + macd_signal * w_macd
+        )
+
+        if weighted_sum >= self.p.consensus_threshold:
+            atr_val = self.atr[0]
+            if atr_val <= 0:
+                return
+            price = self.data.close[0]
+            portfolio_value = self.broker.getvalue()
+            base_position_size = self.p.max_trade_pct * portfolio_value
+            raw_shares = base_position_size / atr_val
+            cap_shares = (self.p.max_trade_pct * portfolio_value) / price
+            final_shares = int(min(raw_shares, cap_shares))
+            if final_shares > 0:
+                self.order = self.buy(size=final_shares)
+```
+```json
+{"assumptions": [
+  {"topic": "entry logic: AND vs consensus", "choice": "Treat the four listed buy conditions as the 'signals' that feed the aggregation rule, requiring a weighted consensus of at least 3-of-4 rather than a strict AND of all four.", "reason": "The 'Additional rules' section explicitly restates the same four indicator conditions and gives the concrete combination rule ('at least 3 out of 4 indicators must give a buy signal'), which supersedes the more ambiguous 'following conditions are met' phrasing in the entry section."},
+  {"topic": "market regime detection method", "choice": "Regime = trending if |SMA(50) slope over a 10-bar lookback| / ATR(14) exceeds 0.5, else ranging; defaults to neutral (equal weights) until 10 bars past SMA warm-up exist.", "reason": "Spec requires a trending/ranging detector but specifies no method or indicator for it; using SMA slope avoids introducing an indicator (e.g. ADX) not listed in the spec's indicator set."},
+  {"topic": "regime indicator weight values", "choice": "Base weight 1.0 per indicator; trending regime sets SMA/MACD weight=1.5 and RSI/BB weight=0.5 (reversed for ranging), weights always sum to 4 so the 3-of-4 threshold keeps a consistent scale.", "reason": "Spec gives only illustrative examples of which indicators to favor per regime, with no numeric weights."},
+  {"topic": "position sizing base value", "choice": "base_position_size = 5% of current portfolio value; raw ATR-based shares = base_position_size/ATR(14); final size = min(raw shares, 5%-of-portfolio shares at current price), floored to whole shares.", "reason": "Spec's formula position_size = base_position_size/ATR leaves base_position_size undefined; anchoring it to the spec's own explicit 5%-per-trade figure ties both stated formulas together without inventing an unrelated constant."},
+  {"topic": "20% aggregate position cap", "choice": "Not separately enforced; the canonical single-position-at-a-time rule keeps any one trade at <=5% of portfolio, inherently under the 20% aggregate ceiling.", "reason": "The spec's aggregate figure only becomes binding under pyramiding/multiple concurrent positions, which is not explicitly mandated, so the canonical default of one position at a time applies and makes the cap non-binding."},
+  {"topic": "fractional shares", "choice": "Floor the computed size to an integer number of shares.", "reason": "The sizing formulas produce a continuous value; whole-share sizing is the standard broker/backtrader convention and the spec does not address fractional shares."}
+]}
+```

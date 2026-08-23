@@ -1,0 +1,158 @@
+{
+  "task_id": 79,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport math\nimport collections\nimport statistics\n\n\nclass BreakoutMomentumTrendFollowing(bt.Strategy):\n    params = dict(\n        weekly_lookback=52,\n        daily_sma_period=200,\n        hourly_resistance_period=20,\n        volume_avg_period=20,\n        atr_period=14,\n        atr_mult=2.0,\n        pct_stop=0.06,\n        risk_pct=0.01,\n        tp_pct=0.05,\n        near_high_pct=0.03,\n    )\n\n    def __init__(self):\n        self.hh20 = bt.indicators.Highest(self.data.high(-1), period=self.p.hourly_resistance_period)\n        self.vol_sma20 = bt.indicators.SMA(self.data.volume(-1), period=self.p.volume_avg_period)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        self.daily_closes = collections.deque(maxlen=self.p.daily_sma_period)\n        self.weekly_highs = collections.deque(maxlen=self.p.weekly_lookback)\n        self.cur_day_date = None\n        self.cur_week_key = None\n        self.week_high = None\n\n        self.entry_order = None\n        self.stop_order = None\n        self.entry_price = None\n        self.stop_price = None\n        self.position_type = None\n        self.tp_taken = False\n\n    def _update_aggregates(self):\n        dt = self.data.datetime.date(0)\n\n        if self.cur_day_date is None:\n            self.cur_day_date = dt\n        elif dt != self.cur_day_date:\n            self.daily_closes.append(self.data.close[-1])\n            self.cur_day_date = dt\n\n        iso = dt.isocalendar()\n        week_key = (iso[0], iso[1])\n        if self.cur_week_key is None:\n            self.cur_week_key = week_key\n            self.week_high = self.data.high[0]\n        elif week_key != self.cur_week_key:\n            self.weekly_highs.append(self.week_high)\n            self.cur_week_key = week_key\n            self.week_high = self.data.high[0]\n        else:\n            self.week_high = max(self.week_high, self.data.high[0])\n\n    def _compute_stop(self, entry_price):\n        atr_stop = entry_price - self.p.atr_mult * self.atr[0]\n        pct_stop = entry_price * (1 - self.p.pct_stop)\n        return max(atr_stop, pct_stop)\n\n    def _compute_size(self, entry_price, stop_price):\n        risk_per_share = entry_price - stop_price\n        if risk_per_share <= 0:\n            return 0\n        risk_amount = self.broker.getvalue() * self.p.risk_pct\n        return int(math.floor(risk_amount / risk_per_share))\n\n    def _reset_state(self):\n        self.entry_price = None\n        self.stop_price = None\n        self.stop_order = None\n        self.position_type = None\n        self.tp_taken = False\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if self.entry_order is not None and order.ref == self.entry_order.ref:\n            if order.status == order.Completed:\n                self.entry_price = order.executed.price\n                stop_price = self._compute_stop(self.entry_price)\n                self.stop_price = stop_price\n                self.stop_order = self.sell(\n                    exectype=bt.Order.Stop, price=stop_price, size=self.position.size\n                )\n            self.entry_order = None\n            return\n\n        if order.status == order.Completed and order.issell() and self.position.size == 0:\n            self._reset_state()\n\n    def next(self):\n        self._update_aggregates()\n\n        daily_sma = (\n            statistics.mean(self.daily_closes)\n            if len(self.daily_closes) >= self.p.daily_sma_period\n            else None\n        )\n        weekly_level = (\n            max(self.weekly_highs)\n            if len(self.weekly_highs) >= self.p.weekly_lookback\n            else None\n        )\n\n        if self.position:\n            if self.position_type == 'short_term':\n                if not self.tp_taken and self.entry_price is not None:\n                    gain = (self.data.close[0] - self.entry_price) / self.entry_price\n                    if gain >= self.p.tp_pct:\n                        close_size = int(math.floor(self.position.size * 0.5))\n                        if close_size >= 1:\n                            if self.stop_order is not None:\n                                self.cancel(self.stop_order)\n                            remaining = self.position.size - close_size\n                            self.sell(size=close_size)\n                            self.stop_order = self.sell(\n                                exectype=bt.Order.Stop, price=self.entry_price, size=remaining\n                            )\n                            self.tp_taken = True\n                if weekly_level is not None and self.data.close[0] > weekly_level:\n                    self.position_type = 'long_term'\n            return\n\n        if self.entry_order is not None:\n            return\n\n        if daily_sma is None:\n            return\n        if self.data.close[0] <= daily_sma:\n            return\n\n        if weekly_level is not None and self.data.close[0] > weekly_level:\n            entry_price = self.data.close[0]\n            stop_price = self._compute_stop(entry_price)\n            size = self._compute_size(entry_price, stop_price)\n            if size >= 1:\n                self.position_type = 'long_term'\n                self.tp_taken = False\n                self.entry_order = self.buy(size=size)\n            return\n\n        if weekly_level is not None:\n            near_threshold = weekly_level * (1 - self.p.near_high_pct)\n            if self.data.close[0] >= near_threshold:\n                return\n\n        if self.data.close[0] > self.hh20[0] and self.data.volume[0] > self.vol_sma20[0]:\n            entry_price = self.data.close[0]\n            stop_price = self._compute_stop(entry_price)\n            size = self._compute_size(entry_price, stop_price)\n            if size >= 1:\n                self.position_type = 'short_term'\n                self.tp_taken = False\n                self.entry_order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Weekly and daily 'timeframes' are derived manually inside next() by aggregating the single hourly feed (tracking day/ISO-week rollovers) rather than using true resampled data feeds, since only one bt.feeds.PandasData (1h) is provided by the harness.",
+      "reason": "Spec calls for three timeframes but the environment supplies a single hourly feed; manual aggregation from OHLCV is the closest literal reading without external data or cerebro-level resampling."
+    },
+    {
+      "topic": "warm-up definition",
+      "choice": "The 200-day SMA and 52-week high are computed only from completed (finalized) daily/weekly bars, excluding the current in-progress day/week; entries are skipped until 200 completed daily closes and 52 completed weekly highs exist.",
+      "reason": "The spec's daily/weekly values are meant to reflect closed bars; the in-progress day/week isn't a settled data point yet."
+    },
+    {
+      "topic": "increased volume",
+      "choice": "'Increased volume' on the short-term entry = current hourly volume > 20-hour SMA of volume (previous 20 bars, excluding current).",
+      "reason": "Spec states the volume must be 'increased' without a numeric threshold or lookback; a 20-bar average matches the stated 20-hour resistance lookback for consistency."
+    },
+    {
+      "topic": "ATR parameters/timeframe",
+      "choice": "ATR(14) computed on the hourly bars (the feed the spec assigns to 'position management').",
+      "reason": "Spec gives '2x ATR' without period or timeframe; 14 is the standard default and hourly matches the timeframe explicitly tied to exit/position management."
+    },
+    {
+      "topic": "percentage stop value",
+      "choice": "Fixed 6% (midpoint of the stated 5-8% range) used as the percentage-based stop candidate.",
+      "reason": "Spec gives a range, not a single number; a concrete value is required to compute a stop price."
+    },
+    {
+      "topic": "ATR-stop variant",
+      "choice": "Only the '2x ATR below entry' ATR-stop variant is implemented; the alternative 'below the relevant swing low' is not implemented.",
+      "reason": "Spec offers swing-low as an alternate example without defining a swing-low detection method; implementing it would require inventing an unspecified indicator."
+    },
+    {
+      "topic": "more conservative stop",
+      "choice": "For a long, 'more conservative' = the higher (closer-to-entry) of the ATR stop and percentage stop, i.e. stop_price = max(entry - 2*ATR, entry * (1 - 0.06)).",
+      "reason": "A tighter stop caps the potential loss to a smaller amount, matching the intent of 'more conservative' for a long position's stop-loss."
+    },
+    {
+      "topic": "risk-based position sizing",
+      "choice": "Risk 1% of current broker equity per trade (risk_amount / (entry_price - stop_price), floored to whole shares); entry/stop price used for sizing is the signal bar's close, re-based to the actual fill price for the stop order once the market entry order completes.",
+      "reason": "Spec gives a 1-2% range, so a specific conservative value (1%) is chosen; actual fill price is unknown until the order executes on the next bar, so the signal-bar close is used as the sizing estimate, a standard backtest approximation."
+    },
+    {
+      "topic": "near weekly high exclusion",
+      "choice": "'Near the historical weekly high' = current close within 3% below the N-week breakout level (skip short-term entry if close >= weekly_level * 0.97).",
+      "reason": "Spec states the rule qualitatively without a numeric proximity threshold; 3% is a reasonable, declared buffer."
+    },
+    {
+      "topic": "50% take-profit rounding",
+      "choice": "Take-profit closes floor(position_size * 0.5) whole shares; the remainder (which may be slightly more than 50% for odd share counts) keeps the recomputed breakeven stop.",
+      "reason": "Fractional shares aren't tradable; flooring is the natural whole-share interpretation of '50%'."
+    },
+    {
+      "topic": "position sizing method unstated by canonical default",
+      "choice": "Explicit-size buy()/sell() calls are used everywhere (no default sizer) because the spec explicitly mandates risk-based position sizing, overriding the canonical unsized-buy default.",
+      "reason": "Canonical default 1 only applies when the spec is silent on sizing; here the spec is explicit."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 7,
+  "tape": [
+    {
+      "dt": "2024-07-16T19:30:00",
+      "side": "BUY",
+      "size": 439.0,
+      "price": 7.755000114440918
+    },
+    {
+      "dt": "2024-07-18T18:30:00",
+      "side": "SELL",
+      "size": -439.0,
+      "price": 7.533776427667022
+    },
+    {
+      "dt": "2024-08-26T14:30:00",
+      "side": "BUY",
+      "size": 466.0,
+      "price": 7.769999980926514
+    },
+    {
+      "dt": "2024-08-27T13:30:00",
+      "side": "SELL",
+      "size": -466.0,
+      "price": 7.555887950638193
+    },
+    {
+      "dt": "2024-08-27T19:30:00",
+      "side": "BUY",
+      "size": 514.0,
+      "price": 7.820000171661377
+    },
+    {
+      "dt": "2024-08-28T13:30:00",
+      "side": "SELL",
+      "size": -514.0,
+      "price": 7.633465417259892
+    },
+    {
+      "dt": "2024-08-29T14:30:00",
+      "side": "BUY",
+      "size": 356.0,
+      "price": 8.024999618530273
+    },
+    {
+      "dt": "2024-09-03T13:30:00",
+      "side": "SELL",
+      "size": -356.0,
+      "price": 7.749714985885961
+    },
+    {
+      "dt": "2024-09-13T14:30:00",
+      "side": "BUY",
+      "size": 415.0,
+      "price": 7.655700206756592
+    },
+    {
+      "dt": "2024-09-16T18:30:00",
+      "side": "SELL",
+      "size": -207.0,
+      "price": 8.055000305175781
+    },
+    {
+      "dt": "2024-09-24T13:30:00",
+      "side": "SELL",
+      "size": -208.0,
+      "price": 7.655700206756592
+    },
+    {
+      "dt": "2024-09-27T14:30:00",
+      "side": "BUY",
+      "size": 489.0,
+      "price": 8.026000022888184
+    },
+    {
+      "dt": "2024-09-30T17:30:00",
+      "side": "SELL",
+      "size": -489.0,
+      "price": 7.828671445948385
+    },
+    {
+      "dt": "2024-10-04T14:30:00",
+      "side": "BUY",
+      "size": 466.0,
+      "price": 7.940000057220459
+    },
+    {
+      "dt": "2024-10-07T13:30:00",
+      "side": "SELL",
+      "size": -233.0,
+      "price": 8.359999656677246
+    }
+  ]
+}

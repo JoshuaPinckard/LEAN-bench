@@ -1,0 +1,169 @@
+```python
+import backtrader as bt
+
+
+class HybridCoreOverlayStrategy(bt.Strategy):
+    params = dict(
+        core_weight=0.50,
+        core_rebalance_bars=21,
+        overlay_weight=0.05,
+        max_overlay_lots=5,
+        overlay_timestop_bars=10,
+        accum_atr_mult=1.0,
+        tp1_atr_mult=0.5,
+        tp2_atr_mult=0.5,
+        sl_atr_mult=1.5,
+        sl_pct_mult=0.90,
+        underacq_pct_mult=0.90,
+        rally_atr_mult=1.0,
+        emergency_pct_mult=0.90,
+    )
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.sma200 = bt.indicators.SMA(self.data.close, period=200)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.accum_level = self.sma50 - self.p.accum_atr_mult * self.atr
+        self.crossover_l = bt.indicators.CrossOver(self.data.close, self.accum_level)
+
+        self.core_shares = 0
+        self.core_order = None
+        self.core_initialized = False
+        self.bars_since_rebalance = 0
+
+        self.overlay_lots = []
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        tag = order.info.get('tag')
+
+        if order.status == order.Completed:
+            if tag == 'core':
+                if order.isbuy():
+                    self.core_shares += order.executed.size
+                else:
+                    self.core_shares -= abs(order.executed.size)
+                self.core_order = None
+            elif tag == 'overlay_entry':
+                lot = order.info.get('lot')
+                lot['size'] = order.executed.size
+                lot['entry_price'] = order.executed.price
+                lot['entry_bar'] = len(self)
+                lot['entry_atr'] = self.atr[0]
+                lot['tp1'] = lot['entry_price'] + self.p.tp1_atr_mult * lot['entry_atr']
+                lot['sl'] = min(
+                    lot['entry_price'] - self.p.sl_atr_mult * lot['entry_atr'],
+                    lot['entry_price'] * self.p.sl_pct_mult,
+                )
+                lot['active'] = True
+                lot['order'] = None
+            elif tag == 'overlay_exit':
+                lot = order.info.get('lot')
+                lot['active'] = False
+                lot['order'] = None
+                if lot in self.overlay_lots:
+                    self.overlay_lots.remove(lot)
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if tag == 'core':
+                self.core_order = None
+            elif tag == 'overlay_entry':
+                lot = order.info.get('lot')
+                if lot in self.overlay_lots:
+                    self.overlay_lots.remove(lot)
+            elif tag == 'overlay_exit':
+                lot = order.info.get('lot')
+                lot['order'] = None
+
+    def _rebalance_core(self, portfolio_value, close):
+        target = int((self.p.core_weight * portfolio_value) / close)
+        delta = target - self.core_shares
+        if delta != 0:
+            if delta > 0:
+                self.core_order = self.buy(size=delta)
+            else:
+                self.core_order = self.sell(size=-delta)
+            self.core_order.addinfo(tag='core')
+
+    def next(self):
+        close = self.data.close[0]
+        portfolio_value = self.broker.getvalue()
+
+        if not self.core_initialized:
+            self._rebalance_core(portfolio_value, close)
+            self.core_initialized = True
+            self.bars_since_rebalance = 0
+        else:
+            self.bars_since_rebalance += 1
+            if self.bars_since_rebalance >= self.p.core_rebalance_bars and self.core_order is None:
+                self._rebalance_core(portfolio_value, close)
+                self.bars_since_rebalance = 0
+
+        sma50 = self.sma50[0]
+        sma200 = self.sma200[0]
+        atr = self.atr[0]
+        uptrend = sma50 >= sma200
+        downtrend = sma50 < sma200
+
+        emergency = downtrend and (close < sma200 * self.p.emergency_pct_mult)
+        if emergency:
+            for lot in list(self.overlay_lots):
+                if lot['active'] and lot['order'] is None:
+                    o = self.sell(size=lot['size'])
+                    o.addinfo(tag='overlay_exit', lot=lot)
+                    lot['order'] = o
+            return
+
+        tp2 = sma50 + self.p.tp2_atr_mult * atr
+        for lot in list(self.overlay_lots):
+            if not lot['active'] or lot['order'] is not None:
+                continue
+            if close >= lot['tp1'] or close >= tp2:
+                o = self.sell(size=lot['size'])
+                o.addinfo(tag='overlay_exit', lot=lot)
+                lot['order'] = o
+            elif close <= lot['sl']:
+                o = self.sell(size=lot['size'])
+                o.addinfo(tag='overlay_exit', lot=lot)
+                lot['order'] = o
+            elif (len(self) - lot['entry_bar']) >= self.p.overlay_timestop_bars:
+                o = self.sell(size=lot['size'])
+                o.addinfo(tag='overlay_exit', lot=lot)
+                lot['order'] = o
+
+        u_level = sma50 + self.p.rally_atr_mult * atr
+        active_open_lots = [l for l in self.overlay_lots if l['active'] and l['order'] is None]
+        if active_open_lots and close >= u_level:
+            for lot in active_open_lots:
+                o = self.sell(size=lot['size'])
+                o.addinfo(tag='overlay_exit', lot=lot)
+                lot['order'] = o
+
+        underacq_block = close < self.p.underacq_pct_mult * sma50
+        above_sma50_block = close > sma50
+        occupied_lots = len([l for l in self.overlay_lots if l['active'] or l['order'] is not None])
+
+        if (uptrend and not underacq_block and not above_sma50_block
+                and occupied_lots < self.p.max_overlay_lots
+                and self.crossover_l[0] > 0):
+            size = int((self.p.overlay_weight * portfolio_value) / close)
+            if size > 0:
+                lot = dict(active=False, order=None, size=0)
+                self.overlay_lots.append(lot)
+                o = self.buy(size=size)
+                o.addinfo(tag='overlay_entry', lot=lot)
+                lot['order'] = o
+```
+```json
+{"assumptions": [
+  {"topic": "capital basis for sizing", "choice": "Both the 50% core target and the 5% overlay lot size are computed against current broker portfolio value (self.broker.getvalue()) at the moment of sizing, not fixed initial cash.", "reason": "The core is explicitly described as periodically rebalanced to a 50% weight, which only makes sense measured against a moving portfolio value; overlay sizing uses the same convention for consistency."},
+  {"topic": "core rebalance cadence", "choice": "Rebalance the core toward its 50% target every 21 trading bars (~1 month).", "reason": "Spec says 'rebalance periodically' without a stated interval; 21 bars is a reasonable, declared default cadence."},
+  {"topic": "core/overlay start timing", "choice": "The core is first established on the strategy's first next() call, which backtrader delays to bar ~200 because of the automatic SMA_200 warm-up (minperiod), per canonical default #6.", "reason": "No manual bar-skipping is permitted per the canonical defaults, so the core inherits the same automatic warm-up as the rest of the strategy rather than being force-started at bar 1."},
+  {"topic": "rally profit-taking percentage", "choice": "When Close >= U triggers, close 100% of currently open overlay lots (the top of the stated 50-100% discretionary range).", "reason": "Spec explicitly leaves the exact percentage 'at discretion'; a full close is the simplest deterministic choice within the stated bound."},
+  {"topic": "stop-loss ATR timing", "choice": "The 1.5xATR_14 term in the stop-loss formula uses the ATR value observed at the overlay lot's entry (fixed), not a trailing/current ATR.", "reason": "Spec marks the take-profit threshold '(fixed at entry)' and frames both TP and SL as a fixed per-trade risk definition in the Risk section; using entry ATR for both keeps the fixed-risk framing internally consistent."},
+  {"topic": "share rounding", "choice": "Core and overlay order sizes are truncated to whole shares via int().", "reason": "Backtrader orders require integer share counts; spec is silent on rounding and this is the canonical no-fractional-share convention."},
+  {"topic": "overlay exposure cap enforcement", "choice": "The stated caps (<=5 lots, <=25% overlay, <=75% total) are enforced solely via the fixed 5%-per-lot sizing and the 5-lot count limit at entry time, with no additional continuous mark-to-market trimming.", "reason": "Spec describes sizing/limits at signal time only and does not instruct active rebalancing or trimming of the overlay for later drift."},
+  {"topic": "emergency mode and core rebalancing", "choice": "Emergency mode closes all active overlay lots and skips the rest of that bar's overlay logic, but does not pause the independent periodic core rebalance.", "reason": "Spec states the core is left 'unchanged' as part of the emergency close action itself, not that the separate periodic rebalance mechanism should halt; the core is described as a permanent, always-on component."}
+]}
+```

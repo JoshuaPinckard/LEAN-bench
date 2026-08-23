@@ -1,0 +1,89 @@
+```python
+import backtrader as bt
+
+
+class SingleAssetVolatilityRotation(bt.Strategy):
+    params = dict(
+        boll_period=20,
+        boll_dev=2,
+        atr_period=14,
+        atr_sma_period=30,
+        atr_filter_mult=0.5,
+        rotation_pct=0.05,
+        meanrev_pct=0.05,
+        protect_pct=0.03,
+        cooldown_days=30,
+    )
+
+    def __init__(self):
+        self.boll = bt.indicators.BollingerBands(
+            self.data, period=self.p.boll_period, devfactor=self.p.boll_dev)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+
+        self.order = None
+        self.base_established = False
+        self.in_tactical = False
+        self.anchor_high = None
+        self.sell_price = None
+        self.tactical_size = 0.0
+        self.cooldown_until = -1
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.base_established:
+            self.order = self.buy()
+            self.base_established = True
+            return
+
+        if self.in_tactical:
+            price = self.data.close[0]
+            if price <= self.anchor_high * (1 - self.p.meanrev_pct):
+                self._buyback()
+            elif price >= self.sell_price * (1 + self.p.protect_pct):
+                self._buyback()
+            return
+
+        if len(self) < self.cooldown_until:
+            return
+
+        vol_ok = self.atr[0] > self.p.atr_filter_mult * self.atr_sma[0]
+        if self.data.close[0] >= self.boll.top[0] and vol_ok:
+            self._sell_tactical()
+
+    def _sell_tactical(self):
+        price = self.data.close[0]
+        target_value = self.p.rotation_pct * self.broker.getvalue()
+        size = target_value / price
+        size = min(size, self.position.size)
+        if size <= 0:
+            return
+        self.order = self.sell(size=size)
+        self.tactical_size = size
+        self.anchor_high = self.data.high[0]
+        self.sell_price = price
+        self.in_tactical = True
+
+    def _buyback(self):
+        self.order = self.buy(size=self.tactical_size)
+        self.in_tactical = False
+        self.anchor_high = None
+        self.sell_price = None
+        self.tactical_size = 0.0
+        self.cooldown_until = len(self) + self.p.cooldown_days
+```
+```json
+{"assumptions": [
+  {"topic": "base position establishment", "choice": "Establish the base long position with a single unsized self.buy() (default sizer) the first time next() runs (i.e. once indicators satisfy minperiod), and never resize/close it except via the tactical rotation buys/sells.", "reason": "Spec says the strategy must 'maintain a base long position' but never states how or when it is entered or sized; canonical default #1 (plain self.buy(), default sizer) applies since this specific sizing/entry decision is unstated."},
+  {"topic": "buy-back sizing", "choice": "The buy-back (exit) leg repurchases exactly the number of shares sold at the preceding tactical entry (cached as tactical_size at sell time), rather than recomputing a fresh 5% of the portfolio value at exit time.", "reason": "The exits are described as 'complete the cycle' and 'cancel the reduction', implying restoration of the exact amount removed; recomputing a new 5% at exit (on a possibly different portfolio value) would not reliably restore the base position."},
+  {"topic": "reference prices for anchor/sell/exit checks", "choice": "The 'sell price' is the signal bar's closing price and the 'anchor high' is that same bar's high; the -5%/+3% exit thresholds are also tested against subsequent bars' closing prices (not intrabar highs/lows or the actual next-bar order fill price).", "reason": "The entry condition is explicitly closing-price based; backtrader fills market orders on the next bar's open, so using signal-bar close/high keeps anchor_high/sell_price consistent with the spec's closing-price framing, and the spec gives no basis for switching to intrabar or fill-price values on the exit checks."},
+  {"topic": "single active rotation", "choice": "Only one tactical sell/buy-back cycle can be open at a time; new upper-band touches are ignored while a rotation is already open.", "reason": "The spec tracks a single anchor-high/sell-price pair per cycle, which only makes sense for one active rotation at a time; this is the direct reading of the mechanics rather than an arbitrary choice."},
+  {"topic": "share size rounding", "choice": "Sizes computed as 5% of portfolio value / price are used as continuous (fractional) share counts, with no rounding to whole shares.", "reason": "The spec expresses trade size purely as a percentage of portfolio value with no mention of lot/share rounding, so fractional sizing preserves exact fidelity to the stated percentage."}
+]}
+```

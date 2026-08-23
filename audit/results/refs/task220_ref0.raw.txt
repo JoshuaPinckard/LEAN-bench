@@ -1,0 +1,213 @@
+```python
+import backtrader as bt
+
+
+class AggressiveCombinedStrategy(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_dev', 2),
+        ('rsi_period', 14),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('ema_period', 50),
+        ('atr_period', 14),
+        ('rsi_low', 40),
+        ('rsi_high', 60),
+        ('rsi_oversold', 30),
+        ('rsi_overbought', 70),
+        ('scalp_tp_atr_mult', 1.25),
+        ('scalp_stop_atr_mult', 1.0),
+        ('scalp_time_stop', 4),
+        ('scalp_extreme_lookback', 5),
+        ('swing_tp_atr_mult', 2.5),
+        ('swing_stop_atr_mult', 1.0),
+        ('swing_time_stop', 7),
+        ('pullback_atr_mult', 0.5),
+        ('vol_filter_threshold', 0.03),
+        ('risk_pct', 0.015),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal)
+        self.ema50 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.cross_lower = bt.indicators.CrossOver(self.data.close, self.bb.bot)
+        self.cross_upper = bt.indicators.CrossOver(self.bb.top, self.data.close)
+        self.macd_cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+
+        self.addminperiod(2)
+
+        self.order = None
+        self.position_type = None
+        self.entry_bar = None
+        self.stop_price = None
+        self.tp_atr_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _hist(self, ago=0):
+        return self.macd.macd[ago] - self.macd.signal[ago]
+
+    def _size_for_stop(self, stop_distance):
+        if stop_distance <= 0:
+            return 0
+        value = self.broker.getvalue()
+        risk_amount = self.p.risk_pct * value
+        return int(risk_amount / stop_distance)
+
+    def _enter_scalp(self, is_long):
+        lb = self.p.scalp_extreme_lookback
+        atr0 = self.atr[0]
+        close = self.data.close[0]
+        if is_long:
+            local_extreme = min(self.data.low.get(size=lb))
+            stop_price = local_extreme - self.p.scalp_stop_atr_mult * atr0
+            stop_distance = close - stop_price
+            size = self._size_for_stop(stop_distance)
+            if size <= 0:
+                return
+            self.order = self.buy(size=size)
+            self.tp_atr_price = close + self.p.scalp_tp_atr_mult * atr0
+        else:
+            local_extreme = max(self.data.high.get(size=lb))
+            stop_price = local_extreme + self.p.scalp_stop_atr_mult * atr0
+            stop_distance = stop_price - close
+            size = self._size_for_stop(stop_distance)
+            if size <= 0:
+                return
+            self.order = self.sell(size=size)
+            self.tp_atr_price = close - self.p.scalp_tp_atr_mult * atr0
+
+        self.position_type = 'scalp_long' if is_long else 'scalp_short'
+        self.entry_bar = len(self)
+        self.stop_price = stop_price
+
+    def _enter_swing(self, is_long):
+        atr0 = self.atr[0]
+        close = self.data.close[0]
+        stop_distance = self.p.swing_stop_atr_mult * atr0
+        size = self._size_for_stop(stop_distance)
+        if size <= 0:
+            return
+        if is_long:
+            self.order = self.buy(size=size)
+            self.tp_atr_price = close + self.p.swing_tp_atr_mult * atr0
+        else:
+            self.order = self.sell(size=size)
+            self.tp_atr_price = close - self.p.swing_tp_atr_mult * atr0
+
+        self.position_type = 'swing_long' if is_long else 'swing_short'
+        self.entry_bar = len(self)
+        self.stop_price = None
+
+    def _manage_position(self):
+        close = self.data.close[0]
+        bars_held = len(self) - self.entry_bar
+
+        if self.position_type == 'scalp_long':
+            if close <= self.stop_price or close >= self.bb.mid[0] or close >= self.tp_atr_price:
+                self.order = self.close()
+            elif bars_held >= self.p.scalp_time_stop:
+                self.order = self.close()
+
+        elif self.position_type == 'scalp_short':
+            if close >= self.stop_price or close <= self.bb.mid[0] or close <= self.tp_atr_price:
+                self.order = self.close()
+            elif bars_held >= self.p.scalp_time_stop:
+                self.order = self.close()
+
+        elif self.position_type == 'swing_long':
+            if close >= self.tp_atr_price or close >= self.bb.top[0]:
+                self.order = self.close()
+            elif self.macd_cross[0] == -1:
+                self.order = self.close()
+            elif bars_held >= self.p.swing_time_stop:
+                self.order = self.close()
+
+        elif self.position_type == 'swing_short':
+            if close <= self.tp_atr_price or close <= self.bb.bot[0]:
+                self.order = self.close()
+            elif self.macd_cross[0] == 1:
+                self.order = self.close()
+            elif bars_held >= self.p.swing_time_stop:
+                self.order = self.close()
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            self._manage_position()
+            return
+
+        atr = self.atr[0]
+        close = self.data.close[0]
+        if (atr / close) > self.p.vol_filter_threshold:
+            return
+
+        rsi = self.rsi[0]
+        hist0 = self._hist(0)
+        hist1 = self._hist(-1)
+        hist2 = self._hist(-2)
+
+        if self.cross_lower[0] == 1 and self.p.rsi_low <= rsi <= self.p.rsi_high:
+            momentum_long = (self.macd_cross[0] == 1) or (hist0 > hist1 > hist2)
+            if momentum_long:
+                self._enter_scalp(is_long=True)
+                return
+
+        if self.cross_upper[0] == 1 and self.p.rsi_low <= rsi <= self.p.rsi_high:
+            momentum_short = (self.macd_cross[0] == -1) or (hist0 < hist1 < hist2)
+            if momentum_short:
+                self._enter_scalp(is_long=False)
+                return
+
+        trend_up = close > self.ema50[0] and self.ema50[0] > self.ema50[-1]
+        if trend_up:
+            macd_bull = self.macd.macd[0] > self.macd.signal[0] and self.macd.macd[0] > 0
+            pullback = abs(close - self.bb.mid[0]) <= self.p.pullback_atr_mult * atr
+            rsi_ok = (self.p.rsi_low <= rsi <= self.p.rsi_high) or \
+                     (self.rsi[-1] < self.p.rsi_oversold and rsi > self.p.rsi_low)
+            if macd_bull and pullback and rsi_ok:
+                self._enter_swing(is_long=True)
+                return
+
+        trend_down = close < self.ema50[0] and self.ema50[0] < self.ema50[-1]
+        if trend_down:
+            macd_bear = self.macd.macd[0] < self.macd.signal[0] and self.macd.macd[0] < 0
+            pullback = abs(close - self.bb.mid[0]) <= self.p.pullback_atr_mult * atr
+            rsi_ok = (self.p.rsi_low <= rsi <= self.p.rsi_high) or \
+                     (self.rsi[-1] > self.p.rsi_overbought and rsi < self.p.rsi_high)
+            if macd_bear and pullback and rsi_ok:
+                self._enter_swing(is_long=False)
+                return
+```
+```json
+{"assumptions": [
+  {"topic": "scalp_take_profit_atr_mult", "choice": "1.25 ATR (midpoint of stated 1-1.5 ATR range) used as the fixed-ATR take-profit target for scalps, alongside bb.mid as an alternative target; exit fires on whichever is touched first.", "reason": "spec gives a range, not a single value, and a deterministic exit threshold is required."},
+  {"topic": "scalp_stop_local_extreme_lookback", "choice": "Local extreme = min low (longs) / max high (shorts) over the most recent 5 bars including the entry bar.", "reason": "spec calls for a stop '1 ATR beyond the local extreme' but does not define the lookback window for that extreme; 5 bars ties to the strategy's own 3-5 bar scalp holding horizon."},
+  {"topic": "scalp_time_stop_bars", "choice": "4 bars (midpoint of stated 3-5 bar range).", "reason": "spec gives a range; a single bar count is required for a coded exit rule."},
+  {"topic": "swing_take_profit_atr_mult", "choice": "2.5 ATR (midpoint of stated 2-3 ATR range), alongside touch of the opposite Bollinger band as an alternative target.", "reason": "spec gives a range without a single value."},
+  {"topic": "swing_time_stop_bars", "choice": "7 bars (near midpoint of stated 5-10 bar range).", "reason": "spec gives a range; a single bar count is required."},
+  {"topic": "risk_per_trade_pct", "choice": "1.5% of current portfolio value (midpoint of stated 1-2% range) used as risk_per_trade in the sizing formula.", "reason": "spec gives a range without a single fixed percentage."},
+  {"topic": "swing_stop_distance_for_sizing", "choice": "1 ATR is used as the notional stop distance in the risk_per_trade/stop_distance sizing formula for swing trades; no separate protective stop-loss order is placed for swing positions beyond this sizing use.", "reason": "the sizing formula presupposes an ATR-based stop distance, but the swing subsection defines no explicit stop-loss level (unlike the scalp subsection's explicit '1 ATR beyond local extreme'); 1 ATR keeps the sizing convention consistent with the scalp side."},
+  {"topic": "volatility_filter_scope", "choice": "The ATR(14)/close > 0.03 filter is applied to skip new entries for both scalp and swing signals.", "reason": "the filter is worded generically ('skip new entries') even though it appears in the swing subsection; treated as a global entry filter rather than swing-only."},
+  {"topic": "oversold_overbought_thresholds", "choice": "RSI oversold defined as <30 and overbought as >70 for the 'RSI exiting oversold/overbought' swing entry clauses.", "reason": "spec references these zones without stating their entry thresholds; 30/70 are the conventional RSI extremes."},
+  {"topic": "concurrent_scalp_swing_signal_precedence", "choice": "If both a scalp and a swing entry condition are satisfied on the same bar, the scalp entry is evaluated and taken first.", "reason": "the spec presents scalp before swing and does not address simultaneous signals; only one position is held at a time per the single-position convention."},
+  {"topic": "position_size_rounding", "choice": "Share count = floor(risk_amount / stop_distance); if this floors to 0 the entry is skipped for that bar.", "reason": "spec gives a sizing formula but no rounding convention; whole-share sizing is the natural convention for equities."},
+  {"topic": "macd_momentum_confirmation_definition", "choice": "Momentum confirmation for scalps = MACD line crosses its signal line in the mean-reverting direction (bullish cross for longs, bearish for shorts) OR the MACD histogram (macd - signal) moves monotonically toward zero over two consecutive bars in the corresponding direction.", "reason": "spec states this qualitatively without an exact formula; this is the literal reading of 'crosses its signal line toward the mean' and 'histogram moves toward zero for two bars in a row.'"},
+  {"topic": "manual_minperiod_bump", "choice": "self.addminperiod(2) is added so manual indexing of the MACD histogram at [-1]/[-2] is always backed by valid indicator data.", "reason": "the two-bars-in-a-row histogram check looks back further than CrossOver's own automatic minperiod guarantees; addminperiod is backtrader's supported mechanism for this, consistent with relying on automatic warm-up handling."},
+  {"topic": "infeasible", "choice": "No slippage model is set from within the strategy; commission accounting relies entirely on the harness-configured broker (0.001 per the environment spec), applied automatically on every fill.", "reason": "Cerebro/broker setup, including any slippage model, is owned by the harness per the environment description; a bt.Strategy class has no reliable way to add slippage without risking conflict with that harness-controlled broker configuration."}
+]}
+```

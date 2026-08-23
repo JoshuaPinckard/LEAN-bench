@@ -1,0 +1,156 @@
+```python
+import backtrader as bt
+import math
+
+
+class TDP(bt.Indicator):
+    """Time-decay-weighted percentile-rank oscillator (0-100)."""
+    lines = ('tdp',)
+    params = (
+        ('period', 100),
+        ('decay', 0.05),
+    )
+
+    def __init__(self):
+        self.addminperiod(self.p.period)
+        self._weights = [math.exp(-self.p.decay * k) for k in range(self.p.period)]
+        self._wsum = sum(self._weights)
+
+    def next(self):
+        current_close = self.data.close[0]
+        weighted_count = 0.0
+        for k in range(self.p.period):
+            c = self.data.close[-k]
+            if c <= current_close:
+                weighted_count += self._weights[k]
+        self.lines.tdp[0] = 100.0 * weighted_count / self._wsum
+
+
+class TDPDivergenceStrategy(bt.Strategy):
+    params = (
+        ('tdp_period', 100),
+        ('tdp_decay', 0.05),
+        ('ema_period', 22),
+        ('long_entry_1', 30),
+        ('long_entry_2', 15),
+        ('short_entry_1', 70),
+        ('short_entry_2', 85),
+        ('long_exit_mid', 50),
+        ('long_exit_opp', 70),
+        ('short_exit_mid', 50),
+        ('short_exit_opp', 30),
+        ('div_window', 20),
+        ('use_divergence', False),
+        ('stop_pct', 0.05),
+    )
+
+    def __init__(self):
+        self.tdp = TDP(self.data, period=self.p.tdp_period, decay=self.p.tdp_decay)
+        self.tdp_ema = bt.indicators.EMA(self.tdp, period=self.p.ema_period)
+        self.order = None
+        self.stop_order = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.stop_order:
+            if order.status == order.Completed:
+                self.stop_order = None
+                self.order = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+            return
+
+        if order.status == order.Completed:
+            if self.position.size != 0:
+                if self.position.size > 0:
+                    stop_price = order.executed.price * (1 - self.p.stop_pct)
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=self.position.size)
+                else:
+                    stop_price = order.executed.price * (1 + self.p.stop_pct)
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=abs(self.position.size))
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def _bullish_divergence(self):
+        if len(self) <= self.p.div_window:
+            return False
+        prior_closes = self.data.close.get(ago=-1, size=self.p.div_window)
+        prior_tdp = self.tdp_ema.get(ago=-1, size=self.p.div_window)
+        if not prior_closes or not prior_tdp:
+            return False
+        lower_low = self.data.close[0] < min(prior_closes)
+        higher_low = self.tdp_ema[0] > min(prior_tdp)
+        return lower_low and higher_low
+
+    def _bearish_divergence(self):
+        if len(self) <= self.p.div_window:
+            return False
+        prior_closes = self.data.close.get(ago=-1, size=self.p.div_window)
+        prior_tdp = self.tdp_ema.get(ago=-1, size=self.p.div_window)
+        if not prior_closes or not prior_tdp:
+            return False
+        higher_high = self.data.close[0] > max(prior_closes)
+        lower_high = self.tdp_ema[0] < max(prior_tdp)
+        return higher_high and lower_high
+
+    def next(self):
+        if self.order:
+            return
+
+        if len(self) < 2:
+            return
+
+        cur = self.tdp_ema[0]
+        prev = self.tdp_ema[-1]
+
+        cross_up_30 = prev <= self.p.long_entry_1 and cur > self.p.long_entry_1
+        cross_up_15 = prev <= self.p.long_entry_2 and cur > self.p.long_entry_2
+        cross_down_70 = prev >= self.p.short_entry_1 and cur < self.p.short_entry_1
+        cross_down_85 = prev >= self.p.short_entry_2 and cur < self.p.short_entry_2
+
+        cross_down_50 = prev >= self.p.long_exit_mid and cur < self.p.long_exit_mid
+        cross_up_70 = prev <= self.p.long_exit_opp and cur > self.p.long_exit_opp
+        cross_up_50 = prev <= self.p.short_exit_mid and cur > self.p.short_exit_mid
+        cross_down_30 = prev >= self.p.short_exit_opp and cur < self.p.short_exit_opp
+
+        if not self.position:
+            long_signal = cross_up_30 or cross_up_15
+            short_signal = cross_down_70 or cross_down_85
+
+            if long_signal and self.p.use_divergence:
+                long_signal = self._bullish_divergence()
+            if short_signal and self.p.use_divergence:
+                short_signal = self._bearish_divergence()
+
+            if long_signal:
+                self.order = self.buy()
+            elif short_signal:
+                self.order = self.sell()
+            return
+
+        if self.position.size > 0:
+            if cross_down_50 or cross_up_70:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+        elif self.position.size < 0:
+            if cross_up_50 or cross_down_30:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "decay value", "choice": "tdp_decay=0.05", "reason": "Spec defines w_k = exp(-decay*k) as a formula but gives no example numeric value for decay (unlike N=100 and D=20 which have examples); chose a moderate default that produces a meaningful decay profile over a 100-bar window."},
+  {"topic": "percentile-rank formula", "choice": "percentile = 100 * (sum of w_k for bars with close_k <= current_close) / (sum of all w_k), over k=0..N-1 including the current bar (k=0)", "reason": "Spec states 'percentile rank of the current close within the last N bars using exponential time-decay weights' and 'scale to 0..100' but does not give the exact combination formula; this is the literal, standard weighted-percentile-rank construction consistent with the stated weights and range."},
+  {"topic": "crossing definition", "choice": "'crosses up above X' = prev<=X and cur>X; 'crosses down below X' = prev>=X and cur<X", "reason": "Spec uses crossing language for entries/exits but does not define the boundary-inclusive convention; used the standard convention where the crossing bar's prior value is inclusive of the threshold."},
+  {"topic": "divergence filter default state", "choice": "use_divergence parameter defaults to False (entries fire on threshold crosses alone unless enabled)", "reason": "Spec explicitly labels this block 'Optional divergence filter', so it is not treated as a mandatory condition on the core entry rules; exposed as a toggle parameter per the spec's instruction to 'include parameters for ... divergence window D'."},
+  {"topic": "divergence lower-low/higher-high definition", "choice": "'lower low over last D bars' = current close < min(close over prior D bars, excluding current); analogous for higher low, higher high, lower high on tdp_ema/close", "reason": "Spec states the divergence concept but not the exact window mechanics (inclusive/exclusive of current bar, swing-point vs. simple rolling extreme); used the simplest literal rolling-extreme-vs-current-bar reading consistent with the stated D-bar window."},
+  {"topic": "stop loss type", "choice": "Fixed percent stop (stop_pct=0.05, i.e., 5%) implemented as a genuine broker-side bt.Order.Stop order sized to the open position, placed immediately after entry fill and canceled if the indicator-based exit fires first", "reason": "Spec says 'choose one and implement: fixed percent stop ... or ATR-based stop'; chose the fixed-percent variant per the spec's own example (5%). Implemented via a real Stop order (rather than a manual close-price check in next()) so the stop is enforced intrabar against the actual stop price, which is the most literal reading of 'stop loss' in the backtrader environment."}
+]}
+```

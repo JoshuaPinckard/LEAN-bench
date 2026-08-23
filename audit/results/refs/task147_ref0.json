@@ -1,0 +1,442 @@
+{
+  "task_id": 147,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass GridMartingaleStrategy(bt.Strategy):\n    params = dict(\n        grid_distance_pct=0.01,\n        take_profit_pct=0.005,\n        reinvest_multiplier=2,\n        max_reinvest_levels=5,\n        base_size=1,\n    )\n\n    def __init__(self):\n        self.direction = None\n        self.level = 0\n        self.total_size = 0\n        self.total_cost = 0.0\n        self.last_entry_price = None\n\n        self.grid_buy_order = None\n        self.grid_sell_order = None\n        self.reinvest_order = None\n        self.tp_order = None\n\n    def next(self):\n        if self.direction is None:\n            if self.grid_buy_order is not None:\n                self.cancel(self.grid_buy_order)\n            if self.grid_sell_order is not None:\n                self.cancel(self.grid_sell_order)\n            price = self.data.close[0]\n            buy_price = price * (1 - self.p.grid_distance_pct)\n            sell_price = price * (1 + self.p.grid_distance_pct)\n            self.grid_buy_order = self.buy(\n                exectype=bt.Order.Limit, price=buy_price, size=self.p.base_size)\n            self.grid_sell_order = self.sell(\n                exectype=bt.Order.Limit, price=sell_price, size=self.p.base_size)\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order == self.grid_buy_order:\n            if order.status == order.Completed:\n                self.grid_buy_order = None\n                self._on_entry_fill(order, 'long')\n                if self.grid_sell_order is not None:\n                    self.cancel(self.grid_sell_order)\n                    self.grid_sell_order = None\n            else:\n                self.grid_buy_order = None\n        elif order == self.grid_sell_order:\n            if order.status == order.Completed:\n                self.grid_sell_order = None\n                self._on_entry_fill(order, 'short')\n                if self.grid_buy_order is not None:\n                    self.cancel(self.grid_buy_order)\n                    self.grid_buy_order = None\n            else:\n                self.grid_sell_order = None\n        elif order == self.reinvest_order:\n            if order.status == order.Completed:\n                self.reinvest_order = None\n                self._on_entry_fill(order, self.direction)\n            else:\n                self.reinvest_order = None\n        elif order == self.tp_order:\n            if order.status == order.Completed:\n                self.tp_order = None\n                self._on_position_closed()\n            else:\n                self.tp_order = None\n\n    def _on_entry_fill(self, order, direction):\n        price = order.executed.price\n        size = abs(order.executed.size)\n        if self.direction is None:\n            self.direction = direction\n            self.total_cost = price * size\n            self.total_size = size\n            self.level = 0\n        else:\n            self.total_cost += price * size\n            self.total_size += size\n            self.level += 1\n        self.last_entry_price = price\n        avg_price = self.total_cost / self.total_size\n        self._update_tp_order(avg_price)\n        self._update_reinvest_order()\n\n    def _update_tp_order(self, avg_price):\n        if self.tp_order is not None:\n            self.cancel(self.tp_order)\n        if self.direction == 'long':\n            tp_price = avg_price * (1 + self.p.take_profit_pct)\n        else:\n            tp_price = avg_price * (1 - self.p.take_profit_pct)\n        self.tp_order = self.close(exectype=bt.Order.Limit, price=tp_price)\n\n    def _update_reinvest_order(self):\n        if self.reinvest_order is not None:\n            self.cancel(self.reinvest_order)\n            self.reinvest_order = None\n        if self.level >= self.p.max_reinvest_levels:\n            return\n        next_size = self.p.base_size * (self.p.reinvest_multiplier ** (self.level + 1))\n        if self.direction == 'long':\n            next_price = self.last_entry_price * (1 - self.p.grid_distance_pct)\n            self.reinvest_order = self.buy(\n                exectype=bt.Order.Limit, price=next_price, size=next_size)\n        else:\n            next_price = self.last_entry_price * (1 + self.p.grid_distance_pct)\n            self.reinvest_order = self.sell(\n                exectype=bt.Order.Limit, price=next_price, size=next_size)\n\n    def _on_position_closed(self):\n        if self.reinvest_order is not None:\n            self.cancel(self.reinvest_order)\n            self.reinvest_order = None\n        self.direction = None\n        self.level = 0\n        self.total_size = 0\n        self.total_cost = 0.0\n        self.last_entry_price = None",
+  "assumptions": [
+    {
+      "topic": "grid distance",
+      "choice": "Initial and reinvestment grid orders are placed 1% away from the reference price (current close for the initial grid, last fill price for reinvestment steps)",
+      "reason": "Spec says 'a certain distance from the current price' without a number; 1% is the bench convention for an unstated grid spacing and reuses the spec's own trailing-entry example threshold context."
+    },
+    {
+      "topic": "take-profit margin",
+      "choice": "0.5% from the volume-weighted average entry price",
+      "reason": "Directly matches the spec's own example ('e.g., 0.5% from the averaged entry price')."
+    },
+    {
+      "topic": "initial position size",
+      "choice": "base_size = 1 unit",
+      "reason": "Spec says this is 'set by the user' but gives no value; chose a minimal concrete size so the doubling sequence (1,2,4,8,16,32) stays implementable within the fixed $10,000 starting cash."
+    },
+    {
+      "topic": "shorting",
+      "choice": "Enabled: grid sell orders open short positions, grid buy orders open long positions",
+      "reason": "Spec explicitly requires 'a grid of limit buy and sell orders' for a perpetual-futures contrarian market maker, i.e. entries in both directions, which overrides the bench's long-only default."
+    },
+    {
+      "topic": "pyramiding / re-entry",
+      "choice": "Enabled: reinvestment orders add to an open position in the same direction while it is losing",
+      "reason": "This is the core Martingale mechanic the spec explicitly describes, overriding the bench's default of one position with no re-entry."
+    },
+    {
+      "topic": "simultaneous long+short (hedge mode)",
+      "choice": "Not modeled; only one directional grid (long or short) is active at a time. When either side of the initial grid fills, the opposite pending order is canceled, and after the position fully closes via take-profit both sides are re-armed",
+      "reason": "infeasible \u2014 backtrader's default broker maintains a single netted position per data feed, so true simultaneous long and short exposure ('hedge mode') on one instrument cannot be represented; this is the closest literal reading that preserves the grid's two-sided intent while respecting the netting model."
+    },
+    {
+      "topic": "trailing entry / trailing exit",
+      "choice": "Not implemented; only the static grid + fixed take-profit method (the spec's own base description) is used",
+      "reason": "infeasible \u2014 the spec labels both trailing features as optional alternatives ('can use'), and they require tracking retracement from intrabar extremes / order-book depth that is not derivable from daily OHLCV bars; the static method is fully specified and chosen instead."
+    },
+    {
+      "topic": "grid maintenance frequency",
+      "choice": "While flat, cancel and recreate both grid orders on every bar so they stay centered on the current close",
+      "reason": "Spec requires the strategy to 'automatically create and cancel limit orders to maintain the grid around the current price' but does not state a recentering frequency; per-bar recentering is the most literal reading given the bar-by-bar next() execution model."
+    },
+    {
+      "topic": "behavior after max reinvestment level reached",
+      "choice": "No further reinvestment orders are placed once the cap (5) is hit; the take-profit order remains active and the position simply waits to close, with no forced stop-loss exit",
+      "reason": "Spec only requires a limit on the number/volume of reinvestments to cap risk; it does not state any forced-exit rule beyond that cap, so none was added."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 22,
+  "tape": [
+    {
+      "dt": "2020-01-03T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 71.56322834377139
+    },
+    {
+      "dt": "2020-01-06T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 71.92104448549023
+    },
+    {
+      "dt": "2020-01-06T05:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 70.75402846338375
+    },
+    {
+      "dt": "2020-01-08T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 72.58048080444335
+    },
+    {
+      "dt": "2020-01-09T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 73.99320238999518
+    },
+    {
+      "dt": "2020-01-09T05:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 73.99320238999518
+    },
+    {
+      "dt": "2020-01-13T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 75.48475479125976
+    },
+    {
+      "dt": "2020-01-14T05:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 76.27147857331117
+    },
+    {
+      "dt": "2020-01-15T05:00:00",
+      "side": "BUY",
+      "size": 5.0,
+      "price": 75.10344798902688
+    },
+    {
+      "dt": "2020-01-16T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 75.73042755126953
+    },
+    {
+      "dt": "2020-01-17T05:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 76.48773182678222
+    },
+    {
+      "dt": "2020-01-24T05:00:00",
+      "side": "SELL",
+      "size": -4.0,
+      "price": 77.25260914505004
+    },
+    {
+      "dt": "2020-01-27T05:00:00",
+      "side": "BUY",
+      "size": 7.0,
+      "price": 74.67235687385794
+    },
+    {
+      "dt": "2020-01-28T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 75.28405419350632
+    },
+    {
+      "dt": "2020-01-29T05:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 78.13792264122904
+    },
+    {
+      "dt": "2020-01-30T05:00:00",
+      "side": "BUY",
+      "size": 3.0,
+      "price": 76.80069999286152
+    },
+    {
+      "dt": "2020-01-31T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 77.21826278686524
+    },
+    {
+      "dt": "2020-02-03T05:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 73.28515870612867
+    },
+    {
+      "dt": "2020-02-04T05:00:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 75.9367288800473
+    },
+    {
+      "dt": "2020-02-05T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 77.91396771511286
+    },
+    {
+      "dt": "2020-02-06T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 77.5243978765373
+    },
+    {
+      "dt": "2020-02-07T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 77.53774383544922
+    },
+    {
+      "dt": "2020-02-10T05:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 75.84415588740227
+    },
+    {
+      "dt": "2020-02-11T05:00:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 78.11818095050265
+    },
+    {
+      "dt": "2020-02-12T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 77.92652565002442
+    },
+    {
+      "dt": "2020-02-13T05:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 78.70579090652465
+    },
+    {
+      "dt": "2020-02-14T05:00:00",
+      "side": "BUY",
+      "size": 3.0,
+      "price": 78.05380564191945
+    },
+    {
+      "dt": "2020-02-18T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 76.12900862033511
+    },
+    {
+      "dt": "2020-02-19T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 77.24912158938099
+    },
+    {
+      "dt": "2020-02-20T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 77.34177108764648
+    },
+    {
+      "dt": "2020-02-21T05:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 76.56835337677002
+    },
+    {
+      "dt": "2020-02-24T05:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 71.75962518984169
+    },
+    {
+      "dt": "2020-02-25T05:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 71.04202893794327
+    },
+    {
+      "dt": "2020-02-26T05:00:00",
+      "side": "BUY",
+      "size": 16.0,
+      "price": 69.16934036398257
+    },
+    {
+      "dt": "2020-02-27T05:00:00",
+      "side": "BUY",
+      "size": 32.0,
+      "price": 67.85853712666133
+    },
+    {
+      "dt": "2020-03-02T05:00:00",
+      "side": "SELL",
+      "size": -63.0,
+      "price": 69.61676227302996
+    },
+    {
+      "dt": "2020-03-03T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 71.41244361877442
+    },
+    {
+      "dt": "2020-03-03T05:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 73.3069988099028
+    },
+    {
+      "dt": "2020-03-05T05:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 70.69831918258667
+    },
+    {
+      "dt": "2020-03-06T05:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 68.07580613740882
+    },
+    {
+      "dt": "2020-03-09T04:00:00",
+      "side": "BUY",
+      "size": 8.0,
+      "price": 63.670171942415024
+    },
+    {
+      "dt": "2020-03-10T04:00:00",
+      "side": "SELL",
+      "size": -14.0,
+      "price": 66.90258302825225
+    },
+    {
+      "dt": "2020-03-11T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 66.96292517997638
+    },
+    {
+      "dt": "2020-03-12T04:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 61.78481820985721
+    },
+    {
+      "dt": "2020-03-13T04:00:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 63.94535922482894
+    },
+    {
+      "dt": "2020-03-13T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 61.16697002775864
+    },
+    {
+      "dt": "2020-03-16T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 58.40757727472599
+    },
+    {
+      "dt": "2020-03-17T04:00:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 59.74978006097213
+    },
+    {
+      "dt": "2020-03-17T04:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 57.823501501978726
+    },
+    {
+      "dt": "2020-03-18T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 57.88132562490314
+    },
+    {
+      "dt": "2020-03-19T04:00:00",
+      "side": "SELL",
+      "size": -3.0,
+      "price": 59.720822675289355
+    },
+    {
+      "dt": "2020-03-20T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 58.49985168457031
+    },
+    {
+      "dt": "2020-03-20T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 59.68166687011719
+    },
+    {
+      "dt": "2020-03-23T04:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 55.05931255400759
+    },
+    {
+      "dt": "2020-03-24T04:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 57.05813597182242
+    },
+    {
+      "dt": "2020-03-25T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 59.00172500610351
+    },
+    {
+      "dt": "2020-03-25T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 60.53192941719469
+    },
+    {
+      "dt": "2020-04-01T04:00:00",
+      "side": "BUY",
+      "size": 2.0,
+      "price": 58.411707756042475
+    },
+    {
+      "dt": "2020-04-02T04:00:00",
+      "side": "SELL",
+      "size": -2.0,
+      "price": 58.901422073593125
+    },
+    {
+      "dt": "2020-04-02T04:00:00",
+      "side": "BUY",
+      "size": 4.0,
+      "price": 57.827590678482046
+    },
+    {
+      "dt": "2020-04-03T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 58.535687370300295
+    },
+    {
+      "dt": "2020-04-06T04:00:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 60.56812074968202
+    },
+    {
+      "dt": "2020-04-07T04:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 62.72754867553711
+    },
+    {
+      "dt": "2020-04-07T04:00:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 65.37206847487805
+    }
+  ]
+}

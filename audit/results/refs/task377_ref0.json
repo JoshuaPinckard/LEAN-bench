@@ -1,0 +1,42 @@
+{
+  "task_id": 377,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import datetime\n\nimport backtrader as bt\n\n\nclass IntradayMiddayReversal(bt.Strategy):\n    params = dict(\n        session_start=datetime.time(9, 30),\n        session_end=datetime.time(16, 0),\n        morning_start=datetime.time(9, 30),\n        morning_end=datetime.time(11, 30),\n        midday_start=datetime.time(11, 30),\n        midday_end=datetime.time(13, 30),\n        eod_time=datetime.time(15, 45),\n        sma_period=20,\n        rsi_period=14,\n        trend_lookback=4,\n        stop_pct=0.02,\n    )\n\n    def __init__(self):\n        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n\n        self.order = None\n        self.entry_price = None\n        self.stop_price = None\n\n        self.current_day = None\n        self.trend_computed = False\n        self.morning_trend = None\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n        if order.status == order.Completed:\n            if self.position:\n                if self.entry_price is None:\n                    self.entry_price = order.executed.price\n                    if self.position.size > 0:\n                        self.stop_price = self.entry_price * (1 - self.p.stop_pct)\n                    else:\n                        self.stop_price = self.entry_price * (1 + self.p.stop_pct)\n            else:\n                self.entry_price = None\n                self.stop_price = None\n        elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n            pass\n        self.order = None\n\n    def next(self):\n        current_time = self.data.datetime.time(0)\n        current_date = self.data.datetime.date(0)\n\n        if self.current_day != current_date:\n            self.current_day = current_date\n            self.trend_computed = False\n            self.morning_trend = None\n\n        if not self.trend_computed and current_time == self.p.morning_end:\n            self.trend_computed = True\n            if len(self) >= self.p.sma_period + self.p.trend_lookback:\n                close = self.data.close[0]\n                sma_now = self.sma[0]\n                sma_prev = self.sma[-self.p.trend_lookback]\n                if close > sma_now and sma_now > sma_prev:\n                    self.morning_trend = 'up'\n                elif close < sma_now and sma_now < sma_prev:\n                    self.morning_trend = 'down'\n                else:\n                    self.morning_trend = None\n            else:\n                self.morning_trend = None\n\n        if self.order:\n            return\n\n        if self.position:\n            have_prev_rsi = len(self.rsi) > 1\n            if self.position.size > 0:\n                if self.data.low[0] <= self.stop_price:\n                    self.order = self.close()\n                    return\n                if have_prev_rsi and self.rsi[-1] >= 50 and self.rsi[0] < 50:\n                    self.order = self.close()\n                    return\n                if current_time >= self.p.eod_time:\n                    self.order = self.close()\n                    return\n            else:\n                if self.data.high[0] >= self.stop_price:\n                    self.order = self.close()\n                    return\n                if have_prev_rsi and self.rsi[-1] <= 50 and self.rsi[0] > 50:\n                    self.order = self.close()\n                    return\n                if current_time >= self.p.eod_time:\n                    self.order = self.close()\n                    return\n            return\n\n        if self.morning_trend is None:\n            return\n\n        if not (self.p.midday_start <= current_time < self.p.midday_end):\n            return\n\n        if len(self.rsi) <= 1:\n            return\n\n        if self.morning_trend == 'up' and self.rsi[-1] >= 50 and self.rsi[0] < 50:\n            self.order = self.sell()\n        elif self.morning_trend == 'down' and self.rsi[-1] <= 50 and self.rsi[0] > 50:\n            self.order = self.buy()",
+  "assumptions": [
+    {
+      "topic": "exit-priority",
+      "choice": "Per bar, check stop-loss breach first, then the opposite RSI cross, then EOD liquidation time; only the first true condition triggers the close.",
+      "reason": "Spec lists the stop-loss as a separately-checked-each-bar rule, then states the cross/EOD exit as 'whichever comes first'; when multiple conditions coincide on one bar an explicit priority is needed and stop-loss (risk control) is given precedence."
+    },
+    {
+      "topic": "stop-loss check basis",
+      "choice": "Stop breach is tested against the bar's Low (long) or High (short) rather than Close only.",
+      "reason": "Only OHLCV bar data is available (no tick/order-book data); using High/Low is the closest literal reading of a price level 'checked each bar' with a fixed percentage stop."
+    },
+    {
+      "topic": "session_start/session_end usage",
+      "choice": "09:30-16:00 session bounds are declared as parameters but not used to filter bars.",
+      "reason": "The supplied data feed already contains only regular-session 15m bars, so no additional session filtering logic is applied; the times are still defined per the spec."
+    },
+    {
+      "topic": "order fill timing",
+      "choice": "Entries/exits use plain self.buy()/self.sell()/self.close() market orders, filled at the next bar's open per backtrader's default broker behavior.",
+      "reason": "Canonical defaults specify plain orders for unstated sizing/closing; no stop-order or same-bar-fill mechanism was specified, so no override of the environment's default fill timing was introduced."
+    },
+    {
+      "topic": "re-entry within a day",
+      "choice": "If a position exits before 13:30 while the day's classified trend and midday window are still active, a new entry on a subsequent qualifying RSI cross is allowed.",
+      "reason": "The spec restricts entries only by 'one position at a time' and 'no new entries after 13:30'; it does not state a one-trade-per-day limit, so none was added."
+    },
+    {
+      "topic": "warm-up for trend lookback",
+      "choice": "The 11:30 trend classification (and SMA[-4] lookback) only evaluates once len(self) >= sma_period + trend_lookback bars exist; days without enough history simply get morning_trend=None (no trade).",
+      "reason": "Backtrader's automatic minperiod (max of SMA(20) and RSI(14)) governs when next() first runs; the extra length guard prevents indexing sma[-4] before it is valid, consistent with relying on automatic warm-up rather than manual bar-skipping."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

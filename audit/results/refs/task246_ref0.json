@@ -1,0 +1,57 @@
+{
+  "task_id": 246,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\n\nimport backtrader as bt\n\n\nclass PostDisasterCapitulationBounce(bt.Strategy):\n    params = (\n        ('sma_fast', 20),\n        ('sma_slow', 50),\n        ('rsi_period', 14),\n        ('atr_period', 14),\n        ('vol_period', 20),\n        ('cap_window', 5),\n        ('active_window', 10),\n        ('drop_pct', 0.15),\n        ('vol_spike_mult', 7.0),\n        ('vol_ease_mult', 0.8),\n        ('volatility_pct', 0.03),\n        ('tp2_pct', 0.5),\n        ('risk_pct', 0.02),\n    )\n\n    def __init__(self):\n        self.sma20 = bt.indicators.SMA(self.data.close, period=self.p.sma_fast)\n        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_slow)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.volsma = bt.indicators.SMA(self.data.volume, period=self.p.vol_period)\n        self.rsi_cross = bt.indicators.CrossOver(self.rsi, 30)\n\n        self.order = None\n        self.cap_bar = None\n        self.cap_low = None\n        self.cap_high_vol = None\n        self.range_L = None\n        self.range_H = None\n\n        self.stop_price = None\n        self.tp2_price = None\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def next(self):\n        self._update_capitulation_state()\n\n        if self.order is not None:\n            return\n\n        if self.position:\n            self._check_exits()\n        else:\n            self._check_entry()\n\n    def _update_capitulation_state(self):\n        drop_confirmed = self.data.close[0] <= self.data.close[-self.p.cap_window] * (1 - self.p.drop_pct)\n        if not drop_confirmed:\n            return\n\n        best_offset = None\n        best_vol = None\n        for offset in range(self.p.cap_window):\n            if len(self) - offset < self.p.vol_period:\n                continue\n            is_down = self.data.close[-offset] < self.data.open[-offset]\n            vol_spike = self.data.volume[-offset] > self.p.vol_spike_mult * self.volsma[-offset]\n            if is_down and vol_spike:\n                v = self.data.volume[-offset]\n                if best_vol is None or v > best_vol:\n                    best_vol = v\n                    best_offset = offset\n\n        if best_offset is None:\n            return\n\n        candidate_bar = len(self) - best_offset\n        window_expired = self.cap_bar is not None and len(self) > self.cap_bar + self.p.active_window\n\n        if self.cap_bar is None or window_expired or best_vol > self.cap_high_vol:\n            self.cap_bar = candidate_bar\n            self.cap_low = self.data.low[-best_offset]\n            self.cap_high_vol = best_vol\n            highs = [self.data.high[-(best_offset + k)] for k in range(self.p.vol_period)]\n            self.range_H = max(highs)\n            self.range_L = self.cap_low\n\n    def _in_active_window(self):\n        return self.cap_bar is not None and len(self) <= self.cap_bar + self.p.active_window\n\n    def _check_entry(self):\n        if not self._in_active_window() or self.range_L is None or self.range_H is None:\n            return\n\n        positive_day = self.data.close[0] > self.data.open[0]\n        rsi_cross_up = self.rsi_cross[0] > 0\n        vol_normal = self.data.volume[0] >= self.p.vol_ease_mult * self.volsma[0]\n        vol_range = (self.data.high[0] - self.data.low[0]) / self.data.open[0] >= self.p.volatility_pct\n        trend_ok = self.data.close[0] > self.sma20[0]\n\n        if not (positive_day and rsi_cross_up and vol_normal and vol_range and trend_ok):\n            return\n\n        L = self.range_L\n        H = self.range_H\n        stop = L - 1.0 * self.atr[0]\n        entry_price = self.data.close[0]\n        risk_per_share = entry_price - stop\n        if risk_per_share <= 0:\n            return\n\n        equity = self.broker.getvalue()\n        size = math.floor((self.p.risk_pct * equity) / risk_per_share)\n        if size < 1:\n            return\n\n        self.stop_price = stop\n        self.tp2_price = L + self.p.tp2_pct * (H - L)\n        self.order = self.buy(size=size)\n\n    def _check_exits(self):\n        if self.data.low[0] <= self.stop_price:\n            self.order = self.close()\n            return\n\n        touched_tp2 = self.data.high[0] >= self.tp2_price\n        touched_sma50 = self.data.low[0] <= self.sma50[0] <= self.data.high[0]\n        if touched_tp2 or touched_sma50:\n            self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "cap day selection",
+      "choice": "When multiple days in the trailing 5-day window qualify as a cap day (down day with volume > 7x VolSMA20), the day with the highest volume is chosen as the cap day.",
+      "reason": "Spec says 'on one of the last 5 days' without a tiebreak rule; the additional rule about redefining on a 'more extreme by volume' cap day implies volume is the natural priority metric."
+    },
+    {
+      "topic": "capitulation/redefinition timing",
+      "choice": "Every bar, re-evaluate the rolling 5-day window (drop condition + cap-day scan). If no active cap day is stored, the stored one's 10-day window has expired, or a new candidate has higher volume, redefine cap_date/L/H and restart the 10-day window.",
+      "reason": "Implements 'capitulation confirmed' and the additional redefinition rule as a single consistent stateful mechanism, since the spec describes both using the same 5-day scanning logic."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "TP1/TP3/TP4 stepwise partial exits are not implemented; instead the position is closed entirely at TP2 or upon touching SMA(50), whichever occurs first.",
+      "reason": "The spec defines TP1-TP4 price levels but never states what fraction of the position to exit at each level, so true stepwise scaling cannot be implemented as written. The spec's own fallback clause ('If partial exit is unavailable, close the entire position at TP2 ... or upon touching SMA(50), whichever occurs first') is fully specified and is used as the literal, implementable behavior."
+    },
+    {
+      "topic": "exit levels fixed at entry",
+      "choice": "Stop price and TP2 price are computed once at entry from the L/H range then in effect and are not recalculated even if L/H are later redefined for future signals.",
+      "reason": "Spec explicitly states the stop is 'fixed at entry and not trailed'; the same treatment is applied to TP2 for consistency since an open trade's targets should not shift under it."
+    },
+    {
+      "topic": "entry price for sizing",
+      "choice": "EntryPrice in the position-sizing formula uses the signal bar's Close.",
+      "reason": "The actual fill price is unknown until the market order executes (typically next bar's open in backtrader); Close is the most recent known price at signal time."
+    },
+    {
+      "topic": "touching SMA(50)",
+      "choice": "Defined as the bar's Low <= SMA50 <= High (the SMA50 value falls within the bar's range).",
+      "reason": "Spec says 'touching SMA(50)' without further detail; using the bar's High/Low range is the literal reading of a price touching a level intraday."
+    },
+    {
+      "topic": "TP2/stop intrabar detection",
+      "choice": "TP2 touch is detected via High[0] >= TP2; stop-loss touch is detected via Low[0] <= Stop.",
+      "reason": "OHLC bars have no tick path, so the bar's High/Low extremes are used to detect whether a level was reached during the bar."
+    },
+    {
+      "topic": "same-bar stop vs. target conflict",
+      "choice": "If both the stop-loss and the TP2/SMA50 exit trigger on the same bar, the stop-loss is checked and applied first.",
+      "reason": "Spec does not specify intrabar sequencing; prioritizing the stop is a defensive, capital-preservation-first choice since exact intrabar order is unknowable from OHLC data."
+    },
+    {
+      "topic": "non-positive risk-per-share",
+      "choice": "If EntryPrice - Stop <= 0, the signal is skipped (treated the same as size < 1).",
+      "reason": "Spec does not address this edge case; sizing formula is undefined/invalid when risk per share is not positive, so skipping is the only safe behavior."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

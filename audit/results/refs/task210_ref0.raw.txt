@@ -1,0 +1,73 @@
+```python
+import backtrader as bt
+
+
+class LowVolatilityMonthlyStrategy(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_devfactor', 2.0),
+        ('atr_period', 14),
+        ('long_window', 252),
+        ('percentile_threshold', 20.0),
+        ('volume_threshold', 1000000),
+        ('min_bars', 126),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.long_window)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.long_window)
+
+        self.bb_width = (self.bb.top - self.bb.bot) / self.bb.mid
+
+        self.min_required_bars = self.p.bb_period + self.p.long_window - 1
+
+        self.order = None
+        self.last_month = None
+        self.prev_signal = False
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def _condition_met(self):
+        if len(self.data) < max(self.p.min_bars, self.min_required_bars):
+            return False
+
+        current_width = self.bb_width[0]
+        width_window = [self.bb_width[-i] for i in range(self.p.long_window)]
+
+        rank = 100.0 * sum(1 for v in width_window if v <= current_width) / len(width_window)
+        low_vol_percentile = rank <= self.p.percentile_threshold
+
+        atr_below_avg = self.atr[0] < self.atr_sma[0]
+        liquid = self.vol_sma[0] >= self.p.volume_threshold
+
+        return low_vol_percentile and atr_below_avg and liquid
+
+    def next(self):
+        current_month = self.data.datetime.date(0).month
+
+        if self.last_month is not None and current_month != self.last_month and self.order is None:
+            if self.prev_signal:
+                if not self.position:
+                    self.order = self.order_target_percent(target=1.0)
+            else:
+                if self.position:
+                    self.order = self.close()
+
+        self.prev_signal = self._condition_met()
+        self.last_month = current_month
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Detect 'last trading day of month' retrospectively: each bar's condition is evaluated and stored, and when the following bar's month differs, that stored value (computed on the true last trading day of the prior month) drives the rebalance order submitted on the first bar of the new month.", "reason": "backtrader's next() has no look-ahead access to future bars, so the last day of a month cannot be identified while it is the current bar; this is the closest literal reading achievable. Combined with backtrader's default next-bar order execution, the fill lands one bar after the literal 'beginning of next month' open."},
+  {"topic": "percentile window definition", "choice": "Percentile rank of width is computed over the trailing 252-bar window including the current bar's own width value (% of the 252 values <= current value).", "reason": "Spec says 'its percentile over 252 days' without defining inclusion/exclusion of the current observation; trailing-inclusive window is the standard reading."},
+  {"topic": "position sizing", "choice": "Used order_target_percent(target=1.0) to open the long, sized to 100% of current portfolio value.", "reason": "Spec explicitly states sizing at '100% of capital', overriding the plain buy() default; order_target_percent is the standard backtrader mechanism for full-capital allocation."},
+  {"topic": "data warm-up guard", "choice": "Added explicit guard requiring len(self.data) >= max(126, bb_period+long_window-1=271) before evaluating any condition, on top of backtrader's automatic indicator minperiod.", "reason": "Spec explicitly states a 126-bar minimum; additionally, automatic minperiod (265, driven by SMA(ATR,252)) is slightly short of the 271 bars needed for a fully populated 252-day width percentile window, so an explicit check was required for correctness."},
+  {"topic": "indicator price source", "choice": "BollingerBands and ATR computed on the full data feed (defaulting to Close for BB, High/Low/Close for ATR); SMA(volume) computed on self.data.volume.", "reason": "Spec does not name an alternate price source; this is standard indicator usage."}
+]}
+```

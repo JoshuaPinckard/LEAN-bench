@@ -1,0 +1,149 @@
+```python
+import backtrader as bt
+import collections
+
+
+class SofiMeanReversionFlagStrategy(bt.Strategy):
+    params = (
+        ('ema_short_period', 10),
+        ('ema_long_period', 20),
+        ('position_filter_pct', 0.01),
+        ('pullback_tolerance_pct', 0.003),
+        ('flag_lookback', 5),
+        ('flag_consolidation_pct', 0.015),
+        ('skip_bars_after_open', 2),
+        ('vrvp_lookback', 20),
+        ('vrvp_thin_pocket_pctile', 0.2),
+        ('vrvp_key_level', 26.0),
+        ('stop_loss_pct', 0.015),
+        ('take_profit_pct', 0.04),
+        ('risk_pct', 0.015),
+    )
+
+    def __init__(self):
+        self.ema10 = bt.indicators.EMA(self.data.close, period=self.p.ema_short_period)
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_long_period)
+        self.order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.target_price = None
+        self.year_high = None
+        self.last_date = None
+        self.last_close = None
+        self.gap_fill_level = None
+        self.day_bar_count = 0
+        self.vrvp_window = collections.deque(maxlen=self.p.vrvp_lookback)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_price = order.executed.price
+            self.stop_price = self.entry_price * (1 - self.p.stop_loss_pct)
+            self.target_price = self.entry_price * (1 + self.p.take_profit_pct)
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        current_date = self.data.datetime.date(0)
+        new_day = self.last_date is None or current_date != self.last_date
+
+        if new_day:
+            # "closes the day below EMA" can only be evaluated once the day has ended,
+            # i.e. at the first bar of the following day, using the prior bar's close.
+            if self.last_date is not None and self.position and self.order is None:
+                if self.data.close[-1] < self.ema10[-1] or self.data.close[-1] < self.ema20[-1]:
+                    self.order = self.close()
+            if self.last_close is not None and self.data.open[0] > self.last_close:
+                self.gap_fill_level = self.last_close
+            else:
+                self.gap_fill_level = None
+            self.day_bar_count = 0
+            self.last_date = current_date
+        else:
+            self.day_bar_count += 1
+
+        self.last_close = self.data.close[0]
+
+        self.year_high = self.data.high[0] if self.year_high is None else max(self.year_high, self.data.high[0])
+
+        # VRVP proxy: volume-weighted range, ranked against its trailing distribution.
+        metric = (self.data.high[0] - self.data.low[0]) * self.data.volume[0]
+        is_thin_pocket = False
+        if len(self.vrvp_window) == self.vrvp_window.maxlen:
+            rank = sum(1 for v in self.vrvp_window if v <= metric) / len(self.vrvp_window)
+            is_thin_pocket = rank <= self.p.vrvp_thin_pocket_pctile
+        self.vrvp_window.append(metric)
+
+        if self.order:
+            return
+
+        if self.position:
+            if self.data.close[0] <= self.stop_price:
+                self.order = self.close()
+            elif self.data.close[0] >= self.target_price:
+                self.order = self.close()
+            return
+
+        trend_filter = self.data.close[0] > self.ema10[0] and self.data.close[0] > self.ema20[0]
+        position_filter = self.data.close[0] >= self.year_high * (1 - self.p.position_filter_pct)
+        vrvp_filter = self.data.close[0] > self.p.vrvp_key_level and is_thin_pocket
+        gap_open_block = (self.gap_fill_level is not None) and (self.day_bar_count == 0)
+
+        if not (trend_filter and position_filter and vrvp_filter) or gap_open_block:
+            return
+
+        tol = self.p.pullback_tolerance_pct
+        ema10_rising = self.ema10[0] > self.ema10[-1]
+        ema20_rising = self.ema20[0] > self.ema20[-1]
+
+        touched_gap = (
+            self.gap_fill_level is not None
+            and self.data.low[0] <= self.gap_fill_level * (1 + tol)
+            and self.data.close[0] >= self.gap_fill_level * (1 - tol)
+        )
+        touched_ema10 = (
+            ema10_rising
+            and self.data.low[0] <= self.ema10[0] * (1 + tol)
+            and self.data.close[0] > self.ema10[0]
+        )
+        touched_ema20 = (
+            ema20_rising
+            and self.data.low[0] <= self.ema20[0] * (1 + tol)
+            and self.data.close[0] > self.ema20[0]
+        )
+        reversal_candle = self.data.close[0] > self.data.open[0] and self.data.close[0] > self.data.close[-1]
+        option_a = (touched_gap or touched_ema10 or touched_ema20) and reversal_candle
+
+        option_b = False
+        if self.day_bar_count >= self.p.skip_bars_after_open + self.p.flag_lookback:
+            window_highs = [self.data.high[-i] for i in range(1, self.p.flag_lookback + 1)]
+            window_lows = [self.data.low[-i] for i in range(1, self.p.flag_lookback + 1)]
+            flag_high = max(window_highs)
+            flag_low = min(window_lows)
+            if flag_low > 0:
+                flag_range_pct = (flag_high - flag_low) / flag_low
+                if flag_range_pct <= self.p.flag_consolidation_pct and self.data.close[0] > flag_high:
+                    option_b = True
+
+        if option_a or option_b:
+            stop_distance = self.data.close[0] * self.p.stop_loss_pct
+            risk_amount = self.broker.getvalue() * self.p.risk_pct
+            size = int(risk_amount / stop_distance)
+            if size > 0:
+                self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "EMA timeframe", "choice": "EMA(10) and EMA(20) are computed directly on the single provided 15-minute feed and reused for the trend filter, pullback entries, and the EOD exit check.", "reason": "Spec repeatedly refers to these as intraday EMAs (10/20-period on the 15-min chart) and no separate daily feed is available in this environment."},
+  {"topic": "infeasible", "choice": "52-week high approximated as the expanding maximum of High since the start of the backtest data.", "reason": "The feed only spans ~2026-05-26 to 2026-08-19 (~12 weeks), so a true 52-week high cannot be computed; this is the closest literal reading given available OHLCV history."},
+  {"topic": "infeasible", "choice": "'Closes the day below EMA' is detected by comparing consecutive bars' dates; on the first bar of a new day, the prior bar's close is checked against ema10/ema20 to decide the exit.", "reason": "Only 15-minute bars are available, so a daily close must be inferred from session-boundary transitions without look-ahead."},
+  {"topic": "VRVP construction", "choice": "VRVP is proxied as (High-Low)*Volume per bar, ranked as a percentile against its own trailing 20-bar window; a 'thin pocket' is a reading at or below the 20th percentile, required jointly with Close > $26.", "reason": "'Volume-Weighted Volatility Percentile' is not a standard/defined indicator and the spec gives no formula, only a qualitative description."},
+  {"topic": "pullback/flag pattern parameters", "choice": "Gap-fill level = previous day's close (used only when today's open > previous close); flag window = 5 bars evaluated after skipping the first 2 bars of the day, consolidation = trailing 5-bar High-Low range <= 1.5%, breakout = close above that range's high; pullback touch tolerance = 0.3%.", "reason": "Spec describes both patterns qualitatively with no numeric thresholds; reasonable literal parameters were chosen and declared."},
+  {"topic": "pullback reversal signal", "choice": "'Shows signs of reversing upward' implemented as the entry bar closing above its own open and above the prior bar's close, after price dipped to/near the pullback level.", "reason": "Spec is qualitative here; a concrete literal proxy was needed to make the rule testable."},
+  {"topic": "stop-loss/take-profit distance", "choice": "Stop-loss = 1.5% below entry (midpoint of the stated 1-2% range); take-profit = 4% above entry (midpoint of the stated 3-5% range); both checked against bar Close.", "reason": "Spec explicitly offers these as reasonable-default ranges with no single value stated; midpoints were picked and close-based checks used for determinism."},
+  {"topic": "position sizing / risk", "choice": "Share size = floor((portfolio value * 1.5% risk) / stop-loss distance in price), using the anticipated close as entry-price basis.", "reason": "Spec explicitly requires constant risk-per-trade not exceeding 1-2% of capital tied to the stop-loss distance, overriding the plain default sizer; 1.5% chosen as the midpoint of the stated range."},
+  {"topic": "gap-up open avoidance", "choice": "Entries are blocked only on the first bar of a day that opened with a gap up (open > previous close); non-gap days are not restricted at the open.", "reason": "Literal reading of 'avoids entering positions at the open during a gap-up' as conditional specifically on gap-up days."},
+  {"topic": "sector filter / ORB confirmation", "choice": "Not implemented in code.", "reason": "Spec explicitly states the sector filter is not implemented in code and that the strategy does not use opening-range-breakout confirmation."}
+]}
+```

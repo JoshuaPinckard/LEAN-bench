@@ -1,0 +1,54 @@
+{
+  "task_id": 171,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass SyntheticCoveredCallStrategy(bt.Strategy):\n    params = dict(\n        cycle_len=21,\n        strike_mult=1.15,\n        bb_period=20,\n        bb_devfactor=2.0,\n        atr_period=14,\n        sma_period=20,\n        sell_fraction=0.40,      # midpoint of stated 30-50% lock-in sell\n        roll_fraction=0.70,      # upper bound of stated \"up to 70%\" roll sell\n        min_core_fraction=0.60,  # midpoint of stated 50-70% core floor\n        roll_bars_remaining=5,\n        block_sell_bars_remaining=2,\n    )\n\n    def __init__(self):\n        self.sma20 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor\n        )\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n\n        self.order = None\n        self.initial_size = None\n        self.cycle_bar = 0\n        self.K = None\n        self.k_sold_this_cycle = False\n        self.pending_buyback = 0\n\n    def notify_order(self, order):\n        if order.status == order.Completed and self.initial_size is None and order.isbuy():\n            self.initial_size = order.executed.size\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def _set_new_K(self):\n        close = self.data.close[0]\n        self.K = max(close * self.p.strike_mult, self.bb.top[0])\n\n    def next(self):\n        if self.order:\n            return\n\n        if self.initial_size is None:\n            self.order = self.buy()\n            return\n\n        if self.K is None:\n            self._set_new_K()\n\n        close = self.data.close[0]\n        current_size = self.position.size\n        core_min_size = self.initial_size * self.p.min_core_fraction\n        bars_remaining = (self.p.cycle_len - 1) - self.cycle_bar\n\n        # Rule 3: deep ITM roll up and out\n        if bars_remaining <= self.p.roll_bars_remaining and close > (self.K + self.atr[0]):\n            max_sellable = current_size - core_min_size\n            if max_sellable > 0:\n                sell_amt = int(min(current_size * self.p.roll_fraction, max_sellable))\n                if sell_amt > 0:\n                    self.order = self.sell(size=sell_amt)\n            self.cycle_bar = 0\n            self._set_new_K()\n            self.k_sold_this_cycle = False\n            return\n\n        # Rule 1: reaching K locks in gains (blocked near cycle end per rule 2)\n        if (not self.k_sold_this_cycle) and bars_remaining > self.p.block_sell_bars_remaining and close >= self.K:\n            max_sellable = current_size - core_min_size\n            if max_sellable > 0:\n                sell_amt = int(min(current_size * self.p.sell_fraction, max_sellable))\n                if sell_amt > 0:\n                    self.order = self.sell(size=sell_amt)\n                    self.pending_buyback += sell_amt\n            self.k_sold_this_cycle = True\n\n        # Buyback of the locked-in portion on return to SMA(20) or a touch of the lower band\n        if self.order is None and self.pending_buyback > 0:\n            if close <= self.sma20[0] or self.data.low[0] <= self.bb.bot[0]:\n                self.order = self.buy(size=self.pending_buyback)\n                self.pending_buyback = 0\n\n        # Cycle rollover\n        if self.cycle_bar >= self.p.cycle_len - 1:\n            self.cycle_bar = 0\n            self._set_new_K()\n            self.k_sold_this_cycle = False\n        else:\n            self.cycle_bar += 1",
+  "assumptions": [
+    {
+      "topic": "initial_core_entry",
+      "choice": "Establish the core long position with a single plain self.buy() on the first bar next() is called (i.e., after indicator warm-up), and record its filled size as the reference 'core' size for the risk-management floor.",
+      "reason": "Spec says to 'hold a long-term core long position' but never states when/how to open it; canonical default #1 requires the plain, unsized buy call."
+    },
+    {
+      "topic": "fixed_values_from_stated_ranges",
+      "choice": "Used sell_fraction=40% (midpoint of 30-50%) for the rule-1 lock-in sell, min_core_fraction=60% (midpoint of 50-70%) for the always-keep-core floor, and roll_fraction=70% (the stated upper bound) for the deep-ITM roll sell.",
+      "reason": "Spec gives ranges, not single numbers; picked internally consistent midpoints/bounds and declared them as required."
+    },
+    {
+      "topic": "percentage_of_position_basis",
+      "choice": "'Sell 30-50%/up to 70% of the position' is computed against the *current* position size at the moment of the sale; the 'always keep 50-70% core' floor is computed against the *originally established* core size.",
+      "reason": "The spec uses 'the position' for the sell actions and 'core' specifically for the risk floor, suggesting two distinct reference quantities; all sells are additionally capped so the position never drops below the core floor."
+    },
+    {
+      "topic": "buyback_trigger_definition",
+      "choice": "'Return to SMA(20)' is read as Close <= SMA(20); 'touch of the lower Bollinger band' is read as Low <= lower band.",
+      "reason": "Spec doesn't define the exact touch/return condition; these are the most literal readings of 'return to' (price falls back to/through the average) and 'touch' (the bar's low reaches the band)."
+    },
+    {
+      "topic": "roll_shares_buyback_scope",
+      "choice": "Shares sold in the deep-ITM roll (rule 3) are not added to the pending-buyback tracker and are not automatically repurchased.",
+      "reason": "Only rule 1 explicitly states a buyback condition (return to SMA20 / lower band); rule 3 states no such condition, just an immediate new cycle, so the roll sale is treated as a permanent reduction analogous to rolling the option away."
+    },
+    {
+      "topic": "reaching_K_price_reference",
+      "choice": "Both 'reaching K' (rule 1) and the deep-ITM check (rule 3) use the bar's Close price.",
+      "reason": "The spec explicitly uses Close for the deep-ITM condition and for the K formula itself; Close is used consistently for the analogous 'reaching K' check since no other price field is named."
+    },
+    {
+      "topic": "share_rounding",
+      "choice": "Computed sell/buyback sizes are truncated to whole shares via int().",
+      "reason": "Backtrader positions in this environment are whole-share; truncation guarantees the core-floor constraint is never violated by rounding up."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2020-01-31T05:00:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 77.29020649112265
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+```python
+import backtrader as bt
+
+
+class ATHExitStrategy(bt.Strategy):
+    params = dict(
+        sma_fast_period=20,
+        sma_slow_period=50,
+        rsi_period=14,
+        volume_period=20,
+        volume_threshold=1.2,
+        rsi_overbought=70,
+        risk_pct=0.02,
+    )
+
+    def __init__(self):
+        self.sma20 = bt.indicators.SMA(self.data.close, period=self.p.sma_fast_period)
+        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_slow_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.vol_avg = bt.indicators.SMA(self.data.volume, period=self.p.volume_period)
+
+        self.order = None
+        self.ath = None
+
+        self.in_overbought = False
+        self.cur_peak_price = None
+        self.cur_peak_rsi = None
+        self.prev_peak_price = None
+        self.prev_peak_rsi = None
+        self.divergence_signal = False
+
+    def _update_ath(self):
+        is_new_ath = self.ath is None or self.data.close[0] > self.ath
+        if is_new_ath:
+            self.ath = self.data.close[0]
+        return is_new_ath
+
+    def _update_divergence_state(self):
+        self.divergence_signal = False
+        if self.rsi[0] > self.p.rsi_overbought:
+            if not self.in_overbought:
+                self.in_overbought = True
+                self.cur_peak_price = self.data.close[0]
+                self.cur_peak_rsi = self.rsi[0]
+            else:
+                if self.data.close[0] > self.cur_peak_price:
+                    self.cur_peak_price = self.data.close[0]
+                if self.rsi[0] > self.cur_peak_rsi:
+                    self.cur_peak_rsi = self.rsi[0]
+        else:
+            if self.in_overbought:
+                self.in_overbought = False
+                if (self.prev_peak_price is not None
+                        and self.cur_peak_price > self.prev_peak_price
+                        and self.cur_peak_rsi < self.prev_peak_rsi):
+                    self.divergence_signal = True
+                self.prev_peak_price = self.cur_peak_price
+                self.prev_peak_rsi = self.cur_peak_rsi
+
+    def prenext(self):
+        self._update_ath()
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        is_new_ath = self._update_ath()
+        self._update_divergence_state()
+
+        if self.order:
+            return
+
+        if not self.position:
+            if is_new_ath:
+                cash_alloc = self.p.risk_pct * self.broker.getvalue()
+                size = int(cash_alloc / self.data.close[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
+            return
+
+        volume_confirmed = self.data.volume[0] > self.p.volume_threshold * self.vol_avg[0]
+        stop_loss = self.data.close[0] < self.sma50[0]
+        main_signal = self.data.close[0] < self.sma20[0] and volume_confirmed
+        reversal_signal = self.divergence_signal
+
+        if stop_loss or main_signal or reversal_signal:
+            self.order = self.close()
+            return
+
+        if is_new_ath:
+            partial_size = int(self.position.size / 2)
+            if partial_size > 0:
+                self.order = self.sell(size=partial_size)
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "The stated entry precondition (\"activated only for stocks that are already in a long position\") cannot be realized in a fresh single-asset backtest that starts flat with cash; the closest literal reading is to enter long (sized at 2% of capital) on the same new-ATH event that the spec uses to define the strategy's activation.", "reason": "Backtrader has no mechanism to seed a pre-existing position; the ATH event is the only concrete trigger the spec ties to the strategy's applicability."},
+  {"topic": "ath_definition", "choice": "All-time high is tracked as the running maximum of the daily Close price from the very start of the feed (tracked through prenext during indicator warm-up), and 'new ATH' means today's Close exceeds that running maximum.", "reason": "Spec doesn't specify High vs Close for ATH; Close is used consistently elsewhere in the spec's exit conditions, so it was chosen for consistency."},
+  {"topic": "volume_filter_scope", "choice": "The 20%-above-20-day-average volume filter is applied only to the main SMA20 take-profit signal, not to the SMA50 stop-loss or the RSI-divergence reversal filter.", "reason": "Spec frames the filter explicitly as confirming 'the exit signal (e.g., a break below SMA 20)'; gating a final stop-loss on volume would contradict its stated purpose as capital protection."},
+  {"topic": "partial_take_profit_repeat", "choice": "The 50%-of-position partial take-profit can fire on every new-ATH bar while a position is open (not just once), each time selling half of the currently held share count.", "reason": "Spec states 'When the price reaches a new ATH, take profit on 50% of the total position' as a standing rule rather than a one-time event."},
+  {"topic": "dma_indicator", "choice": "The Double Moving Average (DMA) indicator is realized as the same SMA(20)/SMA(50) already required by the main-signal and stop-loss rules; no separate fast/slow crossover exit rule was added.", "reason": "Spec lists DMA among indicators 'to identify a trend reversal' but states no standalone crossover condition beyond the close-vs-SMA20/SMA50 rules already given."},
+  {"topic": "bearish_divergence_mechanics", "choice": "Implemented as a state machine tracking peak price and peak RSI for each RSI>70 episode; a divergence (and exit) is flagged on the bar RSI crosses back below 70 if that episode's peak price exceeds the prior episode's peak price while its peak RSI is lower.", "reason": "Spec names the bearish-divergence concept but does not specify exact detection mechanics."},
+  {"topic": "position_sizing_method", "choice": "Initial size is computed as floor(2% of current portfolio value / close price), i.e. notional allocation, not a stop-distance-based risk formula; share counts are floored to integers.", "reason": "Spec literally states 'position size should be 2% of total trading capital,' and backtrader requires whole-share order sizes."}
+]}
+```

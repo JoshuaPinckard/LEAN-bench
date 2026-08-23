@@ -1,0 +1,156 @@
+```python
+import backtrader as bt
+import collections
+import statistics
+
+
+class AlphatrendSqueezeMomentumStrategy(bt.Strategy):
+
+    def __init__(self):
+        self.ema50 = bt.indicators.EMA(self.data.close, period=50)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.macd = bt.indicators.MACD(self.data.close, period_me1=12, period_me2=26, period_signal=9)
+
+        self.bbwidth = self.bb.top - self.bb.bot
+        self.bbwidth_sma = bt.indicators.SMA(self.bbwidth, period=100)
+        self.macd_hist = self.macd.macd - self.macd.signal
+
+        self.order = None
+        self.pending_entry = False
+        self.pending_entry_atr = None
+        self.entry_price = None
+        self.take_profit_price = None
+        self.trade_pnls = collections.deque(maxlen=20)
+
+    def _squeeze_recent(self):
+        for i in range(5):
+            if self.bbwidth[-i] <= self.bbwidth_sma[-i] * 0.85:
+                return True
+        return False
+
+    def _risk_fraction(self):
+        if len(self.trade_pnls) < 10:
+            return 0.01
+        wins = [p for p in self.trade_pnls if p > 0]
+        losses = [abs(p) for p in self.trade_pnls if p < 0]
+        if not wins or not losses:
+            return 0.01
+        w = len(wins) / len(self.trade_pnls)
+        avg_win = statistics.mean(wins)
+        avg_loss = statistics.mean(losses)
+        if avg_loss <= 0:
+            return 0.01
+        r = avg_win / avg_loss
+        if r <= 0:
+            return 0.01
+        kelly = w - (1 - w) / r
+        return max(0.005, min(0.02, kelly))
+
+    def _compute_size(self, price, stop_price, risk_fraction):
+        risk_per_share = abs(price - stop_price)
+        if risk_per_share <= 0:
+            return 0
+        cash_at_risk = risk_fraction * self.broker.getvalue()
+        return int(cash_at_risk / risk_per_share)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed:
+            if self.pending_entry:
+                self.entry_price = order.executed.price
+                if order.isbuy():
+                    self.take_profit_price = self.entry_price + 1.5 * self.pending_entry_atr
+                else:
+                    self.take_profit_price = self.entry_price - 1.5 * self.pending_entry_atr
+                self.pending_entry = False
+            self.order = None
+        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+            self.pending_entry = False
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.trade_pnls.append(trade.pnlcomm)
+            self.entry_price = None
+            self.take_profit_price = None
+
+    def next(self):
+        if self.order:
+            return
+
+        dt = self.data.datetime.time(0)
+        session_end = (dt.hour, dt.minute) >= (15, 30)
+
+        close = self.data.close[0]
+        ema = self.ema50[0]
+        atr = self.atr[0]
+
+        if self.position:
+            is_long = self.position.size > 0
+            if session_end:
+                self.order = self.close()
+                return
+            if is_long:
+                stop_level = ema - 0.5 * atr
+                if close < stop_level:
+                    self.order = self.close()
+                    return
+                if self.take_profit_price is not None and close >= self.take_profit_price:
+                    self.order = self.close()
+                    return
+            else:
+                stop_level = ema + 0.5 * atr
+                if close > stop_level:
+                    self.order = self.close()
+                    return
+                if self.take_profit_price is not None and close <= self.take_profit_price:
+                    self.order = self.close()
+                    return
+            return
+
+        uptrend = close > ema and (close - ema) > 0.5 * atr
+        downtrend = close < ema and (ema - close) > 0.5 * atr
+
+        squeeze_recent = self._squeeze_recent()
+        expansion = self.bbwidth[0] > self.bbwidth[-1]
+        hist0 = self.macd_hist[0]
+        hist_prev = self.macd_hist[-1]
+
+        vol_long = squeeze_recent and expansion and hist0 > 0 and hist0 > hist_prev
+        vol_short = squeeze_recent and expansion and hist0 < 0 and hist0 < hist_prev
+
+        risk_fraction = self._risk_fraction()
+
+        if uptrend:
+            stop_price = ema - 0.5 * atr
+            full_size = self._compute_size(close, stop_price, risk_fraction)
+            size = full_size if vol_long else full_size // 2
+            if size > 0:
+                self.pending_entry = True
+                self.pending_entry_atr = atr
+                self.order = self.buy(size=size)
+        elif downtrend:
+            stop_price = ema + 0.5 * atr
+            full_size = self._compute_size(close, stop_price, risk_fraction)
+            size = full_size if vol_short else full_size // 2
+            if size > 0:
+                self.pending_entry = True
+                self.pending_entry_atr = atr
+                self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Implemented only on the single provided 30m data feed; 1h/2h variants are not run since the harness supplies exactly one bt.feeds.PandasData feed.", "reason": "Execution environment fixes a single 30m feed; multi-timeframe evaluation requires additional data feeds not available."},
+  {"topic": "infeasible", "choice": "Profit Factor, Kelly estimate, and Win Ratio 'for selecting the best parameters' are treated as offline, cross-timeframe parameter-selection metrics and are not computed or acted upon inside the strategy.", "reason": "These are described as criteria for choosing parameters/timeframes outside a backtest run, not as intra-strategy trading logic, and the harness runs one fixed-parameter strategy instance."},
+  {"topic": "session_end_detection", "choice": "End of RTH is detected when the current bar's time is >= 15:30 (tuple comparison on hour/minute, no datetime import needed).", "reason": "OHLCV feed carries no explicit session/exchange-calendar field; 30m bars starting at 09:30 make 15:30 the last regular bar before the 16:00 close."},
+  {"topic": "squeeze_lookback_window", "choice": "'Squeeze condition met recently' reuses the spec's own Squeeze definition (checked over the current bar plus the 4 preceding bars, 5 bars total).", "reason": "The spec's Squeeze definition already embeds the 'last 5 bars' lookback, so it is applied directly rather than adding a second lookback."},
+  {"topic": "take_profit_atr_source", "choice": "ATR(14) is captured at the signal bar (when entry conditions were evaluated) and reused both for the risk-based stop distance used in sizing and for the fixed 1.5*ATR profit target once the order fills.", "reason": "Spec calls the target 'fixed... from entry price'; freezing ATR at signal time keeps sizing and target internally consistent instead of drifting with later bars' ATR."},
+  {"topic": "position_sizing_risk_per_share", "choice": "Risk-per-share = |signal close - stop level (EMA50 \u00b1 0.5*ATR at the signal bar)|; shares = floor(risk_fraction * broker portfolio value / risk_per_share); alternative (trend-only) entries use floor(full_size/2).", "reason": "Spec states 'risk 1% of capital per trade' without defining the loss-per-share denominator; the strategy's own EMA/ATR stop rule is the only distance given, so it is used as risk-per-share."},
+  {"topic": "kelly_rolling_estimate", "choice": "Rolling window = last 20 closed trades; Kelly fraction f = W - (1-W)/R (W = win rate, R = avg win / avg loss magnitude) is only used once >=10 closed trades exist, otherwise risk defaults to flat 1%; result always clipped to [0.5%, 2%].", "reason": "Spec says 'optionally use a Kelly fraction based on a rolling estimate' without specifying window size or minimum sample; a conventional trailing-trade window and minimum sample were chosen to avoid unstable early-backtest estimates."},
+  {"topic": "capital_basis", "choice": "'Capital' for risk-fraction sizing = self.broker.getvalue() (total portfolio equity), not cash balance.", "reason": "Standard convention for percent-risk position sizing; spec does not distinguish cash vs. equity."},
+  {"topic": "entry_gating", "choice": "Trend condition (1) is always required to open a position; the squeeze/expansion/MACD condition (2) only decides full vs. half size and never triggers an entry by itself.", "reason": "Literal reading of the numbered Long/Short Entry conditions plus the explicit 'alternative trend entry' clause, which only describes the case where condition 1 alone is satisfied."},
+  {"topic": "share_rounding", "choice": "Computed share counts are truncated to integers; if the resulting size is 0 (full or half), no order is submitted that bar.", "reason": "backtrader's default sizing requires whole shares and the spec does not address fractional-share handling."}
+]}
+```

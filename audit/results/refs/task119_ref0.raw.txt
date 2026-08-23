@@ -1,0 +1,217 @@
+```python
+import backtrader as bt
+
+
+class SupplyDemandSwingStrategy(bt.Strategy):
+    params = (
+        ('consol_window', 3),
+        ('consol_max_pct', 0.01),
+        ('impulse_min_pct', 0.01),
+        ('min_zone_height_pct', 0.005),
+        ('risk_pct', 0.01),
+        ('sl_buffer_pct', 0.005),
+        ('rr_default', 2.0),
+        ('trend_sma_period', 20),
+        ('rsi_period', 14),
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+
+        self._day_date = None
+        self._day_o = None
+        self._day_h = None
+        self._day_l = None
+        self._day_c = None
+        self.daily_bars = []
+        self.daily_closes = []
+
+        self._h4_count = 0
+        self._h4_o = None
+        self._h4_h = None
+        self._h4_l = None
+        self._h4_c = None
+        self.h4_bars = []
+
+        self.demand_zones = []
+        self.supply_zones = []
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+        self._pending_stop = None
+        self._pending_target = None
+
+    def _update_daily(self):
+        dt = self.data.datetime.date(0)
+        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]
+        if self._day_date is None:
+            self._day_date = dt
+            self._day_o, self._day_h, self._day_l, self._day_c = o, h, l, c
+        elif dt == self._day_date:
+            self._day_h = max(self._day_h, h)
+            self._day_l = min(self._day_l, l)
+            self._day_c = c
+        else:
+            self.daily_bars.append((self._day_o, self._day_h, self._day_l, self._day_c))
+            self.daily_closes.append(self._day_c)
+            self._detect_zone(self.daily_bars)
+            self._day_date = dt
+            self._day_o, self._day_h, self._day_l, self._day_c = o, h, l, c
+
+    def _update_h4(self):
+        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]
+        if self._h4_count == 0:
+            self._h4_o, self._h4_h, self._h4_l, self._h4_c = o, h, l, c
+        else:
+            self._h4_h = max(self._h4_h, h)
+            self._h4_l = min(self._h4_l, l)
+            self._h4_c = c
+        self._h4_count += 1
+        if self._h4_count == 4:
+            self.h4_bars.append((self._h4_o, self._h4_h, self._h4_l, self._h4_c))
+            self._detect_zone(self.h4_bars)
+            self._h4_count = 0
+
+    def _detect_zone(self, bars):
+        w = self.p.consol_window
+        if len(bars) < w + 1:
+            return
+        window = bars[-(w + 1):-1]
+        i_open, i_high, i_low, i_close = bars[-1]
+        zone_high = max(b[1] for b in window)
+        zone_low = min(b[2] for b in window)
+        ref_price = i_close
+        if ref_price <= 0:
+            return
+        if (zone_high - zone_low) / ref_price > self.p.consol_max_pct:
+            return
+        if (zone_high - zone_low) / ref_price < self.p.min_zone_height_pct:
+            return
+        if abs(i_close - i_open) / ref_price < self.p.impulse_min_pct:
+            return
+        if i_close > i_open and i_close > zone_high:
+            self.demand_zones.append({'low': zone_low, 'high': zone_high})
+        elif i_close < i_open and i_close < zone_low:
+            self.supply_zones.append({'low': zone_low, 'high': zone_high})
+
+    def _enter_long(self, zone):
+        entry_price = self.data.close[0]
+        stop_price = zone['low'] * (1 - self.p.sl_buffer_pct)
+        risk_per_unit = entry_price - stop_price
+        if risk_per_unit <= 0:
+            return
+        target = None
+        for sz in self.supply_zones:
+            if sz['low'] > entry_price and (target is None or sz['low'] < target):
+                target = sz['low']
+        if target is None:
+            target = entry_price + self.p.rr_default * risk_per_unit
+        size = (self.broker.getvalue() * self.p.risk_pct) / risk_per_unit
+        if size <= 0:
+            return
+        self._pending_stop = stop_price
+        self._pending_target = target
+        self.order = self.buy(size=size)
+
+    def _enter_short(self, zone):
+        entry_price = self.data.close[0]
+        stop_price = zone['high'] * (1 + self.p.sl_buffer_pct)
+        risk_per_unit = stop_price - entry_price
+        if risk_per_unit <= 0:
+            return
+        target = None
+        for dz in self.demand_zones:
+            if dz['high'] < entry_price and (target is None or dz['high'] > target):
+                target = dz['high']
+        if target is None:
+            target = entry_price - self.p.rr_default * risk_per_unit
+        size = (self.broker.getvalue() * self.p.risk_pct) / risk_per_unit
+        if size <= 0:
+            return
+        self._pending_stop = stop_price
+        self._pending_target = target
+        self.order = self.sell(size=size)
+
+    def next(self):
+        self._update_daily()
+        self._update_h4()
+
+        if self.order or self.position:
+            return
+
+        if len(self.daily_closes) < self.p.trend_sma_period:
+            return
+
+        sma = sum(self.daily_closes[-self.p.trend_sma_period:]) / self.p.trend_sma_period
+        last_daily_close = self.daily_closes[-1]
+        uptrend = last_daily_close > sma
+        downtrend = last_daily_close < sma
+
+        price_open = self.data.open[0]
+        price_high = self.data.high[0]
+        price_low = self.data.low[0]
+        price_close = self.data.close[0]
+
+        if uptrend:
+            for zone in reversed(self.demand_zones):
+                zlow, zhigh = zone['low'], zone['high']
+                zmid = (zlow + zhigh) / 2.0
+                if zlow <= price_low <= zhigh and price_low <= zmid:
+                    if price_close > price_low and price_close > price_open:
+                        if self.rsi[0] < 50:
+                            self._enter_long(zone)
+                            break
+        elif downtrend:
+            for zone in reversed(self.supply_zones):
+                zlow, zhigh = zone['low'], zone['high']
+                zmid = (zlow + zhigh) / 2.0
+                if zlow <= price_high <= zhigh and price_high >= zmid:
+                    if price_close < price_high and price_close < price_open:
+                        if self.rsi[0] > 50:
+                            self._enter_short(zone)
+                            break
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.order:
+            self.order = None
+            if order.status == order.Completed:
+                size = abs(order.executed.size)
+                if order.isbuy():
+                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=self._pending_stop, size=size)
+                    self.limit_order = self.sell(exectype=bt.Order.Limit, price=self._pending_target, size=size)
+                else:
+                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=self._pending_stop, size=size)
+                    self.limit_order = self.buy(exectype=bt.Order.Limit, price=self._pending_target, size=size)
+            return
+
+        if order == self.stop_order or order == self.limit_order:
+            if order.status == order.Completed:
+                other = self.limit_order if order == self.stop_order else self.stop_order
+                if other is not None and other.status in [other.Submitted, other.Accepted]:
+                    self.cancel(other)
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                if order == self.stop_order:
+                    self.stop_order = None
+                else:
+                    self.limit_order = None
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible: multi-timeframe data", "choice": "Synthesize 1D and 4H bars internally from the single supplied 1H feed (daily bars split on calendar-date change; 4H bars grouped every 4 consecutive 1H bars), instead of using separate resampled bt datafeeds.", "reason": "The harness supplies only one 1H PandasData feed; backtrader's real multi-timeframe resampling is configured at the cerebro level, which is outside the strategy class, so this is the closest literal reading achievable inside a single bt.Strategy."},
+  {"topic": "4H bar alignment", "choice": "4H synthetic bars group every 4 consecutive 1H bars in feed order, not aligned to fixed clock boundaries.", "reason": "Spec does not specify session/clock alignment for the 4H timeframe."},
+  {"topic": "consolidation/zone detection algorithm", "choice": "A candidate zone is the high/low range of a 3-bar consolidation window (on daily or 4H synthetic bars) whose range is <=1% of price, immediately followed by a directional impulse bar with body >=1% of price closing beyond the range (demand if bullish breakout, supply if bearish breakdown).", "reason": "Spec describes zones qualitatively but gives no numeric thresholds for 'period of consolidation' or 'sharp' move; concrete values were chosen to operationalize the rule."},
+  {"topic": "minimum zone height enforcement", "choice": "Candidate zones with height < 0.5% of the impulse bar's close are discarded rather than artificially widened.", "reason": "Spec states a minimum height requirement but not how to expand an undersized zone; treating it as a validity filter is the more literal reading."},
+  {"topic": "zone lifecycle", "choice": "Once identified, a zone remains valid for the rest of the backtest with no expiry/invalidation logic.", "reason": "Spec never states that zones expire or get invalidated after being touched or broken."},
+  {"topic": "trend filter definition", "choice": "Daily trend = uptrend if the latest completed daily close > SMA(20) of daily closes, downtrend if below.", "reason": "Spec requires checking trend direction on 1D but names no indicator/method for it."},
+  {"topic": "optional RSI and 1H confirmation", "choice": "Both the RSI(14) confirmation (<50 long, >50 short) and 1H-level pullback entries are implemented as active, required conditions.", "reason": "Although marked '(Optional)' in prose, the spec gives concrete RSI(14) parameters and explicitly allows 1H entries; since the environment only provides 1H bars, using them for entries is also the literal way to satisfy the 'lower timeframe' pullback rule."},
+  {"topic": "bounce trigger definition", "choice": "A bounce is: the bar's low (long) / high (short) touches the lower/upper half of the zone (boundary to midpoint), and the bar closes back beyond its own low/high in the trade direction.", "reason": "Spec's 'bounces off the boundary or central part' is descriptive, not a precise numeric trigger."},
+  {"topic": "entry order timing", "choice": "Entries are submitted as plain market self.buy()/self.sell() in next(), filled at the following bar's open.", "reason": "Spec allows either close-of-current or open-of-next; next-open fill is backtrader's native market-order behavior and matches canonical default #1."},
+  {"topic": "stop-loss / take-profit execution", "choice": "After entry fills, a real Stop order (0.5%-buffered zone boundary) and a real Limit order (nearest opposing zone's near edge, else 2:1 R:R) are submitted as a manual OCO pair; whichever fills first cancels the other. SL/TP levels and size are computed from the signal bar's close as an entry-price proxy.", "reason": "Genuine Stop/Limit order types give faithful 'reaches this price' exit semantics; the true fill price is unknown until the next bar's open."},
+  {"topic": "position sizing risk percentage", "choice": "Risk 1% of current portfolio value per trade.", "reason": "Spec specifies a 1-2% range without pinning an exact value; 1% is the conservative bound within that stated range."},
+  {"topic": "zone selection priority", "choice": "When multiple zones qualify for a pullback touch on the same bar, the most recently formed zone is checked first.", "reason": "Spec does not state how to prioritize among overlapping/qualifying zones."}
+]}
+```

@@ -1,0 +1,187 @@
+{
+  "task_id": 151,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass TickAnomalyStrategy(bt.Strategy):\n    params = dict(\n        sma_period=10,\n        rsi_period=14,\n        vol_avg_period=50,\n        price_dev_pct=0.001,\n        rsi_entry_lower=40,\n        rsi_entry_upper=60,\n        vol_surge_pct=0.20,\n        stop_loss_pct=0.005,\n        take_profit_pct=0.008,\n        rsi_exit_lower=30,\n        rsi_exit_upper=70,\n        position_pct=0.01,\n        max_positions=3,\n        min_tick_interval=3,\n        opening_minutes_ignore=5,\n    )\n\n    def __init__(self):\n        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.avg_volume = bt.indicators.SMA(self.data.volume, period=self.p.vol_avg_period)\n\n        # Manual bookkeeping of up to max_positions independent \"positions\" (with\n        # their own entry price/size) since the broker only tracks one net\n        # position per data feed.\n        self.open_positions = []\n        self.next_pos_id = 0\n        self.last_open_bar = None\n        self.entry_order_pending = False\n        self.session_date = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        info = order.info\n        if order.status == order.Completed:\n            if info.get('action') == 'entry':\n                self.open_positions.append({\n                    'id': info['pos_id'],\n                    'direction': info['direction'],\n                    'entry_price': order.executed.price,\n                    'size': abs(order.executed.size),\n                    'exit_pending': False,\n                })\n                self.last_open_bar = len(self)\n                self.entry_order_pending = False\n            elif info.get('action') == 'exit':\n                pos_id = info.get('pos_id')\n                self.open_positions = [p for p in self.open_positions if p['id'] != pos_id]\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            if info.get('action') == 'entry':\n                self.entry_order_pending = False\n            elif info.get('action') == 'exit':\n                pos_id = info.get('pos_id')\n                for p in self.open_positions:\n                    if p['id'] == pos_id:\n                        p['exit_pending'] = False\n\n    def next(self):\n        dt = self.data.datetime.datetime(0)\n        if self.session_date is None or dt.date() != self.session_date:\n            self.session_date = dt.date()\n            self.session_start_dt = dt\n        minutes_since_open = (dt - self.session_start_dt).total_seconds() / 60.0\n        in_opening_window = minutes_since_open < self.p.opening_minutes_ignore\n\n        price = self.data.close[0]\n        sma_val = self.sma[0]\n        rsi_val = self.rsi[0]\n        vol = self.data.volume[0]\n        avg_vol = self.avg_volume[0]\n\n        for pos in list(self.open_positions):\n            if pos['exit_pending']:\n                continue\n            direction = pos['direction']\n            entry_price = pos['entry_price']\n            exit_signal = False\n            if direction == 'long':\n                if price <= entry_price * (1 - self.p.stop_loss_pct):\n                    exit_signal = True\n                elif price >= entry_price * (1 + self.p.take_profit_pct):\n                    exit_signal = True\n                elif price < sma_val:\n                    exit_signal = True\n                elif rsi_val < self.p.rsi_exit_lower or rsi_val > self.p.rsi_exit_upper:\n                    exit_signal = True\n            else:\n                if price >= entry_price * (1 + self.p.stop_loss_pct):\n                    exit_signal = True\n                elif price <= entry_price * (1 - self.p.take_profit_pct):\n                    exit_signal = True\n                elif price > sma_val:\n                    exit_signal = True\n                elif rsi_val < self.p.rsi_exit_lower or rsi_val > self.p.rsi_exit_upper:\n                    exit_signal = True\n\n            if exit_signal:\n                pos['exit_pending'] = True\n                if direction == 'long':\n                    self.sell(size=pos['size'], action='exit', pos_id=pos['id'])\n                else:\n                    self.buy(size=pos['size'], action='exit', pos_id=pos['id'])\n\n        if in_opening_window:\n            return\n        if self.entry_order_pending:\n            return\n        if len(self.open_positions) >= self.p.max_positions:\n            return\n        if self.last_open_bar is not None and (len(self) - self.last_open_bar) < self.p.min_tick_interval:\n            return\n\n        long_signal = (\n            price > sma_val * (1 + self.p.price_dev_pct)\n            and self.p.rsi_entry_lower <= rsi_val <= self.p.rsi_entry_upper\n            and vol > avg_vol * (1 + self.p.vol_surge_pct)\n        )\n        short_signal = (\n            price < sma_val * (1 - self.p.price_dev_pct)\n            and self.p.rsi_entry_lower <= rsi_val <= self.p.rsi_entry_upper\n            and vol > avg_vol * (1 + self.p.vol_surge_pct)\n        )\n\n        has_long = any(p['direction'] == 'long' for p in self.open_positions)\n        has_short = any(p['direction'] == 'short' for p in self.open_positions)\n\n        if long_signal and not has_short:\n            size = (self.broker.getvalue() * self.p.position_pct) / price\n            self.next_pos_id += 1\n            self.entry_order_pending = True\n            self.buy(size=size, action='entry', direction='long', pos_id=self.next_pos_id)\n        elif short_signal and not has_long:\n            size = (self.broker.getvalue() * self.p.position_pct) / price\n            self.next_pos_id += 1\n            self.entry_order_pending = True\n            self.sell(size=size, action='entry', direction='short', pos_id=self.next_pos_id)",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Treat each 1-minute bar as one 'tick': 'last tick price' = bar Close, 'last tick volume' = bar Volume.",
+      "reason": "The harness only supplies 1-minute OHLCV bars, not true tick data; this is the closest literal reading achievable in this environment."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Only allow pyramiding entries in the same direction as any currently open position(s); block an opposite-direction entry signal while positions are open in the other direction.",
+      "reason": "Backtrader with a single data feed uses a standard netting broker, not independent long/short hedged sub-positions (as the spec's 'up to 3 simultaneous positions' model implies). Allowing an opposite-direction buy/sell would net against and incorrectly reduce/close existing tracked positions instead of opening an independent one."
+    },
+    {
+      "topic": "position sizing",
+      "choice": "Size (shares) = (0.01 * current broker portfolio value) / current close price, recomputed at each new entry; fractional share sizes are allowed.",
+      "reason": "Spec states position size must be 1% of total trading capital but does not define whether capital means cash or total equity, nor whether shares must be integer; used total broker equity via getvalue() and left size unrounded since the spec is silent."
+    },
+    {
+      "topic": "signal reversal exit",
+      "choice": "Implemented as a direct comparison (price below SMA for long, above SMA for short) rather than a strict cross-detection.",
+      "reason": "Once the condition first triggers the position is closed and removed, so a plain directional comparison is functionally equivalent to a 'cross' for exit purposes."
+    },
+    {
+      "topic": "opening-window scope",
+      "choice": "The first-5-minutes-of-day suppression applies only to new entry signals; existing exit checks (stop-loss, take-profit, signal reversal, RSI exit) still run during that window.",
+      "reason": "The spec calls these 'trading signals' to ignore at the open, which most naturally refers to new-position entry signals, not risk exits on already-open positions."
+    },
+    {
+      "topic": "session-open detection",
+      "choice": "Start of each trading session is detected by comparing the current bar's date to the previous bar's date (first bar of a new date = session start).",
+      "reason": "The feed has no explicit session-open marker; this is the standard way to infer session start from bar timestamps alone."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 12,
+  "tape": [
+    {
+      "dt": "2026-08-11T19:32:00",
+      "side": "SELL",
+      "size": -0.32821321518939667,
+      "price": 304.69000244140625
+    },
+    {
+      "dt": "2026-08-11T19:40:00",
+      "side": "BUY",
+      "size": 0.32821321518939667,
+      "price": 304.6889953613281
+    },
+    {
+      "dt": "2026-08-11T19:55:00",
+      "side": "BUY",
+      "size": 0.3279644598918213,
+      "price": 304.8800048828125
+    },
+    {
+      "dt": "2026-08-12T13:31:00",
+      "side": "SELL",
+      "size": -0.3279644598918213,
+      "price": 304.0299987792969
+    },
+    {
+      "dt": "2026-08-12T14:57:00",
+      "side": "BUY",
+      "size": 0.33000517121923395,
+      "price": 302.989990234375
+    },
+    {
+      "dt": "2026-08-12T15:00:00",
+      "side": "SELL",
+      "size": -0.33000517121923395,
+      "price": 302.42999267578125
+    },
+    {
+      "dt": "2026-08-12T19:41:00",
+      "side": "SELL",
+      "size": -0.3317629514661847,
+      "price": 301.3900146484375
+    },
+    {
+      "dt": "2026-08-12T19:45:00",
+      "side": "BUY",
+      "size": 0.3317629514661847,
+      "price": 301.6000061035156
+    },
+    {
+      "dt": "2026-08-13T14:26:00",
+      "side": "BUY",
+      "size": 0.32787355449080685,
+      "price": 304.94500732421875
+    },
+    {
+      "dt": "2026-08-13T14:33:00",
+      "side": "SELL",
+      "size": -0.32787355449080685,
+      "price": 305.07000732421875
+    },
+    {
+      "dt": "2026-08-13T16:32:00",
+      "side": "SELL",
+      "size": -0.32979872923682063,
+      "price": 303.1700134277344
+    },
+    {
+      "dt": "2026-08-13T16:39:00",
+      "side": "BUY",
+      "size": 0.32979872923682063,
+      "price": 303.29998779296875
+    },
+    {
+      "dt": "2026-08-13T18:51:00",
+      "side": "SELL",
+      "size": -0.32967655889605335,
+      "price": 303.2799987792969
+    },
+    {
+      "dt": "2026-08-13T19:05:00",
+      "side": "BUY",
+      "size": 0.32967655889605335,
+      "price": 303.31500244140625
+    },
+    {
+      "dt": "2026-08-18T13:57:00",
+      "side": "BUY",
+      "size": 0.3259189816713625,
+      "price": 306.7650146484375
+    },
+    {
+      "dt": "2026-08-18T14:02:00",
+      "side": "SELL",
+      "size": -0.3259189816713625,
+      "price": 308.393310546875
+    },
+    {
+      "dt": "2026-08-18T16:08:00",
+      "side": "BUY",
+      "size": 0.32262218712788626,
+      "price": 309.8900146484375
+    },
+    {
+      "dt": "2026-08-18T16:19:00",
+      "side": "SELL",
+      "size": -0.32262218712788626,
+      "price": 310.0150146484375
+    },
+    {
+      "dt": "2026-08-18T19:57:00",
+      "side": "SELL",
+      "size": -0.3224869622457745,
+      "price": 310.0400085449219
+    },
+    {
+      "dt": "2026-08-19T13:31:00",
+      "side": "BUY",
+      "size": 0.3224869622457745,
+      "price": 310.6300048828125
+    },
+    {
+      "dt": "2026-08-19T15:26:00",
+      "side": "SELL",
+      "size": -0.31414538890449134,
+      "price": 318.2650146484375
+    },
+    {
+      "dt": "2026-08-19T15:35:00",
+      "side": "BUY",
+      "size": 0.31414538890449134,
+      "price": 317.42999267578125
+    },
+    {
+      "dt": "2026-08-19T16:05:00",
+      "side": "BUY",
+      "size": 0.3156224491658575,
+      "price": 316.7799987792969
+    },
+    {
+      "dt": "2026-08-19T16:11:00",
+      "side": "SELL",
+      "size": -0.3156224491658575,
+      "price": 316.70001220703125
+    }
+  ]
+}

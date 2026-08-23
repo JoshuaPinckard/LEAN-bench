@@ -1,0 +1,124 @@
+```python
+import backtrader as bt
+
+
+class DownwardReversalNoDelta(bt.Strategy):
+    params = dict(
+        ema_period=50,
+        bb_period=20,
+        bb_dev=2.0,
+        atr_period=14,
+        atr_sma_period=50,
+        vol_sma_period=20,
+        vol_spike_mult=1.5,
+        sl_atr_mult=0.5,
+        risk_pct=0.01,
+        rsi_period=14,
+        rsi_avoid_below=35.0,
+        midline_rising_bars=3,
+    )
+
+    def __init__(self):
+        self.ema = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+
+        self.order = None
+        self.stop_order = None
+        self.tp_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+            if order == self.tp_order:
+                self.tp_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        op = self.data.open[0]
+        hi = self.data.high[0]
+        lo = self.data.low[0]
+        cl = self.data.close[0]
+        vol = self.data.volume[0]
+        rng = hi - lo
+        if rng == 0:
+            return
+
+        vol_spike = vol >= self.p.vol_spike_mult * self.vol_sma[0]
+
+        if self.position:
+            bullish = cl > op
+            close_upper_third = (hi - cl) / rng <= 0.33
+            lower_wick = (min(op, cl) - lo) >= 2 * abs(cl - op)
+            near_lower_bb = lo <= self.bb.lines.bot[0]
+            if bullish and close_upper_third and lower_wick and near_lower_bb and vol_spike:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                if self.tp_order:
+                    self.cancel(self.tp_order)
+                self.order = self.close()
+            return
+
+        trend = cl < self.ema[0]
+        vol_filter = self.atr[0] > self.atr_sma[0]
+        touch_upper = hi >= self.bb.lines.top[0]
+
+        bearish = cl < op
+        close_lower_third = (cl - lo) / rng <= 0.33
+        upper_wick = hi - max(op, cl)
+        body = abs(cl - op)
+        lower_range = min(op, cl) - lo
+        long_upper_wick = (upper_wick >= 2 * body) and (upper_wick >= 1.5 * lower_range)
+        wick_strength = (upper_wick / rng) >= 0.5
+
+        pattern = bearish and close_lower_third and long_upper_wick and vol_spike and wick_strength
+
+        rsi_ok = self.rsi[0] >= self.p.rsi_avoid_below
+
+        mid = self.bb.lines.mid
+        midline_rising = mid[0] > mid[-1] > mid[-2] > mid[-3]
+
+        if trend and vol_filter and touch_upper and pattern and rsi_ok and not midline_rising:
+            sl = hi + self.p.sl_atr_mult * self.atr[0]
+            risk_dist = sl - cl
+            if risk_dist <= 0:
+                return
+            risk_amount = self.p.risk_pct * self.broker.getvalue()
+            size = int(risk_amount / risk_dist)
+            if size < 1:
+                return
+            tp = cl - risk_dist
+
+            orders = self.sell_bracket(
+                size=size,
+                exectype=bt.Order.Market,
+                stopprice=sl,
+                limitprice=tp,
+            )
+            self.order, self.stop_order, self.tp_order = orders
+```
+```json
+{"assumptions": [
+  {"topic": "risk_pct", "choice": "Used 1% of portfolio value as risk per trade", "reason": "Spec states a 1-2% range without a single value; picked the conservative end."},
+  {"topic": "alternative profit-taking", "choice": "Implemented only the stated Base take-profit (1R); did not implement the 'partial TP at midline, rest at 1R' or 'full exit at midline' alternatives", "reason": "Spec presents these as an optional 'alternative' without deterministic selection criteria between them, so the explicitly-named base rule is used."},
+  {"topic": "SL/TP reference price", "choice": "R and TP are computed from the signal bar's close as the entry reference, submitted immediately as a market-order bracket (sell_bracket) with stopprice/limitprice fixed at signal time", "reason": "SL formula depends on the signal candle's high/ATR, so levels must be fixed at signal detection; actual fill price may differ slightly since orders execute on the next bar under default backtrader timing."},
+  {"topic": "position size rounding", "choice": "Floored computed size to whole shares; skip entry if size < 1", "reason": "Backtrader's default broker/sizer trades whole shares; spec doesn't address fractional sizing."},
+  {"topic": "RSI filter", "choice": "Implemented as a hard block: avoid entry when RSI(14) < 35; did not add a separate hard RSI >= 50 requirement", "reason": "Spec uses 'avoid' (hard directive) for the <35 clause and 'preferable' (soft language) for the >=50 note, so only the explicit hard threshold is enforced."},
+  {"topic": "midline rising filter", "choice": "Interpreted 'rising for 3+ bars in a row' as three consecutive bar-over-bar increases: mid[0] > mid[-1] > mid[-2] > mid[-3]", "reason": "Spec doesn't define the exact comparison window."},
+  {"topic": "opposite-signal exit mechanics", "choice": "On the alternative bullish reversal signal, cancel any pending stop-loss/take-profit orders and close the full position at market", "reason": "Spec doesn't specify interaction between the SL/TP bracket and the opposite-signal exit; immediate full close is the most direct literal reading."},
+  {"topic": "optional quality filters", "choice": "Implemented the RSI<35 avoidance and midline-rising block as hard entry-blocking filters", "reason": "Although labeled 'optional', the spec supplies concrete numeric thresholds for both, so they are enforced literally."},
+  {"topic": "zero-range bar guard", "choice": "Skip candle-pattern evaluation entirely when high == low", "reason": "Avoids division by zero in wick-ratio calculations; not addressed by spec."}
+]}
+```

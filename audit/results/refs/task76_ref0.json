@@ -1,0 +1,62 @@
+{
+  "task_id": 76,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\n\nimport backtrader as bt\n\n\nclass EntropyPoolingStressStrategy(bt.Strategy):\n    params = (\n        ('lookback', 60),\n        ('target_return', 1.00),\n        ('target_vol', 0.20),\n        ('shift_threshold', 0.05),\n        ('exit_threshold', 0.05),\n        ('spike_ratio', 0.10),\n        ('volume_period', 20),\n        ('max_iter', 50),\n        ('tol', 1e-8),\n        ('periods_per_year', 252),\n    )\n\n    def __init__(self):\n        self.order = None\n        self.stop_price = None\n        self.target_price = None\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_period)\n        self.daily_mu = self.p.target_return / self.p.periods_per_year\n        self.daily_sigma = self.p.target_vol / math.sqrt(self.p.periods_per_year)\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def _entropy_pool(self, returns, prior_probs, mu_target, sigma_target):\n        n = len(returns)\n        lam1, lam2 = 0.0, 0.0\n        m2_target = sigma_target ** 2 + mu_target ** 2\n        for _ in range(self.p.max_iter):\n            try:\n                exps = [math.exp(-lam1 * r - lam2 * r * r) for r in returns]\n            except OverflowError:\n                return None, False\n            weighted = [prior_probs[i] * exps[i] for i in range(n)]\n            z = sum(weighted)\n            if not z or math.isnan(z) or math.isinf(z):\n                return None, False\n            w = [x / z for x in weighted]\n            mean_r = sum(w[i] * returns[i] for i in range(n))\n            mean_r2 = sum(w[i] * returns[i] ** 2 for i in range(n))\n            g1 = mean_r - mu_target\n            g2 = mean_r2 - m2_target\n            if abs(g1) < self.p.tol and abs(g2) < self.p.tol:\n                return w, True\n            mean_r3 = sum(w[i] * returns[i] ** 3 for i in range(n))\n            mean_r4 = sum(w[i] * returns[i] ** 4 for i in range(n))\n            # Newton step on the dual: J = -Cov_w[(r, r^2)], solved via 2x2 closed form.\n            cov11 = mean_r2 - mean_r * mean_r\n            cov12 = mean_r3 - mean_r * mean_r2\n            cov22 = mean_r4 - mean_r2 * mean_r2\n            det = cov11 * cov22 - cov12 * cov12\n            if abs(det) < 1e-14:\n                return None, False\n            lam1 += (cov22 * g1 - cov12 * g2) / det\n            lam2 += (-cov12 * g1 + cov11 * g2) / det\n            if abs(lam1) > 1e6 or abs(lam2) > 1e6:\n                return None, False\n        return None, False\n\n    def _quality_ok(self, probs, n):\n        if probs is None:\n            return False\n        ens = 1.0 / sum(p * p for p in probs)\n        return ens >= self.p.spike_ratio * n\n\n    def _weighted_quantile(self, values, probs, q):\n        pairs = sorted(zip(values, probs), key=lambda x: x[0])\n        cum = 0.0\n        for v, p in pairs:\n            cum += p\n            if cum >= q:\n                return v\n        return pairs[-1][0]\n\n    def _weighted_std(self, values, probs):\n        mean = sum(v * p for v, p in zip(values, probs))\n        var = sum(p * (v - mean) ** 2 for v, p in zip(values, probs))\n        return math.sqrt(var) if var > 0 else 0.0\n\n    def _size_from_vol(self, vol):\n        if vol <= 0:\n            return 0\n        return max(1, int(round(1.0 / vol)))\n\n    def next(self):\n        if self.order:\n            return\n        if len(self.data) < self.p.lookback + 1:\n            return\n\n        closes = list(self.data.close.get(size=self.p.lookback + 1))\n        if len(closes) < self.p.lookback + 1:\n            return\n        returns = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]\n        n = len(returns)\n        prior_probs = [1.0 / n] * n\n        prior_median = self._weighted_quantile(returns, prior_probs, 0.5)\n\n        high_volume = self.data.volume[0] > self.vol_sma[0]\n\n        pos_probs, pos_conv = self._entropy_pool(returns, prior_probs, self.daily_mu, self.daily_sigma)\n        neg_probs, neg_conv = self._entropy_pool(returns, prior_probs, -self.daily_mu, self.daily_sigma)\n        pos_ok = pos_conv and self._quality_ok(pos_probs, n)\n        neg_ok = neg_conv and self._quality_ok(neg_probs, n)\n        pos_median = self._weighted_quantile(returns, pos_probs, 0.5) if pos_ok else None\n        neg_median = self._weighted_quantile(returns, neg_probs, 0.5) if neg_ok else None\n\n        if not self.position:\n            if pos_ok and high_volume and (pos_median - prior_median) > self.p.shift_threshold:\n                post_vol = self._weighted_std(returns, pos_probs)\n                size = self._size_from_vol(post_vol)\n                if size >= 1:\n                    p05 = self._weighted_quantile(returns, pos_probs, 0.05)\n                    p95 = self._weighted_quantile(returns, pos_probs, 0.95)\n                    entry_price = self.data.close[0]\n                    self.stop_price = entry_price * (1 + p05)\n                    self.target_price = entry_price * (1 + p95)\n                    self.order = self.buy(size=size)\n            elif neg_ok and high_volume and (prior_median - neg_median) > self.p.shift_threshold:\n                post_vol = self._weighted_std(returns, neg_probs)\n                size = self._size_from_vol(post_vol)\n                if size >= 1:\n                    p05 = self._weighted_quantile(returns, neg_probs, 0.05)\n                    p95 = self._weighted_quantile(returns, neg_probs, 0.95)\n                    entry_price = self.data.close[0]\n                    self.stop_price = entry_price * (1 + p95)\n                    self.target_price = entry_price * (1 + p05)\n                    self.order = self.sell(size=size)\n            return\n\n        price = self.data.close[0]\n        if self.position.size > 0:\n            if price <= self.stop_price or price >= self.target_price:\n                self.order = self.close()\n                return\n            reverted = pos_ok and abs(pos_median - prior_median) < self.p.exit_threshold\n            opposite = neg_ok and (prior_median - neg_median) > self.p.shift_threshold\n            if reverted or opposite:\n                self.order = self.close()\n        elif self.position.size < 0:\n            if price >= self.stop_price or price <= self.target_price:\n                self.order = self.close()\n                return\n            reverted = neg_ok and abs(neg_median - prior_median) < self.p.exit_threshold\n            opposite = pos_ok and (pos_median - prior_median) > self.p.shift_threshold\n            if reverted or opposite:\n                self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "scenario_window",
+      "choice": "Prior distribution = uniform 1/N over a rolling 60-bar window of daily returns; recomputed each bar.",
+      "reason": "Spec never states the scenario-set size used for the prior/posterior distributions."
+    },
+    {
+      "topic": "stress_target_scale",
+      "choice": "target_return and target_vol are treated as annualized figures and converted to per-bar moment targets via mu_daily=target_return/252 and sigma_daily=target_vol/sqrt(252), matched against the daily-return scenario set.",
+      "reason": "Spec gives example targets (+100% return, 20% vol) without stating their horizon; these are standard annualized conventions in the entropy-pooling/portfolio-optimization literature the spec draws from, and a literal same-scale reading (100% as a single daily return target) is unreachable by any historical daily-return scenario set, which would make the strategy permanently non-convergent."
+    },
+    {
+      "topic": "entropy_pooling_solver",
+      "choice": "Implemented Meucci-style Entropy Pooling as exponential tilting of the prior matched to the target mean and variance via a hand-rolled 2-variable Newton-Raphson on the convex dual (closed-form 2x2 Jacobian from the tilted covariance of (r, r^2)).",
+      "reason": "Only backtrader/math imports are available (no numpy/scipy), so a literal fminunc/fmincon call is infeasible; this is the standard closed-form dual solution to the two stated view constraints (target return, target volatility) and directly serves as the 'fminunc analog' the spec references."
+    },
+    {
+      "topic": "optimizer_quality_filter",
+      "choice": "A scenario is treated as non-convergent (and its signal skipped) if the Newton iteration fails to satisfy the moment constraints within max_iter=50, the dual overflows/underflows, the local Jacobian is singular, or the multipliers diverge beyond 1e6.",
+      "reason": "Spec asks to skip signals when the optimizer 'does not converge to a stable solution' but gives no exact numeric test; these are the standard failure modes of the exponential-tilting dual."
+    },
+    {
+      "topic": "strange_behavior_threshold",
+      "choice": "Posterior flagged as an abnormal spike/bimodal outcome (and its signal skipped) when the Effective Number of Scenarios ENS=1/sum(p_j^2) falls below 10% of the window size.",
+      "reason": "Spec names 'bimodal/abnormal spikes' as a filter but gives no numeric criterion; ENS is the standard entropy-pooling diagnostic for probability-mass concentration on a small subset of scenarios."
+    },
+    {
+      "topic": "median_shift_exit_threshold",
+      "choice": "Reused the same 5% value as the entry threshold Y for the exit threshold Z.",
+      "reason": "Spec gives an explicit example value only for Y ('5% or more'); it references Z ('less than Z%') without a distinct example."
+    },
+    {
+      "topic": "volume_filter",
+      "choice": "'High trading volume' operationalized as current bar volume above its own 20-bar SMA; applied only to new entries, not to exits/stops.",
+      "reason": "Spec states a volume filter with no numeric threshold; gating stop-loss/take-profit on volume would leave open risk unmanaged, which the spec's risk-management section does not intend."
+    },
+    {
+      "topic": "stop_take_profit_levels",
+      "choice": "5th/95th percentile return levels from the entry-triggering posterior are converted to fixed price levels at the entry close (level = entry_price * (1 + percentile_return)) and held constant until the position closes, rather than recomputed every bar.",
+      "reason": "Spec states stop-loss/take-profit as price levels 'corresponding to' posterior percentiles without saying whether they are recomputed daily; fixed bracket levels anchored at entry match standard stop-loss/take-profit semantics."
+    },
+    {
+      "topic": "position_sizing",
+      "choice": "size = round(1 / posterior_volatility) shares from the entry-triggering scenario's realized weighted posterior volatility, floored at a 1-share minimum (skip the trade if this rounds below 1).",
+      "reason": "Spec states the formula literally ('position size = 1 / (posterior volatility)'); backtrader order sizes must be positive integers, so rounding and a 1-share floor are the minimal mechanical translation."
+    },
+    {
+      "topic": "multi_asset_diversification",
+      "choice": "Not implemented; the strategy trades only the single AAPL feed provided by the harness.",
+      "reason": "infeasible - the harness supplies exactly one bt.feeds.PandasData feed with no other asset or portfolio data available."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

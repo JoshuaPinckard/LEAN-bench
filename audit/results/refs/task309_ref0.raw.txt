@@ -2,76 +2,56 @@
 import backtrader as bt
 
 
-class MeanReversionZScore(bt.Strategy):
-    # Default parameters for the medium-risk profile as stated in the spec.
-    params = (
-        ('ma_period', 20),        # 20-period SMA
-        ('std_period', 20),       # 20-period StdDev
-        ('entry_threshold', 2.0), # go long < -2, short > +2
-        ('exit_threshold', 0.0),  # cover/reverse when Z returns near 0
-        ('stop_loss', 0.02),      # 2% hard stop-loss from entry
+class MeanReversionZScoreStrategy(bt.Strategy):
+    params = dict(
+        period=20,
+        entry_threshold=2.0,
+        exit_threshold=0.0,
+        stop_pct=0.02,
     )
 
     def __init__(self):
-        # 20-period SMA and 20-period StdDev of price (close).
-        self.sma = bt.indicators.SimpleMovingAverage(
-            self.data.close, period=self.p.ma_period)
-        self.stddev = bt.indicators.StandardDeviation(
-            self.data.close, period=self.p.std_period)
-        # Z-Score of price versus the MA.
-        self.zscore = (self.data.close - self.sma) / self.stddev
-
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.period)
+        self.stddev = bt.indicators.StdDev(self.data.close, period=self.p.period)
         self.order = None
         self.entry_price = None
 
     def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
-            return
         if order.status == order.Completed:
-            # After a closing fill the position is flat; after an entry fill
-            # it is set. Track the entry price for the hard stop.
-            if not self.position:
-                self.entry_price = None
-            else:
-                self.entry_price = order.executed.price
-        if order.status in [order.Completed, order.Canceled,
-                             order.Margin, order.Rejected]:
+            self.entry_price = order.executed.price
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
             self.order = None
 
     def next(self):
         if self.order:
             return
 
-        z = self.zscore[0]
+        if self.stddev[0] == 0:
+            return
+
+        zscore = (self.data.close[0] - self.sma[0]) / self.stddev[0]
 
         if self.position:
             if self.position.size > 0:
-                # Long: 2% hard stop-loss from entry (intrabar touch).
-                if self.entry_price is not None and \
-                        self.data.low[0] <= self.entry_price * (1.0 - self.p.stop_loss):
+                if self.data.close[0] <= self.entry_price * (1 - self.p.stop_pct):
                     self.order = self.close()
                     return
-                # Z-Score returned near 0 -> cover.
-                if z >= self.p.exit_threshold:
+                if zscore >= self.p.exit_threshold:
                     self.order = self.close()
                     return
             elif self.position.size < 0:
-                # Short: 2% hard stop-loss from entry (intrabar touch).
-                if self.entry_price is not None and \
-                        self.data.high[0] >= self.entry_price * (1.0 + self.p.stop_loss):
+                if self.data.close[0] >= self.entry_price * (1 + self.p.stop_pct):
                     self.order = self.close()
                     return
-                # Z-Score returned near 0 -> cover.
-                if z <= self.p.exit_threshold:
+                if zscore <= self.p.exit_threshold:
                     self.order = self.close()
                     return
         else:
-            # Entries at the +/- 2 thresholds.
-            if z < -self.p.entry_threshold:
+            if zscore < -self.p.entry_threshold:
                 self.order = self.buy()
-            elif z > self.p.entry_threshold:
+            elif zscore > self.p.entry_threshold:
                 self.order = self.sell()
 ```
 ```json
-{"assumptions": [{"topic": "zscore-formula", "choice": "Z-Score = (close - SMA20) / StdDev20 using close prices for 'price'.", "reason": "Spec defines a 'Z-Score of price versus the MA' but does not name the price field; close is the standard bar price for a bar-close strategy."}, {"topic": "stddev-definition", "choice": "Use backtrader's bt.indicators.StandardDeviation (population std, divides by period) computed on close.", "reason": "Spec says '20-period Standard Deviation' without specifying sample vs population; the library's StandardDeviation is the direct literal indicator."}, {"topic": "exit-near-zero", "choice": "'Returns near 0' is implemented as crossing the exit threshold 0: a long is closed when Z >= 0, a short when Z <= 0.", "reason": "Spec states exit threshold 0; 'near 0' is read as reaching that threshold rather than an invented tolerance band."}, {"topic": "covering-vs-reversing", "choice": "At the 0 threshold the open position is closed with self.close(); an opposite-direction entry occurs only afterward when the opposite +/-2 threshold is met (no single-step position reversal).", "reason": "Entries are gated by +/-2 and exits by 0; closing at 0 then re-entering at the opposite extreme reproduces both 'covering' and later 'reversing' without adding logic beyond the stated thresholds."}, {"topic": "stop-loss-trigger", "choice": "2% hard stop from entry is monitored intrabar via bar low (long) / high (short); on breach the position is closed with a market self.close() (fills next bar open per the environment).", "reason": "'Hard stop-loss' implies an intrabar price level being touched; exit execution uses a market order because canonical defaults route exits through self.close()."}, {"topic": "shorting", "choice": "Shorting is enabled (default self.sell()/self.buy-to-cover via self.close()).", "reason": "Spec explicitly calls for going short when Z > +2, overriding the long-only canonical default."}]}
+{"assumptions": [{"topic": "stop_loss_basis", "choice": "Evaluate the 2% hard stop-loss against the bar Close price rather than intrabar High/Low.", "reason": "Spec states a 2% stop from entry but does not specify intrabar monitoring; Close-based evaluation matches the cadence used for the Z-Score signal itself, since no order-book/intrabar detail is given in the OHLCV feed."}, {"topic": "exit_interpretation", "choice": "Treat 'covering or reversing when Z-Score returns near 0' as fully closing the open position via close() (long exits when Z-Score>=0, short exits when Z-Score<=0), rather than flipping directly into the opposite side without an intervening flat period.", "reason": "The stated exit trigger is only the Z-Score returning to 0; it does not restate the +-2 entry-threshold breach needed to justify an immediate reversal, so a literal reading supports close-only exits with new entries evaluated independently on subsequent bars."}, {"topic": "zero_stddev_guard", "choice": "Skip signal evaluation on any bar where the 20-period StdDev is exactly 0.", "reason": "Spec is silent on degenerate zero-volatility bars; this avoids an undefined division by zero in the Z-Score calculation without altering stated thresholds."}, {"topic": "priority_on_conflict", "choice": "When both the stop-loss and the Z-Score exit condition are true on the same bar, the stop-loss check is evaluated first.", "reason": "Spec calls the stop-loss 'hard,' implying it functions as a risk control that should take precedence over the mean-reversion exit signal."}]}
 ```

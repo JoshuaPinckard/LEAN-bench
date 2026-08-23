@@ -1,0 +1,131 @@
+Looking at the spec, the trickiest parts are the entry/exit mechanics and the risk-based sizing. Let me finalize the implementation.
+
+```python
+import datetime
+import backtrader as bt
+
+
+class CreditSpreadProxyStrategy(bt.Strategy):
+    params = dict(
+        sma_period=20,
+        trend_lookback=30,
+        boll_period=20,
+        boll_devfactor=2.0,
+        atr_period=14,
+        tp_atr_mult=0.25,
+        sl_atr_mult=1.25,
+        risk_pct=0.01,
+        risk_capital=4000.0,
+        vol_filter_pct=0.02,
+        trade_start_time=datetime.time(11, 0),
+        flatten_time=datetime.time(15, 30),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.sma_prior = self.sma(-self.p.trend_lookback)
+        self.boll = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.boll_period, devfactor=self.p.boll_devfactor
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.cross_bot = bt.indicators.CrossOver(self.data.close, self.boll.bot)
+        self.cross_top = bt.indicators.CrossOver(self.data.close, self.boll.top)
+
+        self.order = None
+        self.tp_price = None
+        self.sl_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.tp_price = None
+            self.sl_price = None
+
+    def next(self):
+        bar_time = self.data.datetime.time(0)
+
+        if self.position:
+            if self.order:
+                return
+            if self.position.size > 0:
+                if self.data.low[0] <= self.sl_price:
+                    self.order = self.close()
+                    return
+                if self.data.high[0] >= self.tp_price:
+                    self.order = self.close()
+                    return
+            else:
+                if self.data.high[0] >= self.sl_price:
+                    self.order = self.close()
+                    return
+                if self.data.low[0] <= self.tp_price:
+                    self.order = self.close()
+                    return
+            if bar_time >= self.p.flatten_time:
+                self.order = self.close()
+            return
+
+        if self.order:
+            return
+
+        if bar_time < self.p.trade_start_time or bar_time >= self.p.flatten_time:
+            return
+
+        close = self.data.close[0]
+        sma = self.sma[0]
+        sma_prior = self.sma_prior[0]
+
+        bullish = close > sma and sma > sma_prior
+        bearish = close < sma and sma < sma_prior
+        if not bullish and not bearish:
+            return
+
+        atr_val = self.atr[0]
+        if (atr_val / close) > self.p.vol_filter_pct:
+            return
+
+        mid = self.boll.mid[0]
+        top = self.boll.top[0]
+        bot = self.boll.bot[0]
+        risk_amount = self.p.risk_pct * self.p.risk_capital
+
+        if bullish and self.cross_bot[0] > 0:
+            entry_est = close
+            tp_distance = min(self.p.tp_atr_mult * atr_val, abs(mid - entry_est))
+            sl_distance = max(self.p.sl_atr_mult * atr_val, abs(top - entry_est))
+            size = int(risk_amount // sl_distance)
+            if size < 1:
+                return
+            self.tp_price = entry_est + tp_distance
+            self.sl_price = entry_est - sl_distance
+            self.order = self.buy(size=size)
+        elif bearish and self.cross_top[0] < 0:
+            entry_est = close
+            tp_distance = min(self.p.tp_atr_mult * atr_val, abs(entry_est - mid))
+            sl_distance = max(self.p.sl_atr_mult * atr_val, abs(entry_est - bot))
+            size = int(risk_amount // sl_distance)
+            if size < 1:
+                return
+            self.tp_price = entry_est - tp_distance
+            self.sl_price = entry_est + sl_distance
+            self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "trade_start_time", "choice": "Entries allowed only when bar time >= 11:00 (09:30 open + 90 minutes)", "reason": "Spec states trading begins 90 minutes after market open; 09:30+90min=11:00 is the literal computation."},
+  {"topic": "flatten_time", "choice": "Force-close any open position and block new entries starting at 15:30 (30 minutes before the 16:00 close), the earliest point in the stated 15-30 minute window", "reason": "Spec gives a range ('15-30 minutes before close') rather than one instant; acting at the earliest point guarantees compliance with both boundaries of the stated window."},
+  {"topic": "opposite_bollinger_band", "choice": "For a long entry (signalled off the lower band), the 'opposite band' used in the stop-loss farther-distance comparison is the upper band; symmetrically the lower band for short entries", "reason": "The spec emphasizes the stop must be 'far' and produce an unfavorable ~5:1 risk/reward versus the small take-profit; only the far-side (opposite) band, not the near/entry-side band, produces a large enough distance to match that stated ratio."},
+  {"topic": "bracket_reference_price", "choice": "Take-profit/stop-loss distances and position size are computed using the signal bar's close price and same-bar ATR/Bollinger values as the assumed entry price, fixed at order submission time", "reason": "The spec's TP/SL are defined 'from entry,' but backtrader market orders fill on the next bar; using the signal bar's close as the entry estimate is the most literal value available at decision time and keeps sizing and bracket levels internally consistent."},
+  {"topic": "exit_price_reference", "choice": "Stop-loss and take-profit hits are detected using the bar's Low (for long stop / short target) and High (for long target / short stop), not Close", "reason": "Spec describes price-level stop/target hits ('touching/breaking'); intrabar High/Low is the literal way to detect a level being reached given only OHLCV columns, rather than only checking Close."},
+  {"topic": "exit_priority", "choice": "When both stop-loss and take-profit levels are touched on the same bar, the stop-loss check is evaluated first", "reason": "Spec does not address simultaneous hits; checking the adverse (stop) condition first is the conservative literal choice given no stated tie-break rule."},
+  {"topic": "risk_capital_basis", "choice": "The 1% risk-per-trade sizing uses the spec-stated $4000 capital figure literally, independent of the harness's actual $10,000 starting cash", "reason": "Spec explicitly states 'initial capital $4000' for the risk-management rule; fidelity requires using the stated figure rather than substituting the harness's broker cash."},
+  {"topic": "position_size_rounding", "choice": "Share count is floored to a whole number via integer division of risk amount by per-share stop distance; a result of 0 causes the signal to be skipped", "reason": "Spec requires skipping the signal when the risk cannot be respected; fractional shares are not standard, so flooring is the literal, conservative way to never exceed the 1% risk cap."},
+  {"topic": "sideways_filter_duplication", "choice": "No separate 'since the day's open' sideways check was added beyond the SMA(20)/30-bar trend condition", "reason": "Rule 9's sideways-market filter restates the same trend condition already defined in rule 2 (bullish/bearish/otherwise-sideways); implementing rule 2 already prevents trading whenever the trend condition is not met, so no additional indicator or state was introduced."},
+  {"topic": "trend_30_bars_ago_lookback", "choice": "Implemented via a time-delayed reference to the SMA(20) line, `self.sma(-30)`, rather than manual index bookkeeping", "reason": "This lets backtrader extend the strategy's automatic minperiod to cover the 30-bar lookback, per the canonical default to rely on automatic minperiod rather than manual bar-skipping."}
+]}
+```

@@ -1,0 +1,94 @@
+```python
+import math
+
+import backtrader as bt
+
+
+class ScalpingPullbackStrategy(bt.Strategy):
+
+    def __init__(self):
+        self.sma50 = bt.indicators.SMA(self.data.close, period=50)
+        self.rsi = bt.indicators.RSI(self.data.close, period=14)
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=50)
+        self.boll = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=20)
+
+        self.order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.target_price = None
+        self.signal_atr = None
+        self.entry_bar_index = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            if order.status == order.Completed:
+                if order.isbuy():
+                    self.entry_price = order.executed.price
+                    self.stop_price = self.entry_price - 1.5 * self.signal_atr
+                    self.target_price = self.entry_price + 1.5 * self.signal_atr
+                    self.entry_bar_index = len(self)
+                else:
+                    self.entry_price = None
+                    self.stop_price = None
+                    self.target_price = None
+                    self.signal_atr = None
+                    self.entry_bar_index = None
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            trend_ok = self.data.close[0] > self.sma50[0]
+
+            pullback_ok = False
+            for i in range(1, 6):
+                if self.rsi[-i] < 50 and self.rsi[-i - 1] >= 50:
+                    pullback_ok = True
+                    break
+
+            trigger_ok = self.rsi[0] > 50 and self.rsi[-1] <= 50
+
+            volume_ok = self.data.volume[0] > self.vol_sma[0]
+
+            atr_val = self.atr[0]
+            volatility_ok = atr_val <= self.atr_sma[0] * 1.3
+            gap = abs(self.data.open[0] - self.data.close[-1])
+            gap_ok = gap <= atr_val
+
+            if trend_ok and pullback_ok and trigger_ok and volume_ok and volatility_ok and gap_ok:
+                risk_per_share = 1.5 * atr_val
+                if risk_per_share > 0:
+                    equity = self.broker.getvalue()
+                    size = math.floor(0.02 * equity / risk_per_share)
+                    if size > 0:
+                        self.signal_atr = atr_val
+                        self.order = self.buy(size=size)
+        else:
+            bars_since_entry = len(self) - self.entry_bar_index
+
+            if self.data.close[0] <= self.stop_price:
+                self.order = self.close()
+            elif bars_since_entry < 3 and (self.data.close[0] - self.entry_price) >= self.signal_atr:
+                self.order = self.close()
+            elif self.data.close[0] >= self.target_price:
+                self.order = self.close()
+            elif bars_since_entry < 5 and self.data.high[0] >= self.boll.top[0]:
+                self.order = self.close()
+            elif self.rsi[0] < 40:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "sizing/entry-price basis", "choice": "Compute order size at signal time using the signal bar's ATR(14) (risk_per_share = 1.5*ATR); after the buy fills, recompute stop/target from the actual executed fill price using that same ATR value.", "reason": "The spec's size formula and stop/target both need an 'entry' price, but in backtrader entry price is only known after the order fills; using the signal-bar ATR consistently for sizing, stop, and target keeps risk-per-share internally consistent."},
+  {"topic": "exit priority order", "choice": "When multiple exit conditions are true on the same bar, check in this order: stop-loss, fast exit, take-profit price target, Bollinger upper-band touch, protective RSI exit.", "reason": "Spec does not state a priority; stop-loss is checked first as the risk-limiting rule, and a deterministic order is required to have a single, reproducible action per bar."},
+  {"topic": "definition of 'first N bars after entry'", "choice": "bars_since_entry is 0 on the bar the entry order fills, so 'first 3 bars' = bars_since_entry in {0,1,2} and 'first 5 bars' = {0,1,2,3,4}.", "reason": "Spec does not clarify whether the fill bar itself counts as bar one; counting it as the first bar is the most literal reading of 'after entry'."},
+  {"topic": "scope of the 5-bar window in the take-profit rule", "choice": "The '...within the first 5 bars after entry' clause is read as qualifying only the Bollinger-band-touch condition; the ATR-based take-profit price target (entry + 1.5*ATR) is checked every bar the position remains open.", "reason": "Grammatically the time clause immediately follows the Bollinger-band clause; the price-target clause is phrased independently and shares the same unrestricted-duration style as the stop-loss."},
+  {"topic": "price used for touch/target checks", "choice": "Take-profit price target is checked against bar Close (matches the spec's literal 'close at ...'); the Bollinger upper-band 'touch' is checked against bar High (an intrabar touch).", "reason": "The spec explicitly uses the word 'close' for the ATR target but 'touch' for the band, which conventionally implies an intrabar high reaching the level."},
+  {"topic": "gap direction for volatility filter", "choice": "Gap is computed as the absolute difference |open[0] - close[-1]|.", "reason": "Spec says 'the gap ... > ATR(14)' without specifying sign; using an unsigned gap treats upward and downward gaps symmetrically, which is the most literal reading of 'gap'."},
+  {"topic": "protective RSI-exit time window", "choice": "The RSI<40 protective exit is checked every bar for the life of the position, with no time limit.", "reason": "Unlike the fast-exit and Bollinger-touch rules, the spec attaches no bar-count qualifier to this condition."}
+]}
+```

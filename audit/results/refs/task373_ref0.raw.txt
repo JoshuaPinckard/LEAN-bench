@@ -1,0 +1,118 @@
+```python
+import datetime
+
+import backtrader as bt
+
+
+class LunchBreakFadeStrategy(bt.Strategy):
+    params = dict(
+        morning_start=datetime.time(9, 30),
+        morning_end=datetime.time(11, 30),
+        midday_end=datetime.time(14, 30),
+        trend_threshold=0.005,
+        volume_period=20,
+        rsi_period=14,
+        rsi_short_entry=60,
+        rsi_long_entry=40,
+        rsi_short_exit=60,
+        rsi_long_exit=40,
+        stop_pct=0.02,
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_period)
+
+        self.order = None
+        self.stop_price = None
+
+        self.current_date = None
+        self.morning_open = None
+        self.daily_bias = None
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if self.position:
+                if self.position.size > 0:
+                    self.stop_price = self.position.price * (1 - self.p.stop_pct)
+                else:
+                    self.stop_price = self.position.price * (1 + self.p.stop_pct)
+            else:
+                self.stop_price = None
+
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        bar_date = self.data.datetime.date(0)
+        bar_time = self.data.datetime.time(0)
+
+        if bar_date != self.current_date:
+            self.current_date = bar_date
+            self.daily_bias = None
+            self.morning_open = None
+
+        if bar_time == self.p.morning_start:
+            self.morning_open = self.data.open[0]
+
+        if bar_time == self.p.morning_end:
+            if self.morning_open is not None:
+                pct_change = (self.data.close[0] - self.morning_open) / self.morning_open
+                if pct_change >= self.p.trend_threshold:
+                    self.daily_bias = 'short'
+                elif pct_change <= -self.p.trend_threshold:
+                    self.daily_bias = 'long'
+                else:
+                    self.daily_bias = None
+
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0:
+                if self.data.close[0] <= self.stop_price:
+                    self.order = self.close()
+                    return
+                if self.rsi[0] < self.p.rsi_long_exit and self.rsi[-1] >= self.p.rsi_long_exit:
+                    self.order = self.close()
+                    return
+            else:
+                if self.data.close[0] >= self.stop_price:
+                    self.order = self.close()
+                    return
+                if self.rsi[0] > self.p.rsi_short_exit and self.rsi[-1] <= self.p.rsi_short_exit:
+                    self.order = self.close()
+                    return
+
+            if bar_time >= self.p.midday_end:
+                self.order = self.close()
+                return
+
+            return
+
+        if bar_time < self.p.morning_end or bar_time >= self.p.midday_end:
+            return
+
+        if self.daily_bias is None:
+            return
+
+        if self.data.volume[0] >= self.vol_sma[0]:
+            return
+
+        if self.daily_bias == 'short':
+            if self.rsi[0] < self.p.rsi_short_entry and self.rsi[-1] >= self.p.rsi_short_entry:
+                self.order = self.sell()
+        elif self.daily_bias == 'long':
+            if self.rsi[0] > self.p.rsi_long_entry and self.rsi[-1] <= self.p.rsi_long_entry:
+                self.order = self.buy()
+```
+```json
+{"assumptions": [
+  {"topic": "entry price for stop-loss", "choice": "Stop level is computed from the order's actual fill price (backtrader's position.price, captured in notify_order) rather than the signal bar's close, since backtrader fills entry orders at the next bar's open.", "reason": "Spec says 'stop-loss 2% away from entry price'; the true entry price is the filled price, not the close on the signal bar."},
+  {"topic": "stop-loss evaluation", "choice": "Manual stop logic checked once per bar by comparing the bar's close price to the fixed 2% stop level.", "reason": "Spec explicitly allows 'Backtrader stop orders or manual stop logic'; manual close-based checking is simplest to reconcile with the other exit conditions (RSI reversal, time exit) without managing multiple concurrent order types."},
+  {"topic": "re-entry within a day", "choice": "A new qualifying entry is allowed later the same day after a position is closed (stop/RSI/time), as long as it is still within the 11:30-14:30 window and daily bias is unchanged.", "reason": "The spec's 'at most one position at a time' is a concurrency constraint, not an explicit once-per-day limit; nothing in the spec restricts trade count per day."},
+  {"topic": "midday window boundary", "choice": "The 11:30 bar itself is eligible for entries (window treated as inclusive of 11:30), since that bar's close is simultaneously used to determine the morning bias.", "reason": "Spec states the midday window as '11:30-14:30' and derives the bias from the 11:30 close, implying trading can begin on that same bar."},
+  {"topic": "warm-up / first trading day", "choice": "Relied on backtrader's automatic minperiod (max of RSI(14) and 20-bar volume SMA); next() is not called until bar 20, so the first trading day may have no signals.", "reason": "Canonical default: no manual bar-skipping beyond backtrader's automatic minperiod."},
+  {"topic": "feed timezone", "choice": "Assumed the PandasData feed's datetime values represent US/Eastern wall-clock time directly, and compared bar times against naive datetime.time objects (09:30, 11:30, 14:30) accordingly.", "reason": "The data description states bars are already timestamped in US/Eastern (-04:00); backtrader operates on the local wall-clock component of the feed's datetimes."}
+]}
+```

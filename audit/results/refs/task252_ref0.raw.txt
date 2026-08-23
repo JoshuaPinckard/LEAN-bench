@@ -1,0 +1,111 @@
+```python
+import backtrader as bt
+
+
+class TechnicalBreakoutStrategy(bt.Strategy):
+    params = (
+        ('sma_period', 200),
+        ('ema_fast_period', 8),
+        ('ema_slow_period', 20),
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('atr_period', 14),
+        ('atr_sma_period', 14),
+        ('vol_sma_period', 20),
+        ('vol_mult', 1.2),
+        ('bb_width_sma_period', 20),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('tp_atr_mult', 3.0),
+        ('sl_atr_mult', 1.5),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.ema8 = bt.indicators.EMA(self.data.close, period=self.p.ema_fast_period)
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_slow_period)
+
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.bb_width = self.bb.top - self.bb.bot
+        self.bb_width_sma = bt.indicators.SMA(self.bb_width, period=self.p.bb_width_sma_period)
+
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.macd_cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+
+        self.order = None
+        self.atr_at_entry = None
+        self.target_price = None
+        self.stop_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed and order.isbuy():
+            entry_price = order.executed.price
+            self.target_price = entry_price + self.p.tp_atr_mult * self.atr_at_entry
+            self.stop_price = entry_price - self.p.sl_atr_mult * self.atr_at_entry
+
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            squeeze_yesterday = self.bb_width[-1] < self.bb_width_sma[-1]
+            breakout = self.data.close[0] > self.bb.top[0]
+            trend = (
+                self.data.close[0] > self.sma200[0]
+                and self.ema8[0] > self.ema20[0]
+                and self.data.close[0] > self.ema8[0]
+            )
+            confirmation = (
+                self.atr[0] > self.atr_sma[0]
+                and self.data.volume[0] > self.p.vol_mult * self.vol_sma[0]
+            )
+
+            if breakout and squeeze_yesterday and trend and confirmation:
+                entry_price_est = self.data.close[0]
+                atr_now = self.atr[0]
+                stop_est = entry_price_est - self.p.sl_atr_mult * atr_now
+                risk_per_share = entry_price_est - stop_est
+                if risk_per_share > 0:
+                    risk_amount = self.p.risk_pct * self.broker.getvalue()
+                    size = risk_amount / risk_per_share
+                    if size > 0:
+                        self.atr_at_entry = atr_now
+                        self.order = self.buy(size=size)
+        else:
+            close = self.data.close[0]
+            if close >= self.target_price:
+                self.order = self.close()
+            elif close <= self.stop_price:
+                self.order = self.close()
+            elif close < self.ema20[0] or self.macd_cross[0] < 0:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "risk percentage", "choice": "Use 1% (the conservative end of the stated 1-2% range) of current portfolio value (self.broker.getvalue()) as the risk amount per trade for stop-loss sizing.", "reason": "Spec gives a range ('no more than 1-2%') rather than a single value; a deterministic reference implementation requires one fixed number, and capital base ('capital') is not otherwise defined so current portfolio value was used."},
+  {"topic": "position sizing inputs", "choice": "Size is computed from the signal-day close and current ATR(14) as estimates of entry price and stop price, before the buy order is actually filled.", "reason": "Backtrader's default (non-cheat-on-close) execution fills market orders at the next bar's open, not the signal day's close, so the exact fill price is unknown at order-submission time; the signal-day values are used as the best available estimate for sizing."},
+  {"topic": "ATR at time of entry", "choice": "The ATR(14) value from the signal day (the day all entry conditions were confirmed and the buy order was submitted) is captured and used to compute the take-profit and stop-loss levels once the order fills.", "reason": "'ATR(14) at the time of entry' is ambiguous between the signal day and the fill day; using the signal-day value keeps this consistent with the spec's rule that all decisions are made on closing prices of the respective day."},
+  {"topic": "exit evaluation basis", "choice": "Take-profit, stop-loss, and the EMA(20)/MACD trailing exit are all evaluated against the daily close price, not intrabar high/low.", "reason": "The spec states 'All decisions are made based on the closing prices of the respective day,' applied uniformly to both entries and exits."},
+  {"topic": "exit condition priority", "choice": "Each bar, take-profit is checked first, then stop-loss, then the EMA(20)/MACD weakness exit; only one close() is issued per bar.", "reason": "The spec does not state a priority order among these three exit triggers when more than one could apply on the same close, so a fixed evaluation order was chosen for determinism."}
+]}
+```

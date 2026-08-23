@@ -1,0 +1,72 @@
+{
+  "task_id": 35,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport math\nimport collections\nimport statistics\n\n\nclass TrendChannelBreakoutStrategy(bt.Strategy):\n    params = (\n        ('stop_loss_pct', 0.01),\n        ('risk_pct', 0.01),\n        ('volatility_threshold_pct', 0.01),\n        ('volume_filter_ratio', 0.5),\n        ('session_end_hour', 15),\n        ('session_end_minute', 0),\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data, period=14)\n        self.tsi = bt.indicators.TSI(self.data)\n        self.sma20 = bt.indicators.SMA(self.data, period=20)\n        self.sma50 = bt.indicators.SMA(self.data, period=50)\n\n        self.order = None\n        self.last_date = None\n\n        self.upper_channel = None\n        self.lower_channel = None\n        self.day_skipped = False\n\n        self.cum_pv = 0.0\n        self.cum_vol = 0.0\n        self.vwap = None\n\n        self.pvt = 0.0\n\n        self.bucket_volume = 0.0\n        self.volume_history = collections.defaultdict(list)\n\n        self.entry_price = None\n        self.entry_stop_price = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status == order.Completed:\n            if order.isbuy():\n                self.entry_price = order.executed.price\n                if self.lower_channel is not None:\n                    self.entry_stop_price = min(\n                        self.entry_price * (1 - self.p.stop_loss_pct),\n                        self.lower_channel,\n                    )\n                else:\n                    self.entry_stop_price = self.entry_price * (1 - self.p.stop_loss_pct)\n            else:\n                self.entry_price = None\n                self.entry_stop_price = None\n            self.order = None\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n            self.entry_stop_price = None\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        t = self.data.datetime.time(0)\n\n        if dt != self.last_date:\n            self.last_date = dt\n            self.upper_channel = None\n            self.lower_channel = None\n            self.day_skipped = False\n            self.cum_pv = 0.0\n            self.cum_vol = 0.0\n            self.vwap = None\n            self.bucket_volume = 0.0\n\n        typical_price = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0\n        vol = self.data.volume[0]\n        self.cum_pv += typical_price * vol\n        self.cum_vol += vol\n        if self.cum_vol > 0:\n            self.vwap = self.cum_pv / self.cum_vol\n\n        if len(self) > 1 and self.data.close[-1] != 0:\n            self.pvt += vol * (self.data.close[0] - self.data.close[-1]) / self.data.close[-1]\n\n        if (t.hour, t.minute) == (9, 55):\n            self.upper_channel = self.data.high[0]\n        if (t.hour, t.minute) == (10, 0):\n            self.lower_channel = self.data.low[0]\n            if self.upper_channel is not None and self.lower_channel > 0:\n                channel_range_pct = (self.upper_channel - self.lower_channel) / self.lower_channel\n                if channel_range_pct > self.p.volatility_threshold_pct:\n                    self.day_skipped = True\n\n        self.bucket_volume += vol\n        is_5m_close = (t.minute % 5 == 4)\n\n        if self.position and self.order is None:\n            if self.entry_stop_price is not None and self.data.low[0] <= self.entry_stop_price:\n                self.order = self.close()\n            elif self.upper_channel is not None and self.data.close[0] <= self.upper_channel:\n                self.order = self.close()\n            elif self.data.low[0] <= self.sma50[0]:\n                self.order = self.close()\n\n        if is_5m_close:\n            time_key = (t.hour, (t.minute // 5) * 5)\n            hist = self.volume_history[time_key]\n            volume_ok = True\n            if hist:\n                avg_vol = statistics.mean(hist)\n                if avg_vol > 0 and self.bucket_volume < self.p.volume_filter_ratio * avg_vol:\n                    volume_ok = False\n\n            if (not self.position and self.order is None and not self.day_skipped\n                    and self.upper_channel is not None and self.lower_channel is not None\n                    and (t.hour, t.minute) <= (self.p.session_end_hour, self.p.session_end_minute)):\n\n                breakout = self.data.close[0] > self.upper_channel\n                trend_ok = self.sma20[0] > self.sma50[0]\n                momentum_ok = (self.rsi[0] > 50) or (self.tsi.tsi[0] > 0)\n\n                if breakout and trend_ok and momentum_ok and volume_ok:\n                    entry_price_est = self.data.close[0]\n                    stop_price = min(\n                        entry_price_est * (1 - self.p.stop_loss_pct),\n                        self.lower_channel,\n                    )\n                    risk_per_share = entry_price_est - stop_price\n                    if risk_per_share > 0:\n                        risk_amount = self.p.risk_pct * self.broker.getvalue()\n                        size = int(risk_amount / risk_per_share)\n                        if size > 0:\n                            self.entry_stop_price = stop_price\n                            self.order = self.buy(size=size)\n\n            self.volume_history[time_key].append(self.bucket_volume)\n            self.bucket_volume = 0.0",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "The harness supplies a single 1-minute feed only, so no true resampled 5-minute OHLC feed is available. A 5-minute close is synthesized by treating the 1-minute bar whose minute-of-hour mod 5 equals 4 (e.g. 9:34, 9:39, ...) as the close of the 5-minute candle beginning at the corresponding :x0/:x5 mark, and using that 1-minute bar's close as the '5m close' for breakout/reversal evaluation.",
+      "reason": "Spec requires 5m execution signals but the environment fixes a single 1m data feed; this is the closest literal reading without a second resampled feed."
+    },
+    {
+      "topic": "warm-up interaction with day 1",
+      "choice": "Relied on backtrader's automatic minperiod (SMA50/TSI need ~50 bars) per canonical default 6, which delays the first next() call past the 9:55/10:00 capture bars on the very first trading day. As a result no channel is established and no trades occur on day 1; channel construction and trading behave normally from day 2 onward.",
+      "reason": "Canonical default 6 mandates relying on automatic minperiod with no manual bar-skipping since the spec states no warm-up handling; this is a declared side effect, not a workaround."
+    },
+    {
+      "topic": "volatility filter threshold",
+      "choice": "Skip the trading day if (9:55 high - 10:00 low) / 10:00 low > 1.0%.",
+      "reason": "Spec says 'unusually large' without a number; 1.0% of SPY intraday price was chosen as a concrete, conservative threshold for a 5-minute range."
+    },
+    {
+      "topic": "stop-loss percentage",
+      "choice": "Fixed stop-loss of 1.0% below entry, further floored to be at or below the lower channel line: stop_price = min(entry*(1-1%), lower_channel).",
+      "reason": "Spec offers '0.5% or 1.0%' and separately requires the stop be placed below the lower channel line; 1.0% was chosen and combined via min() to literally satisfy both stated constraints. The 'recent swing low' alternative was not implemented since the spec presents it as an alternative ('or') to the fixed-percentage method."
+    },
+    {
+      "topic": "position sizing risk percentage",
+      "choice": "Risk 1% of current broker equity per trade: size = (risk_pct * broker.getvalue()) / (estimated_entry_price - stop_price).",
+      "reason": "Spec gives '1% or 2%' without specifying which; 1% chosen as the more conservative option matching the stated small-account risk focus."
+    },
+    {
+      "topic": "position sizing entry-price estimate",
+      "choice": "Order size and stop distance at submission time use the breakout bar's close as an estimated entry price; the actual stop price is then recalculated from the real fill price in notify_order once the order completes.",
+      "reason": "Backtrader's default broker fills market orders at the next bar's open, so the true entry price is unknown at order-submission time; the estimate is the closest literal approach without introducing custom order types the spec doesn't request."
+    },
+    {
+      "topic": "lower white trend line",
+      "choice": "Interpreted the 'lower white trend line' used for take-profit as the SMA50 (the slower/lower of the SMA20-over-SMA50 bullish pair the spec offers as the trend-line proxy). Exit triggers when the bar's low touches or drops through SMA50.",
+      "reason": "Spec names 'white trend lines' as a drawing-based concept not available in OHLCV/indicator form, and explicitly offers the SMA20-over-SMA50 pair as its proxy; SMA50 is the one that sits below in a bullish regime, matching 'lower'."
+    },
+    {
+      "topic": "momentum confirmation inclusion and logic",
+      "choice": "Implemented as a required entry filter (despite being labeled 'optional but recommended') using OR logic: RSI(14) > 50 OR TSI > 0.",
+      "reason": "The condition is listed as a numbered entry step; 'and/or' was read literally as inclusive-or (at least one true) rather than requiring both."
+    },
+    {
+      "topic": "volume filter definition",
+      "choice": "'Significantly lower than average volume for that time of day' implemented as: the 5-minute breakout bucket's summed volume must be >= 50% of the historical mean bucket volume observed at the same time-of-day slot on prior days in the dataset. If no prior-day history exists yet for that slot, the filter passes by default.",
+      "reason": "Spec gives no explicit threshold; 50% was chosen as a concrete 'significantly lower' cutoff, and same-time-of-day history is built incrementally across the multi-day dataset without look-ahead (only prior days' values are used before the current day's value is appended)."
+    },
+    {
+      "topic": "trend reversal and whipsaw protection merged",
+      "choice": "Both rules are implemented as a single check evaluated on every 1-minute bar while a position is open: if the close drops back to or below the upper channel line, close the position immediately.",
+      "reason": "The two stated rules ('closes back inside the channel' and 'immediately breaks back into the channel after entry') describe the same underlying condition at different re-check cadences; checking every bar satisfies both the 5m-close-based reversal rule and the immediacy required for whipsaw protection without duplicate/conflicting logic."
+    },
+    {
+      "topic": "PVT and VWAP usage",
+      "choice": "PVT and VWAP are computed every bar (PVT cumulative across the whole dataset; VWAP reset daily per standard session-VWAP convention) but are not wired into any entry/exit gating condition.",
+      "reason": "The spec lists them under 'Trend Confirmation Indicators' but gives no explicit threshold or rule for their use in the Entry/Exit sections, unlike RSI, TSI, and the SMA pair which have explicit stated rules; per the instructions, no extra filter was invented for indicators the spec doesn't give a rule for."
+    },
+    {
+      "topic": "time filter scope",
+      "choice": "The 3:00 PM session-end cutoff blocks new entries only; open positions continue to be managed (stop-loss, take-profit, reversal) regardless of time.",
+      "reason": "Spec says 'do not take any trades' after the cutoff, which reads as blocking new entries; risk management on existing positions is a distinct, ongoing obligation the spec doesn't suggest suspending."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

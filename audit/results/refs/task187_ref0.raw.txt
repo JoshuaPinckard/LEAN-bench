@@ -2,71 +2,84 @@
 import backtrader as bt
 
 
-class PeriodicRebalance(bt.Strategy):
-    # Single-asset periodic rebalancing at a constant 100% target weight.
-    # Enter 100% on the start date, force a full close + immediate re-open
-    # every 12 weeks (to book transaction costs), and exit at 52 weeks.
-
-    params = (
-        ('rebalance_weeks', 12),
-        ('horizon_weeks', 52),
-        ('target', 1.0),
+class SingleAssetPeriodicRebalance(bt.Strategy):
+    params = dict(
+        rebalance_weeks=12,
+        horizon_weeks=52,
+        commission=0.001,
     )
 
     def __init__(self):
         self.order = None
-        self.entered = False
-        self.done = False
-        self.pending_reentry = False
-        self.weeks_elapsed = 0
+        self.action = None
         self.last_week_key = None
+        self.week_count = 0
+        self.cycle_entry_week = None
+        self.last_rebalance_elapsed = 0
+        self.need_open = True
+        self.is_new_cycle = True
+
+    def _target_size(self):
+        cash = self.broker.getcash()
+        price = self.data.close[0]
+        if price <= 0:
+            return 0
+        return int(cash / (price * (1 + self.p.commission)))
 
     def notify_order(self, order):
         if order.status in (order.Submitted, order.Accepted):
             return
-        if order.status in (order.Completed, order.Canceled,
-                             order.Margin, order.Rejected):
-            self.order = None
+        if order.status == order.Completed:
+            if self.action == 'open_new_cycle':
+                self.cycle_entry_week = self.week_count
+                self.last_rebalance_elapsed = 0
+            elif self.action == 'close_rebalance':
+                self.need_open = True
+                self.is_new_cycle = False
+            elif self.action == 'exit':
+                self.need_open = True
+                self.is_new_cycle = True
+                self.cycle_entry_week = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if self.action in ('open_new_cycle', 'open_rebalance'):
+                self.need_open = True
+        self.order = None
+        self.action = None
 
     def next(self):
-        # Weekly cadence derived from the daily feed via ISO-week boundaries.
-        week_key = self.data.datetime.date(0).isocalendar()[:2]
-        new_week = week_key != self.last_week_key
-        self.last_week_key = week_key
+        key = self.data.datetime.date(0).isocalendar()[:2]
+        if key != self.last_week_key:
+            self.last_week_key = key
+            self.week_count += 1
 
-        # Entry: on the start date (first available bar) buy 100% of portfolio.
-        if not self.entered:
-            self.order = self.order_target_percent(target=self.p.target)
-            self.entered = True
-            self.weeks_elapsed = 0
+        if self.order is not None:
             return
 
-        if new_week:
-            self.weeks_elapsed += 1
-
-        # Rebalance second leg: re-open 100% the bar after the forced close,
-        # once the close has settled and cash is freed.
-        if self.pending_reentry and not self.position and self.order is None:
-            self.order = self.order_target_percent(target=self.p.target)
-            self.pending_reentry = False
+        if self.need_open:
+            size = self._target_size()
+            if size > 0:
+                self.order = self.buy(size=size)
+                self.action = 'open_new_cycle' if self.is_new_cycle else 'open_rebalance'
+            self.need_open = False
             return
 
-        if self.done:
-            return
-
-        if new_week and self.order is None:
-            # Exit: at the end of the 52-week horizon, close and lock in.
-            if self.weeks_elapsed >= self.p.horizon_weeks:
+        if self.position and self.cycle_entry_week is not None:
+            elapsed = self.week_count - self.cycle_entry_week
+            if elapsed >= self.p.horizon_weeks:
                 self.order = self.close()
-                self.done = True
+                self.action = 'exit'
                 return
-            # Rebalance every 12 weeks: full close, then immediate re-open.
-            if (self.weeks_elapsed > 0 and
-                    self.weeks_elapsed % self.p.rebalance_weeks == 0):
+            if elapsed > 0 and elapsed % self.p.rebalance_weeks == 0 and elapsed != self.last_rebalance_elapsed:
+                self.last_rebalance_elapsed = elapsed
                 self.order = self.close()
-                self.pending_reentry = True
+                self.action = 'close_rebalance'
                 return
 ```
 ```json
-{"assumptions": [{"topic": "infeasible", "choice": "Implement a single 52-week trajectory starting at the first available bar (2020-01-02) instead of 50 independent random-start backtests, and do not average metrics inside the strategy.", "reason": "The harness runs ONE backtest over the fixed 2020-2025 feed with a single strategy instance; 50 separate backtests with independent capital and random starts (each needing a full 52-week forward horizon) cannot be spawned from within one bt.Strategy, and 50 sequential 52-week cycles would exceed the ~6 years of data. Closest literal reading: one full-horizon run whose orders form the comparable execution trace."}, {"topic": "infeasible", "choice": "Do not compute or report total return / maximum drawdown / Sharpe (nor their 50-run averages) inside the strategy.", "reason": "These metrics and their averaging are the Monte-Carlo reporting layer that sits outside a single strategy class; the harness/analyzers evaluate the one run. With only one trajectory available there is nothing to average."}, {"topic": "weekly timeframe", "choice": "Operate on the supplied daily feed and drive the 12-/52-week schedule by counting ISO-week boundary crossings, rather than adding a resampled weekly feed.", "reason": "cerebro (and thus cerebro.resampledata) is fixed by the harness and gives a single daily PandasData feed; a weekly resampled feed cannot be created from within the strategy, so weekly cadence is reconstructed from daily bars via date.isocalendar()."}, {"topic": "start date", "choice": "Use the first available bar as the entry/start date.", "reason": "The spec's selected start date is unconstrained in a single run except that it needs a full 52-week forward horizon; the first bar (2020-01-02) has the entire remaining feed ahead of it, satisfying the horizon requirement."}, {"topic": "rebalance mechanics", "choice": "Model each 12-week rebalance as self.close() on the trigger bar followed by order_target_percent(1.0) on the next bar (a one-bar, ~1-day gap), and size all 100% allocations with order_target_percent rather than plain buy.", "reason": "The spec explicitly states 100% weight and a full close + immediate re-open to incur commissions on both legs. backtrader nets a same-bar round-trip (order_target_percent would emit no trade at target, skipping the second commission) and same-bar close+buy sizing risks margin rejection from overnight gaps; re-opening on the next bar reliably books both the sell and buy commissions on the current (commission-decayed) portfolio value while keeping the round-trip effectively immediate at weekly cadence."}, {"topic": "week counting", "choice": "Rebalance when the elapsed ISO-week count is a positive multiple of 12 (weeks 12/24/36/48) and exit when it reaches 52, with weeks counted from the entry week.", "reason": "The spec ties actions to a weekly schedule (every 12 weeks; end of 52 weeks); counting week-boundary crossings from entry yields the stated 12/24/36/48 rebalances and a 52-week close, giving segments 12+12+12+12+4 = 52 weeks."}]}
+{"assumptions": [
+  {"topic": "weekly timeframe", "choice": "Track weekly cadence by counting ISO calendar-week transitions on the daily feed (increment a week counter whenever date().isocalendar()[:2] changes) instead of actually resampling to weekly bars.", "reason": "Cerebro/data-feed setup, including any resampling, is fixed by the harness; only the single daily self.data feed is available, so true weekly resampling of the spec's 'working timeframe' cannot be added."},
+  {"topic": "infeasible", "choice": "Implement only the entry -> rebalance-every-12-weeks -> exit-at-52-weeks trading rule as one continuous run over the fixed dataset, with the first cycle starting on the first bar and each subsequent cycle chained immediately after the prior cycle's exit.", "reason": "The spec's testing protocol (50 random start dates, one independent backtest per date, then averaging Total Return/Max Drawdown/Sharpe across runs) requires launching many separate backtests and reporting aggregated statistics. The harness runs exactly one Strategy over one fixed cerebro instance and forbids any executing/printing/top-level code outside the strategy class, so multi-run random sampling and cross-run metric averaging cannot be implemented here."},
+  {"topic": "position sizing", "choice": "Size each buy as floor(available_cash / (signal-bar close * 1.001)), i.e. as much of current cash as fits after the 0.1% commission.", "reason": "The spec explicitly calls for 100% portfolio allocation on entry and at every rebalance, which is a stated sizing rule (not covered by the plain-buy canonical default), so size must be computed from available cash rather than left to the default sizer."},
+  {"topic": "order timing", "choice": "The close-then-reopen at each rebalance/cycle transition is submitted as two sequential orders (close, then buy once the close fills) rather than an intra-bar simultaneous close+reopen.", "reason": "Backtrader's default broker fills market orders on a following bar, not instantaneously within the same next() call; true same-instant close-and-reopen is not available in this environment."}
+]}
 ```

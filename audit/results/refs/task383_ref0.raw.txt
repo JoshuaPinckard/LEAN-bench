@@ -1,0 +1,123 @@
+```python
+import math
+import backtrader as bt
+
+
+class AutocorrZScore(bt.Indicator):
+    lines = ('corr', 'z')
+    params = (('period', 20),)
+
+    def __init__(self):
+        self.addminperiod(2 * self.p.period)
+
+    def _update_corr(self):
+        period = self.p.period
+        if len(self.data) < period + 1:
+            self.lines.corr[0] = float('nan')
+            return
+        x = [self.data.close[-i] for i in range(period)]
+        y = [self.data.close[-i] for i in range(1, period + 1)]
+        mean_x = sum(x) / period
+        mean_y = sum(y) / period
+        cov = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+        var_x = sum((xi - mean_x) ** 2 for xi in x)
+        var_y = sum((yi - mean_y) ** 2 for yi in y)
+        denom = math.sqrt(var_x * var_y)
+        self.lines.corr[0] = (cov / denom) if denom != 0 else 0.0
+
+    def _update_z(self):
+        period = self.p.period
+        if len(self.data) < 2 * period:
+            self.lines.z[0] = float('nan')
+            return
+        history = [self.lines.corr[-i] for i in range(period)]
+        if any(math.isnan(v) for v in history):
+            self.lines.z[0] = float('nan')
+            return
+        mean_c = sum(history) / period
+        var_c = sum((v - mean_c) ** 2 for v in history) / period
+        std_c = math.sqrt(var_c)
+        self.lines.z[0] = 0.0 if std_c == 0 else (self.lines.corr[0] - mean_c) / std_c
+
+    def prenext(self):
+        self._update_corr()
+        self._update_z()
+
+    def next(self):
+        self._update_corr()
+        self._update_z()
+
+
+class AutocorrMeanReversionStrategy(bt.Strategy):
+    params = (
+        ('lookback', 20),
+        ('entry_z', 2.0),
+        ('stop_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.zind = AutocorrZScore(self.data, period=self.p.lookback)
+        self.entry_order = None
+        self.stop_order = None
+        self.close_order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        terminal = order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected)
+
+        if order is self.entry_order:
+            if order.status == order.Completed:
+                if order.isbuy():
+                    stop_price = order.executed.price * (1 - self.p.stop_pct)
+                    self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price)
+                else:
+                    stop_price = order.executed.price * (1 + self.p.stop_pct)
+                    self.stop_order = self.buy(exectype=bt.Order.Stop, price=stop_price)
+            if terminal:
+                self.entry_order = None
+        elif order is self.stop_order:
+            if terminal:
+                self.stop_order = None
+        elif order is self.close_order:
+            if terminal:
+                self.close_order = None
+
+    def next(self):
+        z0 = self.zind.lines.z[0]
+        z1 = self.zind.lines.z[-1]
+        if math.isnan(z0) or math.isnan(z1):
+            return
+
+        if self.position:
+            if self.close_order is not None:
+                return
+            if self.position.size > 0:
+                crossed = z1 < 0 and z0 >= 0
+            else:
+                crossed = z1 > 0 and z0 <= 0
+            if crossed:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.close_order = self.close()
+            return
+
+        if self.entry_order is not None or self.stop_order is not None or self.close_order is not None:
+            return
+
+        if z0 > self.p.entry_z and z0 < z1:
+            self.entry_order = self.sell()
+        elif z0 < -self.p.entry_z and z0 > z1:
+            self.entry_order = self.buy()
+```
+```json
+{"assumptions": [
+  {"topic": "autocorrelation_definition", "choice": "Used the primary definition given: rolling Pearson correlation (LookbackPeriod=20) between close and its 1-bar-lagged close, rather than the parenthetical returns-based alternative.", "reason": "Spec offers two equivalent options; the close-vs-lagged-close version is stated first and is the direct literal reading."},
+  {"topic": "variance_convention", "choice": "Used population (N-divisor) variance/standard deviation for both the correlation window and the rolling mean/std of the correlation series.", "reason": "Spec does not specify sample vs. population std; population form matches backtrader's built-in StandardDeviation indicator convention, used as the bench's implicit default where unstated."},
+  {"topic": "entry_turn_definition", "choice": "Interpreted 'z > +2.0 and then z turns down' (and the mirrored long case) as both conditions evaluated on the current bar: z[0] beyond the threshold AND z[0] < z[-1] (or > for the long case).", "reason": "Spec's parenthetical example (z[0] < z[-1]) only defines the turn; it does not state a separate bar for the threshold breach, so the most literal reading applies both clauses to the same signal bar."},
+  {"topic": "exit_cross_definition", "choice": "Implemented 'z crossing back through 0' as a true sign-crossing check between z[-1] and z[0] (opposite sides of zero on consecutive bars), rather than z[0] alone reaching zero.", "reason": "Faithfully captures 'crossing' as a two-bar event, matching standard crossover semantics."},
+  {"topic": "stop_loss_mechanism", "choice": "Placed a native backtrader Stop order at 2% from the actual filled entry price immediately after entry executes; it is canceled if the mean-reversion (z-cross) exit fires first, and vice versa.", "reason": "Spec states a stop-loss level but not its implementation mechanics; a broker-side stop order is the closest literal reading of 'place a stop loss'."},
+  {"topic": "degenerate_variance_guard", "choice": "If the correlation-window variance is zero, corr is set to 0.0; if the rolling std of corr is zero, z is set to 0.0 (both avoid division by zero).", "reason": "Spec does not address zero-variance edge cases; this is a minimal, non-signal-generating fallback for an event not expected to occur with continuous 5-minute price data."}
+]}
+```

@@ -1,0 +1,105 @@
+```python
+import backtrader as bt
+
+
+class ChandelierStops(bt.Indicator):
+    lines = ('longstop', 'shortstop')
+    params = dict(lookback_n=22, atr_mult=3.0, atr_period=14)
+
+    def __init__(self):
+        atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        highest = bt.indicators.Highest(self.data.high, period=self.p.lookback_n)
+        lowest = bt.indicators.Lowest(self.data.low, period=self.p.lookback_n)
+        self.long_stop_raw = highest - self.p.atr_mult * atr
+        self.short_stop_raw = lowest + self.p.atr_mult * atr
+        self._initialized = False
+
+    def next(self):
+        lraw = self.long_stop_raw[0]
+        sraw = self.short_stop_raw[0]
+
+        if not self._initialized:
+            self.lines.longstop[0] = lraw
+            self.lines.shortstop[0] = sraw
+            self._initialized = True
+            return
+
+        close_prev = self.data.close[-1]
+        prev_long = self.lines.longstop[-1]
+        prev_short = self.lines.shortstop[-1]
+
+        if close_prev > prev_long:
+            self.lines.longstop[0] = max(prev_long, lraw)
+        else:
+            self.lines.longstop[0] = lraw
+
+        if close_prev < prev_short:
+            self.lines.shortstop[0] = min(prev_short, sraw)
+        else:
+            self.lines.shortstop[0] = sraw
+
+
+class ChandelierAdxStrategy(bt.Strategy):
+    params = dict(
+        lookback_n=22,
+        atr_mult=3.0,
+        adx_threshold=25,
+        atr_period=14,
+        adx_period=14,
+    )
+
+    def __init__(self):
+        self.adx = bt.indicators.ADX(self.data, period=self.p.adx_period)
+        self.stops = ChandelierStops(
+            self.data,
+            lookback_n=self.p.lookback_n,
+            atr_mult=self.p.atr_mult,
+            atr_period=self.p.atr_period,
+        )
+        self.long_stop = self.stops.lines.longstop
+        self.short_stop = self.stops.lines.shortstop
+
+        self.long_cross = bt.indicators.CrossOver(self.data.close, self.long_stop)
+        self.short_cross = bt.indicators.CrossOver(self.data.close, self.short_stop)
+
+        self.orders = []
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order in self.orders:
+                self.orders.remove(order)
+
+    def next(self):
+        if self.orders:
+            return
+
+        adx_ok = self.adx[0] > self.p.adx_threshold
+        long_entry_signal = self.long_cross[0] > 0
+        long_exit_signal = self.long_cross[0] < 0
+        short_entry_signal = self.short_cross[0] < 0
+        short_exit_signal = self.short_cross[0] > 0
+
+        long_entry = adx_ok and long_entry_signal
+        short_entry = adx_ok and short_entry_signal
+
+        if not self.position:
+            if long_entry:
+                self.orders.append(self.buy())
+            elif short_entry:
+                self.orders.append(self.sell())
+        elif self.position.size > 0:
+            if short_entry:
+                self.orders.append(self.close())
+                self.orders.append(self.sell())
+            elif long_exit_signal:
+                self.orders.append(self.close())
+        elif self.position.size < 0:
+            if long_entry:
+                self.orders.append(self.close())
+                self.orders.append(self.buy())
+            elif short_exit_signal:
+                self.orders.append(self.close())
+```
+```json
+{"assumptions": [{"topic": "trailing_stop_eligibility", "choice": "Interpreted 'in/eligible for long' as: previous bar's close was above the previous bar's LongStop (uptrend regime intact) -> ratchet LongStop = max(LongStop[1], LongStopRaw); otherwise reset LongStop = LongStopRaw. Symmetric rule for ShortStop using previous close vs previous ShortStop. This is the standard published Chandelier Exit ratchet convention and keeps the trailing-stop lines self-contained (price/ATR-based only), matching the instruction to implement them as custom lines independent of strategy position state.", "reason": "The spec's phrase 'in/eligible for long' does not define eligibility explicitly; tying it to position state would require the indicator to reach into the strategy, which conflicts with implementing the stops as standalone custom lines."}, {"topic": "exit_mechanism", "choice": "Implemented exits via close-crossing-the-stop-line signals (CrossOver) rather than a continuously replaced stop order.", "reason": "The spec explicitly offers this as an equivalent alternative ('or place a stop order ... updated each bar'); the crossover approach is simpler and composes cleanly with the required reversal logic."}, {"topic": "signal_priority", "choice": "When both a reversal (opposite-direction ADX-gated entry) and a plain same-bar exit signal are true, the reversal takes priority (close+flip) over a plain exit. When flat and both long and short entry signals fire on the same bar, long entry takes priority.", "reason": "The spec does not specify tie-breaking for simultaneous signals; this is the closest literal reading that preserves both the 'exit on stop cross' and 'reversal on opposite signal' rules without silently dropping one."}]}
+```

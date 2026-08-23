@@ -1,0 +1,127 @@
+```python
+import backtrader as bt
+
+
+class ORBFibonacciStrategy(bt.Strategy):
+    params = (
+        ('ema_fast_period', 9),
+        ('ema_slow_period', 21),
+        ('fib_38', 0.382),
+        ('fib_62', 0.618),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.ema_fast = bt.indicators.EMA(self.data.close, period=self.p.ema_fast_period)
+        self.ema_slow = bt.indicators.EMA(self.data.close, period=self.p.ema_slow_period)
+
+        self.order = None
+        self.current_date = None
+        self.or_set = False
+        self.orh = None
+        self.orl = None
+        self.long_fib38 = None
+        self.long_fib62 = None
+        self.short_fib38 = None
+        self.short_fib62 = None
+        self.breakout_up = False
+        self.breakout_down = False
+
+        self.cum_pv = 0.0
+        self.cum_vol = 0.0
+        self.vwap = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        bar_date = self.data.datetime.date(0)
+
+        if self.current_date is None or bar_date != self.current_date:
+            if self.position:
+                self.close()
+            self.current_date = bar_date
+            self.or_set = False
+            self.orh = None
+            self.orl = None
+            self.breakout_up = False
+            self.breakout_down = False
+            self.cum_pv = 0.0
+            self.cum_vol = 0.0
+            self.vwap = None
+
+        typical_price = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0
+        self.cum_pv += typical_price * self.data.volume[0]
+        self.cum_vol += self.data.volume[0]
+        if self.cum_vol > 0:
+            self.vwap = self.cum_pv / self.cum_vol
+
+        if not self.or_set:
+            self.orh = self.data.high[0]
+            self.orl = self.data.low[0]
+            range_ = self.orh - self.orl
+            self.long_fib38 = self.orh - self.p.fib_38 * range_
+            self.long_fib62 = self.orh - self.p.fib_62 * range_
+            self.short_fib38 = self.orl + self.p.fib_38 * range_
+            self.short_fib62 = self.orl + self.p.fib_62 * range_
+            self.or_set = True
+            return
+
+        if self.order:
+            return
+
+        close = self.data.close[0]
+
+        if self.position:
+            if self.position.size > 0:
+                if close <= self.orl:
+                    self.order = self.close()
+            elif self.position.size < 0:
+                if close >= self.orh:
+                    self.order = self.close()
+            return
+
+        if close > self.orh:
+            self.breakout_up = True
+        if close < self.orl:
+            self.breakout_down = True
+
+        ema_fast_up = self.ema_fast[0] > self.ema_fast[-1]
+        ema_slow_up = self.ema_slow[0] > self.ema_slow[-1]
+        ema_fast_down = self.ema_fast[0] < self.ema_fast[-1]
+        ema_slow_down = self.ema_slow[0] < self.ema_slow[-1]
+
+        if self.breakout_up:
+            pulled_back = close <= self.long_fib38 or close <= self.long_fib62
+            if pulled_back and ema_fast_up and ema_slow_up and self.vwap is not None and close > self.vwap:
+                stop_price = self.orl
+                risk_per_share = close - stop_price
+                if risk_per_share > 0:
+                    size = int((self.broker.getvalue() * self.p.risk_pct) / risk_per_share)
+                    if size > 0:
+                        self.order = self.buy(size=size)
+
+        if self.breakout_down:
+            pulled_back = close >= self.short_fib38 or close >= self.short_fib62
+            if pulled_back and ema_fast_down and ema_slow_down and self.vwap is not None and close < self.vwap:
+                stop_price = self.orh
+                risk_per_share = stop_price - close
+                if risk_per_share > 0:
+                    size = int((self.broker.getvalue() * self.p.risk_pct) / risk_per_share)
+                    if size > 0:
+                        self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "opening-range-definition", "choice": "ORH/ORL are the High/Low of the first 15-minute bar of each trading day (bars are already 15m, so 'first 15 minutes' = first bar of the session).", "reason": "Spec defines ORB from the first 15 minutes of the day; on a 15m feed that is exactly one bar."},
+  {"topic": "fibonacci-direction", "choice": "Long pullback levels measured retracing down from ORH (ORH - 0.382*range, ORH - 0.618*range); short pullback levels measured retracing up from ORL (ORL + 0.382*range, ORL + 0.618*range).", "reason": "Standard Fibonacci retracement convention measures the retracement from the boundary that was just broken, matching the breakout direction; spec is silent on which boundary anchors the retracement."},
+  {"topic": "price-reference", "choice": "Use Close price uniformly for all level comparisons: ORH/ORL breakout, fib pullback proximity, VWAP comparison, and exit checks.", "reason": "Spec does not specify intrabar (High/Low) vs. close-based checks; using Close consistently avoids arbitrarily mixing bases across conditions."},
+  {"topic": "ema-slope-definition", "choice": "'Sloping upward/downward' = current bar's EMA value compared to the immediately preceding bar's EMA value.", "reason": "Simplest literal reading of slope direction with only OHLCV bar data available."},
+  {"topic": "vwap-reset", "choice": "VWAP resets at the start of each trading day (session-anchored), computed as cumulative(((H+L+C)/3)*Volume)/cumulative(Volume).", "reason": "Standard convention for intraday VWAP; consistent with the strategy's single-day trading scope, though spec does not explicitly state the reset."},
+  {"topic": "tp-sl-collapse", "choice": "Take-profit ('reaching' the opposite boundary) and stop-loss ('a break of' the same boundary) are implemented as a single unified exit check at that boundary (Close <= ORL for long, Close >= ORH for short).", "reason": "The spec's literal wording places both the long TP and the long SL at ORL (and both the short TP and SL at ORH) -- the two stated exit rules reference the identical trigger level, so they collapse to one condition without inventing an artificial distinction."},
+  {"topic": "infeasible", "choice": "'Close all positions at end of the trading session' is implemented by force-closing any still-open position at the first bar of the next trading day rather than at the literal last bar of the prior session.", "reason": "backtrader processes bars strictly forward with no look-ahead in next(), so the literal last bar of a session cannot be detected in advance; closing on day-rollover is the closest achievable literal reading."},
+  {"topic": "risk-pct-value", "choice": "Fixed risk-per-trade at 1% of current portfolio value (self.broker.getvalue()).", "reason": "Spec states a range ('1-2%') rather than a single value; 1% is the more commonly cited conservative 'standard' risk-per-trade figure, and a single concrete parameter is required for execution."},
+  {"topic": "ema-daily-reset", "choice": "EMA(9) and EMA(21) are computed continuously across the whole dataset, not reset each day.", "reason": "Unlike VWAP, EMAs are not inherently session-anchored and the spec does not state a daily reset for them; canonical default is to rely on backtrader's automatic continuous indicator computation."}
+]}
+```

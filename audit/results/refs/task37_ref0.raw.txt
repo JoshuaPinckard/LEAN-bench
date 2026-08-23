@@ -1,0 +1,116 @@
+```python
+import backtrader as bt
+
+
+class TrendDayMACrossover(bt.Strategy):
+    params = (
+        ('ma_fast', 20),
+        ('ma_medium', 30),
+        ('ma_slow', 60),
+        ('consolidation_bars', 3),
+        ('consolidation_band', 0.01),
+        ('risk_pct', 0.02),
+        ('tp_level_1', 0.278),
+        ('tp_level_2', 0.28),
+        ('stop_level', 0.265),
+    )
+
+    def __init__(self):
+        self.ma20 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.ma_fast)
+        self.ma30 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.ma_medium)
+        self.ma60 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.ma_slow)
+        self.cross20 = bt.indicators.CrossOver(self.data.close, self.ma20)
+        self.cross30 = bt.indicators.CrossOver(self.data.close, self.ma30)
+
+        self.order = None
+        self.state = 0  # 0: no signal, 1: crossed above MA20, 2: crossed above MA30 (awaiting MA60 consolidation)
+
+        self.current_hour_key = None
+        self.hour_bucket_volume = 0.0
+        self.last_completed_hour_volume = None
+        self.hourly_volume_increasing = False
+
+    def _update_hourly_volume(self):
+        dt = self.data.datetime.datetime(0)
+        hour_key = (dt.year, dt.month, dt.day, dt.hour)
+        if self.current_hour_key is None:
+            self.current_hour_key = hour_key
+        if hour_key != self.current_hour_key:
+            completed_volume = self.hour_bucket_volume
+            if self.last_completed_hour_volume is not None:
+                self.hourly_volume_increasing = completed_volume > self.last_completed_hour_volume
+            self.last_completed_hour_volume = completed_volume
+            self.hour_bucket_volume = 0.0
+            self.current_hour_key = hour_key
+        self.hour_bucket_volume += self.data.volume[0]
+
+    def _is_consolidating_above_ma60(self):
+        n = self.p.consolidation_bars
+        if len(self) < n:
+            return False
+        for i in range(n):
+            close = self.data.close[-i]
+            ma60 = self.ma60[-i]
+            if close <= ma60:
+                return False
+            if abs(close - ma60) / ma60 > self.p.consolidation_band:
+                return False
+        return True
+
+    def _calc_size(self):
+        price = self.data.close[0]
+        value = self.broker.getvalue() * self.p.risk_pct
+        size = int(value / price)
+        return max(size, 1)
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        self._update_hourly_volume()
+
+        if self.order:
+            return
+
+        if not self.position:
+            if self.state == 0:
+                if self.cross20[0] > 0:
+                    self.state = 1
+            elif self.state == 1:
+                if self.data.close[0] < self.ma20[0]:
+                    self.state = 0
+                elif self.cross30[0] > 0:
+                    self.state = 2
+            elif self.state == 2:
+                if self.data.close[0] < self.ma30[0]:
+                    self.state = 0
+                elif self._is_consolidating_above_ma60() and self.hourly_volume_increasing:
+                    size = self._calc_size()
+                    self.order = self.buy(size=size)
+                    self.state = 0
+        else:
+            take_profit_hit = (
+                self.data.high[0] >= self.p.tp_level_1
+                or self.data.high[0] >= self.p.tp_level_2
+            )
+            stop_loss_hit = (
+                self.data.close[0] < self.p.stop_level
+                and self.data.close[0] < self.data.open[0]
+                and self.data.volume[0] > self.data.volume[-1]
+            )
+            if take_profit_hit or stop_loss_hit:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "moving_average_type", "choice": "Used SimpleMovingAverage for MA20/MA30/MA60", "reason": "Spec names periods but not a type; SMA is the plain baseline reading of 'Moving Averages'."},
+  {"topic": "consolidation_definition", "choice": "Quantified 'consolidates above MA60, sliding along it' as: last 3 bars all closing above MA60 and within 1% of MA60", "reason": "Spec describes the behavior qualitatively with no bar count or band width; picked minimal concrete values to make the rule testable."},
+  {"topic": "hourly_volume_aggregation", "choice": "Manually accumulated 5-minute bar volume into calendar-hour buckets and required the latest fully-completed hour's total volume to exceed the previous completed hour's total", "reason": "Harness supplies only the 5-minute feed, not an hourly one; this reproduces the stated 'hourly timeframe, bars grow in size' check from the available data. Partial buckets at each session open (9:30-10:00) are compared as-is, an accepted artifact of calendar-hour bucketing across day boundaries."},
+  {"topic": "position_sizing", "choice": "Size = floor(portfolio_value * 2% / price), minimum 1 share", "reason": "Spec explicitly calls for 'fixed percentage of capital, e.g. 1-2%' rather than deferring to the canonical default; picked 2% as a concrete point in the stated range."},
+  {"topic": "infeasible", "choice": "Implemented take-profit (0.278/0.28) and stop-loss (0.265) as literal absolute price levels compared against High/Close", "reason": "These levels are calibrated for a micro-cap/penny stock priced near $0.20-0.30 and are far below AAPL's 5-minute price range in this feed (~$150-250), so as literally written these exits will essentially never trigger on this asset; implemented literally per instructions rather than substituting a different mechanism."},
+  {"topic": "take_profit_trigger_basis", "choice": "Used intrabar High >= level for take-profit ('price reaches')", "reason": "Spec uses 'reaches' for take-profit versus the explicit 'closes below' used for stop-loss, so the two were given distinct High-vs-Close trigger bases to preserve that wording difference."},
+  {"topic": "stop_loss_volume_check", "choice": "Interpreted 'increasing volume (red bars)' in the stop-loss rule as current bar volume > prior bar volume, with current bar close < open", "reason": "This is a single-bar exit condition distinct from the hourly aggregate used for entries; spec's parenthetical 'red bars' ties it to bar-level volume/candle color rather than an hourly aggregate."},
+  {"topic": "sequential_reset", "choice": "If price closes back below the most recently broken MA (MA20 while awaiting the MA30 cross, or MA30 while awaiting MA60 consolidation) before the next stage completes, the state machine resets to the start", "reason": "Spec requires a strictly sequential breakout confirming an uptrend; falling back below the level just broken invalidates that sequential confirmation."}
+]}
+```

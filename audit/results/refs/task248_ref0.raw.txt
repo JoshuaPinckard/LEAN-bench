@@ -1,0 +1,138 @@
+```python
+import backtrader as bt
+
+
+class LiquidityShockProxyStrategy(bt.Strategy):
+    params = dict(
+        s_period=20,
+        vol_fast_period=10,
+        vol_slow_period=20,
+        atr_period=10,
+        atr_sma_period=50,
+        contraction_mult=0.8,
+        expansion_mult=1.2,
+        vol_ratio_mult=1.5,
+        price_change_thresh=0.001,
+        take_profit_pct=0.005,
+        stop_loss_pct=0.003,
+        risk_pct=0.01,
+        max_lots=3,
+    )
+
+    def __init__(self):
+        self.s = (self.data.high - self.data.low) / self.data.close
+        self.sma_s = bt.indicators.SMA(self.s, period=self.p.s_period)
+        self.sma_vol_fast = bt.indicators.SMA(self.data.volume, period=self.p.vol_fast_period)
+        self.sma_vol_slow = bt.indicators.SMA(self.data.volume, period=self.p.vol_slow_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.sma_atr = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.cross_s = bt.indicators.CrossOver(self.s, self.sma_s)
+
+        self.lots = []
+        self._lot_seq = 0
+        self.exit_refs = {}
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order.ref in self.exit_refs:
+                lot_id = self.exit_refs.pop(order.ref)
+                self.lots = [lot for lot in self.lots if lot['id'] != lot_id]
+            else:
+                direction = 1 if order.isbuy() else -1
+                self._lot_seq += 1
+                self.lots.append({
+                    'id': self._lot_seq,
+                    'entry_price': order.executed.price,
+                    'size': abs(order.executed.size),
+                    'direction': direction,
+                    'order_ref': None,
+                })
+        else:
+            lot_id = self.exit_refs.pop(order.ref, None)
+            if lot_id is not None:
+                for lot in self.lots:
+                    if lot['id'] == lot_id:
+                        lot['order_ref'] = None
+                        break
+
+    def next(self):
+        price = self.data.close[0]
+
+        if self.lots:
+            direction = self.lots[0]['direction']
+
+            crossed_exit = (direction == 1 and self.cross_s[0] > 0) or \
+                           (direction == -1 and self.cross_s[0] < 0)
+            if crossed_exit:
+                for lot in self.lots:
+                    if lot['order_ref'] is not None:
+                        continue
+                    order = self.close(size=lot['size'])
+                    lot['order_ref'] = order.ref
+                    self.exit_refs[order.ref] = lot['id']
+                return
+
+            for lot in self.lots:
+                if lot['order_ref'] is not None:
+                    continue
+                entry = lot['entry_price']
+                if direction == 1:
+                    hit_tp = price >= entry * (1 + self.p.take_profit_pct)
+                    hit_sl = price <= entry * (1 - self.p.stop_loss_pct)
+                else:
+                    hit_tp = price <= entry * (1 - self.p.take_profit_pct)
+                    hit_sl = price >= entry * (1 + self.p.stop_loss_pct)
+                if hit_tp or hit_sl:
+                    order = self.close(size=lot['size'])
+                    lot['order_ref'] = order.ref
+                    self.exit_refs[order.ref] = lot['id']
+
+        if len(self.lots) >= self.p.max_lots:
+            return
+
+        s0 = self.s[0]
+        sma_s0 = self.sma_s[0]
+        price_change = abs(self.data.close[0] - self.data.close[-1]) / self.data.close[-1]
+
+        vol_cond = self.sma_vol_fast[0] > self.p.vol_ratio_mult * self.sma_vol_slow[0]
+        atr_cond = self.atr[0] < self.sma_atr[0]
+        price_cond = price_change <= self.p.price_change_thresh
+
+        long_cond = s0 < self.p.contraction_mult * sma_s0 and vol_cond and atr_cond and price_cond
+        short_cond = s0 > self.p.expansion_mult * sma_s0 and vol_cond and atr_cond and price_cond
+
+        if not (long_cond or short_cond):
+            return
+
+        if self.lots:
+            existing_direction = self.lots[0]['direction']
+            if (existing_direction == 1 and not long_cond) or \
+               (existing_direction == -1 and not short_cond):
+                return
+
+        size = (self.p.risk_pct * self.broker.getvalue()) / price
+        if size <= 0:
+            return
+
+        if long_cond:
+            self.buy(size=size)
+        else:
+            self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "position_sizing", "choice": "Each order's size (shares) is set to exactly (1% of current broker.getvalue()) / current close price, re-evaluated per order.", "reason": "Spec says 'no more than 1% of capital' per order; 1% is the maximal literal size satisfying the constraint, and 'capital' is read as current total portfolio value rather than fixed initial cash."},
+  {"topic": "pyramiding_lot_cap", "choice": "Total simultaneously open lots capped at 3 (the initial entry counts toward this cap), not 3 additions on top of an initial entry.", "reason": "The spec's parenthetical 'no more than 3 simultaneously open lots for one asset' explicitly resolves the ambiguity of 'up to 3 additions' to a total cap of 3."},
+  {"topic": "pyramiding_direction", "choice": "Additional lots are only added in the same direction as the currently open lots; long and short lots are never held concurrently for the asset.", "reason": "The spec's long/short entry conditions are mutually exclusive triggers on the same signal (s vs SMA(s,20)); mixing directions in one pyramided position is not implied and would contradict having a single mandatory 0.3% stop-loss per entry."},
+  {"topic": "addition_trigger", "choice": "A new lot (addition) is opened whenever the same original entry condition (long or short) is true again on a later bar, provided the lot cap is not reached and no pending exit blocks that lot slot.", "reason": "Spec does not define a distinct 'addition' signal separate from the entry condition, so the entry condition is reused for additions, the most literal reading."},
+  {"topic": "exit_crossover_direction", "choice": "CrossOver(s, SMA(s,20)) exits are direction-filtered: an upward cross (s crossing above its SMA) closes long lots, a downward cross closes short lots.", "reason": "'s returns to SMA(s,20)' is only meaningful relative to which side s deviated from (below for longs, above for shorts); an undirected cross would spuriously exit the wrong side."},
+  {"topic": "exit_crossover_scope", "choice": "When the crossover exit fires, ALL currently open lots (up to 3) are closed together in that bar, rather than one lot at a time.", "reason": "The crossover condition is computed on the shared series s/SMA(s,20), not per-lot, so it is read as a position-level (not lot-level) exit signal, while take-profit/stop-loss remain per-lot since they depend on each lot's own entry price."},
+  {"topic": "tp_sl_per_lot", "choice": "Take-profit (0.5%) and stop-loss (0.3%) are evaluated independently for each lot against that lot's own entry price, using the bar's close price, closing only that lot's size when triggered.", "reason": "Spec states stop-loss is 'from the entry price' and each lot has its own entry, consistent with pyramiding up to 3 lots."},
+  {"topic": "tp_sl_evaluation_price", "choice": "Take-profit/stop-loss and crossover-exit conditions are evaluated against each bar's close (not intrabar high/low), with the resulting market close() order filling at the next bar's open per backtrader's default execution.", "reason": "Spec gives no intrabar execution rule and the single OHLCV feed with default (non-cheat-on-open) market order timing is the standard/available mechanism; using close avoids inventing intrabar-fill assumptions."},
+  {"topic": "order_guard_design", "choice": "Instead of a single blocking order-tracking flag, pending exit orders are tracked per lot (lot['order_ref']) and via an order-ref-to-lot map, since up to 3 lots can have independent, concurrently pending exit orders.", "reason": "The canonical single-order guard is designed for a single-position strategy; the spec's explicit multi-lot (up to 3) risk management requires tracking multiple concurrent orders without blocking unrelated lot exits/entries."},
+  {"topic": "order_sizing_fractional_shares", "choice": "Order sizes computed from the 1% capital rule are not rounded to whole shares.", "reason": "Spec gives a percentage-of-capital sizing rule without a rounding/lot-size rule, and backtrader's default broker accepts fractional sizes."}
+]}
+```

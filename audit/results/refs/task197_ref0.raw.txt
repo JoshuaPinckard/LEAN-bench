@@ -1,0 +1,99 @@
+```python
+        if order.status in [order.Canceled, order.Margin, order.Rejected]:
+            if order == self.entry_order:
+                self.entry_order = None
+                self.entry_submit_len = None
+                if self.state == 'ENTRY_PENDING':
+                    self._reset_trade_state()
+
+    def next(self):
+        if len(self) < 55:
+            return
+
+        high3 = self.data.high[-3]
+        low3 = self.data.low[-3]
+        is_pivot_high = (high3 > self.data.high[-6] and high3 > self.data.high[-5] and
+                          high3 > self.data.high[-4] and high3 > self.data.high[-2] and
+                          high3 > self.data.high[-1] and high3 > self.data.high[0])
+        is_pivot_low = (low3 < self.data.low[-6] and low3 < self.data.low[-5] and
+                         low3 < self.data.low[-4] and low3 < self.data.low[-2] and
+                         low3 < self.data.low[-1] and low3 < self.data.low[0])
+        if is_pivot_high:
+            self.last_pivot_high = high3
+        if is_pivot_low:
+            self.pivot_lows.append(low3)
+
+        uptrend = self.data.close[0] > self.sma[0] and self.sma[0] > self.sma[-5]
+        ascending = len(self.pivot_lows) == 2 and self.pivot_lows[1] > self.pivot_lows[0]
+
+        if self.state == 'ENTRY_PENDING':
+            if (self.entry_order is not None and
+                    self.entry_order.status in [self.entry_order.Submitted, self.entry_order.Accepted] and
+                    len(self) > self.entry_submit_len + 1):
+                self.cancel(self.entry_order)
+            return
+
+        if self.state == 'IDLE':
+            if (self.last_pivot_high is not None and uptrend and ascending and
+                    self.data.close[0] > self.last_pivot_high + 0.25 * self.atr[0]):
+                self.level = self.last_pivot_high
+                self.breakout_bar = len(self)
+                self.last_pivot_high = None
+                self.state = 'WATCHING_RETEST'
+            return
+
+        if self.state == 'WATCHING_RETEST':
+            days_since = len(self) - self.breakout_bar
+            if days_since > 10:
+                self._reset_trade_state()
+                return
+            if days_since < 1:
+                return
+
+            tol = 0.25 * self.atr[0]
+            touch = abs(self.data.low[0] - self.level) <= tol
+            if not touch:
+                return
+
+            body = abs(self.data.close[0] - self.data.open[0])
+            lower_wick = min(self.data.open[0], self.data.close[0]) - self.data.low[0]
+            hammer = lower_wick >= 1.5 * body and self.data.close[0] > self.data.open[0]
+            engulfing = (self.data.close[0] > self.data.high[-1] and
+                         self.data.open[0] <= self.data.close[-1])
+            wick_at_level = self.data.low[0] <= self.level and self.data.close[0] > self.data.open[0]
+            if not (hammer or engulfing or wick_at_level):
+                return
+
+            atr_pct = self.atr[0] / self.data.close[0]
+            range_pct = (self.data.high[0] - self.data.low[0]) / self.data.close[0]
+            if atr_pct > 0.025 or range_pct > 0.035:
+                return
+
+            atr_signal = self.atr[0]
+            entry_threshold = self.level + 0.5 * atr_signal
+            self.sl_price = self.level - 0.5 * atr_signal
+            r_max = entry_threshold - self.sl_price
+            equity = self.broker.getvalue()
+            size = int((0.01 * equity) / r_max) if r_max > 0 else 0
+            if size < 1:
+                self._reset_trade_state()
+                return
+
+            self.entry_order = self.buy(exectype=bt.Order.Limit,
+                                         price=entry_threshold, size=size)
+            self.entry_submit_len = len(self)
+            self.state = 'ENTRY_PENDING'
+            return
+```
+```json
+{"assumptions": [
+  {"topic": "pivot_window", "choice": "Pivot-high/low with 'window 3 bars' implemented as left=3/right=3 bars (bar's High/Low strictly exceeds all 3 bars on each side), confirmed with a 3-bar lag once the right-side bars are known.", "reason": "Spec gives only a single 'window 3 bars' figure; symmetric 3-left/3-right is the standard convention for pivot detection and requires strict inequality (ties are not pivots)."},
+  {"topic": "trend_gate_timing", "choice": "Uptrend and ascending-structure conditions are evaluated only at the moment of confirmed breakout (level definition), not re-checked during the retest window or at entry.", "reason": "Spec lists trend/channel conditions ahead of level definition, framing them as prerequisites for establishing that a pivot-high is 'former resistance in an uptrend'; no instruction to keep re-validating them afterward, and adding one would be an extra filter not stated."},
+  {"topic": "infeasible", "choice": "'Buy at the open of the next day only if Open <= S+0.5*ATR, else skip' is implemented as a Buy Limit order (price = S+0.5*ATR, computed on the signal day) submitted on the signal day and manually cancelled if unfilled after exactly one bar.", "reason": "Backtrader's next() cannot know tomorrow's open at decision time and a same-bar market order always fills on the following bar's open, not the bar being evaluated; a next-bar Limit order is the closest literal, broker-native mechanism that fills at the open when the open satisfies the threshold and lets the harness's default (non-cheat-on-open) broker enforce the price gate, expiring (skipping) after one bar otherwise."},
+  {"topic": "atr_timing", "choice": "ATR(14) used for the entry threshold and for SL (S-0.5*ATR) is the value on the retest/signal day, not the entry day.", "reason": "The entry-day ATR is unknown at the moment the order must be sized and submitted (signal day); using the last known ATR is the only causal choice."},
+  {"topic": "position_sizing", "choice": "Quantity is computed at signal-day order submission as floor(0.01*equity / (entry_threshold - SL)), using the worst-case anticipated entry price (S+0.5*ATR) rather than the actual (unknown) fill price; if this floors to 0, the setup is abandoned.", "reason": "Order size must be fixed at submission time, before the fill price is known; sizing off the worst-case entry price guarantees realized risk never exceeds the stated 1% cap."},
+  {"topic": "tp_size_rounding", "choice": "Position quantity is split into four tranches via integer floor division (base = size//4) for TP1-TP3, with TP4 absorbing the remainder so the sum exactly equals the filled size.", "reason": "Spec requires exact quarters but real order sizes are integers; this is the standard rounding convention and guarantees full closure by TP4."},
+  {"topic": "sl_management", "choice": "The single 'common SL' is implemented as a Stop order that is cancelled and resubmitted at the new remaining size after each partial TP fill.", "reason": "Backtrader has no native construct for a resting stop order whose size auto-adjusts as sibling limit orders partially fill; cancel-and-replace is the standard idiom to keep the stop covering exactly the remaining position."},
+  {"topic": "warmup_guard", "choice": "next() returns immediately while len(self) < 55 (SMA(50) minperiod plus the 5-bar-back and 6-bar pivot-window lookbacks).", "reason": "Backtrader's automatic minperiod only covers indicator objects (SMA(50), ATR(14)); manual indexing such as self.sma[-5] and the 6-bar pivot window is not tracked by it, so an explicit guard is required to avoid reading uninitialized history, not a spec-driven warm-up rule."}
+]}
+```

@@ -1,0 +1,106 @@
+```python
+import backtrader as bt
+import collections
+
+
+class DailySmaLimitOcoStrategy(bt.Strategy):
+    params = (
+        ('sma_period', 20),
+        ('tp_pct', 0.02),
+        ('sl_pct', 0.015),
+    )
+
+    def __init__(self):
+        self.daily_closes = collections.deque(maxlen=self.p.sma_period)
+        self.current_date = None
+        self.last_close = None
+        self.prev_close = None
+        self.prev_sma = None
+        self.entry_order = None
+        self.tp_order = None
+        self.sl_order = None
+
+    def _finalize_day(self, close_price):
+        self.daily_closes.append(close_price)
+        sma = None
+        if len(self.daily_closes) >= self.p.sma_period:
+            sma = sum(self.daily_closes) / self.p.sma_period
+
+        signal = None
+        if self.prev_close is not None and self.prev_sma is not None and sma is not None:
+            if self.prev_close <= self.prev_sma and close_price > sma:
+                signal = 'buy'
+            elif self.prev_close >= self.prev_sma and close_price < sma:
+                signal = 'sell'
+
+        self.prev_close = close_price
+        self.prev_sma = sma
+        return signal
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        o = self.data.open[0]
+        c = self.data.close[0]
+
+        if self.current_date is None:
+            self.current_date = dt
+        elif dt != self.current_date:
+            if self.entry_order is not None:
+                self.cancel(self.entry_order)
+                self.entry_order = None
+
+            close_of_prev_day = self.last_close
+            signal = self._finalize_day(close_of_prev_day)
+            self.current_date = dt
+
+            if signal is not None and not self.position and self.entry_order is None:
+                if signal == 'buy':
+                    self.entry_order = self.buy(exectype=bt.Order.Limit, price=close_of_prev_day)
+                else:
+                    self.entry_order = self.sell(exectype=bt.Order.Limit, price=o)
+
+        self.last_close = c
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order == self.entry_order:
+                self.entry_order = None
+                entry_price = order.executed.price
+                if order.isbuy():
+                    tp_price = entry_price * (1.0 + self.p.tp_pct)
+                    sl_price = entry_price * (1.0 - self.p.sl_pct)
+                    tp = self.sell(exectype=bt.Order.Limit, price=tp_price)
+                    sl = self.sell(exectype=bt.Order.Stop, price=sl_price, oco=tp)
+                else:
+                    tp_price = entry_price * (1.0 - self.p.tp_pct)
+                    sl_price = entry_price * (1.0 + self.p.sl_pct)
+                    tp = self.buy(exectype=bt.Order.Limit, price=tp_price)
+                    sl = self.buy(exectype=bt.Order.Stop, price=sl_price, oco=tp)
+                self.tp_order = tp
+                self.sl_order = sl
+            elif order == self.tp_order:
+                self.tp_order = None
+            elif order == self.sl_order:
+                self.sl_order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.entry_order:
+                self.entry_order = None
+            elif order == self.tp_order:
+                self.tp_order = None
+            elif order == self.sl_order:
+                self.sl_order = None
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Only a single hourly PandasData feed is provided by the harness (no separate daily feed and no strategy-level access to cerebro.resampledata). Daily bars are synthesized inside the strategy by grouping hourly bars per calendar date: daily open = open of that date's first hourly bar, daily close = close of that date's last hourly bar. SMA(20) is computed manually as a rolling mean of the last 20 synthesized daily closes instead of via a bt.indicators.SMA bound to a true daily data feed.", "reason": "The spec requires a genuine daily timeframe for signal generation, but the fixed execution environment supplies only one hourly feed and forbids strategy-level cerebro/data setup, so daily bars must be derived from the hourly series."},
+  {"topic": "order-execution-timing", "choice": "Day-rollover (and thus signal detection / new entry-order placement) is detected reactively when the first hourly bar of the new day arrives in next(). Because backtrader evaluates orders submitted in next() starting from the following bar, the entry limit order becomes eligible to fill from the 2nd hourly bar of day t+1 onward rather than its very first bar.", "reason": "This is standard, causal (non-lookahead) backtrader order-execution behavior for any next()-driven strategy; peeking ahead to place the order one bar earlier would introduce lookahead bias and is not idiomatic."},
+  {"topic": "entry order expiry", "choice": "Instead of using the order 'valid' parameter, the strategy explicitly cancels any still-pending entry order at the next day's rollover (i.e., once day t+1 has fully elapsed without a fill).", "reason": "Gives deterministic, auditable control over the 'not filled during day t+1 -> signal inactive' rule rather than relying on backtrader's internal intraday DAY-validity expiry semantics."},
+  {"topic": "signal overlap while in position", "choice": "Daily close/SMA tracking and crossover detection continue every day regardless of position state, but a new signal is only converted into an entry order when there is no open position and no pending entry order; signals arising while a position/pending order exists are dropped, not queued.", "reason": "Spec only describes inactivity for the unfilled-order case; combined with the canonical single-position/no-pyramiding rule, dropping overlapping signals is the simplest reading that avoids inventing a queuing mechanism the spec does not state."},
+  {"topic": "OCO bracket implementation", "choice": "After the entry order fills, the take-profit (limit) and stop-loss (stop) orders are submitted separately using backtrader's native oco= linkage (sl order created with oco=tp order) rather than buy_bracket()/sell_bracket().", "reason": "Spec explicitly separates the initial limit entry from the post-fill OCO pair; buy_bracket/sell_bracket would submit all three orders together at signal time, which does not match 'immediately after it is filled, place an OCO bracket'."},
+  {"topic": "entry price for TP/SL levels", "choice": "+2%/-1.5% offsets are computed from order.executed.price (the actual fill price) of the entry order, not the originally submitted limit price.", "reason": "Spec says '+2% from the entry price', which is most literally the price at which the position was actually entered."},
+  {"topic": "crossover comparison", "choice": "Upward cross defined as prev_close <= prev_SMA20 and close > SMA20 (today); downward cross defined as prev_close >= prev_SMA20 and close < SMA20 (today), using each day's contemporaneous close/SMA pair.", "reason": "Spec does not give exact inequality operators; this mirrors the standard CrossOver convention (e.g. bt.indicators.CrossOver) for close-vs-SMA crossovers."}
+]}
+```

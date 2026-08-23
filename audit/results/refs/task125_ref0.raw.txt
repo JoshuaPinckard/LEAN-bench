@@ -1,0 +1,146 @@
+```python
+import backtrader as bt
+
+
+class AutoRegressiveGradientDescentStrategy(bt.Strategy):
+    params = dict(
+        sma_period=50,
+        rsi_period=14,
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        ar_order=5,
+        learning_rate=1e-6,
+        vol_period=20,
+        vol_multiplier=1.5,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.01,
+        rsi_entry_low=40,
+        rsi_entry_high=60,
+        rsi_overbought=70,
+        rsi_oversold=30,
+        risk_fraction=0.01,
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.macd_cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.stddev = bt.indicators.StandardDeviation(self.data.close, period=self.p.vol_period)
+
+        self.order = None
+        self.entry_price = None
+
+        self.ar_weights = [0.0] * (self.p.ar_order + 1)
+        self.prev_features = None
+        self.next_prediction = None
+
+        self.vol_sum = 0.0
+        self.vol_count = 0
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            self.entry_price = order.executed.price
+            self.order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _ar_predict(self, features):
+        pred = self.ar_weights[0]
+        for i in range(self.p.ar_order):
+            pred += self.ar_weights[i + 1] * features[i]
+        return pred
+
+    def _ar_update(self, actual):
+        error = actual - self.next_prediction
+        lr = self.p.learning_rate
+        self.ar_weights[0] += lr * error
+        for i in range(self.p.ar_order):
+            self.ar_weights[i + 1] += lr * error * self.prev_features[i]
+
+    def next(self):
+        current_close = self.data.close[0]
+
+        model_signal = None
+        if len(self.data) >= self.p.ar_order:
+            if self.next_prediction is not None:
+                self._ar_update(current_close)
+
+            features_now = [self.data.close[-i] for i in range(self.p.ar_order)]
+            prediction = self._ar_predict(features_now)
+            if prediction > current_close:
+                model_signal = 'up'
+            elif prediction < current_close:
+                model_signal = 'down'
+
+            self.prev_features = features_now
+            self.next_prediction = prediction
+
+        current_vol = self.stddev[0]
+        vol_ok = True
+        if self.vol_count > 0:
+            historical_avg_vol = self.vol_sum / self.vol_count
+            if historical_avg_vol > 0 and current_vol > historical_avg_vol * self.p.vol_multiplier:
+                vol_ok = False
+        self.vol_sum += current_vol
+        self.vol_count += 1
+
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0:
+                exit_long = (
+                    current_close >= self.entry_price * (1 + self.p.take_profit_pct)
+                    or current_close <= self.entry_price * (1 - self.p.stop_loss_pct)
+                    or self.rsi[0] > self.p.rsi_overbought
+                    or self.macd_cross[0] < 0
+                )
+                if exit_long:
+                    self.order = self.close()
+            elif self.position.size < 0:
+                exit_short = (
+                    current_close <= self.entry_price * (1 - self.p.take_profit_pct)
+                    or current_close >= self.entry_price * (1 + self.p.stop_loss_pct)
+                    or self.rsi[0] < self.p.rsi_oversold
+                    or self.macd_cross[0] > 0
+                )
+                if exit_short:
+                    self.order = self.close()
+        else:
+            if vol_ok and model_signal is not None:
+                size = (self.p.risk_fraction * self.broker.getvalue()) / current_close
+                long_signal = (
+                    model_signal == 'up'
+                    and current_close > self.sma[0]
+                    and self.p.rsi_entry_low <= self.rsi[0] <= self.p.rsi_entry_high
+                    and self.macd_cross[0] > 0
+                )
+                short_signal = (
+                    model_signal == 'down'
+                    and current_close < self.sma[0]
+                    and self.p.rsi_entry_low <= self.rsi[0] <= self.p.rsi_entry_high
+                    and self.macd_cross[0] < 0
+                )
+                if long_signal:
+                    self.order = self.buy(size=size)
+                elif short_signal:
+                    self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "autoregressive model design", "choice": "Implemented an online AR(5) linear model on the last 5 closing prices (weights initialized to zero, updated each bar via single-sample stochastic gradient descent with learning rate 1e-6 to minimize squared prediction error). The model forecasts next bar's close; 'increase' predicted if forecast > current close, 'decrease' if forecast < current close.", "reason": "Spec requires 'an autoregressive learning model with gradient descent' but specifies no lag order, learning rate, or feature scaling. A small fixed order and a conservative learning rate were chosen since raw price-level features are unnormalized and a larger rate causes divergent oscillation."},
+  {"topic": "MACD histogram crossing its signal line", "choice": "Interpreted as the MACD line crossing its signal line, via bt.indicators.CrossOver(macd.macd, macd.signal).", "reason": "The MACD histogram is defined as macd-signal and has no independent signal line of its own; the histogram crossing zero is mathematically identical to the MACD line crossing the signal line, so this is the closest literal, internally-consistent reading."},
+  {"topic": "short position take-profit/stop-loss direction", "choice": "For shorts, take-profit triggers when price falls 2% below entry and stop-loss triggers when price rises 1% above entry, mirroring the long-side percentages.", "reason": "The spec restates the same 2%/1% thresholds for short exits without stating direction; mirroring is the only reading consistent with TP/SL acting as profit-taking/loss-limiting on a short."},
+  {"topic": "historical average volatility", "choice": "Tracked an expanding (cumulative) average of the 20-period StandardDeviation indicator from strategy start through the prior bar; new entries are blocked when the current bar's 20-period std dev exceeds that running average by more than 50% (> average * 1.5).", "reason": "Spec references a 'historical average' without specifying its window; an expanding average from inception, compared excluding the current bar, is the natural literal reading of 'historical'."},
+  {"topic": "position sizing", "choice": "Position size in shares = (1% of current broker portfolio value) / current close price, applied to both long and short entries.", "reason": "Spec explicitly caps position size at 1% of total trading capital, overriding the bench's plain-buy() default sizing convention."}
+]}
+```

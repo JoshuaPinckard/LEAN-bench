@@ -1,0 +1,144 @@
+```python
+import math
+
+import backtrader as bt
+
+
+class StochasticFullReversalStrategy(bt.Strategy):
+    params = (
+        ('stoch_period', 14),
+        ('period_dfast', 3),
+        ('period_dslow', 3),
+        ('atr_period', 14),
+        ('oversold', 20),
+        ('overbought', 80),
+        ('exit_level', 50),
+        ('stop_pct', 0.02),
+        ('risk_per_trade', 0.01),
+    )
+
+    def __init__(self):
+        self.stoch = bt.indicators.StochasticFull(
+            self.data,
+            period=self.p.stoch_period,
+            period_dfast=self.p.period_dfast,
+            period_dslow=self.p.period_dslow,
+        )
+        self.percK = self.stoch.percK
+        self.percD = self.stoch.percD
+        self.crossover = bt.indicators.CrossOver(self.percK, self.percD)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.order = None
+        self.order_action = None
+        self.entry_price = None
+        self.stop_price = None
+        self.pending_direction = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if self.order_action == 'enter_long':
+                self.entry_price = order.executed.price
+                self.stop_price = self.entry_price * (1 - self.p.stop_pct)
+            elif self.order_action == 'enter_short':
+                self.entry_price = order.executed.price
+                self.stop_price = self.entry_price * (1 + self.p.stop_pct)
+            elif self.order_action == 'close':
+                self.entry_price = None
+                self.stop_price = None
+
+        self.order = None
+        self.order_action = None
+
+    def _enter_long(self):
+        price_est = self.data.close[0]
+        stop_distance = price_est * self.p.stop_pct
+        equity = self.broker.getvalue()
+        size = math.floor((equity * self.p.risk_per_trade) / stop_distance)
+        if size > 0:
+            self.order = self.buy(size=size)
+            self.order_action = 'enter_long'
+
+    def _enter_short(self):
+        price_est = self.data.close[0]
+        stop_distance = price_est * self.p.stop_pct
+        equity = self.broker.getvalue()
+        size = math.floor((equity * self.p.risk_per_trade) / stop_distance)
+        if size > 0:
+            self.order = self.sell(size=size)
+            self.order_action = 'enter_short'
+
+    def next(self):
+        if self.order:
+            return
+
+        k0 = self.percK[0]
+        k1 = self.percK[-1]
+        cross = self.crossover[0]
+
+        long_signal = cross > 0 and k1 < self.p.oversold
+        short_signal = cross < 0 and k1 > self.p.overbought
+
+        if self.position:
+            if self.position.size > 0 and self.data.low[0] <= self.stop_price:
+                self.order = self.close()
+                self.order_action = 'close'
+                return
+            if self.position.size < 0 and self.data.high[0] >= self.stop_price:
+                self.order = self.close()
+                self.order_action = 'close'
+                return
+
+            crossed_down_50 = k1 >= self.p.exit_level and k0 < self.p.exit_level
+            crossed_up_50 = k1 <= self.p.exit_level and k0 > self.p.exit_level
+
+            if self.position.size > 0 and crossed_down_50:
+                self.order = self.close()
+                self.order_action = 'close'
+                return
+            if self.position.size < 0 and crossed_up_50:
+                self.order = self.close()
+                self.order_action = 'close'
+                return
+
+            if self.position.size > 0 and short_signal:
+                self.order = self.close()
+                self.order_action = 'close'
+                self.pending_direction = 'short'
+                return
+            if self.position.size < 0 and long_signal:
+                self.order = self.close()
+                self.order_action = 'close'
+                self.pending_direction = 'long'
+                return
+        else:
+            # Opposite-signal closes remember the intended new direction; the
+            # crossover condition is a single-bar event and won't re-trigger here.
+            if self.pending_direction == 'long':
+                self.pending_direction = None
+                self._enter_long()
+                return
+            if self.pending_direction == 'short':
+                self.pending_direction = None
+                self._enter_short()
+                return
+
+            if long_signal:
+                self._enter_long()
+            elif short_signal:
+                self._enter_short()
+```
+```json
+{"assumptions": [
+  {"topic": "stochastic_lines", "choice": "Use StochasticFull's literal percK and percD lines (not percDSlow) for the '%K'/'%D' referenced in the spec.", "reason": "backtrader's StochasticFull exposes three lines (percK, percD, percDSlow); the spec's parenthetical '(use %K and %D)' most directly maps to the indicator's own percK/percD attribute names."},
+  {"topic": "atr_unused", "choice": "Compute ATR(period=14) as an indicator per the spec, but do not use it in the sizing formula.", "reason": "The spec states ATR is 'for sizing' but the sizing formula it defines (stop_distance_dollars = abs(entry_price - stop_price)) is driven entirely by the fixed 2% stop, not ATR; the ATR indicator is included literally as required but is not wired into any calculation, matching the letter of both statements without inventing an ATR-based blend the spec never specifies."},
+  {"topic": "stop_management", "choice": "Manage the 2% stop manually each bar (compare bar High/Low to a tracked stop_price) rather than submitting Backtrader bracket orders.", "reason": "The spec offers 'bracket orders ... or manage stops manually each bar' as an explicit either/or; manual management integrates more directly with the position-sizing formula and the %K-50 discretionary exit, which a simple bracket stop/limit pair cannot express."},
+  {"topic": "stop_trigger_price", "choice": "Trigger the stop by comparing stop_price against intrabar Low (longs) / High (shorts), not just the bar Close.", "reason": "A fixed stop-loss is conventionally understood to trigger on intrabar price touch; using High/Low is the closest literal reading of a 'stop' with only OHLCV data available."},
+  {"topic": "entry_price_for_sizing", "choice": "Estimate entry_price as the signal bar's Close when computing stop_distance_dollars and order size; after the market order fills, recompute the actual stop_price from order.executed.price.", "reason": "Backtrader market orders submitted in next() fill at the following bar's open, so the true entry price is unknown at sizing time; the spec's formula requires entry_price to size the order, so the current Close is used as the best available estimate, and the stop level is corrected to the true fill price once known."},
+  {"topic": "size_cash_cap", "choice": "Do not apply an explicit cash/margin cap to the computed size.", "reason": "The spec marks this cap as optional ('optionally cap'); with risk_per_trade=1% and stop_pct=2%, position notional value is always exactly 50% of equity regardless of price, which stays within the starting cash, so no cap was added."},
+  {"topic": "exit_priority", "choice": "When multiple exit conditions coincide on the same bar, check stop-loss first, then the %K-50 exit, then an opposite entry signal.", "reason": "The spec does not state a priority order for coincident exit triggers; stop-loss is treated as the primary risk-control check since it is described as a hard-priced boundary, evaluated ahead of the discretionary indicator-based exits."}
+]}
+```

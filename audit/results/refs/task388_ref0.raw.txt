@@ -2,57 +2,39 @@
 import backtrader as bt
 
 
-class WilliamsRMomentumATR(bt.Strategy):
-    params = dict(
-        wr_period=14,          # Williams %R period
-        mom_period=14,         # Momentum period
-        atr_period=14,         # ATR period
-        wr_cross_long=-80,     # %R level crossed UP through for a long entry
-        wr_cross_short=-20,    # %R level crossed DOWN through for a short entry
-        atr_mult=2.0,          # adjustable ATR multiple for the protective stop
-        trailing=False,        # False = static stop from entry (default);
-                               # True  = stop updated each bar (trailing/volatility stop)
+class WilliamsMomentumATRStrategy(bt.Strategy):
+    params = (
+        ('wr_period', 14),
+        ('mom_period', 14),
+        ('atr_period', 14),
+        ('atr_mult', 2.0),
+        ('trailing_stop', False),
     )
 
     def __init__(self):
-        # Built-in Backtrader indicators, exactly as specified
-        self.wr = bt.indicators.WilliamsR(self.data, period=self.p.wr_period)
-        self.mom = bt.indicators.Momentum(self.data, period=self.p.mom_period)
+        self.williams = bt.indicators.WilliamsR(self.data, period=self.p.wr_period)
+        self.momentum = bt.indicators.Momentum(self.data, period=self.p.mom_period)
         self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
-
-        self.order = None        # pending-order guard
-        self.stop_price = None    # active protective stop level
+        self.order = None
+        self.stop_price = None
 
     def notify_order(self, order):
-        if order.status in (order.Submitted, order.Accepted):
-            return
         if order.status == order.Completed:
-            if self.position:
-                # A fresh entry just filled -> set the protective stop from entry price.
-                entry = order.executed.price
-                if self.position.size > 0:      # long
-                    self.stop_price = entry - self.p.atr_mult * self.atr[0]
-                else:                           # short
-                    self.stop_price = entry + self.p.atr_mult * self.atr[0]
-            else:
-                # A close just filled -> flat, no stop.
-                self.stop_price = None
-        # Completed / Canceled / Margin / Rejected -> release the guard
-        self.order = None
+            if order.isbuy():
+                self.stop_price = order.executed.price - self.p.atr_mult * self.atr[0]
+            elif order.issell():
+                self.stop_price = order.executed.price + self.p.atr_mult * self.atr[0]
+
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
 
     def next(self):
-        # Entry signals (evaluated every bar; also used as opposite-signal exits)
-        long_signal = (self.wr[-1] <= self.p.wr_cross_long and
-                       self.wr[0] > self.p.wr_cross_long and
-                       self.mom[0] > 0)
-        short_signal = (self.wr[-1] >= self.p.wr_cross_short and
-                        self.wr[0] < self.p.wr_cross_short and
-                        self.mom[0] < 0)
-
         if self.order:
             return
 
-        # ---- Flat: look for an entry ----
+        long_signal = self.williams[-1] <= -80 and self.williams[0] > -80 and self.momentum[0] > 0
+        short_signal = self.williams[-1] >= -20 and self.williams[0] < -20 and self.momentum[0] < 0
+
         if not self.position:
             if long_signal:
                 self.order = self.buy()
@@ -60,26 +42,37 @@ class WilliamsRMomentumATR(bt.Strategy):
                 self.order = self.sell()
             return
 
-        # ---- In a position: protective stop first, then opposite-signal exit ----
-        if self.position.size > 0:  # long
-            if self.p.trailing:
-                # trailing volatility stop: ratchet up, never down
-                cand = self.data.close[0] - self.p.atr_mult * self.atr[0]
-                self.stop_price = cand if self.stop_price is None else max(self.stop_price, cand)
-            if self.stop_price is not None and self.data.low[0] <= self.stop_price:
+        if self.position.size > 0:
+            if short_signal:
                 self.order = self.close()
-            elif short_signal:
+                return
+            if self.data.close[0] <= self.stop_price:
                 self.order = self.close()
-        else:                       # short
-            if self.p.trailing:
-                # trailing volatility stop: ratchet down, never up
-                cand = self.data.close[0] + self.p.atr_mult * self.atr[0]
-                self.stop_price = cand if self.stop_price is None else min(self.stop_price, cand)
-            if self.stop_price is not None and self.data.high[0] >= self.stop_price:
+                return
+            if self.p.trailing_stop:
+                new_stop = self.data.close[0] - self.p.atr_mult * self.atr[0]
+                if new_stop > self.stop_price:
+                    self.stop_price = new_stop
+
+        elif self.position.size < 0:
+            if long_signal:
                 self.order = self.close()
-            elif long_signal:
+                return
+            if self.data.close[0] >= self.stop_price:
                 self.order = self.close()
+                return
+            if self.p.trailing_stop:
+                new_stop = self.data.close[0] + self.p.atr_mult * self.atr[0]
+                if new_stop < self.stop_price:
+                    self.stop_price = new_stop
 ```
 ```json
-{"assumptions": [{"topic": "atr_mult default", "choice": "atr_mult defaults to 2.0", "reason": "Spec calls the ATR multiple 'adjustable' but states no default value; 2.0 is a common protective-stop multiple and is exposed as a parameter."}, {"topic": "static vs trailing default", "choice": "trailing=False by default (static stop fixed at entry); trailing=True updates the stop each bar", "reason": "Spec requires the default to be a static-from-entry stop with an optional trailing/volatility mode selectable via a parameter."}, {"topic": "trailing stop definition", "choice": "When trailing=True, each bar recompute close - atr_mult*ATR (long) / close + atr_mult*ATR (short) and move the stop only in the favorable direction (ratchet)", "reason": "Spec gives the stop formula relative to a reference price but only says 'updated each bar as a trailing/volatility stop'; anchoring the moving stop to the current close and ratcheting is the standard volatility-stop reading."}, {"topic": "static stop ATR value", "choice": "For the static stop, ATR at the fill bar (self.atr[0] in notify_order) is used together with the executed entry price", "reason": "Spec ties the stop to 'entry_price' and ATR; the fill bar is the point of entry, so its ATR is used to fix the level."}, {"topic": "stop evaluation/execution", "choice": "The stop is evaluated in next() against the current bar's intrabar low (long) / high (short); a hit triggers self.close(), which fills at the next bar's open. Stop is checked before the opposite-signal exit", "reason": "Spec is silent on the stop's order mechanics; a next()-based touch check on low/high is the deterministic, closest literal reading of a protective stop on OHLCV bars, and precedence must be resolved."}, {"topic": "opposite-signal exit / no reversal", "choice": "On an opposite entry signal while in a position, only close (canonical single-position rule); a new position is opened only on a later bar when flat", "reason": "Spec's exit rule says 'close an open position' and does not state reversal; canonical default #3 forbids re-entry while a position is open."}, {"topic": "intraday / seasonality", "choice": "All 5-minute bars are treated identically with no time-of-day, session, or calendar filters", "reason": "Spec says run on intraday data without seasonality assumptions."}]}
+{"assumptions": [
+  {"topic": "position sizing", "choice": "plain self.buy()/self.sell()/self.close() with no explicit size argument", "reason": "spec is silent on sizing; canonical default applies"},
+  {"topic": "stop mechanism implementation", "choice": "protective stop is monitored manually in next() by comparing self.data.close[0] to a stored stop_price and issuing self.close() when breached, rather than submitting a native backtrader StopOrder", "reason": "spec requires the stop to optionally recompute each bar as a trailing stop, which is naturally expressed as a per-bar level check alongside the opposite-signal exit check; a static broker-side stop order could not be dynamically re-priced without cancel/resubmit each bar"},
+  {"topic": "static vs trailing stop", "choice": "default is a static stop fixed at entry (atr_mult * ATR from entry_price, using the ATR value at the bar the entry order fills); a boolean parameter trailing_stop=False can be set True to instead ratchet the stop each bar (long stop only moves up, short stop only moves down) using the then-current ATR", "reason": "spec explicitly asks to specify in code whether stop is static (default) or optionally trailing via a parameter, but does not define the trailing update mechanics, so a standard one-directional ratchet was chosen"},
+  {"topic": "ATR value used at stop initialization", "choice": "the ATR value read in notify_order at order completion (the bar the position actually fills), paired with order.executed.price", "reason": "entry price and the bar of actual fill are only known at order completion; spec does not specify which bar's ATR to use at entry"},
+  {"topic": "re-entry after exit", "choice": "no same-bar re-entry after a position is closed (via opposite signal or stop); a new entry can only occur on a subsequent bar's fresh signal check", "reason": "canonical default: hold at most one position at a time, no pyramiding or re-entry while a position is open; spec does not override this"},
+  {"topic": "warm-up handling", "choice": "no manual bar-skipping; relies on backtrader's automatic minperiod across WilliamsR, Momentum, and ATR", "reason": "canonical default and spec silence on warm-up handling"}
+]}
 ```

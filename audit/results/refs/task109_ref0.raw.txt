@@ -1,0 +1,178 @@
+```python
+import backtrader as bt
+import collections
+
+
+class QLearningIndicatorStrategy(bt.Strategy):
+    params = dict(
+        sma_period=20,
+        rsi_period=14,
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        bb_period=20,
+        bb_dev=2,
+        position_pct=0.10,
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        alpha=0.1,
+        gamma=0.95,
+        optimistic_init=1.0,
+    )
+
+    ACTION_NOTHING = 0
+    ACTION_BUY = 1
+    ACTION_SELL = 2
+    ACTION_CLOSE = 3
+
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.sma_period)
+        self.rsi = bt.indicators.RSI(
+            self.data.close, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.bbands = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev)
+
+        self.order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.target_price = None
+
+        self.q_table = collections.defaultdict(
+            lambda: [0.0, self.p.optimistic_init,
+                     self.p.optimistic_init, self.p.optimistic_init])
+        self.prev_state = None
+        self.prev_action = None
+        self.pending_reward = 0.0
+
+    def _position_status(self):
+        if self.position.size > 0:
+            return 1
+        elif self.position.size < 0:
+            return 2
+        return 0
+
+    def _current_state(self):
+        close = self.data.close[0]
+        sma_state = 1 if close > self.sma[0] else 0
+
+        rsi_val = self.rsi[0]
+        if rsi_val < 30:
+            rsi_state = 0
+        elif rsi_val > 70:
+            rsi_state = 2
+        else:
+            rsi_state = 1
+
+        macd_state = 1 if self.macd.macd[0] > self.macd.signal[0] else 0
+
+        if close < self.bbands.bot[0]:
+            bb_state = 0
+        elif close > self.bbands.top[0]:
+            bb_state = 2
+        else:
+            bb_state = 1
+
+        return (sma_state, rsi_state, macd_state, bb_state, self._position_status())
+
+    def _valid_actions(self, pos_status):
+        if pos_status == 0:
+            return [self.ACTION_NOTHING, self.ACTION_BUY, self.ACTION_SELL]
+        return [self.ACTION_NOTHING, self.ACTION_CLOSE]
+
+    def _select_action(self, state):
+        valid = self._valid_actions(state[4])
+        q_values = self.q_table[state]
+        best_action = valid[0]
+        best_value = q_values[valid[0]]
+        for a in valid[1:]:
+            if q_values[a] > best_value:
+                best_value = q_values[a]
+                best_action = a
+        return best_action
+
+    def _update_q(self, state):
+        if self.prev_state is None:
+            self.pending_reward = 0.0
+            return
+        valid = self._valid_actions(state[4])
+        q_values = self.q_table[state]
+        max_next_q = max(q_values[a] for a in valid)
+        prev_q = self.q_table[self.prev_state][self.prev_action]
+        target = self.pending_reward + self.p.gamma * max_next_q
+        self.q_table[self.prev_state][self.prev_action] = prev_q + self.p.alpha * (target - prev_q)
+        self.pending_reward = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.position.size == 0:
+                self.entry_price = None
+                self.stop_price = None
+                self.target_price = None
+            elif self.entry_price is None:
+                self.entry_price = order.executed.price
+                if self.position.size > 0:
+                    self.stop_price = self.entry_price * (1 - self.p.stop_loss_pct)
+                    self.target_price = self.entry_price * (1 + self.p.take_profit_pct)
+                else:
+                    self.stop_price = self.entry_price * (1 + self.p.stop_loss_pct)
+                    self.target_price = self.entry_price * (1 - self.p.take_profit_pct)
+
+        self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.pending_reward += trade.pnlcomm
+
+    def next(self):
+        if self.order:
+            return
+
+        pos_status = self._position_status()
+
+        if pos_status == 1:
+            if self.data.low[0] <= self.stop_price or self.data.high[0] >= self.target_price:
+                self.order = self.close()
+                return
+        elif pos_status == 2:
+            if self.data.high[0] >= self.stop_price or self.data.low[0] <= self.target_price:
+                self.order = self.close()
+                return
+
+        state = self._current_state()
+        self._update_q(state)
+        action = self._select_action(state)
+
+        if action == self.ACTION_BUY:
+            size = (self.p.position_pct * self.broker.getvalue()) / self.data.close[0]
+            self.order = self.buy(size=size)
+        elif action == self.ACTION_SELL:
+            size = (self.p.position_pct * self.broker.getvalue()) / self.data.close[0]
+            self.order = self.sell(size=size)
+        elif action == self.ACTION_CLOSE:
+            self.order = self.close()
+
+        self.prev_state = state
+        self.prev_action = action
+```
+```json
+{"assumptions": [
+  {"topic": "state discretization", "choice": "SMA state = price above(1)/below(0) the SMA(20); RSI state = oversold(0,<30)/neutral(1,30-70)/overbought(2,>70); MACD state = macd line above(1)/at-or-below(0) signal line; Bollinger state = close below lower band(0)/inside bands(1)/above upper band(2). Full state = these four plus current position status (flat/long/short).", "reason": "Spec requires discretizing the four indicators into states but names no thresholds; these are the standard textbook cutoffs for each indicator, and position status is included because the same indicator reading implies a different decision when flat vs. already in a trade (entry vs. exit signal)."},
+  {"topic": "Q-learning implementation", "choice": "Implemented genuine online tabular Q-learning: a dict keyed by state mapping to Q-values for actions {NOTHING, BUY, SELL, CLOSE}, updated every bar with the standard rule Q(s,a) += alpha*(r + gamma*max_a' Q(s',a') - Q(s,a)); action chosen greedily (argmax over the actions valid for the current position). alpha=0.1, gamma=0.95.", "reason": "Spec's main idea explicitly names Q-learning as the mechanism that 'must develop a trading policy'; alpha/gamma are unstated so standard textbook defaults were used."},
+  {"topic": "reward signal", "choice": "Reward is 0 on every bar except when a trade closes, at which point trade.pnlcomm (realized net P&L) is credited to the update of the most recent state/action pair.", "reason": "Spec says the policy should 'maximize profit' but defines no reward function; realized net P&L is the direct, literal measure of profit."},
+  {"topic": "infeasible", "choice": "Exploration is done via deterministic optimistic Q-value initialization (BUY/SELL/CLOSE start at 1.0, NOTHING at 0.0, so untried actions are preferred until real experience overrides them) instead of epsilon-greedy random sampling; ties are broken in the fixed order NOTHING < BUY < SELL < CLOSE.", "reason": "The allowed-imports whitelist (backtrader, math, collections, statistics) excludes `random`, so a stochastic exploration policy cannot be implemented; optimistic initialization is the standard randomness-free substitute that still guarantees every action is tried instead of the degenerate always-NOTHING policy."},
+  {"topic": "position sizing", "choice": "'10% of total trading capital' is computed each entry as 0.10 * self.broker.getvalue(), converted to a (possibly fractional) share count at the current close price.", "reason": "Spec states the position size explicitly (10%) but not whether it is 10% of initial cash or current equity, or whether shares must be integers; current portfolio value is the standard convention for ongoing position sizing."},
+  {"topic": "stop-loss / take-profit mechanics", "choice": "On position entry the fill price is recorded; each subsequent bar the intrabar High/Low is compared to the 2%/4% stop/target levels, and self.close() is issued the first bar either level is touched, taking priority over the Q-learning action for that bar.", "reason": "Spec states flat percentage stop-loss/take-profit 'for all positions' but not the trigger granularity; checking High/Low (rather than only Close) is the more literal reading of a price 'reaching' a level intrabar."},
+  {"topic": "opposite-direction / pyramiding rule", "choice": "Action space is masked by position status: only NOTHING/BUY/SELL are legal while flat, only NOTHING/CLOSE while in a long or short position (which also enforces the canonical single-position-at-a-time default).", "reason": "This directly satisfies the stated 'avoid opening a new position if a position in the opposite direction is already open' rule and simultaneously implements the bench's no-pyramiding default, since the spec does not separately permit same-direction pyramiding."},
+  {"topic": "long and short entries", "choice": "Both long (BUY) and short (SELL) entries are implemented as literal market orders (self.buy()/self.sell() with the computed size).", "reason": "Spec explicitly requires 'Open a short position (SELL)', overriding the canonical long-only default."}
+]}
+```

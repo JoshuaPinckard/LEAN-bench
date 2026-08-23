@@ -1,0 +1,95 @@
+```python
+import backtrader as bt
+
+
+class LeveragedETFStrategy(bt.Strategy):
+    params = dict(
+        sma_period=200,
+        market_return=0.10,
+        interest_rate=0.067,
+        inflation_rate=0.03,
+        tax_rate=0.25,
+        leverage=2.0,
+        stop_loss_pct=0.20,
+        bars_per_year=252,
+        holding_years=5,
+        rebalance_years=1,
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.sma_period)
+        self.broker.setcommission(commission=0.001, leverage=self.p.leverage, stocklike=True)
+        self.order = None
+        self.order_type = None
+        self.entry_bar = None
+        self.next_rebalance_bar = None
+        self.exit_bar = None
+        self.initial_position_value = None
+        self.net_annual_return = (
+            (self.p.market_return - self.p.interest_rate) * (1 - self.p.tax_rate)
+            - self.p.inflation_rate
+        )
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed and self.order_type == 'entry':
+            self.entry_bar = len(self)
+            self.next_rebalance_bar = self.entry_bar + self.p.bars_per_year * self.p.rebalance_years
+            self.exit_bar = self.entry_bar + self.p.bars_per_year * self.p.holding_years
+            self.initial_position_value = order.executed.price * order.executed.size
+        self.order = None
+        self.order_type = None
+
+    def next(self):
+        if self.order:
+            return
+
+        price = self.data.close[0]
+
+        if not self.position:
+            if price > self.sma[0]:
+                total_position_value = self.broker.getvalue() * self.p.leverage
+                size = total_position_value / price
+                self.order = self.buy(size=size)
+                self.order_type = 'entry'
+            return
+
+        if price < self.sma[0]:
+            self.order = self.close()
+            self.order_type = 'exit'
+            return
+
+        if self.exit_bar is not None and len(self) >= self.exit_bar:
+            self.order = self.close()
+            self.order_type = 'exit'
+            return
+
+        current_position_value = price * self.position.size
+        if (self.initial_position_value is not None
+                and current_position_value < (1 - self.p.stop_loss_pct) * self.initial_position_value):
+            self.order = self.close()
+            self.order_type = 'exit'
+            return
+
+        if self.next_rebalance_bar is not None and len(self) >= self.next_rebalance_bar:
+            target_value = self.broker.getvalue() * self.p.leverage
+            target_size = target_value / price
+            delta = target_size - self.position.size
+            if delta > 0:
+                self.order = self.buy(size=delta)
+                self.order_type = 'rebalance'
+            elif delta < 0:
+                self.order = self.sell(size=-delta)
+                self.order_type = 'rebalance'
+            self.next_rebalance_bar += self.p.bars_per_year * self.p.rebalance_years
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Implemented the 2:1 leverage/borrowing via backtrader's built-in CommissionInfo 'leverage' parameter (self.broker.setcommission(leverage=2.0, stocklike=True)) instead of a real separate borrowed-funds account; no periodic interest, tax, or inflation cash outflows are applied to the account.", "reason": "The environment provides a single cash/commission broker with no external liability account or borrowing mechanism; CommissionInfo.leverage is the closest built-in backtrader feature that allows buying a position larger than available cash, mirroring 'borrow 50%, control 2x position'."},
+  {"topic": "net_annual_return_usage", "choice": "Computed net annual return = (market_return - interest_rate) * (1 - tax_rate) - inflation_rate once in __init__ and stored as self.net_annual_return, but did not use it to gate any entry/exit decision.", "reason": "The spec presents this formula under 'Additional Rules' as an illustrative return calculation, not as a stated trading condition, so no additional filter was invented."},
+  {"topic": "time_period_definition", "choice": "Defined 'annually' and the '5-year' holding period in trading bars (252 bars/year, 1260 bars for 5 years) rather than calendar dates.", "reason": "The allowed imports (backtrader, math, collections, statistics) exclude the datetime module needed for calendar-based date arithmetic, and the feed is daily bars."},
+  {"topic": "stop_loss_reference", "choice": "The 'initial investment value' used for the 20% stop-loss stays fixed at the original entry's executed position value and is not reset when the position is rebalanced annually.", "reason": "The spec does not state whether rebalancing resets the stop-loss baseline; keeping it tied to the original entry is the more literal reading of 'initial investment value'."},
+  {"topic": "exit_priority_order", "choice": "Each bar, checks are evaluated in document order: SMA-trend exit, then fixed holding-period exit, then stop-loss, then annual rebalance (only if no exit fired).", "reason": "The spec lists these as separate conditions without specifying a tie-break order when multiple could trigger on the same bar."}
+]}
+```

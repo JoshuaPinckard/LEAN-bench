@@ -1,0 +1,353 @@
+```python
+import backtrader as bt
+from collections import deque
+
+
+class ForexMTFSwingStrategy(bt.Strategy):
+    params = (
+        ('sma_period', 200),
+        ('sr_lookback', 50),
+        ('pivot_wing', 2),
+        ('h4_bars', 4),
+        ('stoch_period', 14),
+        ('stoch_dfast', 3),
+        ('stoch_dslow', 3),
+        ('rsi_period', 14),
+        ('touch_tolerance', 0.005),
+        ('sl_pct', 0.02),
+        ('tp_pct', 0.02),
+        ('sl_level_buffer', 0.01),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.cur_day = None
+        self.day_high = None
+        self.day_low = None
+        self.day_close = None
+
+        self.daily_closes = deque(maxlen=self.p.sma_period + 10)
+        self.daily_highs = deque(maxlen=self.p.sr_lookback + 10)
+        self.daily_lows = deque(maxlen=self.p.sr_lookback + 10)
+
+        self.daily_sma200 = None
+        self.support_level = None
+        self.resistance_level = None
+        self.uptrend = False
+        self.downtrend = False
+        self.support_bounce = False
+        self.resistance_bounce = False
+
+        self.h4_high = None
+        self.h4_low = None
+        self.h4_close = None
+        self.h4_count_today = 0
+
+        self.h4_highs = deque(maxlen=self.p.stoch_period + 10)
+        self.h4_lows = deque(maxlen=self.p.stoch_period + 10)
+
+        self.raw_k_history = deque(maxlen=self.p.stoch_dfast + 10)
+        self.stoch_k_history = deque(maxlen=self.p.stoch_dslow + 10)
+        self.stoch_k_prev = None
+        self.stoch_k_cur = None
+
+        self.rsi_gains = deque(maxlen=self.p.rsi_period)
+        self.rsi_losses = deque(maxlen=self.p.rsi_period)
+        self.avg_gain = None
+        self.avg_loss = None
+        self.rsi_prev_close = None
+        self.rsi_cur = None
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+        self._pending_side = None
+        self.entry_price = None
+
+    def _find_pivots(self, highs, lows):
+        n = len(highs)
+        w = self.p.pivot_wing
+        window = min(self.p.sr_lookback, n)
+        start = n - window
+        pivot_high = None
+        pivot_low = None
+        for i in range(start + w, n - w):
+            seg_h = highs[i - w:i + w + 1]
+            seg_l = lows[i - w:i + w + 1]
+            if highs[i] == max(seg_h):
+                pivot_high = highs[i]
+            if lows[i] == min(seg_l):
+                pivot_low = lows[i]
+        return pivot_high, pivot_low
+
+    def _update_support_resistance(self):
+        ph, pl = self._find_pivots(list(self.daily_highs), list(self.daily_lows))
+        if ph is not None:
+            self.resistance_level = ph
+        if pl is not None:
+            self.support_level = pl
+
+    def _update_trend_and_bounce(self):
+        close = self.daily_closes[-1]
+        low = self.daily_lows[-1]
+        high = self.daily_highs[-1]
+
+        self.uptrend = self.daily_sma200 is not None and close > self.daily_sma200
+        self.downtrend = self.daily_sma200 is not None and close < self.daily_sma200
+
+        self.support_bounce = False
+        if self.support_level is not None:
+            touched = low <= self.support_level * (1 + self.p.touch_tolerance)
+            bounced = close > self.support_level
+            self.support_bounce = touched and bounced
+
+        self.resistance_bounce = False
+        if self.resistance_level is not None:
+            touched = high >= self.resistance_level * (1 - self.p.touch_tolerance)
+            bounced = close < self.resistance_level
+            self.resistance_bounce = touched and bounced
+
+    def _finalize_daily_bar(self):
+        self.daily_closes.append(self.day_close)
+        self.daily_highs.append(self.day_high)
+        self.daily_lows.append(self.day_low)
+
+        if len(self.daily_closes) >= self.p.sma_period:
+            self.daily_sma200 = sum(list(self.daily_closes)[-self.p.sma_period:]) / self.p.sma_period
+
+        self._update_support_resistance()
+        self._update_trend_and_bounce()
+
+    def _update_rsi(self, close):
+        if self.rsi_prev_close is None:
+            self.rsi_prev_close = close
+            return
+        change = close - self.rsi_prev_close
+        gain = change if change > 0 else 0.0
+        loss = -change if change < 0 else 0.0
+        self.rsi_prev_close = close
+
+        if self.avg_gain is None:
+            self.rsi_gains.append(gain)
+            self.rsi_losses.append(loss)
+            if len(self.rsi_gains) == self.p.rsi_period:
+                self.avg_gain = sum(self.rsi_gains) / self.p.rsi_period
+                self.avg_loss = sum(self.rsi_losses) / self.p.rsi_period
+        else:
+            self.avg_gain = (self.avg_gain * (self.p.rsi_period - 1) + gain) / self.p.rsi_period
+            self.avg_loss = (self.avg_loss * (self.p.rsi_period - 1) + loss) / self.p.rsi_period
+
+        if self.avg_gain is not None:
+            if self.avg_loss == 0:
+                self.rsi_cur = 100.0
+            else:
+                rs = self.avg_gain / self.avg_loss
+                self.rsi_cur = 100.0 - (100.0 / (1.0 + rs))
+
+    def _update_stochastic(self, high, low, close):
+        if len(self.h4_highs) < self.p.stoch_period:
+            return
+        highs = list(self.h4_highs)[-self.p.stoch_period:]
+        lows = list(self.h4_lows)[-self.p.stoch_period:]
+        highest_high = max(highs)
+        lowest_low = min(lows)
+        rng = highest_high - lowest_low
+        raw_k = 50.0 if rng == 0 else 100.0 * (close - lowest_low) / rng
+        self.raw_k_history.append(raw_k)
+
+        if len(self.raw_k_history) < self.p.stoch_dfast:
+            return
+        k_smoothed = sum(list(self.raw_k_history)[-self.p.stoch_dfast:]) / self.p.stoch_dfast
+
+        self.stoch_k_prev = self.stoch_k_cur
+        self.stoch_k_cur = k_smoothed
+        self.stoch_k_history.append(k_smoothed)
+
+    def _finalize_h4_bar(self):
+        if self.h4_close is None:
+            return
+        self.h4_highs.append(self.h4_high)
+        self.h4_lows.append(self.h4_low)
+
+        self._update_rsi(self.h4_close)
+        self._update_stochastic(self.h4_high, self.h4_low, self.h4_close)
+        self._evaluate_signals()
+
+    def _close_position(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.limit_order is not None:
+            self.cancel(self.limit_order)
+        self._pending_side = 'close'
+        self.order = self.close()
+
+    def _enter_long(self):
+        if self.support_level is None:
+            return
+        entry_est = self.data.close[0]
+        support_stop = self.support_level * (1 - self.p.sl_level_buffer)
+        pct_stop = entry_est * (1 - self.p.sl_pct)
+        stop_price = max(support_stop, pct_stop)
+        stop_distance = entry_est - stop_price
+        if stop_distance <= 0:
+            return
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        size = risk_amount / stop_distance
+        if size <= 0:
+            return
+        self._pending_side = 'long'
+        self.order = self.buy(size=size)
+
+    def _enter_short(self):
+        if self.resistance_level is None:
+            return
+        entry_est = self.data.close[0]
+        resistance_stop = self.resistance_level * (1 + self.p.sl_level_buffer)
+        pct_stop = entry_est * (1 + self.p.sl_pct)
+        stop_price = min(resistance_stop, pct_stop)
+        stop_distance = stop_price - entry_est
+        if stop_distance <= 0:
+            return
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        size = risk_amount / stop_distance
+        if size <= 0:
+            return
+        self._pending_side = 'short'
+        self.order = self.sell(size=size)
+
+    def _evaluate_signals(self):
+        if self.stoch_k_prev is None or self.stoch_k_cur is None or self.rsi_cur is None:
+            return
+
+        cross_up_20 = self.stoch_k_prev < 20 and self.stoch_k_cur >= 20
+        cross_down_80 = self.stoch_k_prev > 80 and self.stoch_k_cur <= 80
+
+        position = self.getposition(self.data)
+
+        if position.size > 0 and cross_down_80:
+            self._close_position()
+        elif position.size < 0 and cross_up_20:
+            self._close_position()
+
+        if self.order is not None:
+            return
+
+        if position.size == 0:
+            if self.uptrend and self.support_bounce and cross_up_20 and self.rsi_cur > 50:
+                self._enter_long()
+            elif self.downtrend and self.resistance_bounce and cross_down_80 and self.rsi_cur < 50:
+                self._enter_short()
+
+    def _setup_long_brackets(self, entry_price, size):
+        self.entry_price = entry_price
+        if self.support_level is not None:
+            support_stop = self.support_level * (1 - self.p.sl_level_buffer)
+            pct_stop = entry_price * (1 - self.p.sl_pct)
+            stop_price = max(support_stop, pct_stop)
+        else:
+            stop_price = entry_price * (1 - self.p.sl_pct)
+        target_price = entry_price * (1 + self.p.tp_pct)
+        self.stop_order = self.sell(size=size, exectype=bt.Order.Stop, price=stop_price)
+        self.limit_order = self.sell(size=size, exectype=bt.Order.Limit, price=target_price)
+
+    def _setup_short_brackets(self, entry_price, size):
+        self.entry_price = entry_price
+        if self.resistance_level is not None:
+            resistance_stop = self.resistance_level * (1 + self.p.sl_level_buffer)
+            pct_stop = entry_price * (1 + self.p.sl_pct)
+            stop_price = min(resistance_stop, pct_stop)
+        else:
+            stop_price = entry_price * (1 + self.p.sl_pct)
+        target_price = entry_price * (1 - self.p.tp_pct)
+        self.stop_order = self.buy(size=size, exectype=bt.Order.Stop, price=stop_price)
+        self.limit_order = self.buy(size=size, exectype=bt.Order.Limit, price=target_price)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order is self.order:
+            if order.status == order.Completed:
+                if self._pending_side == 'long':
+                    self._setup_long_brackets(order.executed.price, abs(order.executed.size))
+                elif self._pending_side == 'short':
+                    self._setup_short_brackets(order.executed.price, abs(order.executed.size))
+            self.order = None
+            self._pending_side = None
+        elif order is self.stop_order:
+            if order.status == order.Completed:
+                if self.limit_order is not None:
+                    self.cancel(self.limit_order)
+                self.limit_order = None
+                self.stop_order = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+        elif order is self.limit_order:
+            if order.status == order.Completed:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.stop_order = None
+                self.limit_order = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.limit_order = None
+
+    def next(self):
+        dt = self.data.datetime.date(0)
+        high = self.data.high[0]
+        low = self.data.low[0]
+        close = self.data.close[0]
+
+        if self.cur_day is None:
+            self.cur_day = dt
+            self.day_high = high
+            self.day_low = low
+            self.day_close = close
+            self.h4_high = high
+            self.h4_low = low
+            self.h4_close = close
+            self.h4_count_today = 1
+            return
+
+        if dt != self.cur_day:
+            self._finalize_daily_bar()
+            self._finalize_h4_bar()
+            self.cur_day = dt
+            self.day_high = high
+            self.day_low = low
+            self.day_close = close
+            self.h4_high = high
+            self.h4_low = low
+            self.h4_close = close
+            self.h4_count_today = 1
+            return
+
+        self.day_high = max(self.day_high, high)
+        self.day_low = min(self.day_low, low)
+        self.day_close = close
+
+        self.h4_high = max(self.h4_high, high)
+        self.h4_low = min(self.h4_low, low)
+        self.h4_close = close
+        self.h4_count_today += 1
+
+        if self.h4_count_today >= self.p.h4_bars:
+            self._finalize_h4_bar()
+            self.h4_high = None
+            self.h4_low = None
+            self.h4_close = None
+            self.h4_count_today = 0
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Only one 1h AAPL feed is available (not forex, no separate Daily/H4 feeds). Synthetic Daily bars are built by aggregating all intraday bars sharing the same calendar date (OHLC roll-up); synthetic H4 bars are built by grouping every 4 sequential 1h bars, restarting the group at each new trading day (last group of the day may be a partial <4-bar bucket since the session is only ~7 hourly bars).", "reason": "The environment fixes a single 1h equity feed; this is the closest literal reconstruction of the higher/lower timeframes the spec requires."},
+  {"topic": "support/resistance method", "choice": "Key levels are identified as fractal pivots: a daily bar's high (low) is a confirmed pivot if it is the max (min) among itself and 2 daily bars on each side, scanned over the last 50 daily bars; the most recent confirmed pivot high/low is used as resistance/support.", "reason": "Spec says only 'automatic identification of key levels based on local highs and lows over the last 50 candles' without defining the algorithm; fractal pivot detection is the standard literal reading of 'local highs and lows'."},
+  {"topic": "bounce confirmation", "choice": "A support bounce is confirmed on a daily bar whose low touches within 0.5% of the support level and whose close is above the support level (symmetric rule for resistance/close-below).", "reason": "Spec requires 'retraced to level and bounced' but gives no tolerance or confirmation rule; a small touch tolerance plus close-direction confirmation is a reasonable, declared literal interpretation."},
+  {"topic": "daily signal persistence", "choice": "Trend (SMA200) and support/resistance bounce state are computed once per completed daily bar and held constant for all H4/entry checks during the following trading day.", "reason": "Avoids look-ahead bias from using an unfinished 'today' daily candle while still satisfying 'on the higher timeframe' conditions."},
+  {"topic": "stochastic/RSI computation", "choice": "Stochastic(14,3,3) and RSI(14) are computed manually (Wilder smoothing for RSI; SMA-of-raw-%K then SMA-of-smoothed-%K for stochastic) on the synthetic H4 close/high/low series, since no separate bt data feed object exists for the H4 timeframe to attach bt.indicators to.", "reason": "bt.indicators require a bt.LineSeries/data feed; only manual Python arithmetic on the synthetic H4 series is available in this single-feed environment."},
+  {"topic": "stochastic crossing line", "choice": "The 20/80 crossing conditions are evaluated on the smoothed %K line (SMA(raw%K,3)) rather than %D.", "reason": "Spec says 'Stochastic crosses' without specifying %K vs %D; %K is the conventionally referenced 'Stochastic' line for level crossings."},
+  {"topic": "stop-loss 'or' rule", "choice": "For longs, stop = max(support_level*0.99, entry*0.98); for shorts, stop = min(resistance_level*1.01, entry*1.02) — i.e., whichever candidate stop is tighter (closer to entry) is used.", "reason": "Spec gives two stop-loss definitions joined by 'or' without stating precedence; using the tighter of the two bounds risk consistently with the strategy's stated 1%-of-capital risk cap."},
+  {"topic": "position sizing basis", "choice": "Risk amount = 1% of current broker portfolio value (self.broker.getvalue()); size = risk_amount / stop_distance, where stop_distance and entry price are estimated from the latest close at signal time.", "reason": "Spec states risk must not exceed 1% of total trading capital but doesn't specify equity-vs-cash basis or how to size before the fill price is known; current portfolio value and last close as an entry-price proxy are the most literal, causally available inputs at signal time."},
+  {"topic": "stop/target order mechanism", "choice": "After entry fill, exact stop-loss and take-profit prices are recomputed from the actual fill price and submitted as linked bt.Order.Stop / bt.Order.Limit orders (manually OCO-managed via notify_order), in addition to the Stochastic-based exit signal which uses self.close().", "reason": "Spec defines stop-loss/take-profit as price levels, not as an 'exit signal' instruction; native stop/limit orders are the standard backtrader mechanism for realistic same-bar intrabar execution of static price levels."},
+  {"topic": "shorting enabled", "choice": "Short entries/exits are implemented as specified, overriding the long-only canonical default.", "reason": "The specification explicitly defines a full short-position entry/exit/stop/target section."}
+]}
+```

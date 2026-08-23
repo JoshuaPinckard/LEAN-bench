@@ -1,0 +1,107 @@
+```python
+import backtrader as bt
+import collections
+
+
+class PredictiveImbalanceStrategy(bt.Strategy):
+    params = (
+        ('event_driven', False),      # False = continuous model (default), True = event-driven model
+        ('cont_threshold', 0.2),
+        ('event_threshold', 0.5),
+        ('event_oi_threshold', 0.6),
+        ('atr_period', 14),
+        ('atr_pct_filter', 0.001),    # 0.1% of price
+        ('trade_imb_period', 20),
+        ('vol_sma_period', 20),
+        ('session_start_hour', 10),
+        ('session_end_hour', 16),
+        ('w_oi', 0.5),
+        ('w_ti', 0.3),
+        ('w_vol', 0.1),
+        ('w_atr', 0.1),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.trade_signed_vol = collections.deque(maxlen=self.p.trade_imb_period)
+
+        self.setsizer(bt.sizers.PercentSizer(percents=100))
+
+        self.order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        high = self.data.high[0]
+        low = self.data.low[0]
+        close = self.data.close[0]
+        open_ = self.data.open[0]
+        volume = self.data.volume[0]
+
+        rng = high - low
+        order_imbalance = (2.0 * close - high - low) / rng if rng != 0 else 0.0
+
+        signed_vol = volume if close >= open_ else -volume
+        self.trade_signed_vol.append(signed_vol)
+        total_vol = sum(abs(v) for v in self.trade_signed_vol)
+        trade_imbalance = (sum(self.trade_signed_vol) / total_vol) if total_vol != 0 else 0.0
+
+        vol_sma = self.vol_sma[0]
+        vol_signal = max(-1.0, min(1.0, (volume - vol_sma) / vol_sma)) if vol_sma != 0 else 0.0
+
+        atr_sma = self.atr_sma[0]
+        if atr_sma != 0:
+            direction = 1.0 if close >= open_ else -1.0
+            atr_signal = direction * max(-1.0, min(1.0, (self.atr[0] - atr_sma) / atr_sma))
+        else:
+            atr_signal = 0.0
+
+        raw_forecast = (self.p.w_oi * order_imbalance +
+                         self.p.w_ti * trade_imbalance +
+                         self.p.w_vol * vol_signal +
+                         self.p.w_atr * atr_signal)
+        forecast = max(-1.0, min(1.0, raw_forecast))
+
+        atr_ok = self.atr[0] >= self.p.atr_pct_filter * close
+
+        bar_time = self.data.datetime.time(0)
+        in_session = self.p.session_start_hour <= bar_time.hour < self.p.session_end_hour
+
+        if self.p.event_driven:
+            active = abs(order_imbalance) > self.p.event_oi_threshold
+            buy_th = self.p.event_threshold
+            sell_th = -self.p.event_threshold
+        else:
+            active = True
+            buy_th = self.p.cont_threshold
+            sell_th = -self.p.cont_threshold
+
+        pos = self.position.size
+
+        if self.order is None:
+            if pos > 0 and forecast < 0:
+                self.order = self.close()
+            elif pos < 0 and forecast > 0:
+                self.order = self.close()
+            elif pos == 0 and active and atr_ok and in_session:
+                if forecast > buy_th:
+                    self.order = self.buy()
+                elif forecast < sell_th:
+                    self.order = self.sell()
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Harness allows only one module-level bt.Strategy class, but the spec describes two versions (continuous and event-driven) to compare. Implemented both behaviors in a single class, toggled via the `event_driven` parameter, defaulting to the continuous model.", "reason": "Cannot output two strategy classes for a direct side-by-side backtest comparison; a switchable single class preserves both rule sets literally."},
+  {"topic": "infeasible", "choice": "Order Imbalance proxied as bar-level close-location-value (2*Close-High-Low)/(High-Low); Trade Imbalance proxied as a 20-bar rolling ratio of volume signed by intrabar direction (Close>=Open) to total volume.", "reason": "Genuine order-book (bid/ask) and trade-tape (buyer/seller-initiated) data are not present in OHLCV bars; these are standard OHLCV-derived proxies bounded in [-1,1]."},
+  {"topic": "infeasible", "choice": "Forecast model implemented as a fixed-weight linear combination of order imbalance, trade imbalance, normalized volume, and normalized ATR-vs-its-SMA, clipped to [-1,1], rather than an online-fitted regression against the future 5-bar return.", "reason": "Training on future return as a live per-bar target would require look-ahead (future prices unknown at decision time); a fixed linear combination preserves the spec's 'linear regression style, forecast in [-1,1]' structure without violating causality."},
+  {"topic": "forecast weights", "choice": "Weights set to order imbalance 0.5, trade imbalance 0.3, volume signal 0.1, volatility signal 0.1 (sum to 1).", "reason": "Spec does not specify coefficients; weighted the two named primary features (order/trade imbalance) most heavily, with volume/ATR as minor modulating features as listed under 'additional features'."},
+  {"topic": "lookback periods", "choice": "Used 20 bars for both the trade-imbalance rolling window and the volume SMA baseline.", "reason": "Spec does not specify these periods; chosen as reasonable short-term windows independent of the explicitly stated ATR(14)."},
+  {"topic": "filter scope", "choice": "ATR volatility filter and trading-window filter gate new entries only; the forecast sign-change exit rule is unconditional.", "reason": "Spec states the ATR/window rules block 'new positions' specifically, while the exit rule is described unconditionally; gating exits too could strand open positions outside the session/volatility filter with no way to close them (no stop-loss is used)."},
+  {"topic": "session boundary", "choice": "Trading window compared at hour granularity: 10 <= bar_hour < 16 (local time as provided by the feed).", "reason": "Spec gives only whole-hour boundaries (10:00 to 16:00); treated the 16:00 endpoint as exclusive."}
+]}
+```

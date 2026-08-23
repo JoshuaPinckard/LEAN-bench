@@ -1,0 +1,145 @@
+== 'entry':
+                self.entry_session_index = self.session_count
+            elif self.order_type == 'exit':
+                self._reset_trade_state()
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if self.order_type == 'entry':
+                self._reset_trade_state()
+            elif self.order_type == 'retest':
+                self.retest_done = False
+        self.order = None
+        self.order_type = None
+
+    def _reset_trade_state(self):
+        self.breakout_low = None
+        self.breakout_high = None
+        self.breakout_volume = None
+        self.retest_done = False
+        self.entry_session_index = None
+        self.trail_active = False
+        self.trail_stop = None
+
+    def _position_size(self, entry_price, stop_price):
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        risk_per_share = abs(entry_price - stop_price)
+        if risk_per_share <= 0:
+            return 0
+        return int(risk_amount / risk_per_share)
+
+    def next(self):
+        cur_date = self.data.datetime.date(0)
+        if self._cur_date is None:
+            self._cur_date = cur_date
+        elif cur_date != self._cur_date:
+            self.daily_closes.append(self._prev_close)
+            self._cur_date = cur_date
+            self.session_count += 1
+        self._prev_close = self.data.close[0]
+
+        if len(self.daily_closes) >= self.p.market_sma_period:
+            self.daily_sma = statistics.mean(self.daily_closes)
+        else:
+            self.daily_sma = None
+
+        if self.order:
+            return
+
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+        vol = self.data.volume[0]
+        upper = self.bb.top[0]
+        lower = self.bb.bot[0]
+        mid = self.bb.mid[0]
+        avgvol = self.vol_sma[0]
+
+        if self.position.size == 0:
+            if self.daily_sma is None:
+                return
+
+            if close > upper and vol >= self.p.vol_mult * avgvol and close > self.daily_sma:
+                stop = low
+                size = self._position_size(close, stop)
+                if size > 0:
+                    self.breakout_low = stop
+                    self.breakout_volume = vol
+                    self.order_type = 'entry'
+                    self.order = self.buy(size=size)
+                return
+
+            if close < lower and vol >= self.p.vol_mult * avgvol and close < self.daily_sma:
+                stop = high
+                size = self._position_size(close, stop)
+                if size > 0:
+                    self.breakout_high = stop
+                    self.breakout_volume = vol
+                    self.order_type = 'entry'
+                    self.order = self.sell(size=size)
+                return
+
+        elif self.position.size > 0:
+            stop = self.trail_stop if self.trail_active else self.breakout_low
+            if not self.trail_active and close > self.position.price:
+                self.trail_active = True
+                self.trail_stop = self.position.price + self.atr[0]
+                stop = self.trail_stop
+
+            if low <= stop:
+                self.order_type = 'exit'
+                self.order = self.close()
+            elif low <= mid:
+                self.order_type = 'exit'
+                self.order = self.close()
+            elif self.entry_session_index is not None and \
+                    (self.session_count - self.entry_session_index) >= self.p.max_hold_days:
+                self.order_type = 'exit'
+                self.order = self.close()
+            elif not self.retest_done and low <= upper and vol < self.breakout_volume:
+                size = self._position_size(close, self.breakout_low)
+                if size > 0:
+                    self.retest_done = True
+                    self.order_type = 'retest'
+                    self.order = self.buy(size=size)
+
+        elif self.position.size < 0:
+            stop = self.trail_stop if self.trail_active else self.breakout_high
+            if not self.trail_active and close < self.position.price:
+                self.trail_active = True
+                self.trail_stop = self.position.price - self.atr[0]
+                stop = self.trail_stop
+
+            if high >= stop:
+                self.order_type = 'exit'
+                self.order = self.close()
+            elif high >= mid:
+                self.order_type = 'exit'
+                self.order = self.close()
+            elif self.entry_session_index is not None and \
+                    (self.session_count - self.entry_session_index) >= self.p.max_hold_days:
+                self.order_type = 'exit'
+                self.order = self.close()
+            elif not self.retest_done and high >= lower and vol < self.breakout_volume:
+                size = self._position_size(close, self.breakout_high)
+                if size > 0:
+                    self.retest_done = True
+                    self.order_type = 'retest'
+                    self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "Market filter's '200-period SMA on a higher timeframe (e.g., daily chart)' is built by manually aggregating the fixed 1h feed into synthetic daily closes (last close observed before each date change) and computing a 200-period SMA on that series.", "reason": "The harness supplies a single 1h AAPL data feed; no daily feed or cerebro-level resampling is available to the strategy class, so a true daily SMA can't be added. This is the closest literal, data-driven reading."},
+  {"topic": "infeasible", "choice": "Run all logic on the harness's fixed 1h bars rather than the spec's intended 4H/D1 charts.", "reason": "The execution environment fixes the data feed and timeframe; the strategy code has no way to change it."},
+  {"topic": "position_sizing_capital", "choice": "Use self.broker.getvalue() (current total portfolio equity) as 'Total Capital' in the risk/size formula.", "reason": "Spec doesn't specify fixed starting cash vs. live equity; mark-to-market equity is the standard basis for ongoing 1%-risk sizing."},
+  {"topic": "position_sizing_formula_sign", "choice": "Use abs(Entry Price - Stop Loss Price) as the denominator.", "reason": "The literal formula (Entry - Stop) is negative for shorts since the stop sits above entry, producing a nonsensical negative size; abs() preserves the intended 1%-risk sizing for both directions."},
+  {"topic": "position_sizing_entry_price", "choice": "Approximate 'Entry Price' in the sizing formula with the signal bar's close.", "reason": "Entries are market orders filled at the next bar's open, so the true fill price is unknown at the moment size must be computed; close is the best available proxy."},
+  {"topic": "position_sizing_rounding", "choice": "Truncate computed size to an integer share count via int().", "reason": "Backtrader stock orders require whole-share sizes; spec is silent on fractional shares."},
+  {"topic": "retest_add_limit", "choice": "Allow at most one retest add-on per breakout trade (guarded by a retest_done flag).", "reason": "Spec describes a single retest step; unlimited re-adds aren't stated and would violate the baseline single-position rule beyond the one explicit exception."},
+  {"topic": "market_filter_scope", "choice": "Apply the 200-SMA trend filter only to initial breakout entries, not to the retest add-on.", "reason": "The filter is stated in terms of 'long trades'/'short trades' direction, already validated when the breakout leg opened; the retest is additive to that same trade."},
+  {"topic": "breakeven_reference_price", "choice": "Use backtrader's self.position.price (running average cost) as 'entry price'/'break-even' for the trailing-stop calculation.", "reason": "After a retest add-on the position has a blended cost basis; this is the standard accessible value representing current break-even."},
+  {"topic": "trailing_stop_behavior", "choice": "Implement the trailing stop as a single one-time move from the initial stop to break-even + 1 ATR the first bar the position becomes profitable, not a continuously recalculated trail.", "reason": "Spec says 'move the stop-loss to...' (a singular action), not 'continuously trail'."},
+  {"topic": "exit_trigger_price", "choice": "Use intrabar High/Low (not close-only) to test stop-loss, take-profit, and trailing-stop levels.", "reason": "'Reaches'/'at a level' implies an intrabar touch, consistent with the spec's own touch-based language for the retest condition."},
+  {"topic": "same_bar_exit_priority", "choice": "When multiple exit conditions coincide on one bar, check in order: stop-loss/trailing stop, then take-profit, then max-holding-period, then retest opportunity.", "reason": "Spec doesn't define precedence for simultaneous conditions; risk controls are checked first as the conservative choice."},
+  {"topic": "max_holding_period_unit", "choice": "Count '10 trading days' as 10 distinct calendar-date transitions observed in the 1h feed since the initial breakout fill (not the retest date, not a fixed bar count).", "reason": "Bars-per-day can vary; date-transition counting is the most literal, robust reading of 'trading days' from intraday data."},
+  {"topic": "zero_risk_guard", "choice": "Skip a signaled entry/retest if the computed risk-per-share (|entry-stop|) is zero.", "reason": "Prevents division-by-zero in the position-sizing formula; a numerical safety guard, not an added strategic filter."}
+]}
+```

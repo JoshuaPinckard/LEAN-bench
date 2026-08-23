@@ -1,0 +1,170 @@
+```python
+import backtrader as bt
+
+
+class FairValueGapStrategy(bt.Strategy):
+    params = (
+        ('risk_pct', 0.01),                      # base risk per trade as fraction of equity
+        ('bear_size_multiplier', 63.2 / 60.71),  # scale short size vs long per stated fill-rate stats
+        ('stop_buffer', 0.10),                   # "a few points" beyond FVG boundary
+        ('vol_lookback', 20),
+        ('vol_spike_factor', 1.5),
+        ('wick_body_mult', 2.0),
+        ('long_wick_frac', 0.5),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.fvgs = []
+        self.current_session_date = None
+        self.session_high = None
+        self.session_low = None
+        self.prev_session_high = None
+        self.prev_session_low = None
+        # minutes-since-midnight bounds for the 9:30-16:00 ET NY session
+        self.ny_open_min = 9 * 60 + 30
+        self.ny_close_min = 16 * 60
+
+    def _volume_spike(self):
+        lb = self.p.vol_lookback
+        if len(self) <= lb:
+            return False
+        total = 0.0
+        for i in range(1, lb + 1):
+            total += self.data.volume[-i]
+        avg_vol = total / lb
+        return avg_vol > 0 and self.data.volume[0] >= self.p.vol_spike_factor * avg_vol
+
+    def _bullish_signal(self):
+        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]
+        body = abs(c - o)
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        rng = h - l
+        hammer = rng > 0 and lower_wick >= self.p.wick_body_mult * body and upper_wick <= body
+        long_lower_wick = rng > 0 and lower_wick >= self.p.long_wick_frac * rng
+        return hammer or long_lower_wick or self._volume_spike()
+
+    def _bearish_signal(self):
+        o, h, l, c = self.data.open[0], self.data.high[0], self.data.low[0], self.data.close[0]
+        body = abs(c - o)
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        rng = h - l
+        shooting_star = rng > 0 and upper_wick >= self.p.wick_body_mult * body and lower_wick <= body
+        long_upper_wick = rng > 0 and upper_wick >= self.p.long_wick_frac * rng
+        return shooting_star or long_upper_wick or self._volume_spike()
+
+    def _calc_size(self, stop_dist, fvg_type):
+        equity = self.broker.getvalue()
+        risk_pct = self.p.risk_pct
+        if fvg_type == 'bear':
+            risk_pct *= self.p.bear_size_multiplier
+        size = int((equity * risk_pct) / stop_dist)
+        if size < 1:
+            return 0
+        price = self.data.close[0]
+        if price <= 0:
+            return 0
+        max_affordable = int(self.broker.getcash() / price)
+        return max(0, min(size, max_affordable))
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if self.order is not None and order.ref == self.order.ref:
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                self.order = None
+
+    def next(self):
+        dt0 = self.data.datetime.datetime(0)
+        bar_date = dt0.date()
+        bar_min = dt0.hour * 60 + dt0.minute
+        in_session = self.ny_open_min <= bar_min <= self.ny_close_min
+
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+
+        if self.current_session_date is None or bar_date != self.current_session_date:
+            if self.current_session_date is not None:
+                self.prev_session_high = self.session_high
+                self.prev_session_low = self.session_low
+            self.current_session_date = bar_date
+            self.session_high = high
+            self.session_low = low
+        else:
+            if high > self.session_high:
+                self.session_high = high
+            if low < self.session_low:
+                self.session_low = low
+
+        if in_session and len(self) >= 3:
+            dtm1 = self.data.datetime.datetime(-1)
+            dtm2 = self.data.datetime.datetime(-2)
+            if dtm1.date() == bar_date and dtm2.date() == bar_date:
+                m1 = dtm1.hour * 60 + dtm1.minute
+                m2 = dtm2.hour * 60 + dtm2.minute
+                if self.ny_open_min <= m1 <= self.ny_close_min and self.ny_open_min <= m2 <= self.ny_close_min:
+                    c1_high, c1_low = self.data.high[-2], self.data.low[-2]
+                    c3_high, c3_low = self.data.high[0], self.data.low[0]
+                    if c1_high < c3_low:
+                        self.fvgs.append({'type': 'bull', 'top': c3_low, 'bottom': c1_high,
+                                           'date': bar_date, 'mitigated': False})
+                    elif c1_low > c3_high:
+                        self.fvgs.append({'type': 'bear', 'top': c1_low, 'bottom': c3_high,
+                                           'date': bar_date, 'mitigated': False})
+
+        if in_session and self.order is None and not self.position:
+            for fvg in self.fvgs:
+                if fvg['mitigated'] or fvg['date'] != bar_date:
+                    continue
+                if fvg['type'] == 'bull':
+                    if low <= fvg['top'] and self._bullish_signal():
+                        tp = self.prev_session_high
+                        if tp is not None and tp > close:
+                            stop_price = fvg['bottom'] - self.p.stop_buffer
+                            stop_dist = close - stop_price
+                            if stop_dist > 0:
+                                size = self._calc_size(stop_dist, 'bull')
+                                if size >= 1:
+                                    orders = self.buy_bracket(size=size, exectype=bt.Order.Market,
+                                                               stopprice=stop_price, limitprice=tp)
+                                    self.order = orders[0]
+                                    break
+                else:
+                    if high >= fvg['bottom'] and self._bearish_signal():
+                        tp = self.prev_session_low
+                        if tp is not None and tp < close:
+                            stop_price = fvg['top'] + self.p.stop_buffer
+                            stop_dist = stop_price - close
+                            if stop_dist > 0:
+                                size = self._calc_size(stop_dist, 'bear')
+                                if size >= 1:
+                                    orders = self.sell_bracket(size=size, exectype=bt.Order.Market,
+                                                                stopprice=stop_price, limitprice=tp)
+                                    self.order = orders[0]
+                                    break
+
+        if in_session:
+            for fvg in self.fvgs:
+                if fvg['mitigated']:
+                    continue
+                if fvg['type'] == 'bull' and close <= fvg['top']:
+                    fvg['mitigated'] = True
+                elif fvg['type'] == 'bear' and close >= fvg['bottom']:
+                    fvg['mitigated'] = True
+```
+```json
+{"assumptions": [
+  {"topic": "reversal signal thresholds", "choice": "Bullish confirmation = hammer (lower wick >= 2x body and upper wick <= body) OR long lower wick (>= 50% of bar range) OR volume spike (current volume >= 1.5x the 20-bar average). Bearish confirmation mirrors this with shooting star / long upper wick / volume spike.", "reason": "Spec names hammer, shooting star, long wick, and volume spike as example signals but gives no numeric thresholds; concrete values were needed to make the pattern checks computable."},
+  {"topic": "stop-loss buffer", "choice": "Fixed $0.10 offset beyond the FVG boundary (below the bullish FVG's lower edge / above the bearish FVG's upper edge).", "reason": "Spec says stop-loss is placed 'a few points' beyond the FVG boundary without a number; a small fixed offset is the most literal reading."},
+  {"topic": "take-profit level", "choice": "Previous completed trading session's high (for longs) / low (for shorts).", "reason": "Spec offers three alternatives (previous session high/low, Initial Balance level, or 'another significant level'); previous-session extreme is the only one directly computable from OHLCV with no further undefined parameters, so it was chosen as the concrete implementation."},
+  {"topic": "take-profit validity guard", "choice": "Skip a signal if no previous session has completed yet (first day of data) or if the previous session's high/low has already been surpassed by the current close, leaving no room for the target.", "reason": "Necessary to avoid submitting a take-profit order on the wrong side of the current price; not stated in the spec but required for the order to be logically valid."},
+  {"topic": "position sizing formula", "choice": "Risk-based sizing: size = floor(equity * risk_pct / stop_distance_per_share), with risk_pct = 1% for longs and 1% * (63.2/60.71) for shorts, capped by available cash.", "reason": "Spec ties sizing to 'risk per trade limited by the stop-loss' and to the stated 60.71%/63.2% unfilled-rate stats for bullish/bearish FVGs, but specifies neither a base risk percentage nor an exact scaling formula; this combines both stated constraints into one concrete rule using the given ratio directly."},
+  {"topic": "FVG session-scoped validity", "choice": "An FVG is only eligible for entry signals on the same calendar trading day it formed; once the session date changes it is treated as expired even if not yet mitigated by close.", "reason": "Spec's rationale for the strategy is that these levels act as support/resistance 'during the same trading session' rather than being filled, implying same-session relevance rather than indefinite persistence."},
+  {"topic": "order execution mechanism", "choice": "Entry uses a market order combined with an OCO stop-loss and take-profit (buy_bracket/sell_bracket) submitted together at signal time.", "reason": "Spec calls for opening 'at the price level or immediately after the confirming signal' plus simultaneous stop-loss/take-profit levels; bracket orders are the direct backtrader mechanism for this without inventing extra logic."},
+  {"topic": "entry/stop-distance price reference", "choice": "Current bar's close is used as the reference price for computing stop distance and share size at signal time.", "reason": "The actual fill price of the market order is not known until the next bar; close is the most recent available price for sizing math."},
+  {"topic": "infeasible", "choice": "Initial Balance level and generic 'other significant resistance/support levels' for take-profit were not implemented; only previous-session high/low is used.", "reason": "These alternatives require additional undefined lookback windows or discretionary judgment not derivable from OHLCV alone within the spec's own terms."}
+]}
+```

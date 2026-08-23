@@ -1,0 +1,74 @@
+{
+  "task_id": 62,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\nimport backtrader as bt\n\n\nclass MarketSegmentationStrategy(bt.Strategy):\n    params = dict(\n        atr_period=14,\n        atr_avg_period=50,\n        vol_mult=1.5,\n        ema_fast_period=20,\n        ema_slow_period=50,\n        ema_trend_period=200,\n        slope_period=5,\n        slope_threshold=0.001,\n        close_threshold=0.005,\n        confirm_bars=5,\n        sl_atr_mult=2.0,\n        tp_atr_mult=4.0,\n        risk_pct=0.01,\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.atr_avg = bt.indicators.SimpleMovingAverage(self.atr, period=self.p.atr_avg_period)\n        self.ema_fast = bt.indicators.ExponentialMovingAverage(self.data.close, period=self.p.ema_fast_period)\n        self.ema_slow = bt.indicators.ExponentialMovingAverage(self.data.close, period=self.p.ema_slow_period)\n        self.ema_trend = bt.indicators.ExponentialMovingAverage(self.data.close, period=self.p.ema_trend_period)\n\n        self.order = None\n        self.order_type = None\n        self.stop_order = None\n        self.limit_order = None\n\n        self.last_raw_segment = None\n        self.segment_count = 0\n        self.confirmed_segment = None\n\n        self.entry_atr = None\n        self.entry_direction = None\n        self.pending_size = None\n        self.pending_segment = None\n        self.position_segment = None\n\n        self._min_bars = self.p.ema_trend_period + self.p.slope_period + 1\n\n    def _is_pin_bar(self, bullish):\n        o = self.data.open[0]\n        h = self.data.high[0]\n        l = self.data.low[0]\n        c = self.data.close[0]\n        body = abs(c - o)\n        upper_wick = h - max(o, c)\n        lower_wick = min(o, c) - l\n        if bullish:\n            return lower_wick > 2 * body and upper_wick < body\n        return upper_wick > 2 * body and lower_wick < body\n\n    def _raw_segment(self):\n        fast0 = self.ema_fast[0]\n        slow0 = self.ema_slow[0]\n        fastN = self.ema_fast[-self.p.slope_period]\n        slowN = self.ema_slow[-self.p.slope_period]\n\n        fast_slope = (fast0 - fastN) / fastN\n        slow_slope = (slow0 - slowN) / slowN\n\n        high_vol = self.atr[0] > self.p.vol_mult * self.atr_avg[0]\n\n        is_uptrend = (fast0 > slow0 and fast_slope > self.p.slope_threshold\n                      and slow_slope > self.p.slope_threshold)\n        is_downtrend = (fast0 < slow0 and fast_slope < -self.p.slope_threshold\n                         and slow_slope < -self.p.slope_threshold)\n        is_neutral = (abs(fast0 - slow0) / slow0 < self.p.close_threshold\n                      and abs(fast_slope) < self.p.slope_threshold\n                      and abs(slow_slope) < self.p.slope_threshold)\n\n        if high_vol and is_downtrend:\n            return 2\n        if high_vol and is_uptrend:\n            return 3\n        if (not high_vol) and is_neutral:\n            return 1\n        return 0\n\n    def _trend_filter_slope(self):\n        t0 = self.ema_trend[0]\n        tN = self.ema_trend[-self.p.slope_period]\n        return (t0 - tN) / tN\n\n    def _cancel_bracket(self):\n        if self.stop_order is not None:\n            self.cancel(self.stop_order)\n        if self.limit_order is not None:\n            self.cancel(self.limit_order)\n\n    def next(self):\n        if len(self) < self._min_bars:\n            return\n\n        raw = self._raw_segment()\n\n        if raw == self.last_raw_segment:\n            self.segment_count += 1\n        else:\n            self.last_raw_segment = raw\n            self.segment_count = 1\n\n        if self.segment_count >= self.p.confirm_bars:\n            self.confirmed_segment = raw\n\n        if self.position and self.order is None:\n            if (self.position_segment == 3 and self.confirmed_segment == 2) or \\\n               (self.position_segment == 2 and self.confirmed_segment == 3):\n                self._cancel_bracket()\n                self.order = self.close()\n                self.order_type = 'close'\n                return\n\n        if self.position or self.order is not None:\n            return\n\n        if self.confirmed_segment not in (2, 3):\n            return\n\n        trend_slope = self._trend_filter_slope()\n        allow_long = not (trend_slope < -self.p.slope_threshold)\n        allow_short = not (trend_slope > self.p.slope_threshold)\n\n        fast0 = self.ema_fast[0]\n        slow0 = self.ema_slow[0]\n        zone_lo = min(fast0, slow0)\n        zone_hi = max(fast0, slow0)\n        in_zone = zone_lo <= self.data.close[0] <= zone_hi\n\n        atr_val = self.atr[0]\n        if atr_val <= 0:\n            return\n\n        if self.confirmed_segment == 3 and allow_long:\n            if in_zone or self._is_pin_bar(bullish=True):\n                risk_amount = self.p.risk_pct * self.broker.getvalue()\n                size = int(math.floor(risk_amount / (self.p.sl_atr_mult * atr_val)))\n                if size >= 1:\n                    self.entry_atr = atr_val\n                    self.entry_direction = 'long'\n                    self.pending_size = size\n                    self.pending_segment = self.confirmed_segment\n                    self.order = self.buy(size=size)\n                    self.order_type = 'entry'\n\n        elif self.confirmed_segment == 2 and allow_short:\n            if in_zone or self._is_pin_bar(bullish=False):\n                risk_amount = self.p.risk_pct * self.broker.getvalue()\n                size = int(math.floor(risk_amount / (self.p.sl_atr_mult * atr_val)))\n                if size >= 1:\n                    self.entry_atr = atr_val\n                    self.entry_direction = 'short'\n                    self.pending_size = size\n                    self.pending_segment = self.confirmed_segment\n                    self.order = self.sell(size=size)\n                    self.order_type = 'entry'\n\n    def notify_order(self, order):\n        if order.status in [order.Submitted, order.Accepted]:\n            return\n\n        if order is self.order:\n            if order.status == order.Completed:\n                if self.order_type == 'entry':\n                    entry_price = order.executed.price\n                    atr_val = self.entry_atr\n                    if self.entry_direction == 'long':\n                        stop_price = entry_price - self.p.sl_atr_mult * atr_val\n                        limit_price = entry_price + self.p.tp_atr_mult * atr_val\n                        self.stop_order = self.sell(size=self.pending_size,\n                                                     exectype=bt.Order.Stop,\n                                                     price=stop_price)\n                        self.limit_order = self.sell(size=self.pending_size,\n                                                      exectype=bt.Order.Limit,\n                                                      price=limit_price,\n                                                      oco=self.stop_order)\n                    else:\n                        stop_price = entry_price + self.p.sl_atr_mult * atr_val\n                        limit_price = entry_price - self.p.tp_atr_mult * atr_val\n                        self.stop_order = self.buy(size=self.pending_size,\n                                                    exectype=bt.Order.Stop,\n                                                    price=stop_price)\n                        self.limit_order = self.buy(size=self.pending_size,\n                                                     exectype=bt.Order.Limit,\n                                                     price=limit_price,\n                                                     oco=self.stop_order)\n                    self.position_segment = self.pending_segment\n                elif self.order_type == 'close':\n                    self.position_segment = None\n                    self.entry_atr = None\n                    self.entry_direction = None\n            else:\n                if self.order_type == 'entry':\n                    self.entry_atr = None\n                    self.entry_direction = None\n                    self.pending_size = None\n                    self.pending_segment = None\n            self.order = None\n            self.order_type = None\n            return\n\n        if order is self.stop_order or order is self.limit_order:\n            if order.status == order.Completed:\n                self.position_segment = None\n                self.entry_atr = None\n                self.entry_direction = None\n                self.stop_order = None\n                self.limit_order = None\n            elif order.status in [order.Canceled, order.Margin, order.Rejected]:\n                if order is self.stop_order:\n                    self.stop_order = None\n                if order is self.limit_order:\n                    self.limit_order = None",
+  "assumptions": [
+    {
+      "topic": "segment definition source",
+      "choice": "Used the Entry Conditions section's precise per-segment criteria (Segment2=EMA20<EMA50 both sloping down; Segment3=EMA20>EMA50 both sloping up) as authoritative over the looser Core Idea phrasing ('neutral or downtrend'), since only Entry Conditions attaches exact indicator logic.",
+      "reason": "The two spec sections phrase Segment 2 slightly differently; the Entry Conditions section is the operative, parameter-bearing definition."
+    },
+    {
+      "topic": "numeric definition of 'close/horizontal'",
+      "choice": "EMA20/EMA50 considered 'close' when |EMA20-EMA50|/EMA50 < 0.5%; an EMA is 'horizontal' when its % change over the slope window is < 0.1%.",
+      "reason": "Spec requires detecting a neutral/horizontal state but gives no numeric threshold; chose conservative round percentages."
+    },
+    {
+      "topic": "slope measurement window",
+      "choice": "Slope (angle) of EMA20/EMA50/EMA200 measured as percent change over the last 5 bars; 'sloping up/down' requires this value to exceed +/-0.1%.",
+      "reason": "Spec asks for slope-based trend confirmation but does not specify a lookback window for the slope calculation."
+    },
+    {
+      "topic": "pin bar definition",
+      "choice": "Bullish pin bar: lower wick > 2x candle body and upper wick < body. Bearish pin bar: upper wick > 2x body and lower wick < body.",
+      "reason": "Spec references 'bullish/bearish pin bar' as an alternate entry trigger without a numeric definition; used the standard rejection-candle heuristic."
+    },
+    {
+      "topic": "pullback-into-zone test",
+      "choice": "Tested against the bar's Close price falling within [min(EMA20,EMA50), max(EMA20,EMA50)], not intrabar High/Low.",
+      "reason": "Spec says price pulls back into the EMA zone but does not specify which OHLC field to test; Close is the simplest, most common choice."
+    },
+    {
+      "topic": "confirmed-segment state model",
+      "choice": "Track a raw per-bar segment (1/2/3/0-other); a 'confirmed segment' only updates once the same raw segment has persisted for 5 consecutive bars. Both entry gating and the opposite-segment exit signal use this sticky confirmed value.",
+      "reason": "This directly implements the stated purpose of the 5-bar confirmation rule (filtering 1-2 bar volatility spikes) and gives a well-defined state to compare for the 'segment switches to the opposite' exit rule."
+    },
+    {
+      "topic": "undefined segment combinations",
+      "choice": "Bar states that are neither Segment1 (low-vol/neutral) nor Segment2 (high-vol/down) nor Segment3 (high-vol/up) \u2014 e.g. high-vol/neutral or low-vol/trending \u2014 are treated as 'no action', identical to Segment 1.",
+      "reason": "The spec only assigns trading actions to its three named segments; no action is defined for other combinations."
+    },
+    {
+      "topic": "stop-loss/take-profit mechanics",
+      "choice": "Entry submitted as a plain market order; once filled, SL (Stop) and TP (Limit) orders are submitted at 2 ATR / 4 ATR from the actual fill price, linked via backtrader's OCO (one-cancels-other) so only one can execute.",
+      "reason": "Spec states SL/TP 'from the entry point,' which requires the realized fill price (unknown until the order executes on the next bar) rather than the signal-bar price."
+    },
+    {
+      "topic": "ATR value used for sizing and SL/TP distance",
+      "choice": "The ATR value read at the moment the entry signal fires (not re-read at fill time) is used both to size the position and to compute the SL/TP distances after fill.",
+      "reason": "Keeps the risk-sizing calculation and the resulting stop distance internally consistent; spec does not address the one-bar timing gap between signal and fill."
+    },
+    {
+      "topic": "position sizing / 'total trading capital'",
+      "choice": "Risk amount = 1% x self.broker.getvalue() (total portfolio value) at signal time; size = floor(risk_amount / (2 x ATR)) whole shares; commission is not included in the risk-distance calc; if computed size < 1 share, no trade is taken.",
+      "reason": "Spec mandates 1% risk sizing based on 'total trading capital' but doesn't define it precisely or address fractional shares/commission; portfolio value and whole-share flooring are the standard interpretation."
+    },
+    {
+      "topic": "global trend filter (EMA200) direction",
+      "choice": "Applied symmetrically: block long entries when EMA200's slope (5-bar % change) is below -0.1%, block short entries when it's above +0.1%.",
+      "reason": "Spec gives only one directional example ('if EMA 200 is sloping up, do not open short positions'); the opposite-direction rule for longs is implied by consistency."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2025-04-24T04:00:00",
+      "side": "SELL",
+      "size": -5.0,
+      "price": 203.81310578126346
+    }
+  ]
+}

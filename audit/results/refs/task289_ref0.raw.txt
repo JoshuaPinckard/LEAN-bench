@@ -1,0 +1,124 @@
+```python
+import backtrader as bt
+
+
+class MeanReversionStrikeVectorStrategy(bt.Strategy):
+    params = (
+        ('ema_period', 20),
+        ('bb_period', 20),
+        ('bb_devfactor_entry', 2.0),
+        ('bb_devfactor_exit', 0.5),
+        ('atr_period', 14),
+        ('atr_sma_period', 60),
+        ('atr_filter_mult', 1.5),
+        ('vol_sma_period', 20),
+        ('gap_atr_mult', 1.5),
+        ('stop_atr_mult', 2.0),
+        ('max_bars_in_trade', 20),
+        ('risk_pct', 0.05),
+        ('max_drawdown_pct', 0.10),
+    )
+
+    def __init__(self):
+        self.ema20 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.atr14 = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma60 = bt.indicators.SMA(self.atr14, period=self.p.atr_sma_period)
+        self.vol_sma20 = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.bb2 = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor_entry, movav=bt.indicators.MovAv.Exponential)
+        self.bb05 = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor_exit, movav=bt.indicators.MovAv.Exponential)
+
+        self.cross_lower = bt.indicators.CrossOver(self.data.close, self.bb2.bot)
+        self.cross_upper = bt.indicators.CrossOver(self.data.close, self.bb2.top)
+
+        self.order = None
+        self.position_stop = None
+        self.entry_bar = None
+        self.peak_value = None
+        self.trading_stopped = False
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed:
+            if self.position:
+                self.entry_bar = len(self)
+            else:
+                self.entry_bar = None
+                self.position_stop = None
+        self.order = None
+
+    def next(self):
+        value = self.broker.getvalue()
+        self.peak_value = value if self.peak_value is None else max(self.peak_value, value)
+
+        if self.trading_stopped:
+            return
+
+        if self.order:
+            return
+
+        drawdown = (self.peak_value - value) / self.peak_value if self.peak_value > 0 else 0.0
+        if drawdown >= self.p.max_drawdown_pct:
+            self.trading_stopped = True
+            if self.position:
+                self.order = self.close()
+            return
+
+        close = self.data.close[0]
+        ema = self.ema20[0]
+        atr = self.atr14[0]
+
+        if self.position:
+            if self.position.size > 0:
+                stop_hit = close <= self.position_stop
+            else:
+                stop_hit = close >= self.position_stop
+            reentered_band = self.bb05.bot[0] < close < self.bb05.top[0]
+            bars_held = (len(self) - self.entry_bar) if self.entry_bar is not None else 0
+            time_expired = bars_held >= self.p.max_bars_in_trade
+
+            if reentered_band or time_expired or stop_hit:
+                self.order = self.close()
+            return
+
+        filter_atr_ok = atr <= self.p.atr_filter_mult * self.atr_sma60[0]
+        filter_vol_ok = self.data.volume[0] >= self.vol_sma20[0]
+        filter_gap_ok = abs(self.data.open[0] - self.data.close[-1]) <= self.p.gap_atr_mult * atr
+
+        if not (filter_atr_ok and filter_vol_ok and filter_gap_ok):
+            return
+
+        if self.cross_lower[0] == 1:
+            stop_price = ema - self.p.stop_atr_mult * atr
+            risk = close - stop_price
+            if risk > 0:
+                size = int((self.p.risk_pct * value) / risk)
+                if size > 0:
+                    self.position_stop = stop_price
+                    self.order = self.buy(size=size)
+        elif self.cross_upper[0] == -1:
+            stop_price = ema + self.p.stop_atr_mult * atr
+            risk = stop_price - close
+            if risk > 0:
+                size = int((self.p.risk_pct * value) / risk)
+                if size > 0:
+                    self.position_stop = stop_price
+                    self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "Bollinger Bands center line", "choice": "Built BB(20,2) and BB(20,0.5) with their mid-line as EMA(20) (movav=Exponential) instead of the conventional SMA-centered mid-line", "reason": "Spec states fair price = EMA(20) and explicitly defines the strike vector as 'EMA(20) ± Nσ (from Bollinger)', so entries/exits framed as 'BB(20,2)'/'BB(20,0.5)' are read as bands centered on that same EMA(20) fair price, keeping fair price consistent across bands and the stop-loss formula."},
+  {"topic": "±1σ strike-vector level", "choice": "Not implemented as a separate trading condition", "reason": "The ±1σ level is mentioned only in the narrative description of the strike vector; the stated Entries/Exits/Filters/Risk rules only ever reference ±2σ (entry bands) and ±0.5σ (exit band), so no rule ties to ±1σ."},
+  {"topic": "Stop-loss execution mechanics", "choice": "Checked as an end-of-bar close-price condition (close crosses EMA∓2·ATR) rather than a submitted broker Stop order or intrabar high/low touch", "reason": "Spec gives only the stop price formula, not order-execution mechanics; evaluating it alongside the other next()-based exit conditions (BB(20,0.5) return, N-bar timeout) keeps all exits mechanically consistent."},
+  {"topic": "Sizing/stop inputs use signal-bar values", "choice": "Risk-per-share, stop price, and size are computed from the signal bar's close/EMA(20)/ATR(14) as proxies for the entry fill", "reason": "Actual fill price is unknown until the order executes on the following bar under backtrader's default timing, so signal-bar values are the best available proxy at decision time."},
+  {"topic": "'Capital' in the 5% risk rule", "choice": "Interpreted as current portfolio value (self.broker.getvalue()) at signal time, not the fixed starting cash", "reason": "Risk-based position sizing conventionally scales with current account equity; spec does not specify otherwise."},
+  {"topic": "Drawdown definition and permanence of stop", "choice": "Drawdown computed against the running peak (all-time-high) of portfolio value since strategy start; once the 10% threshold is hit, trading halts permanently for the rest of the backtest", "reason": "Standard drawdown definition; 'stop trading' is read as a one-time, non-resuming circuit breaker since the spec gives no resumption condition."},
+  {"topic": "Position sizing rounding", "choice": "Floor to whole shares via integer division; skip the entry that bar if resulting size is 0 or risk-per-share is non-positive", "reason": "Spec requires risk ≤ 5% of capital, which caps (not fixes) size; fractional shares are not tradable and a non-positive risk-per-share makes the risk formula undefined."},
+  {"topic": "Single-position holding", "choice": "At most one position (long or short) open at a time; no new entries while a position is open", "reason": "Canonical default; spec does not address pyramiding or concurrent long+short exposure."}
+]}
+```

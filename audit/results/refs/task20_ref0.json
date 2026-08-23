@@ -1,0 +1,62 @@
+{
+  "task_id": 20,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport collections\nimport statistics\n\n\nclass ORBFibPullbackStrategy(bt.Strategy):\n    params = dict(\n        or_minutes=60,\n        fifteen_min=15,\n        one_hour=60,\n        trend_sma_period=50,\n        momentum_mult=0.25,\n        risk_pct=0.01,\n        rr_ratio=2.0,\n    )\n\n    def __init__(self):\n        self.order = None\n        self.stop_price = None\n        self.tp_price = None\n        self.entry_dir = None\n\n        self.session_date = None\n        self.min_count = -1\n\n        self.or_high = None\n        self.or_low = None\n        self.or_finalized = False\n\n        self.breakout_dir = None\n        self.impulse_extreme = None\n        self.momentum_confirmed = False\n        self.fib50 = None\n        self.fib618 = None\n\n        # kept across sessions intentionally: trend context should not reset daily\n        self.hourly_closes = collections.deque(maxlen=self.p.trend_sma_period)\n        self.trend_sma = None\n        self.trend_dir = None\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def _reset_day_state(self):\n        self.or_high = None\n        self.or_low = None\n        self.or_finalized = False\n        self._reset_setup_state()\n\n    def _reset_setup_state(self):\n        self.breakout_dir = None\n        self.impulse_extreme = None\n        self.momentum_confirmed = False\n        self.fib50 = None\n        self.fib618 = None\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        if dt != self.session_date:\n            self.session_date = dt\n            self.min_count = 0\n            self._reset_day_state()\n        else:\n            self.min_count += 1\n\n        if self.min_count < self.p.or_minutes:\n            if self.or_high is None:\n                self.or_high = self.data.high[0]\n                self.or_low = self.data.low[0]\n            else:\n                self.or_high = max(self.or_high, self.data.high[0])\n                self.or_low = min(self.or_low, self.data.low[0])\n            if self.min_count == self.p.or_minutes - 1:\n                self.or_finalized = True\n\n        if (self.min_count + 1) % self.p.one_hour == 0:\n            self.hourly_closes.append(self.data.close[0])\n            if len(self.hourly_closes) == self.p.trend_sma_period:\n                self.trend_sma = statistics.mean(self.hourly_closes)\n        if self.trend_sma is not None:\n            self.trend_dir = 'up' if self.hourly_closes[-1] > self.trend_sma else 'down'\n\n        if not self.or_finalized:\n            return\n        if self.order:\n            return\n        if self.position:\n            self._manage_position()\n            return\n\n        is_15m_close = (self.min_count + 1) % self.p.fifteen_min == 0\n        if self.breakout_dir is None and is_15m_close:\n            c = self.data.close[0]\n            if c > self.or_high:\n                self.breakout_dir = 'long'\n                self.impulse_extreme = c\n            elif c < self.or_low:\n                self.breakout_dir = 'short'\n                self.impulse_extreme = c\n            return\n\n        if self.breakout_dir is None:\n            return\n\n        if self.trend_dir is None:\n            return\n        if self.breakout_dir == 'long' and self.trend_dir != 'up':\n            return\n        if self.breakout_dir == 'short' and self.trend_dir != 'down':\n            return\n\n        if not self.momentum_confirmed:\n            or_range = self.or_high - self.or_low\n            if self.breakout_dir == 'long':\n                self.impulse_extreme = max(self.impulse_extreme, self.data.high[0])\n                if self.impulse_extreme >= self.or_high + self.p.momentum_mult * or_range:\n                    self.momentum_confirmed = True\n                    self.fib50 = self.impulse_extreme - 0.5 * (self.impulse_extreme - self.or_high)\n                    self.fib618 = self.impulse_extreme - 0.618 * (self.impulse_extreme - self.or_high)\n                elif self.data.close[0] <= self.or_high:\n                    self._reset_setup_state()\n            else:\n                self.impulse_extreme = min(self.impulse_extreme, self.data.low[0])\n                if self.impulse_extreme <= self.or_low - self.p.momentum_mult * or_range:\n                    self.momentum_confirmed = True\n                    self.fib50 = self.impulse_extreme + 0.5 * (self.or_low - self.impulse_extreme)\n                    self.fib618 = self.impulse_extreme + 0.618 * (self.or_low - self.impulse_extreme)\n                elif self.data.close[0] >= self.or_low:\n                    self._reset_setup_state()\n            return\n\n        price = self.data.close[0]\n        prev_close = self.data.close[-1]\n        if self.breakout_dir == 'long':\n            in_golden_zone = self.fib618 <= price <= self.fib50\n            if in_golden_zone and price > prev_close:\n                self._enter_long()\n            elif price <= self.or_high:\n                self._reset_setup_state()\n        else:\n            in_golden_zone = self.fib50 <= price <= self.fib618\n            if in_golden_zone and price < prev_close:\n                self._enter_short()\n            elif price >= self.or_low:\n                self._reset_setup_state()\n\n    def _enter_long(self):\n        stop = self.or_low\n        entry = self.data.close[0]\n        risk_per_share = entry - stop\n        if risk_per_share <= 0:\n            self._reset_setup_state()\n            return\n        size = int((self.broker.getvalue() * self.p.risk_pct) / risk_per_share)\n        if size <= 0:\n            self._reset_setup_state()\n            return\n        self.stop_price = stop\n        self.tp_price = entry + self.p.rr_ratio * risk_per_share\n        self.entry_dir = 'long'\n        self.order = self.buy(size=size)\n\n    def _enter_short(self):\n        stop = self.or_high\n        entry = self.data.close[0]\n        risk_per_share = stop - entry\n        if risk_per_share <= 0:\n            self._reset_setup_state()\n            return\n        size = int((self.broker.getvalue() * self.p.risk_pct) / risk_per_share)\n        if size <= 0:\n            self._reset_setup_state()\n            return\n        self.stop_price = stop\n        self.tp_price = entry - self.p.rr_ratio * risk_per_share\n        self.entry_dir = 'short'\n        self.order = self.sell(size=size)\n\n    def _manage_position(self):\n        price = self.data.close[0]\n        if self.entry_dir == 'long':\n            if price <= self.stop_price or price >= self.tp_price or price <= self.or_high:\n                self.order = self.close()\n                self._reset_setup_state()\n        else:\n            if price >= self.stop_price or price <= self.tp_price or price >= self.or_low:\n                self.order = self.close()\n                self._reset_setup_state()",
+  "assumptions": [
+    {
+      "topic": "position sizing",
+      "choice": "Size each entry so stop-loss distance risks exactly 1% of current portfolio value (shares = 1% equity / per-share risk).",
+      "reason": "Spec explicitly recommends fixed risk per trade of 1-2% tied to the stop-loss distance; picked the lower end of the stated range as a single concrete value."
+    },
+    {
+      "topic": "take-profit ratio",
+      "choice": "TP = entry +/- 2x the stop-loss distance (1:2 risk:reward).",
+      "reason": "This value is given verbatim in the spec as its own recommended default."
+    },
+    {
+      "topic": "momentum/impulse confirmation threshold",
+      "choice": "Post-breakout price must extend at least 25% of the OR range beyond the breakout boundary before the pullback/Fibonacci search begins; if price falls back inside the range first, the setup is invalidated.",
+      "reason": "Spec requires a 'strong move (impulse)' but gives no numeric threshold; a modest fraction of the OR range was chosen as a literal, minimal quantification."
+    },
+    {
+      "topic": "fibonacci swing anchor",
+      "choice": "The retracement swing runs from the breakout boundary (OR High for longs / OR Low for shorts) to the extreme price reached during the confirmed impulse.",
+      "reason": "Spec says Fibonacci is 'applied to the price move after the range breakout,' i.e., the impulse leg; anchoring at the breakout boundary is the most literal reading."
+    },
+    {
+      "topic": "reversal signal at fibonacci entry",
+      "choice": "Current 1-minute close higher than the prior close (long) / lower than the prior close (short) while price sits in the 50-61.8% golden zone.",
+      "reason": "Spec says price should show 'signs of a reversal' without naming an indicator or pattern; used the simplest directional tick as a literal proxy."
+    },
+    {
+      "topic": "higher-timeframe trend filter",
+      "choice": "Manually aggregated 1-hour bars (built from the single 1-minute feed) with SMA(50) of hourly closes; uptrend if last hourly close > SMA50, downtrend if below.",
+      "reason": "Spec offers '1-hour or 4-hour' as an example; chose 1-hour, the shorter cited option, and built it manually since the harness supplies only a single 1-minute PandasData feed with no cerebro-level resampling available to the strategy."
+    },
+    {
+      "topic": "infeasible",
+      "choice": "Implemented SMA(50) of 1-hour closes exactly as specified, even though the ~6.5-day, 2516-bar 1-minute feed yields at most ~39 hourly closes -- short of 50 -- so the trend filter may stay unset (None) for the whole run, blocking all entries.",
+      "reason": "A true 50-period 1-hour SMA needs roughly 50 trading hours (~8 sessions) of history, more than this environment's fixed data window provides; per the rules, the literal parameter (50) was kept rather than shrinking it to force trades."
+    },
+    {
+      "topic": "session/day boundary",
+      "choice": "A new session is detected via a change in the bar's date; Opening Range, breakout state, and Fibonacci levels reset every new day, while the hourly-close history feeding the trend SMA is not reset and stays continuous across sessions.",
+      "reason": "The OR is explicitly a 'first trading hour' (daily) concept, but the higher-timeframe trend indicator is conventionally continuous market context."
+    },
+    {
+      "topic": "post-exit setup re-arming",
+      "choice": "After any exit (stop-loss, take-profit, or alternative in-range exit) the day's breakout/impulse/Fibonacci state is cleared, allowing a fresh 15-minute breakout to be sought again later the same session rather than disabling trading for the rest of the day.",
+      "reason": "Spec states no one-trade-per-day limit; canonical default #3 only forbids concurrent positions, so sequential re-entries after going flat are the more literal reading."
+    },
+    {
+      "topic": "stop-loss / alternative-exit placement",
+      "choice": "Stop is placed exactly at OR Low (long) / OR High (short) with no buffer; the alternative exit fires as soon as Close crosses back past that same boundary (OR High for longs, OR Low for shorts).",
+      "reason": "Literal reading of 'placed below/above the boundary' and 'full return of the price back inside the initial range.'"
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

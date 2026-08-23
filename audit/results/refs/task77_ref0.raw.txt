@@ -1,0 +1,94 @@
+Reviewing the spec against the fixed OHLCV/backtrader environment — this is a market-making model that needs order-book intensity, true mid-price, and time-to-horizon inputs none of which exist in 1-minute bars, so I'll implement the closest literal reading and declare the gaps.
+
+```python
+import backtrader as bt
+import math
+import collections
+import statistics
+
+
+class AvellanedaStoikovStrategy(bt.Strategy):
+    params = (
+        ('gamma', 0.1),
+        ('mode', 'Inventory'),
+        ('k', 1.5),
+        ('vol_window', 100),
+        ('session_bars', 390),
+        ('max_inventory', 5),
+    )
+
+    def __init__(self):
+        self.returns = collections.deque(maxlen=self.p.vol_window)
+        self.buy_order = None
+        self.sell_order = None
+        self.session_date = None
+        self.day_bar_count = 0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order == self.buy_order:
+                self.buy_order = None
+            if order == self.sell_order:
+                self.sell_order = None
+
+    def next(self):
+        price_mid = self.data.close[0]
+
+        if len(self) > 1:
+            prev_close = self.data.close[-1]
+            if prev_close > 0:
+                self.returns.append(math.log(price_mid / prev_close))
+
+        sigma = statistics.pstdev(self.returns) if len(self.returns) >= 2 else 0.0
+        sigma_sq = sigma * sigma
+
+        current_date = self.data.datetime.date(0)
+        if self.session_date is None or current_date != self.session_date:
+            self.session_date = current_date
+            self.day_bar_count = 0
+        else:
+            self.day_bar_count += 1
+        remaining = max(self.p.session_bars - self.day_bar_count, 1)
+        tau = remaining / float(self.p.session_bars)
+
+        q = self.position.size
+
+        spread = self.p.gamma * sigma_sq * tau + (2.0 / self.p.gamma) * math.log(1.0 + self.p.gamma / self.p.k)
+
+        if self.p.mode == 'Symmetric':
+            reservation_price = price_mid
+        else:
+            reservation_price = price_mid - q * self.p.gamma * sigma_sq * tau
+
+        bid_price = reservation_price - spread / 2.0
+        ask_price = reservation_price + spread / 2.0
+
+        if self.buy_order is not None and self.buy_order.alive():
+            self.cancel(self.buy_order)
+        self.buy_order = None
+        if self.sell_order is not None and self.sell_order.alive():
+            self.cancel(self.sell_order)
+        self.sell_order = None
+
+        if q < self.p.max_inventory:
+            self.buy_order = self.buy(exectype=bt.Order.Limit, price=bid_price)
+        if q > -self.p.max_inventory:
+            self.sell_order = self.sell(exectype=bt.Order.Limit, price=ask_price)
+```
+```json
+{"assumptions": [
+  {"topic": "mode_selection", "choice": "Exposed as a strategy parameter self.p.mode ('Inventory' default, or 'Symmetric')", "reason": "The harness only allows one module-level Strategy class, but the spec requires two operating modes; a parameter lets the grader instantiate either without duplicating the class."},
+  {"topic": "infeasible", "choice": "Use each 1-minute bar's Close price as the mid-price", "reason": "The Avellaneda-Stoikov model requires a true order-book mid-price, but only OHLCV bars are available; Close is the closest literal proxy."},
+  {"topic": "infeasible", "choice": "Fixed order-arrival intensity k = 1.5", "reason": "The A-S optimal-spread formula requires an order-arrival-intensity parameter estimated from order-book/quote data, which is unavailable from OHLCV; 1.5 is a commonly cited reference value used to keep the formula well-defined."},
+  {"topic": "infeasible", "choice": "Treat each 1-minute bar as one 'tick' for quoting/requoting purposes", "reason": "No genuine tick/quote data feed is available in this environment; 1-minute bars are the finest granularity provided."},
+  {"topic": "volatility_estimator", "choice": "Population stdev of log returns over a rolling 100-bar window (vol_window param)", "reason": "Spec requires a volatility term (sigma) in the formulas but specifies no estimator or window length."},
+  {"topic": "time_horizon", "choice": "Normalize (T-t) as fraction of an assumed 390-bar (6.5h) trading session, resetting at each new calendar date in the feed", "reason": "The model needs a time-to-horizon term; the feed has no explicit session-close marker, so a standard regular-session bar count is assumed and reset daily using the bar's date."},
+  {"topic": "max_inventory", "choice": "Cap absolute inventory at 5 units (max_inventory param); stop quoting the side that would breach the cap", "reason": "Spec requires 'mechanisms to control maximum inventory' but gives no numeric limit."},
+  {"topic": "order_sizing", "choice": "Default sizer, no size argument on buy()/sell()", "reason": "Canonical default; spec does not state a position-sizing rule for individual quote fills."},
+  {"topic": "exit_via_price_crossing", "choice": "Interpreted as satisfied by the same inventory-adjusted bid/ask levels from point 1 (no separate stop-loss formula added)", "reason": "Spec states exits 'may also be initiated by the mid-price crossing certain levels based on current inventory and risk parameters' but gives no formula; the bid/ask levels already are those inventory/risk-based levels, so adding an undefined second stop mechanism would be an unstated addition."},
+  {"topic": "position_management", "choice": "Allow continuous inventory accumulation/reduction via repeated buy/sell fills instead of the canonical one-position-at-a-time default", "reason": "The spec explicitly describes a signed inventory q that grows/shrinks (including negative values) through sequential order fills, which requires deviating from the single-entry default."},
+  {"topic": "infeasible", "choice": "Omit computation of total average profit / std of profit / average final inventory / std of final inventory from the strategy class", "reason": "These are aggregate backtest evaluation statistics computed across multiple runs, not per-bar strategy logic, and are outside the scope of a single bt.Strategy class; the harness/analyzers layer handles run-level metrics."}
+]}
+```

@@ -1,0 +1,110 @@
+```python
+import backtrader as bt
+
+
+class ScalpingMomentumStrategy(bt.Strategy):
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=20)
+        self.atr1 = bt.indicators.ATR(self.data, period=1)
+        self.bb = bt.indicators.BollingerBands(self.data, period=20, devfactor=2.0)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.sma)
+
+        self.order = None
+        self.entry_price = 0.0
+        self.max_since_entry = 0.0
+        self.trailing_active = False
+        self.pending_proxy_spread = 0.0
+        self.entry_proxy_spread = 0.0
+        self.trades_today = 0
+        self.current_day = None
+
+        self.total_trades = 0
+        self.total_pnl = 0.0
+        self.total_proxy_spread_sum = 0.0
+        self.avg_proxy_spread = 0.0
+        self.total_slippage_penalty = 0.0
+        self.net_profit_after_penalty = 0.0
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_price = order.executed.price
+            self.max_since_entry = self.entry_price
+            self.trailing_active = False
+            self.trades_today += 1
+            self.entry_proxy_spread = self.pending_proxy_spread
+        self.order = None
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.total_trades += 1
+            self.total_pnl += trade.pnlcomm
+            self.total_proxy_spread_sum += self.entry_proxy_spread
+            self.avg_proxy_spread = self.total_proxy_spread_sum / self.total_trades
+            self.net_profit_after_penalty = self.total_pnl - self.total_slippage_penalty
+
+    def next(self):
+        dt = self.data.datetime.datetime(0)
+        if self.current_day is None or dt.date() != self.current_day:
+            self.current_day = dt.date()
+            self.trades_today = 0
+
+        if self.position:
+            price = self.data.close[0]
+            if price > self.max_since_entry:
+                self.max_since_entry = price
+            if not self.trailing_active and price >= self.entry_price * 1.002:
+                self.trailing_active = True
+            if self.trailing_active and not self.order:
+                trailing_stop_price = self.max_since_entry * (1 - 0.0005)
+                if price <= trailing_stop_price:
+                    proxy_spread_exit = max(self.data.high[0] - self.data.low[0], self.atr1[0])
+                    if proxy_spread_exit > 0.001 * price:
+                        self.total_slippage_penalty += 0.0005 * price * self.position.size
+                    self.order = self.close()
+            return
+
+        if self.order:
+            return
+
+        if self.trades_today >= 5:
+            return
+
+        minutes = dt.hour * 60 + dt.minute
+        if not (585 <= minutes <= 660):
+            return
+
+        if self.crossover[0] <= 0:
+            return
+
+        price = self.data.close[0]
+        proxy_spread = max(self.data.high[0] - self.data.low[0], self.atr1[0])
+        if proxy_spread > 0.001 * price:
+            return
+
+        sma_val = self.sma[0]
+        if abs(price - sma_val) / price > 0.005:
+            return
+
+        bb_width = (self.bb.top[0] - self.bb.bot[0]) / self.bb.mid[0]
+        if bb_width > 0.015:
+            return
+
+        self.pending_proxy_spread = proxy_spread
+        self.order = self.buy(size=100)
+```
+```json
+{"assumptions": [
+  {"topic": "Bollinger Bands parameters", "choice": "period=20, devfactor=2.0 (backtrader defaults)", "reason": "spec names only BB_width formula, not period/devfactor; defaults match the already-specified SMA(20) for internal consistency"},
+  {"topic": "time filter boundaries", "choice": "inclusive 09:45:00-11:00:00 using each bar's own timestamp (feed is already ET)", "reason": "spec states 'trades only from 09:45 to 11:00' without specifying open/closed endpoints"},
+  {"topic": "price reference for entry/trailing logic", "choice": "use bar Close for crossover, entry trigger price, trailing-stop trigger, and max_since_entry tracking; only the proxy-spread calc uses High-Low as explicitly stated", "reason": "spec doesn't specify which price series drives the trailing logic outside the explicitly-defined proxy spread formula"},
+  {"topic": "5 trades/day counter", "choice": "increment on buy order Completed (i.e., actual fills), reset when the bar's date changes", "reason": "spec says 'maximum 5 trades per day' without defining trade vs. order; counting filled entries is the literal reading of an executed trade"},
+  {"topic": "total profit/loss metric", "choice": "sum of trade.pnlcomm (net of broker commission) across closed trades", "reason": "spec asks for 'total profit/loss' as a backtest metric distinct from the separately-defined slippage-penalty adjustment, so commission-net P&L is the natural base figure"},
+  {"topic": "average proxy spread per trade", "choice": "average of the proxy_spread value measured at each trade's entry bar (the value that passed the entry filter)", "reason": "spec doesn't specify entry vs exit vs both; entry-bar value is the one explicitly gated by the spec's spread filter"},
+  {"topic": "slippage penalty mechanics", "choice": "penalty is a metrics-only accumulator (net_profit_after_penalty = total_pnl - total_slippage_penalty); it does not alter the actual close-order fill price", "reason": "spec describes it as 'a fixed add-on to costs' for backtest metrics, not an execution/fill-price change, and the harness controls the broker/order mechanics"},
+  {"topic": "exit-time proxy spread for slippage check", "choice": "recompute max(High-Low, ATR(1)) at the bar where the trailing-stop condition is detected (signal bar), compared against 0.1% of that bar's Close", "reason": "spec ties the penalty to the proxy spread 'upon triggering the exit', read as the bar where the exit condition is met"},
+  {"topic": "no additional exit conditions", "choice": "trailing stop is the sole exit mechanism; no forced close at 11:00 ET, end of day, or end of data", "reason": "spec states only the trailing-stop exit and doesn't declare a time-based flatten rule; the 09:45-11:00 window is applied to entries only, per canonical instruction not to invent extra stops/filters"},
+  {"topic": "ATR(1) definition", "choice": "bt.indicators.ATR(self.data, period=1), i.e., the current bar's True Range", "reason": "literal reading of 'ATR(1)' as stated in the spec"}
+]}
+```

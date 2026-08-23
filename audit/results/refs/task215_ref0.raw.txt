@@ -1,0 +1,111 @@
+```python
+import backtrader as bt
+
+
+class RRGProxyMomentum(bt.Strategy):
+    params = (
+        ('sma_fast_period', 50),
+        ('sma_slow_period', 200),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('rsi_period', 14),
+        ('atr_period', 14),
+        ('rsi_cross_level', 50),
+        ('rsi_tp_level', 70),
+        ('stop_pct', 0.02),
+        ('atr_mult', 2.0),
+        ('take_pct', 0.07),
+        ('use_tp', True),
+        ('risk_pct', 0.01),
+        ('size_cap_pct', 0.10),
+        ('use_volume_filter', False),
+        ('volume_sma_period', 20),
+    )
+
+    def __init__(self):
+        self.sma_fast = bt.indicators.SMA(self.data.close, period=self.p.sma_fast_period)
+        self.sma_slow = bt.indicators.SMA(self.data.close, period=self.p.sma_slow_period)
+        self.macd = bt.indicators.MACDHisto(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.macd_cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
+        self.rsi_cross = bt.indicators.CrossOver(self.rsi, self.p.rsi_cross_level)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_sma_period)
+
+        self.order = None
+        self.entry_price = None
+        self.stop_amount = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.stop_amount = max(
+                    self.p.stop_pct * self.entry_price,
+                    self.p.atr_mult * self.atr[0],
+                )
+            else:
+                self.entry_price = None
+                self.stop_amount = None
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        close = self.data.close[0]
+        sma_f = self.sma_fast[0]
+        sma_s = self.sma_slow[0]
+
+        if self.position:
+            hist = self.macd.histo[0]
+            rsi = self.rsi[0]
+
+            exit_momentum_weak = hist < 0 and close > sma_s
+            exit_trend_reversal = close < sma_s or sma_f < sma_s
+            exit_take_profit = self.p.use_tp and (
+                close >= self.entry_price * (1 + self.p.take_pct) or rsi > self.p.rsi_tp_level
+            )
+            exit_stop_loss = (
+                self.stop_amount is not None and close <= self.entry_price - self.stop_amount
+            )
+
+            if exit_momentum_weak or exit_trend_reversal or exit_take_profit or exit_stop_loss:
+                self.order = self.close()
+            return
+
+        leadership = close > sma_s and sma_f > sma_s
+        momentum = self.macd.histo[0] > 0
+        accel = self.macd_cross[0] > 0 or self.rsi_cross[0] > 0
+        volume_ok = (not self.p.use_volume_filter) or (self.data.volume[0] > self.vol_sma[0])
+
+        if leadership and momentum and accel and volume_ok:
+            stop_amount_est = max(self.p.stop_pct * close, self.p.atr_mult * self.atr[0])
+            capital = self.broker.getvalue()
+            shares_by_risk = (capital * self.p.risk_pct) / stop_amount_est
+            # both terms of the sizing min() normalized to a share count
+            shares_by_cap = (self.p.size_cap_pct * capital) / close
+            size = int(min(shares_by_risk, shares_by_cap))
+            if size > 0:
+                self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "position sizing units", "choice": "The spec's min(10% of capital, capital*1%risk/(stop per share)) mixes a dollar amount with a share count. Converted the '10% of capital' term to a share count by dividing by the entry-bar close price so both terms of the min() are in shares.", "reason": "The two terms as literally written have incompatible units (dollars vs shares/dollar); normalizing to shares is the only way to compute a usable order size while preserving both stated caps."},
+  {"topic": "definition of 'capital'", "choice": "Used self.broker.getvalue() (total portfolio equity) for both the 10% cap and the 1% risk amount.", "reason": "Spec does not specify cash vs equity; equity is the standard basis for risk-based position sizing."},
+  {"topic": "stop-loss as an exit trigger", "choice": "Treated the risk-management 'stop-loss = max(2% of entry price, 2*ATR(14))' as an active exit condition (close <= entry_price - stop_amount triggers close()), even though it is not one of the three numbered 'Exit conditions'.", "reason": "A stop-loss defined under risk management with no way to ever trigger would leave the position unprotected, contradicting its stated purpose; this is the closest literal, functional reading."},
+  {"topic": "exit/stop mechanism", "choice": "All exits (momentum weakening, trend reversal, take-profit, stop-loss) are evaluated as close-price comparisons inside next() and executed via self.close(), rather than as resting broker stop/limit orders.", "reason": "Several exits (RSI>70, MACD histogram sign, trend reversal) are inherently signal-based and cannot be resting orders, so all exits are handled uniformly for consistency; spec does not specify order types for exits."},
+  {"topic": "optional liquidity filter default", "choice": "Implemented volume > SMA(volume,20) as an entry gate controlled by param use_volume_filter, default False.", "reason": "Spec explicitly calls it 'optional' and does not state a default-enabled state; leaving it off keeps entries governed strictly by the three numbered conditions unless explicitly enabled."},
+  {"topic": "unparameterized numeric levels", "choice": "atr_mult (2), rsi_cross_level (50), and rsi_tp_level (70) are exposed as strategy params but defaulted to the literal spec values.", "reason": "Spec's parameterization list only names stop_pct and take_pct explicitly; other numeric constants are kept literal per the spec text while still exposed for clarity."},
+  {"topic": "entry price used for sizing vs. stop", "choice": "Position size is computed using the signal bar's close price as an entry-price estimate; the actual stop_amount used for the in-position stop-loss check is recomputed from the order's executed fill price in notify_order.", "reason": "Backtrader fills market orders at the next bar's open, so the true entry price is only known on fill; sizing must use the signal-bar price since it's decided before submission."},
+  {"topic": "fractional shares", "choice": "Computed size is floored to an integer via int().", "reason": "Spec does not state fractional-share trading; equities are conventionally traded in whole shares."}
+]}
+```

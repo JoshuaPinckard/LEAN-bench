@@ -1,0 +1,115 @@
+```python
+import backtrader as bt
+
+
+class AccumulationBreakoutStrategy(bt.Strategy):
+    params = (
+        ('zone_low', 165.0),
+        ('zone_high', 170.0),
+        ('resistance', 240.0),
+        ('swing_lag', 3),
+        ('absorption_lookback', 3),
+        ('risk_pct', 0.02),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.bar_index = -1
+        self.prev_month = None
+        self.swing_lows = []  # (bar_index, low) points since last August anchor
+
+    def _update_trendline_state(self):
+        self.bar_index += 1
+        dt = self.data.datetime.date(0)
+        if self.prev_month is not None and dt.month == 8 and self.prev_month != 8:
+            self.swing_lows = []
+        self.prev_month = dt.month
+
+        lag = self.p.swing_lag
+        if self.bar_index >= 2 * lag:
+            candidate_x = self.bar_index - lag
+            window = [self.data.low[-i] for i in range(0, 2 * lag + 1)]
+            candidate_low = self.data.low[-lag]
+            if candidate_low == min(window):
+                self.swing_lows.append((candidate_x, candidate_low))
+
+    def _trendline_value(self):
+        pts = self.swing_lows
+        if len(pts) < 2:
+            return None
+        n = len(pts)
+        mean_x = sum(p[0] for p in pts) / n
+        mean_y = sum(p[1] for p in pts) / n
+        num = sum((p[0] - mean_x) * (p[1] - mean_y) for p in pts)
+        den = sum((p[0] - mean_x) ** 2 for p in pts)
+        if den == 0:
+            return None
+        slope = num / den
+        if slope <= 0:
+            return None
+        intercept = mean_y - slope * mean_x
+        return slope * self.bar_index + intercept
+
+    def _absorption_signal(self):
+        n = min(self.p.absorption_lookback, len(self))
+        for i in range(n):
+            o = self.data.open[-i]
+            c = self.data.close[-i]
+            l = self.data.low[-i]
+            body = abs(c - o)
+            lower_wick = min(o, c) - l
+            if c > o or lower_wick > body:
+                return True
+        return False
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def next(self):
+        self._update_trendline_state()
+
+        if self.order:
+            return
+
+        if self.position:
+            if self.data.high[0] >= self.p.resistance:
+                self.order = self.close()
+            elif self.data.close[0] < self.p.zone_low:
+                self.order = self.close()
+            return
+
+        zone_touch = (self.data.low[0] <= self.p.zone_high) and (self.data.high[0] >= self.p.zone_low)
+        if not zone_touch:
+            return
+
+        trendline_value = self._trendline_value()
+        if trendline_value is None or self.data.close[0] < trendline_value:
+            return
+
+        if not self._absorption_signal():
+            return
+
+        entry_price = self.data.close[0]
+        risk_per_share = entry_price - self.p.zone_low
+        if risk_per_share <= 0:
+            return
+
+        risk_amount = self.p.risk_pct * self.broker.getvalue()
+        size = int(risk_amount / risk_per_share)
+        if size <= 0:
+            return
+
+        self.order = self.buy(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "trendline_anchor", "choice": "Re-anchor the swing-low collection used for the ascending trendline at the first bar of every August (no year specified in spec, and the backtest spans multiple Augusts), fitting a least-squares line through confirmed swing lows since that anchor.", "reason": "Spec says the line starts 'from August' and must be determined automatically, but gives no specific year over a 6-year feed."},
+  {"topic": "swing_low_confirmation", "choice": "A bar's low is a confirmed swing low if it is the minimum low in a symmetric 3-bars-before/3-bars-after window; the trendline is refit by least squares each bar from all confirmed points since the anchor.", "reason": "Spec requires an automatic trendline through the lows but gives no detection window or fitting method."},
+  {"topic": "zone_touch_definition", "choice": "Entry condition 1 ('touches or enters the zone') is satisfied when the bar's [low, high] range overlaps [165, 170].", "reason": "Spec doesn't define the exact touch test (close-in-zone vs. intrabar overlap)."},
+  {"topic": "trendline_side_test", "choice": "'Price is above or on the trendline' is tested using the bar's close versus the projected trendline value.", "reason": "Spec doesn't specify which price point to compare against the line."},
+  {"topic": "buyer_absorption", "choice": "Operationalized as: over the last 3 bars, at least one bar is bullish (close>open) or has a lower wick longer than its body.", "reason": "Spec's 'signs of buyer absorption' example (long lower wicks/bullish candles) is qualitative; a concrete rule and lookback were needed."},
+  {"topic": "exit_trigger_basis", "choice": "Take-profit fires on intrabar high touching $240 ('reaches'); stop-loss requires the close to be below $165, matching the spec's explicit 'closes below this level' wording.", "reason": "Spec uses different language for each exit ('reaches' vs. 'closes below'), so each is checked against a different price point."},
+  {"topic": "risk_sizing_reference_price", "choice": "The 2%-risk position size uses the signal bar's close as entry-price reference, shares floored to a whole number, and the trade is skipped if risk-per-share is not positive.", "reason": "Spec states the risk formula (2% capital / (entry - 165)) but not the exact reference price or fractional-share handling."}
+]}
+```

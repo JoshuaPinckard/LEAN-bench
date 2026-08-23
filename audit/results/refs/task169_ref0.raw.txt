@@ -1,0 +1,168 @@
+```python
+import backtrader as bt
+
+
+class RegimeVolatilityStrategy(bt.Strategy):
+    params = dict(
+        atr_period=14,
+        bb_period=20,
+        bb_dev=2,
+        vol_ema_period=50,
+        ema_fast_period=10,
+        ema_slow_period=30,
+        sma_trend_period=50,
+        rsi_period=14,
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        cvi_low=0.9,
+        cvi_high=1.1,
+        cvi_mid=1.0,
+        rsi_mid=50,
+        rsi_meanrev_long_entry=35,
+        rsi_meanrev_long_exit=55,
+        low_atr_mult=1.5,
+        high_atr_mult=2.5,
+        base_risk_pct=0.01,
+        size_mult_low=1.3,
+        size_mult_mid=1.0,
+        size_mult_high=0.7,
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data, period=self.p.bb_period, devfactor=self.p.bb_dev
+        )
+        self.bb_width = self.bb.lines.top - self.bb.lines.bot
+        self.atr_ema = bt.indicators.EMA(self.atr, period=self.p.vol_ema_period)
+        self.bbw_ema = bt.indicators.EMA(self.bb_width, period=self.p.vol_ema_period)
+        self.ema_fast = bt.indicators.EMA(self.data.close, period=self.p.ema_fast_period)
+        self.ema_slow = bt.indicators.EMA(self.data.close, period=self.p.ema_slow_period)
+        self.sma_trend = bt.indicators.SMA(self.data.close, period=self.p.sma_trend_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.macd = bt.indicators.MACD(
+            self.data.close,
+            period_me1=self.p.macd_fast,
+            period_me2=self.p.macd_slow,
+            period_signal=self.p.macd_signal,
+        )
+        self.ema_cross = bt.indicators.CrossOver(self.ema_fast, self.ema_slow)
+
+        self.order = None
+        self.entry_type = None
+        self.stop_price = None
+        self.prev_cvi = None
+        self.prev_macd_hist = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        cvi = 0.5 * (self.atr[0] / self.atr_ema[0]) + 0.5 * (
+            self.bb_width[0] / self.bbw_ema[0]
+        )
+        macd_hist = self.macd.macd[0] - self.macd.signal[0]
+
+        prev_cvi = self.prev_cvi
+        prev_macd_hist = self.prev_macd_hist
+        self.prev_cvi = cvi
+        self.prev_macd_hist = macd_hist
+
+        is_last_bar = len(self.data) == self.data.buflen()
+
+        if self.order:
+            return
+
+        close = self.data.close[0]
+
+        if self.position:
+            exit_signal = is_last_bar
+            if not exit_signal:
+                if self.entry_type == 'trend':
+                    if prev_cvi is not None and prev_cvi <= self.p.cvi_mid < cvi:
+                        exit_signal = True
+                    elif close <= self.stop_price:
+                        exit_signal = True
+                else:
+                    if prev_cvi is not None and prev_cvi >= self.p.cvi_mid > cvi:
+                        exit_signal = True
+                    elif close <= self.stop_price:
+                        exit_signal = True
+                    elif self.entry_type == 'meanrev' and (
+                        close >= self.bb.lines.mid[0]
+                        or self.rsi[0] > self.p.rsi_meanrev_long_exit
+                    ):
+                        exit_signal = True
+
+            if exit_signal:
+                self.order = self.close()
+                self.entry_type = None
+                self.stop_price = None
+            return
+
+        if is_last_bar:
+            return
+
+        cvi_mult = self.p.size_mult_mid
+        if cvi < self.p.cvi_low:
+            cvi_mult = self.p.size_mult_low
+        elif cvi > self.p.cvi_high:
+            cvi_mult = self.p.size_mult_high
+
+        def submit_long(entry_type, atr_mult):
+            stop_dist = atr_mult * self.atr[0]
+            if stop_dist <= 0:
+                return False
+            equity = self.broker.getvalue()
+            raw_size = (equity * self.p.base_risk_pct / stop_dist) * cvi_mult
+            size = int(raw_size)
+            if size < 1:
+                return False
+            self.stop_price = close - stop_dist
+            self.entry_type = entry_type
+            self.order = self.buy(size=size)
+            return True
+
+        if cvi < self.p.cvi_low:
+            if (
+                self.ema_cross[0] > 0
+                and close > self.sma_trend[0]
+                and self.rsi[0] > self.p.rsi_mid
+            ):
+                if submit_long('trend', self.p.low_atr_mult):
+                    return
+        elif cvi > self.p.cvi_high:
+            if (
+                close <= self.bb.lines.bot[0]
+                and self.rsi[0] < self.p.rsi_meanrev_long_entry
+            ):
+                if submit_long('meanrev', self.p.high_atr_mult):
+                    return
+
+        if prev_cvi is not None and prev_macd_hist is not None:
+            cvi_cross_up = prev_cvi < self.p.cvi_mid <= cvi
+            macd_cross_up = prev_macd_hist < 0 <= macd_hist
+            if (
+                cvi_cross_up
+                and macd_cross_up
+                and self.rsi[0] > self.p.rsi_mid
+                and close > self.sma_trend[0]
+            ):
+                submit_long('shift', self.p.high_atr_mult)
+```
+```json
+{"assumptions": [
+  {"topic": "shorting", "choice": "Implemented long-only; all three 'Short (if allowed)' branches are omitted.", "reason": "Canonical default: long-only unless the spec explicitly calls for shorting. The spec phrases every short branch conditionally ('if allowed'), never mandating it, so the default applies."},
+  {"topic": "base risk R% and sizing formula", "choice": "R = 1% of current portfolio value; size = floor((equity * R / stop_distance) * CVI_regime_multiplier), where stop_distance = regime ATR multiple * ATR(14). Skip the entry if the computed size rounds to 0 shares.", "reason": "The spec states position size is regime-multiplier-scaled (1.3x/1.0x/0.7x) off an unspecified 'base risk R% per trade' but never gives R a numeric value or defines 'base size'. Tying R to a classic risk-based formula (risk amount / ATR stop distance) is the most literal way to connect the stated 'risk management' framing to the ATR stop distances the spec already defines."},
+  {"topic": "ATR stop multiplier for regime-shift (PC2 trigger) entries", "choice": "Use the high-volatility 2.5*ATR stop and the high-volatility regime-change exit rule (close if CVI later drops back below 1.0) for shift-triggered entries.", "reason": "The spec only assigns ATR stop multiples to the low-vol and high-vol buckets, not to shift-trigger entries. Since the implemented (bullish) shift only fires when CVI crosses upward through 1.0 (i.e., moving from low/intermediate toward the high-vol regime), treating it as a high-vol trade for stop/exit purposes is the closest literal mapping."},
+  {"topic": "Bollinger 'touch/break' reference price", "choice": "Use bar Close vs. the band (Close <= lower band / Close >= upper band), not intraday High/Low.", "reason": "The spec never specifies which OHLC field defines a 'touch', and every other condition in the spec (SMA/EMA/RSI/MACD comparisons) is stated in terms of Close, so Close is used for consistency."},
+  {"topic": "entry-type priority when multiple conditions coincide on one bar", "choice": "Regime-bucket entries (low-vol trend, high-vol mean-reversion) are checked before, and take priority over, the regime-shift trigger entry on the same bar.", "reason": "The spec lists the three entry types in this order and does not state a tie-break; the shift trigger is meant for the narrow moment of a fresh 1.0-level cross rather than sustained regime membership, so letting sustained-regime entries take precedence is the more literal reading."},
+  {"topic": "end-of-day time-based exit", "choice": "Implemented as: liquidate any open position on the final bar of the dataset; no other per-bar 'end of day' flattening is enforced.", "reason": "infeasible - the feed is 1-day bars with no intraday/session boundary data, so a literal 'close everything at the end of each trading day' would force same-bar liquidation of every trade (since each bar already IS one full day), nullifying every other stated exit rule (ATR stops, mean-reversion targets, regime-change exits) which clearly presume multi-day holds. Liquidating at the last available bar is the closest non-degenerate literal application of 'close all positions' given the only day-boundary observable in this feed."},
+  {"topic": "PC3 noise metric J", "choice": "Not computed.", "reason": "The spec explicitly states J = ATR/BB_width is observed/monitoring-only and 'not included in the strategy', i.e., it drives no rule, so it is omitted entirely."},
+  {"topic": "crossing definitions for CVI/1.0 and MACD histogram/0", "choice": "Computed manually each bar from stored previous-bar values using a non-strict crossing test (prior value strictly on one side, current value at-or-past the threshold on the other side).", "reason": "CVI and the MACD histogram are derived formulas, not native backtrader lines, so bt.indicators.CrossOver cannot be applied to them directly; the spec doesn't specify a tie-break convention for an exact-equality bar, so a standard strictly-before/at-or-past convention was chosen."},
+  {"topic": "ATR stop trailing behavior", "choice": "Stop price is fixed at entry (entry Close minus regime ATR multiple * ATR at entry) and does not trail.", "reason": "The spec states a stop distance but never says it should trail with price or update ATR; a static stop is the plainer literal reading."},
+  {"topic": "moving average input series", "choice": "EMA(10), EMA(30), and SMA(50) are all computed on Close.", "reason": "The spec never states the input series for these MAs, but compares them against Close elsewhere (e.g., 'Close > SMA(50)'), making Close the consistent, non-arbitrary default."}
+]}
+```

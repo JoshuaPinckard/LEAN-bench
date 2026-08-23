@@ -1,0 +1,164 @@
+```python
+import backtrader as bt
+import math
+
+
+class BreakoutSupportResistanceStrategy(bt.Strategy):
+    params = dict(
+        level_period=60,
+        confirm_period=100,
+        touch_pct=0.002,
+        min_touches=3,
+        breakout_pct=0.005,
+        volume_period=20,
+        volume_mult=1.3,
+        sl_pct=0.01,
+        tp_pct=0.02,
+        max_hold_bars=5,
+        risk_pct=0.01,
+        atr_period=14,
+    )
+
+    def __init__(self):
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.highest_res = bt.indicators.Highest(self.data.high(-1), period=self.p.level_period)
+        self.lowest_sup = bt.indicators.Lowest(self.data.low(-1), period=self.p.level_period)
+
+        self.addminperiod(self.p.confirm_period + 1)
+
+        self.entry_order = None
+        self.stop_order = None
+        self.limit_order = None
+
+        self.broken_level = None
+        self.entry_bar = None
+        self.direction = None
+
+    def _count_touches(self, price_line, level):
+        count = 0
+        for i in range(1, self.p.confirm_period + 1):
+            if abs(price_line[-i] - level) / level <= self.p.touch_pct:
+                count += 1
+        return count
+
+    def _has_pending_orders(self):
+        return self.entry_order is not None or self.stop_order is not None or self.limit_order is not None
+
+    def next(self):
+        if self.position:
+            self._check_alternative_exit()
+            return
+
+        if self._has_pending_orders():
+            return
+
+        resistance = self.highest_res[0]
+        support = self.lowest_sup[0]
+        close = self.data.close[0]
+        volume_confirmed = self.data.volume[0] > self.volume_sma[0] * self.p.volume_mult
+
+        if close >= resistance * (1 + self.p.breakout_pct) and volume_confirmed:
+            if self._count_touches(self.data.high, resistance) >= self.p.min_touches:
+                self._enter_long(resistance)
+                return
+
+        if close <= support * (1 - self.p.breakout_pct) and volume_confirmed:
+            if self._count_touches(self.data.low, support) >= self.p.min_touches:
+                self._enter_short(support)
+                return
+
+    def _enter_long(self, resistance):
+        entry_price = self.data.close[0]
+        stop = resistance * (1 - self.p.sl_pct)
+        risk = entry_price - stop
+        if risk <= 0:
+            return
+        size = math.floor((self.broker.getvalue() * self.p.risk_pct) / risk)
+        if size <= 0:
+            return
+        take_profit = entry_price * (1 + self.p.tp_pct)
+
+        main, stop_o, limit_o = self.buy_bracket(
+            size=size,
+            price=entry_price,
+            exectype=bt.Order.Market,
+            stopprice=stop,
+            limitprice=take_profit,
+        )
+        self.entry_order, self.stop_order, self.limit_order = main, stop_o, limit_o
+        self.broken_level = resistance
+        self.direction = 'long'
+
+    def _enter_short(self, support):
+        entry_price = self.data.close[0]
+        stop = support * (1 + self.p.sl_pct)
+        risk = stop - entry_price
+        if risk <= 0:
+            return
+        size = math.floor((self.broker.getvalue() * self.p.risk_pct) / risk)
+        if size <= 0:
+            return
+        take_profit = entry_price * (1 - self.p.tp_pct)
+
+        main, stop_o, limit_o = self.sell_bracket(
+            size=size,
+            price=entry_price,
+            exectype=bt.Order.Market,
+            stopprice=stop,
+            limitprice=take_profit,
+        )
+        self.entry_order, self.stop_order, self.limit_order = main, stop_o, limit_o
+        self.broken_level = support
+        self.direction = 'short'
+
+    def _check_alternative_exit(self):
+        if self.entry_bar is None:
+            return
+        bars_held = len(self.data) - self.entry_bar
+        if bars_held < 1 or bars_held > self.p.max_hold_bars:
+            return
+        close = self.data.close[0]
+        if self.direction == 'long' and close < self.broken_level:
+            self._cancel_bracket_and_close()
+        elif self.direction == 'short' and close > self.broken_level:
+            self._cancel_bracket_and_close()
+
+    def _cancel_bracket_and_close(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+        if self.limit_order is not None:
+            self.cancel(self.limit_order)
+        self.close()
+
+    def notify_order(self, order):
+        if order.status == order.Completed:
+            if order == self.entry_order:
+                self.entry_order = None
+                self.entry_bar = len(self.data)
+            elif order == self.stop_order:
+                self.stop_order = None
+            elif order == self.limit_order:
+                self.limit_order = None
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order == self.entry_order:
+                self.entry_order = None
+            elif order == self.stop_order:
+                self.stop_order = None
+            elif order == self.limit_order:
+                self.limit_order = None
+
+        if not self.position and not self._has_pending_orders():
+            self.entry_bar = None
+            self.direction = None
+            self.broken_level = None
+```
+```json
+{"assumptions": [
+  {"topic": "lookback window definition", "choice": "The 60-candle level window and 100-candle touch-confirmation window are computed over the bars strictly preceding the current (signal) bar, using delayed lines (data.high(-1)/data.low(-1)) as the indicator input.", "reason": "Spec is silent on whether 'last N candles' includes the current bar; including it would make the breakout condition (close beyond the extreme of a window containing the current bar's own high/low) structurally unreachable, so the level must be set from prior bars only."},
+  {"topic": "stop-loss/take-profit execution mechanism", "choice": "SL and TP are implemented as native backtrader Stop and Limit child orders via buy_bracket/sell_bracket (OCO group), executing intrabar off High/Low; the 'entry price' used to compute the 2% take-profit target is the signal bar's close (the same price used to evaluate the breakout condition), since the bracket must be submitted before the market order's actual next-bar fill price is known.", "reason": "Spec states SL/TP as price levels without specifying execution mechanics; native stop/limit orders are the literal, standard reading of 'stop-loss'/'take-profit' and give realistic intrabar triggering rather than only checking at bar close."},
+  {"topic": "alternative exit candle count", "choice": "The 5-candle alternative-exit window is counted starting from the bar after the entry fill (bars_held 1..5); the fill bar itself is excluded.", "reason": "Spec says 'within 5 candles after entry', which reads as candles following the entry bar rather than including it."},
+  {"topic": "ATR(14) inclusion", "choice": "ATR(14) is instantiated as an indicator but not referenced in any entry/exit condition.", "reason": "Spec explicitly allows adding ATR(14) 'only for volatility monitoring, without changing the entry/exit rules', so it is present per the spec's own wording but kept inert."},
+  {"topic": "volume/touch comparison operators", "choice": "Volume confirmation uses strict '>' (volume > SMA*1.3) and touch confirmation uses '<=' (within 0.2% inclusive).", "reason": "Spec wording ('volume > SMA... by 30%+', 'within 0.2%') most directly maps to these operators; declared since the spec does not give exact inequality boundaries."}
+]}
+```

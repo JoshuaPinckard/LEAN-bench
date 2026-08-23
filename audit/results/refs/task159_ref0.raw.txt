@@ -1,0 +1,117 @@
+```python
+import backtrader as bt
+
+
+class LongTermMeanReversionStrategy(bt.Strategy):
+    params = dict(
+        bb_period=120,
+        bb_dev=2,
+        rsi_period=14,
+        rsi_lower=30,
+        rsi_upper=70,
+        atr_period=14,
+        atr_sma_period=50,
+        atr_vol_mult=1.5,
+        vol_sma_period=20,
+        max_hold_bars=20,
+        risk_per_trade=0.01,
+    )
+
+    def __init__(self):
+        self.boll = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.cross_lower = bt.indicators.CrossOver(self.data.close, self.boll.lines.bot)
+        self.cross_upper = bt.indicators.CrossOver(self.data.close, self.boll.lines.top)
+        self.cross_rsi_lo = bt.indicators.CrossOver(self.rsi, self.p.rsi_lower)
+        self.cross_rsi_hi = bt.indicators.CrossOver(self.rsi, self.p.rsi_upper)
+
+        self.order = None
+        self.stop_order = None
+        self.entry_bar = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order is self.order:
+            self.order = None
+            if order.status == order.Completed and self.position:
+                self.entry_bar = len(self)
+                atr_val = self.atr[0]
+                if self.position.size > 0:
+                    stop_price = order.executed.price - 2 * atr_val
+                    self.stop_order = self.sell(
+                        size=self.position.size, exectype=bt.Order.Stop, price=stop_price)
+                else:
+                    stop_price = order.executed.price + 2 * atr_val
+                    self.stop_order = self.buy(
+                        size=abs(self.position.size), exectype=bt.Order.Stop, price=stop_price)
+        elif order is self.stop_order:
+            self.stop_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        volume_filter = self.data.volume[0] > self.vol_sma[0]
+        volatility_filter = self.atr[0] < self.atr_sma[0] * self.p.atr_vol_mult
+        filters_ok = volume_filter and volatility_filter
+
+        long_signal = (self.cross_lower[0] > 0) or (self.cross_rsi_lo[0] > 0)
+        short_signal = (self.cross_upper[0] < 0) or (self.cross_rsi_hi[0] < 0)
+
+        if self.position:
+            bars_held = len(self) - self.entry_bar
+            exit_now = False
+
+            if self.position.size > 0:
+                if self.data.close[0] >= self.boll.lines.mid[0]:
+                    exit_now = True
+                elif short_signal:
+                    exit_now = True
+            else:
+                if self.data.close[0] <= self.boll.lines.mid[0]:
+                    exit_now = True
+                elif long_signal:
+                    exit_now = True
+
+            if bars_held >= self.p.max_hold_bars:
+                exit_now = True
+
+            if exit_now:
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                self.order = self.close()
+            return
+
+        if not filters_ok:
+            return
+
+        atr_val = self.atr[0]
+        if atr_val <= 0:
+            return
+
+        size = (self.broker.getvalue() * self.p.risk_per_trade) / (2 * atr_val)
+
+        if long_signal:
+            self.order = self.buy(size=size)
+        elif short_signal:
+            self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "risk_per_trade value", "choice": "risk_per_trade = 1% of current portfolio value (broker.getvalue() * 0.01), used each entry", "reason": "Spec gives the sizing formula size = risk_per_trade / (2*ATR) but never states the numeric value of risk_per_trade; 1% of equity is a standard convention for this label."},
+  {"topic": "position sizing method", "choice": "Implemented the volatility-based formula (size = risk_per_trade / (2*ATR(14))) rather than a fixed size", "reason": "Spec offers 'fixed position size or volatility-based' but then supplies an explicit volatility-based formula, indicating that formula is the intended rule."},
+  {"topic": "stop-loss mechanism", "choice": "Implemented as a broker-side Stop order placed at entry fill price ± 2*ATR(14) immediately after the entry order completes; canceled if the position is exited by any other rule", "reason": "Spec states 'stop-loss = 2*ATR(14)' as a price-distance rule; a resting stop order is the closest literal, order-level reading of a stop-loss in backtrader."},
+  {"topic": "filters scope", "choice": "Volume/volatility filters gate entries only, not the opposite-signal exit or other exits", "reason": "Spec lists the filters directly under the entry rules, not under the exit rules."},
+  {"topic": "opposite-signal exit definition", "choice": "Defined using the same crossover conditions as entries (BB-band cross or RSI-threshold cross) with no filter requirement", "reason": "Spec names 'opposite signal' without redefining it, so the entry signal definitions are reused for exit detection."},
+  {"topic": "middle-band exit direction", "choice": "For longs, exit when close >= SMA(120) (mid band); for shorts, exit when close <= SMA(120)", "reason": "Spec says 'return to middle band' without specifying direction; interpreted as price reaching the mean from its entry side."},
+  {"topic": "ATR zero guard", "choice": "Skip entry on a bar where ATR(14) <= 0", "reason": "Prevents a division-by-zero in the sizing formula; a numerical safety guard, not a strategy rule."},
+  {"topic": "middle band indicator reuse", "choice": "Used BollingerBands' built-in mid line (SMA(close,120)) instead of a separate SMA(120) indicator", "reason": "They are numerically identical and both match the spec's stated 'SMA(120)' middle band."}
+]}
+```

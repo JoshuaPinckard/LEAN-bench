@@ -1,0 +1,128 @@
+{
+  "task_id": 297,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\n\nimport backtrader as bt\n\n\nclass OptionsProxyStrategy(bt.Strategy):\n    params = (\n        ('strategy_type', 1),  # 1 = Strategy 1 (CSP-proxy), 2 = Strategy 2 (CC-proxy)\n        ('atr_period', 14),\n        ('bb_period', 20),\n        ('bb_devfactor', 2.0),\n        ('sma_period', 50),\n        ('ema_period', 20),\n        ('rsi_period', 14),\n        ('vol_sma_period', 20),\n        ('k_min', 0.01),\n        ('k_max', 0.05),\n        ('expiration_bars', 20),\n        ('rsi_entry_threshold', 35.0),\n        ('size_pct_s1', 0.20),\n        ('size_pct_s2', 1.00),\n    )\n\n    def __init__(self):\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.bb = bt.indicators.BollingerBands(\n            self.data, period=self.p.bb_period, devfactor=self.p.bb_devfactor)\n        self.sma50 = bt.indicators.SMA(self.data, period=self.p.sma_period)\n        self.ema20 = bt.indicators.EMA(self.data, period=self.p.ema_period)\n        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)\n        self.crossover = bt.indicators.CrossOver(self.ema20, self.sma50)\n\n        self.order = None\n        self.entry_price = None\n        self.entry_bar = None\n        self.k_entry = None\n        self.atr_entry = None\n        self.protection_active = False\n        self.pending_k = None\n        self.pending_atr = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n        if order.status == order.Completed and order.isbuy():\n            self.entry_price = order.executed.price\n            self.entry_bar = len(self)\n            self.protection_active = False\n            if self.p.strategy_type == 1:\n                self.k_entry = self.pending_k\n                self.atr_entry = self.pending_atr\n            else:\n                self.k_entry = self._k()\n                self.atr_entry = self.atr[0]\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def _k(self):\n        k_raw = self.atr[0] / self.data.close[0]\n        return max(self.p.k_min, min(self.p.k_max, k_raw))\n\n    def _liquidity_ok(self):\n        return self.data.volume[0] > self.vol_sma[0]\n\n    def next(self):\n        if self.order is not None:\n            return\n        if self.p.strategy_type == 1:\n            self._next_strategy1()\n        else:\n            self._next_strategy2()\n\n    def _next_strategy1(self):\n        if not self.position:\n            if (self.data.close[0] < self.bb.lines.bot[0]\n                    and self.rsi[0] < self.p.rsi_entry_threshold\n                    and self._liquidity_ok()):\n                k = self._k()\n                limit_price = self.data.close[0] * (1 - k)\n                alloc = self.broker.getvalue() * self.p.size_pct_s1\n                size = math.floor(alloc / limit_price)\n                if size > 0:\n                    self.pending_k = k\n                    self.pending_atr = self.atr[0]\n                    self.order = self.buy(exectype=bt.Order.Limit, price=limit_price, size=size)\n            return\n\n        bars_held = len(self) - self.entry_bar\n        tp_level = max(self.entry_price + 0.5 * self.k_entry * self.entry_price,\n                        self.bb.lines.mid[0])\n        sl_level = self.entry_price - 1.5 * self.atr_entry\n\n        if self.data.close[0] >= tp_level:\n            self.order = self.close()\n        elif self.data.close[0] <= sl_level:\n            self.order = self.close()\n        elif bars_held >= self.p.expiration_bars:\n            self.order = self.close()\n\n    def _next_strategy2(self):\n        if not self.position:\n            if (self.crossover[0] > 0\n                    and self.data.close[0] > self.ema20[0]\n                    and self._liquidity_ok()):\n                alloc = self.broker.getvalue() * self.p.size_pct_s2\n                size = math.floor(alloc / self.data.close[0])\n                if size > 0:\n                    self.order = self.buy(size=size)\n            return\n\n        bars_held = len(self) - self.entry_bar\n        protect_trigger = self.entry_price * (1 + 0.5 * self.k_entry)\n        tp_pct_level = self.entry_price * (1 + self.k_entry)\n\n        if not self.protection_active and self.data.close[0] >= protect_trigger:\n            self.protection_active = True\n\n        take_profit = (self.data.close[0] >= self.bb.lines.top[0]\n                        or self.data.close[0] >= tp_pct_level)\n\n        if self.protection_active:\n            stop_trigger = self.data.close[0] < self.ema20[0]\n        else:\n            stop_trigger = (self.data.close[0] < (self.ema20[0] - 1.0 * self.atr[0])\n                             or self.crossover[0] < 0)\n\n        if take_profit:\n            self.order = self.close()\n        elif stop_trigger:\n            self.order = self.close()\n        elif bars_held >= self.p.expiration_bars:\n            self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "The harness permits only ONE module-level bt.Strategy class, but the spec describes two strategies to be run separately and compared. Implemented both as branches of a single class selected by a 'strategy_type' param (1=CSP-proxy, default; 2=CC-proxy), since two live strategy classes cannot be output.",
+      "reason": "Hard constraint of the execution environment; closest literal reading preserves both strategies' full logic, selectable rather than simultaneous."
+    },
+    {
+      "topic": "position sizing base",
+      "choice": "'% of capital' interpreted as % of current total portfolio value (self.broker.getvalue()), not just free cash.",
+      "reason": "Spec says 'capital', not 'cash'; getvalue() is the standard equity measure and equals cash when flat (only one position held at a time)."
+    },
+    {
+      "topic": "position sizing rounding",
+      "choice": "Share count floored to a whole number via math.floor.",
+      "reason": "Spec doesn't state fractional-share handling; equities are conventionally traded in whole shares."
+    },
+    {
+      "topic": "Strategy 1 take-profit formula",
+      "choice": "tp_level = max(Entry + 0.5*k*Entry, current Bollinger mid-band value); triggered when Close >= tp_level.",
+      "reason": "Literal parsing of 'max(Entry + 0.5*k*Entry, middle Bollinger line reached...)' as a max of two candidate exit price levels, checked against Close for consistency with the rest of the spec's Close-based conditions."
+    },
+    {
+      "topic": "Strategy 1 stop-loss ATR reference",
+      "choice": "ATR(14) in 'Entry - 1.5*ATR(14)' is fixed at the entry/signal bar (not recomputed daily), giving a fixed-distance stop.",
+      "reason": "The formula anchors to a fixed 'Entry' price, implying a fixed stop distance computed once, matching common ATR-stop technique."
+    },
+    {
+      "topic": "Strategy 1 k snapshot",
+      "choice": "k used in L and in exit TP formulas is computed once at the bar the limit order is placed (signal bar) and reused through the trade's exits, rather than recomputed on the fill bar or daily.",
+      "reason": "k is defined once to size L; reusing the same value keeps the position's implied 'strike/premium' internally consistent for that trade."
+    },
+    {
+      "topic": "Strategy 1 resting limit order",
+      "choice": "The entry limit order has no explicit expiry and is left as a standard GTC order until filled/canceled/margin-rejected by the broker; the 'activate only if...' filters gate only the initial placement, not re-checked while the order is outstanding.",
+      "reason": "Spec doesn't state how long the pending limit order remains active before entry."
+    },
+    {
+      "topic": "Strategy 2 stop-loss/protection interaction",
+      "choice": "The '50% protection' trailing-stop-to-EMA(20) supersedes (tightens) the base stop-loss once Close first reaches Entry*(1+0.5k); before that threshold, the base stop-loss (Close < EMA-1*ATR, or reverse crossover) applies. These are treated as one stateful stop mechanism rather than two independently-checked exits.",
+      "reason": "The two adjacent bullets both describe stop behavior around EMA(20); treating protection as tightening the stop avoids a contradictory reading where two different EMA-based stop levels are checked simultaneously."
+    },
+    {
+      "topic": "Strategy 2 reverse crossover direction",
+      "choice": "'reverse CrossOver (SMA(50) crosses EMA(20) from above to below)' implemented as EMA(20) crossing below SMA(50) (the mirror of the entry golden-cross), i.e., crossover[0] < 0 on the same CrossOver(EMA,SMA) indicator used for entry.",
+      "reason": "Read literally, 'SMA crosses EMA from above to below' describes the same directional event as the entry signal (a contradiction for an exit condition); interpreted as a wording slip and resolved to the standard death-cross exit."
+    },
+    {
+      "topic": "exit condition priority",
+      "choice": "When multiple exit conditions are true on the same bar, priority follows the spec's bullet order: take-profit first, then stop-loss/protection, then time-out, for both strategies.",
+      "reason": "Spec doesn't state a tie-break; using the stated listing order is the most literal deterministic choice."
+    },
+    {
+      "topic": "exit trigger price reference",
+      "choice": "All TP/SL/protection level checks (besides the explicit entry-fill rule 'Low <= L') are evaluated against the daily Close, not High/Low.",
+      "reason": "Spec expresses its other conditions (Close < lower band, Close > EMA, RSI, etc.) in terms of Close, so Close was used for consistency where the trigger reference wasn't stated."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 5,
+  "tape": [
+    {
+      "dt": "2021-03-08T05:00:00",
+      "side": "BUY",
+      "size": 17.0,
+      "price": 114.00526923991812
+    },
+    {
+      "dt": "2021-03-17T04:00:00",
+      "side": "SELL",
+      "size": -17.0,
+      "price": 120.71293967926185
+    },
+    {
+      "dt": "2022-01-25T05:00:00",
+      "side": "BUY",
+      "size": 13.0,
+      "price": 153.7412137269669
+    },
+    {
+      "dt": "2022-01-31T05:00:00",
+      "side": "SELL",
+      "size": -13.0,
+      "price": 166.35470576493188
+    },
+    {
+      "dt": "2022-05-12T04:00:00",
+      "side": "BUY",
+      "size": 14.0,
+      "price": 139.96043637411066
+    },
+    {
+      "dt": "2022-05-31T04:00:00",
+      "side": "SELL",
+      "size": -14.0,
+      "price": 146.1364342695409
+    },
+    {
+      "dt": "2022-12-28T05:00:00",
+      "side": "BUY",
+      "size": 16.0,
+      "price": 124.10330688846395
+    },
+    {
+      "dt": "2023-01-12T05:00:00",
+      "side": "SELL",
+      "size": -16.0,
+      "price": 131.6457054280313
+    },
+    {
+      "dt": "2023-08-07T04:00:00",
+      "side": "BUY",
+      "size": 11.0,
+      "price": 176.26568121821822
+    },
+    {
+      "dt": "2023-08-29T04:00:00",
+      "side": "SELL",
+      "size": -11.0,
+      "price": 177.4548654120463
+    }
+  ]
+}

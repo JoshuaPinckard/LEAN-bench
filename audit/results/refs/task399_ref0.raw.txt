@@ -1,0 +1,114 @@
+```python
+import backtrader as bt
+
+
+class Supertrend(bt.Indicator):
+    lines = ('supertrend', 'trend', 'final_upper', 'final_lower')
+    params = (('period', 10), ('multiplier', 3.0))
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.period)
+        self._seeded = False
+
+    def next(self):
+        hl2 = (self.data.high[0] + self.data.low[0]) / 2.0
+        basic_upper = hl2 + self.p.multiplier * self.atr[0]
+        basic_lower = hl2 - self.p.multiplier * self.atr[0]
+
+        if not self._seeded:
+            final_upper = basic_upper
+            final_lower = basic_lower
+            trend = 1
+            self._seeded = True
+        else:
+            prior_final_upper = self.l.final_upper[-1]
+            prior_final_lower = self.l.final_lower[-1]
+            prior_close = self.data.close[-1]
+            current_close = self.data.close[0]
+            prior_trend = self.l.trend[-1]
+
+            final_upper = (basic_upper if (basic_upper < prior_final_upper
+                                            or prior_close > prior_final_upper)
+                           else prior_final_upper)
+            final_lower = (basic_lower if (basic_lower > prior_final_lower
+                                            or prior_close < prior_final_lower)
+                           else prior_final_lower)
+
+            if current_close > prior_final_upper:
+                trend = 1
+            elif current_close < prior_final_lower:
+                trend = -1
+            else:
+                trend = prior_trend
+
+        self.l.final_upper[0] = final_upper
+        self.l.final_lower[0] = final_lower
+        self.l.trend[0] = trend
+        self.l.supertrend[0] = final_lower if trend == 1 else final_upper
+
+
+class SupertrendIntradayStrategy(bt.Strategy):
+    params = (
+        ('atr_period', 10),
+        ('multiplier', 3.0),
+        ('volume_period', 20),
+        ('percent_equity', 0.25),
+    )
+
+    def __init__(self):
+        self.st = Supertrend(self.data, period=self.p.atr_period, multiplier=self.p.multiplier)
+        self.volume_sma = bt.indicators.SMA(self.data.volume, period=self.p.volume_period)
+        self.orders = []
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order in self.orders:
+                self.orders.remove(order)
+
+    def _target_size(self):
+        equity = self.broker.getvalue()
+        price = self.data.close[0]
+        return int((equity * self.p.percent_equity) / price)
+
+    def next(self):
+        if self.orders:
+            return
+        if len(self.st) < 2:
+            return
+
+        trend = self.st.trend[0]
+        prior_trend = self.st.trend[-1]
+        flip_up = prior_trend == -1 and trend == 1
+        flip_down = prior_trend == 1 and trend == -1
+
+        if not (flip_up or flip_down):
+            return
+
+        is_long = self.position.size > 0
+        is_short = self.position.size < 0
+
+        if (is_long and flip_down) or (is_short and flip_up):
+            self.orders.append(self.close())
+
+        volume_filter = self.data.volume[0] > self.volume_sma[0]
+        if volume_filter:
+            if flip_up and not is_long:
+                size = self._target_size()
+                if size > 0:
+                    self.orders.append(self.buy(size=size))
+            elif flip_down and not is_short:
+                size = self._target_size()
+                if size > 0:
+                    self.orders.append(self.sell(size=size))
+```
+```json
+{"assumptions": [
+  {"topic": "initial trend state", "choice": "On the first bar the Supertrend indicator can compute (ATR warm-up satisfied), there is no prior final_upper/final_lower to reference, so final bands are seeded directly from basic_upper/basic_lower and trend is initialized to up (1).", "reason": "The spec's recursive definition requires prior values that do not exist on the indicator's first valid bar; spec is silent on initialization."},
+  {"topic": "flip evaluation warm-up", "choice": "The strategy does not evaluate entry/exit logic until the Supertrend indicator has produced at least 2 valid bars (needed to detect a trend flip via trend[-1] vs trend[0]).", "reason": "Flip detection is inherently a two-bar comparison; the indicator's own automatic minperiod only guarantees one valid bar, so no manual bar-skipping beyond this minimal look-back is used."},
+  {"topic": "position sizing", "choice": "Fixed 25% of current broker equity (self.broker.getvalue()) per entry, computed as int(equity*0.25/close) shares.", "reason": "Spec explicitly calls for percent-of-equity sizing in the 20-30% range for a medium risk profile but gives no exact figure; 25% chosen as the midpoint."},
+  {"topic": "position transition on opposite flip", "choice": "On an opposite trend flip, an open position is closed unconditionally (no volume filter), and independently a new position in the flip direction is opened if the volume filter passes, i.e. the strategy stops-and-reverses on confirmed flips.", "reason": "The spec states both a flip-triggered exit rule (unconditional) and flip-triggered long/short entry rules (volume-gated); since entries are exclusively flip-triggered, the only reading under which the spec's stated short and long trading both actually occur over time is treating exit and reversal-entry as co-occurring on the same flip event."},
+  {"topic": "volume filter scope", "choice": "The volume > SMA(volume,20) filter is applied only to entries, not to the exit/close action.", "reason": "The spec ties the volume condition explicitly to the Entry clause; the Exit clause states no such condition."},
+  {"topic": "ATR smoothing method", "choice": "Used backtrader's default ATR implementation (Wilder/RMA-style smoothing) with period=10.", "reason": "Spec specifies only the ATR period and multiplier, not the smoothing method, so the standard backtrader default is used."},
+  {"topic": "order guarding with reversal", "choice": "Used a list of pending order references (self.orders) instead of a single order flag, since a stop-and-reverse bar submits two orders (close + new entry) in the same next() call.", "reason": "Canonical default #5 requires guarding pending orders; a single-order flag would be insufficient when two orders can be pending simultaneously from one flip event."}
+]}
+```

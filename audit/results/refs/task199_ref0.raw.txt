@@ -1,0 +1,163 @@
+Looking at this spec, I need to implement a multi-phase position management strategy (entry → partial profit-take → CC-phase management with trailing stop/timeout) with several manually-computed metrics (rolling percentile of Bollinger width, rolling dollar volume) since backtrader has no built-in indicators for these.
+
+```python
+import backtrader as bt
+from collections import deque
+
+
+class SpotWheelBBATRStrategy(bt.Strategy):
+    params = dict(
+        sma_len=200,
+        bb_len=20,
+        bb_dev=2,
+        atr_len=14,
+        volp_lookback=500,
+        volp_thresh=70,
+        risk_per_trade=0.015,
+        max_alloc=0.15,
+        cc_timeout=35,
+        cc_overrun=0.10,
+        price_lo=50,
+        price_hi=500,
+        liq_lookback=20,
+        liq_thresh=50_000_000,
+    )
+
+    def __init__(self):
+        self.sma200 = bt.indicators.SMA(self.data.close, period=self.p.sma_len)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_len, devfactor=self.p.bb_dev
+        )
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_len)
+        self.crossover = bt.indicators.CrossOver(self.data.close, self.bb.bot)
+
+        self.w_history = deque(maxlen=self.p.volp_lookback)
+        self.dollarvol_history = deque(maxlen=self.p.liq_lookback)
+
+        self.order = None
+        self.pending_atr = None
+        self.entry_price = None
+        self.initial_size = 0
+        self.stop_price = None
+        self.partial_taken = False
+        self.partial_bar = None
+        self.trail_floor = None
+        self.highest_since_partial = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.initial_size = order.executed.size
+                self.stop_price = min(
+                    self.entry_price * 0.90,
+                    self.entry_price - 1.5 * self.pending_atr,
+                )
+                self.partial_taken = False
+                self.partial_bar = None
+                self.trail_floor = None
+                self.highest_since_partial = None
+            else:
+                if not self.partial_taken and self.position.size > 0:
+                    self.partial_taken = True
+                    self.partial_bar = len(self)
+                    self.stop_price = self.entry_price
+                    self.trail_floor = self.entry_price + 0.5 * self.atr[0]
+                    self.highest_since_partial = self.data.close[0]
+                elif self.position.size == 0:
+                    self.entry_price = None
+                    self.initial_size = 0
+                    self.stop_price = None
+                    self.partial_taken = False
+                    self.partial_bar = None
+                    self.trail_floor = None
+                    self.highest_since_partial = None
+
+        self.order = None
+
+    def next(self):
+        w = (self.bb.top[0] - self.bb.bot[0]) / self.bb.mid[0]
+        self.w_history.append(w)
+        self.dollarvol_history.append(self.data.volume[0] * self.data.close[0])
+
+        if self.order:
+            return
+
+        if not self.position:
+            self._check_entry(w)
+        else:
+            self._manage_position()
+
+    def _check_entry(self, w):
+        count = sum(1 for x in self.w_history if x <= w)
+        w_percentile = count / len(self.w_history) * 100.0
+
+        trend_ok = self.data.close[0] > self.sma200[0]
+        vol_ok = w_percentile > self.p.volp_thresh
+        price_ok = self.p.price_lo <= self.data.close[0] <= self.p.price_hi
+        if len(self.dollarvol_history) < self.p.liq_lookback:
+            liq_ok = False
+        else:
+            liq_ok = (
+                sum(self.dollarvol_history) / len(self.dollarvol_history)
+            ) > self.p.liq_thresh
+
+        if self.crossover[0] == 1 and trend_ok and vol_ok and price_ok and liq_ok:
+            close = self.data.close[0]
+            atr_val = self.atr[0]
+            equity = self.broker.getvalue()
+            stop_est = min(close * 0.90, close - 1.5 * atr_val)
+            risk_per_share = close - stop_est
+            if risk_per_share <= 0:
+                return
+            size_alloc = (self.p.max_alloc * equity) / close
+            size_risk = (self.p.risk_per_trade * equity) / risk_per_share
+            size = int(min(size_alloc, size_risk))
+            if size > 0:
+                self.pending_atr = atr_val
+                self.order = self.buy(size=size)
+
+    def _manage_position(self):
+        high = self.data.high[0]
+        low = self.data.low[0]
+
+        if not self.partial_taken:
+            if low <= self.stop_price:
+                self.order = self.close()
+                return
+            if high >= self.bb.mid[0]:
+                partial_size = int(round(self.initial_size * 0.5))
+                partial_size = min(partial_size, self.position.size)
+                if partial_size > 0:
+                    self.order = self.sell(size=partial_size)
+                return
+        else:
+            self.highest_since_partial = max(self.highest_since_partial, high)
+            trail_candidate = self.highest_since_partial - self.atr[0]
+            self.stop_price = max(self.stop_price, self.trail_floor, trail_candidate)
+
+            if low <= self.stop_price:
+                self.order = self.close()
+                return
+            if high >= self.bb.top[0] or high >= self.entry_price * (1.0 + self.p.cc_overrun):
+                self.order = self.close()
+                return
+            if len(self) - self.partial_bar >= self.p.cc_timeout:
+                self.order = self.close()
+                return
+```
+```json
+{"assumptions": [
+  {"topic": "entry order type", "choice": "Use a plain market order (self.buy()) on the signal bar rather than a limit order at bb.bot.", "reason": "Spec explicitly offers 'or at market on the signal bar' as an alternative to the limit; market avoids unresolved limit-order fill/expiry semantics not specified."},
+  {"topic": "sizing reference price", "choice": "Compute stop distance and share count using the signal bar's close as the entry estimate; once the buy order fills, recompute the tracked stop_price from the actual executed fill price using the same ATR value captured at signal time.", "reason": "Spec's sizing formula needs an 'entry' price before the order exists; using signal-bar close is the closest available estimate, then the real fill price is used for ongoing stop management."},
+  {"topic": "intrabar trigger checks", "choice": "Entry crossover uses close (as literally specified via CrossOver(close, bb.bot)). Stop-loss checks use the bar's low <= stop, and profit-target/mid-band checks use the bar's high >= target.", "reason": "Spec is silent on close-only vs intrabar evaluation for stop/target levels; checking against high/low is the more faithful literal reading of a price level being 'reached' or a stop being hit on a daily bar."},
+  {"topic": "optional trailing stop mechanics", "choice": "After partial profit-taking, stop_price starts at max(entry, entry+0.5*ATR_at_partial) and then ratchets up each bar to max(current stop, trail_floor, highest_high_since_partial - current ATR); never decreases.", "reason": "Spec labels the trailing stop 'optional' but gives its formula ('entry + 0.5*ATR, trail by ATR as price rises'); implemented as stated with a concrete, monotonic ratcheting rule since the spec doesn't detail the exact trailing mechanics."},
+  {"topic": "500-bar percentile window ramp-up", "choice": "Compute the Bollinger-width percentile using an expanding window (whatever history is available, up to 500 bars) rather than blocking all entries until a full 500-bar window accumulates.", "reason": "Spec does not state whether trading should be suppressed before the lookback window is full; expanding-window percentile is the closest literal reading of 'percentile of W over 500 bars' without adding an unstated extra warm-up rule."},
+  {"topic": "20-bar liquidity filter ramp-up", "choice": "Treat the liquidity filter as failed (not met) until 20 bars of dollar-volume history have accumulated after the strategy's own indicator warm-up.", "reason": "Consistent treatment with the percentile ramp-up assumption; the filter cannot be evaluated without a full 20-bar window, so it defaults to fail-closed rather than fail-open."},
+  {"topic": "partial profit-take share rounding", "choice": "Partial size = round(initial position size * 0.5) to the nearest whole share, capped at the current position size.", "reason": "Spec says 'take profit on 50% of the position' without specifying rounding for fractional shares; whole-share rounding matches standard equity trading and the canonical no-pyramiding/whole-position conventions."},
+  {"topic": "equity basis for sizing/risk", "choice": "Use self.broker.getvalue() (total account equity) for both the 15% max-allocation cap and the 1.5% risk-per-trade calculation.", "reason": "Spec refers to 'capital' and 'equity' interchangeably without distinguishing cash vs total equity; total account value is the standard reading for both position-sizing constraints."}
+]}
+```

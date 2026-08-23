@@ -1,0 +1,117 @@
+```python
+import math
+
+import backtrader as bt
+
+
+class PartialTakeProfitTrailingStop(bt.Strategy):
+    params = (
+        ('risk_pct', 0.01),
+        ('partial_pct', 0.5),
+        ('tp_r_mult', 1.5),
+        ('trail_pct', 0.0075),
+    )
+
+    def __init__(self):
+        self.order = None
+        self.exit_reason = None
+        self._pending_stop = None
+
+        self.entry_price = None
+        self.stop_price = None
+        self.r = None
+        self.entry_size = 0
+        self.partial_size = 0
+        self.partial_tp_price = None
+        self.partial_taken = False
+
+        self.trail_active = False
+        self.trail_extreme = None
+        self.trail_stop_price = None
+
+    def _reset_state(self):
+        self.entry_price = None
+        self.stop_price = None
+        self.r = None
+        self.entry_size = 0
+        self.partial_size = 0
+        self.partial_tp_price = None
+        self.partial_taken = False
+        self.trail_active = False
+        self.trail_extreme = None
+        self.trail_stop_price = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+                self.stop_price = self._pending_stop
+                self.r = self.entry_price - self.stop_price
+                self.entry_size = order.executed.size
+                psize = math.ceil(self.entry_size * self.p.partial_pct)
+                psize = min(psize, self.entry_size - 1)
+                self.partial_size = psize
+                self.partial_tp_price = self.entry_price + self.p.tp_r_mult * self.r
+                self.partial_taken = False
+                self.trail_active = False
+            else:
+                if self.exit_reason == 'partial_tp':
+                    self.partial_taken = True
+                    self.trail_active = True
+                    self.trail_extreme = order.executed.price
+                    self.trail_stop_price = self.trail_extreme * (1 - self.p.trail_pct)
+                else:
+                    self._reset_state()
+
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+            self.exit_reason = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            equity = self.broker.getvalue()
+            risk_amount = equity * self.p.risk_pct
+            stop_ref = self.data.low[0]
+            r_est = self.data.close[0] - stop_ref
+            if r_est <= 0:
+                return
+            size = int(risk_amount / r_est)
+            if size < 2:
+                return
+            self._pending_stop = stop_ref
+            self.order = self.buy(size=size)
+            return
+
+        if not self.partial_taken:
+            if self.data.low[0] <= self.stop_price:
+                self.exit_reason = 'stop'
+                self.order = self.close()
+            elif self.data.high[0] >= self.partial_tp_price:
+                self.exit_reason = 'partial_tp'
+                self.order = self.sell(size=self.partial_size)
+            return
+
+        self.trail_extreme = max(self.trail_extreme, self.data.high[0])
+        self.trail_stop_price = self.trail_extreme * (1 - self.p.trail_pct)
+        if self.data.low[0] <= self.trail_stop_price:
+            self.exit_reason = 'trailing'
+            self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "long-only scope", "choice": "Only the long-side mechanics (entry, partial take-profit, trailing stop) are implemented and exercised; the short-side rules (partial TP, trailing stop, EOD forced close) described in the spec are not coded.", "reason": "The spec's own entry-conditions section restricts backtesting to 'enter a long position at the candle open if there are no open positions' — the short-side rules describe the general strategy but are never reachable under that stated backtest entry rule, so adding unused short logic would be dead code."},
+  {"topic": "initial stop-loss placement", "choice": "Initial stop-loss is placed at the low of the bar that generates the entry signal (the bar preceding the fill); R = actual fill price - that fixed stop level.", "reason": "The spec says to use 'standard risk management' to set the initial stop and derive R from it but never states how to compute the stop level itself; placing it below the signal bar's low is a standard, commonly used risk-management technique consistent with the spec's own worked example (entry 100 / stop 99 -> R=1)."},
+  {"topic": "position sizing before fill", "choice": "Risk-based share count is computed from an R estimate using the signal bar's close and low (close - low), before the entry order fills at the next bar's open; the true R (and TP/trailing levels) are recomputed after fill using the actual fill price against the same fixed stop level.", "reason": "Backtrader fills a next()-submitted buy at the following bar's open, so the exact fill price is unknown at the moment size must be chosen; using the visible signal-bar data to size the trade mirrors how this is handled in live trading and keeps monetary risk close to the target 1%."},
+  {"topic": "partial take-profit fraction", "choice": "Fixed at 50% of the position, with the executed share count computed via ceiling rounding (not floor) so the closed fraction never dips below 50% for small integer share counts.", "reason": "Spec allows 50-75%; 50% was chosen as the simplest concrete value in range. Ceiling rounding is used because plain integer truncation could push the realized fraction below the specified 50% floor for small position sizes."},
+  {"topic": "same-bar stop vs. partial-TP conflict", "choice": "If a single bar's range touches both the initial stop-loss and the partial take-profit level, the stop-loss is treated as hit first and the position is fully closed.", "reason": "Only OHLC data is available, so the true intrabar sequence of touches is unknown; prioritizing the stop-loss is the conservative, worst-case-ordering convention."},
+  {"topic": "level-touch execution timing", "choice": "Stop-loss, partial-TP, and trailing-stop triggers are detected using each bar's already-known High/Low, but the resulting close/sell order fills at the next bar's open (standard backtrader market-order timing), rather than at the exact touched price within the triggering bar.", "reason": "infeasible — the harness does not enable cheat-on-close and provides a single daily OHLCV feed, so filling exactly at an intrabar price level within the same bar it was detected is not achievable; this mirrors the same next-bar-open mechanism used for the spec's 'enter at candle open' rule."},
+  {"topic": "1-3 day holding period for longs", "choice": "Treated as a descriptive characterization of expected trade duration, not a rule requiring a forced time-based exit.", "reason": "The spec states the strategy 'is aimed at' holding 1-3 days but specifies no action to take if a trade runs longer, so no additional exit condition was invented; actual duration is left to emerge from the stop/partial-TP/trailing-stop mechanics."},
+  {"topic": "minimum position size", "choice": "If the 1%-risk sizing formula yields fewer than 2 shares, no entry is taken on that bar.", "reason": "A 1-share position cannot be partially closed (50-75%) while leaving a remainder for the trailing-stop phase, so a minimum of 2 shares is required for the strategy's mechanics to apply."}
+]}
+```

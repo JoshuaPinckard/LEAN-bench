@@ -1,0 +1,131 @@
+```python
+import backtrader as bt
+
+
+class RenkoTrendFollowingStrategy(bt.Strategy):
+    params = dict(
+        brick_size=50.0,
+    )
+
+    def __init__(self):
+        self.renko_level = None
+        self.brick_directions = []
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+
+    def _cancel_exit_orders(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+            self.stop_order = None
+        if self.limit_order is not None:
+            self.cancel(self.limit_order)
+            self.limit_order = None
+
+    def _process_brick(self, direction):
+        prev_direction = self.brick_directions[-1] if self.brick_directions else None
+        self.brick_directions.append(direction)
+
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0 and direction == -1:
+                self._cancel_exit_orders()
+                self.order = self.close()
+            elif self.position.size < 0 and direction == 1:
+                self._cancel_exit_orders()
+                self.order = self.close()
+            return
+
+        if prev_direction is not None and direction == prev_direction:
+            cash = self.broker.getcash()
+            price = self.data.close[0]
+            size = int(cash / price)
+            if size > 0:
+                if direction == 1:
+                    self.order = self.buy(size=size)
+                else:
+                    self.order = self.sell(size=size)
+
+    def next(self):
+        if self.renko_level is None:
+            self.renko_level = self.data.close[0]
+            return
+
+        close = self.data.close[0]
+
+        while close - self.renko_level >= self.p.brick_size:
+            self.renko_level += self.p.brick_size
+            self._process_brick(1)
+
+        while self.renko_level - close >= self.p.brick_size:
+            self.renko_level -= self.p.brick_size
+            self._process_brick(-1)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.stop_order:
+            if order.status == order.Completed:
+                self.stop_order = None
+                if self.limit_order is not None:
+                    self.cancel(self.limit_order)
+                    self.limit_order = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+            return
+
+        if order == self.limit_order:
+            if order.status == order.Completed:
+                self.limit_order = None
+                if self.stop_order is not None:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.limit_order = None
+            return
+
+        if order == self.order:
+            if order.status == order.Completed:
+                self.order = None
+                if order.isbuy() and self.position.size > 0:
+                    entry_price = order.executed.price
+                    size = self.position.size
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        price=entry_price - self.p.brick_size,
+                        size=size,
+                    )
+                    self.limit_order = self.sell(
+                        exectype=bt.Order.Limit,
+                        price=entry_price + 2 * self.p.brick_size,
+                        size=size,
+                    )
+                elif order.issell() and self.position.size < 0:
+                    entry_price = order.executed.price
+                    size = abs(self.position.size)
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop,
+                        price=entry_price + self.p.brick_size,
+                        size=size,
+                    )
+                    self.limit_order = self.buy(
+                        exectype=bt.Order.Limit,
+                        price=entry_price - 2 * self.p.brick_size,
+                        size=size,
+                    )
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.order = None
+```
+```json
+{"assumptions": [
+  {"topic": "renko_source_price", "choice": "Build Renko bricks from the Close price series only (standard/renko-close construction with multi-brick support per bar), rather than mixing High/Low thresholds.", "reason": "Spec says 'use OHLC data to build the Renko chart' without specifying which field determines brick thresholds; Close is the conventional default source for Renko charts, and the OHLCV feed is the data being used."},
+  {"topic": "position_sizing", "choice": "Size = int(current available cash / current close price), recomputed at each entry, applied identically for both long and short entries.", "reason": "Spec states 'fixed size, e.g. 100% of available capital' but is silent on exact formula and on short-side sizing; using live cash/price at entry is the most literal reading of '100% of available capital' for each new trade."},
+  {"topic": "stop_take_profit_mechanism", "choice": "Place stop-loss and take-profit as separate Stop/Limit orders submitted only after the entry order actually fills, anchored to the executed fill price, with manual one-cancels-other bookkeeping instead of backtrader's buy_bracket/sell_bracket.", "reason": "Bracket orders in backtrader compute stop/limit prices relative to the price at order-creation time, not the eventual fill price, which would misalign with the spec's 'distance ... from the entry point'."},
+  {"topic": "trend_confirmation_scope", "choice": "Apply the 'last two bricks same direction' confirmation filter only to new entries, not to reversal exits.", "reason": "The spec lists exit conditions separately and unconditionally ('close when a brick forms below/above the previous one'), while the trend-confirmation rule is introduced only under entry-related additional rules to filter false signals."},
+  {"topic": "reversal_exit_reentry_ordering", "choice": "On a reversal brick that closes an existing position, do not evaluate a new opposite-direction entry on that same brick; a new entry requires its own subsequent two-brick confirmation.", "reason": "The reversal brick by construction differs in direction from the brick before it, so it cannot itself satisfy the 'last two bricks same direction' entry filter; keeping exit and entry as separate brick events is the direct consequence of applying both stated rules together."},
+  {"topic": "first_brick_baseline", "choice": "The first processed bar only initializes the Renko reference level (no brick, no signal); brick formation and signals begin once price first moves by one brick size from that baseline.", "reason": "Spec is silent on chart initialization; a starting reference point is required before any 'previous brick' comparison is possible."}
+]}
+```

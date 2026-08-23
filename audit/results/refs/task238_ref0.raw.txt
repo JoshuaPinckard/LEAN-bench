@@ -1,0 +1,265 @@
+```python
+import backtrader as bt
+
+
+class ScalpingStrategy(bt.Strategy):
+    params = dict(
+        use_module_a=True,
+        use_module_b=True,
+        use_rsi_filter=True,
+        use_macd_filter=True,
+        use_atr_vol_filter=False,
+        use_bbands_squeeze=False,
+        risk_perc=0.01,
+        initial_stop_atr_mult=1.5,
+        trailing_atr_mult=1.0,
+        tp_r_mult=2.0,
+        time_stop_bars=10,
+        atr_vol_sma_period=50,
+        bb_width_sma_period=20,
+    )
+
+    def __init__(self):
+        self.ema5 = bt.indicators.EMA(self.data, period=5)
+        self.ema8 = bt.indicators.EMA(self.data, period=8)
+        self.ema13 = bt.indicators.EMA(self.data, period=13)
+        self.ema9 = bt.indicators.EMA(self.data, period=9)
+        self.ema21 = bt.indicators.EMA(self.data, period=21)
+
+        self.rsi = bt.indicators.RSI(self.data, period=14)
+
+        self.macd = bt.indicators.MACD(
+            self.data, period_me1=12, period_me2=26, period_signal=9
+        )
+        self.macd_hist = self.macd.macd - self.macd.signal
+
+        self.bb = bt.indicators.BollingerBands(self.data, period=20, devfactor=2)
+        self.bb_width = self.bb.top - self.bb.bot
+        self.bb_width_sma = bt.indicators.SMA(
+            self.bb_width, period=self.p.bb_width_sma_period
+        )
+
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_vol_sma_period)
+
+        self.order = None
+
+        self.a_long_pb_high = None
+        self.a_short_pb_low = None
+        self.b_long_touch_high = None
+        self.b_short_touch_low = None
+
+        self.direction = None
+        self.entry_price = None
+        self.initial_stop_price = None
+        self.tp_price = None
+        self.extreme_price = None
+        self.bars_in_trade = 0
+
+    def _module_a_signals(self):
+        long_sig = False
+        short_sig = False
+
+        bullish = (
+            self.ema5[0] > self.ema8[0] > self.ema13[0]
+            and (self.ema5[0] - self.ema8[0]) > (self.ema5[-1] - self.ema8[-1])
+            and (self.ema8[0] - self.ema13[0]) > (self.ema8[-1] - self.ema13[-1])
+        )
+        if bullish:
+            if self.data.low[0] <= self.ema5[0]:
+                self.a_long_pb_high = self.data.high[0]
+            elif self.a_long_pb_high is not None and self.data.high[0] > self.a_long_pb_high:
+                rsi_ok = (not self.p.use_rsi_filter) or self.rsi[0] < 70
+                macd_ok = (not self.p.use_macd_filter) or self.macd_hist[0] > 0
+                atr_ok = (not self.p.use_atr_vol_filter) or self.atr[0] > self.atr_sma[0]
+                bb_ok = (not self.p.use_bbands_squeeze) or self.bb_width[0] < self.bb_width_sma[0]
+                if rsi_ok and macd_ok and atr_ok and bb_ok:
+                    long_sig = True
+                self.a_long_pb_high = None
+        else:
+            self.a_long_pb_high = None
+
+        bearish = (
+            self.ema5[0] < self.ema8[0] < self.ema13[0]
+            and (self.ema8[0] - self.ema5[0]) > (self.ema8[-1] - self.ema5[-1])
+            and (self.ema13[0] - self.ema8[0]) > (self.ema13[-1] - self.ema8[-1])
+        )
+        if bearish:
+            if self.data.high[0] >= self.ema5[0]:
+                self.a_short_pb_low = self.data.low[0]
+            elif self.a_short_pb_low is not None and self.data.low[0] < self.a_short_pb_low:
+                rsi_ok = (not self.p.use_rsi_filter) or self.rsi[0] > 30
+                macd_ok = (not self.p.use_macd_filter) or self.macd_hist[0] < 0
+                atr_ok = (not self.p.use_atr_vol_filter) or self.atr[0] > self.atr_sma[0]
+                bb_ok = (not self.p.use_bbands_squeeze) or self.bb_width[0] < self.bb_width_sma[0]
+                if rsi_ok and macd_ok and atr_ok and bb_ok:
+                    short_sig = True
+                self.a_short_pb_low = None
+        else:
+            self.a_short_pb_low = None
+
+        return long_sig, short_sig
+
+    def _module_b_signals(self):
+        long_sig = False
+        short_sig = False
+
+        flag = self.bb_width[0] < self.bb_width_sma[0]
+        touch = (
+            self.data.low[0] <= self.ema9[0] <= self.data.high[0]
+            or self.data.low[0] <= self.ema21[0] <= self.data.high[0]
+        )
+
+        long_trend = (
+            self.ema9[0] > self.ema21[0]
+            and (self.ema9[0] - self.ema21[0]) > (self.ema9[-1] - self.ema21[-1])
+            and (self.ema9[-1] - self.ema21[-1]) > (self.ema9[-2] - self.ema21[-2])
+        )
+        if long_trend:
+            if flag and touch:
+                self.b_long_touch_high = self.data.high[0]
+            elif self.b_long_touch_high is not None and self.data.high[0] > self.b_long_touch_high:
+                rsi_ok = (not self.p.use_rsi_filter) or (40 <= self.rsi[0] <= 65)
+                macd_ok = (not self.p.use_macd_filter) or self.macd_hist[0] > 0
+                atr_ok = (not self.p.use_atr_vol_filter) or self.atr[0] > self.atr_sma[0]
+                bb_ok = (not self.p.use_bbands_squeeze) or self.bb_width[0] < self.bb_width_sma[0]
+                if rsi_ok and macd_ok and atr_ok and bb_ok:
+                    long_sig = True
+                self.b_long_touch_high = None
+        else:
+            self.b_long_touch_high = None
+
+        short_trend = (
+            self.ema9[0] < self.ema21[0]
+            and (self.ema21[0] - self.ema9[0]) > (self.ema21[-1] - self.ema9[-1])
+            and (self.ema21[-1] - self.ema9[-1]) > (self.ema21[-2] - self.ema9[-2])
+        )
+        if short_trend:
+            if flag and touch:
+                self.b_short_touch_low = self.data.low[0]
+            elif self.b_short_touch_low is not None and self.data.low[0] < self.b_short_touch_low:
+                rsi_ok = (not self.p.use_rsi_filter) or (35 <= self.rsi[0] <= 60)
+                macd_ok = (not self.p.use_macd_filter) or self.macd_hist[0] < 0
+                atr_ok = (not self.p.use_atr_vol_filter) or self.atr[0] > self.atr_sma[0]
+                bb_ok = (not self.p.use_bbands_squeeze) or self.bb_width[0] < self.bb_width_sma[0]
+                if rsi_ok and macd_ok and atr_ok and bb_ok:
+                    short_sig = True
+                self.b_short_touch_low = None
+        else:
+            self.b_short_touch_low = None
+
+        return long_sig, short_sig
+
+    def _reset_position_state(self):
+        self.direction = None
+        self.entry_price = None
+        self.initial_stop_price = None
+        self.tp_price = None
+        self.extreme_price = None
+        self.bars_in_trade = 0
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if self.position.size == 0:
+                self._reset_position_state()
+            elif order.isbuy():
+                self.entry_price = order.executed.price
+                dist = self.p.initial_stop_atr_mult * self.atr[0]
+                self.initial_stop_price = self.entry_price - dist
+                self.tp_price = self.entry_price + self.p.tp_r_mult * dist
+                self.extreme_price = self.entry_price
+                self.bars_in_trade = 0
+                self.direction = 'long'
+            else:
+                self.entry_price = order.executed.price
+                dist = self.p.initial_stop_atr_mult * self.atr[0]
+                self.initial_stop_price = self.entry_price + dist
+                self.tp_price = self.entry_price - self.p.tp_r_mult * dist
+                self.extreme_price = self.entry_price
+                self.bars_in_trade = 0
+                self.direction = 'short'
+
+        self.order = None
+
+    def _enter(self, direction):
+        dist = self.p.initial_stop_atr_mult * self.atr[0]
+        if dist <= 0:
+            return
+        risk_amount = self.p.risk_perc * self.broker.getvalue()
+        size = int(risk_amount / dist)
+        if size < 1:
+            return
+        if direction == 'long':
+            self.order = self.buy(size=size)
+        else:
+            self.order = self.sell(size=size)
+
+    def _manage_position(self, opp_long_sig, opp_short_sig):
+        self.bars_in_trade += 1
+        if self.direction == 'long':
+            self.extreme_price = max(self.extreme_price, self.data.high[0])
+            trailing = max(
+                self.ema21[0], self.extreme_price - self.p.trailing_atr_mult * self.atr[0]
+            )
+            stop_price = max(self.initial_stop_price, trailing)
+            exit_now = (
+                self.data.low[0] <= stop_price
+                or self.data.high[0] >= self.tp_price
+                or opp_short_sig
+                or self.data.close[0] < self.ema13[0]
+                or self.bars_in_trade >= self.p.time_stop_bars
+            )
+            if exit_now:
+                self.order = self.close()
+        else:
+            self.extreme_price = min(self.extreme_price, self.data.low[0])
+            trailing = min(
+                self.ema21[0], self.extreme_price + self.p.trailing_atr_mult * self.atr[0]
+            )
+            stop_price = min(self.initial_stop_price, trailing)
+            exit_now = (
+                self.data.high[0] >= stop_price
+                or self.data.low[0] <= self.tp_price
+                or opp_long_sig
+                or self.data.close[0] > self.ema13[0]
+                or self.bars_in_trade >= self.p.time_stop_bars
+            )
+            if exit_now:
+                self.order = self.close()
+
+    def next(self):
+        if self.order:
+            return
+
+        long_a = short_a = long_b = short_b = False
+        if self.p.use_module_a:
+            long_a, short_a = self._module_a_signals()
+        if self.p.use_module_b:
+            long_b, short_b = self._module_b_signals()
+
+        long_sig = long_a or long_b
+        short_sig = short_a or short_b
+
+        if not self.position:
+            if long_sig:
+                self._enter('long')
+            elif short_sig:
+                self._enter('short')
+        else:
+            self._manage_position(long_sig, short_sig)
+```
+```json
+{"assumptions": [
+  {"topic": "position_sizing", "choice": "Fixed risk R = 1% of current broker equity per trade; size = int(risk_amount / (1.5*ATR(14))), floored to whole shares, entry skipped if size < 1", "reason": "Spec states 'fixed risk R per trade based on ATR' but never gives the risk percentage/amount; 1% of equity is a conventional default and the exact magnitude is not covered by canonical defaults, so it is declared here."},
+  {"topic": "filter_semantics", "choice": "use_rsi_filter and use_macd_filter toggle enforcement of the RSI/MACD threshold conditions that are already written into each module's Long/Short entry rules (e.g. RSI<70, MACD hist>0 for Module A long); use_atr_vol_filter and use_bbands_squeeze are additional global gates (ATR(14)>SMA(ATR14,50) and BB width<SMA(width,20)) applied identically on top of both modules' own logic", "reason": "The spec names these four filters as separate switchable components but only gives an explicit formula for the ATR and BB-squeeze filters; since RSI/MACD thresholds are already stated inside the module rules, the most literal non-inventive reading is that the RSI/MACD filter switches gate those same stated thresholds rather than introducing new ones."},
+  {"topic": "touch_definition", "choice": "'Price touches EMA(9) or EMA(21)' is implemented as low[0] <= EMA <= high[0] (the bar's range spans the EMA level)", "reason": "Spec does not define 'touch' precisely; bar-range containment is the standard literal interpretation with OHLC-only data."},
+  {"topic": "pullback_state_tracking", "choice": "The pullback/touch bar's high (or low) is tracked as the most recent bar satisfying the pullback/touch condition while the trend holds; breakout must occur on a strictly later bar; the tracker is cleared once a signal fires or the trend condition becomes false", "reason": "Spec describes pullback-then-breakout as a two-step sequence but does not specify the state machine; this is the closest literal, non-repeating implementation (prevents the same stale pullback level from firing a signal on every subsequent bar)."},
+  {"topic": "trailing_stop_combination", "choice": "Effective stop = max(initial 1.5*ATR stop, EMA21, extremum - 1*ATR) for longs (min, mirrored, for shorts) — i.e. the stop only tightens over time, never loosens", "reason": "Spec lists an initial stop and a separate trailing stop (itself defined as the max of EMA21 and an ATR-from-extremum level) without stating how the two interact; combining them as a tightening-only stop is the standard, literal trading-system reading of 'initial stop' + 'trailing stop'."},
+  {"topic": "opposite_signal_exit", "choice": "'Exit on the opposite signal' reuses the exact same Module A/B trend+pullback+breakout+RSI/MACD/filter logic evaluated for the opposite direction, computed every bar (including while a position is open) rather than a simplified trend-only check", "reason": "Keeps the opposite-signal exit consistent with the literal entry-signal definition instead of inventing a separate simplified rule."},
+  {"topic": "signal_precedence", "choice": "When both modules (or both directions) produce a signal on the same bar, Module A takes precedence over Module B, and long takes precedence over short", "reason": "Spec does not state a tie-break rule for simultaneous signals; an arbitrary deterministic precedence is declared since the spec gives no guidance."},
+  {"topic": "atr_stop_timing", "choice": "The ATR(14) value used for the initial 1.5*ATR stop distance is read at the bar the entry order actually fills (the bar after the signal bar, per backtrader's default next-bar-open fill), not the signal bar", "reason": "Backtrader market orders fill on the next bar; the fill-bar ATR is the only value known at the point the stop/TP levels can be fixed, and the spec does not address order-fill timing (infeasible to use the signal-bar ATR since size/stop must be set at execution)."}
+]}
+```

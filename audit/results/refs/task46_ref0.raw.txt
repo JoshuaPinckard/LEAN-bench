@@ -1,0 +1,318 @@
+```python
+import backtrader as bt
+
+
+class ElliottWavePatternStrategy(bt.Strategy):
+    def __init__(self):
+        self.order = None
+        self.pivots = []
+        self.last_impulse = None
+        self.stop_price = None
+        self.take_profit_price = None
+        self.key_level = None
+
+        self.PIVOT_BARS = 5
+        self.TOL = 0.03
+        self.MIN_PATTERN_PCT = 0.02
+        self.VOL_MA_PERIOD = 20
+        self.VOL_CONFIRM_MULT = 1.2
+        self.FIB_TOL = 0.35
+        self.POLE_LOOKBACK = 10
+        self.POLE_THRESHOLD = 0.08
+        self.FLAG_LOOKBACK = 5
+        self.FLAG_RATIO = 0.5
+        self.TP_MULT = 1.618
+        self.RISK_PCT = 0.02
+        self.STOP_BUFFER = 0.002
+        self.IMPULSE_RECENCY = 20
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order = None
+
+    def _add_pivot(self, idx, price, ptype):
+        if self.pivots and self.pivots[-1][2] == ptype:
+            if (ptype == 'H' and price > self.pivots[-1][1]) or (ptype == 'L' and price < self.pivots[-1][1]):
+                self.pivots[-1] = (idx, price, ptype)
+        else:
+            self.pivots.append((idx, price, ptype))
+        if len(self.pivots) > 50:
+            self.pivots.pop(0)
+
+    def _update_pivots(self):
+        W = self.PIVOT_BARS
+        if len(self) <= 2 * W:
+            return
+        cand_high = self.data.high[-W]
+        cand_low = self.data.low[-W]
+        window = range(0, 2 * W + 1)
+        is_high = all(cand_high >= self.data.high[-i] for i in window)
+        is_low = all(cand_low <= self.data.low[-i] for i in window)
+        idx = len(self) - 1 - W
+        if is_high:
+            self._add_pivot(idx, cand_high, 'H')
+        if is_low:
+            self._add_pivot(idx, cand_low, 'L')
+
+    def _check_impulse(self):
+        p = self.pivots
+        if len(p) < 6:
+            return
+        p0, p1, p2, p3, p4, p5 = p[-6:]
+        types = [x[2] for x in (p0, p1, p2, p3, p4, p5)]
+        if types == ['L', 'H', 'L', 'H', 'L', 'H']:
+            direction = 'up'
+        elif types == ['H', 'L', 'H', 'L', 'H', 'L']:
+            direction = 'down'
+        else:
+            return
+        v0, v1, v2, v3, v4, v5 = p0[1], p1[1], p2[1], p3[1], p4[1], p5[1]
+        if direction == 'up':
+            valid = v1 > v0 and v0 < v2 < v1 and v3 > v1 and v4 > v1 and v4 < v3 and v5 > v3
+        else:
+            valid = v1 < v0 and v1 < v2 < v0 and v3 < v1 and v4 < v1 and v4 > v3 and v5 < v3
+        if not valid:
+            return
+        w1 = abs(v1 - v0)
+        w3 = abs(v3 - v2)
+        w5 = abs(v5 - v4)
+        if w1 == 0 or w3 == 0 or (w3 < w1 and w3 < w5):
+            return
+        fib3_target = 1.618 * w1
+        fib4_target = 0.618 * w3
+        fib4_actual = abs(v4 - v3)
+        if abs(w3 - fib3_target) > self.FIB_TOL * fib3_target:
+            return
+        if abs(fib4_actual - fib4_target) > self.FIB_TOL * fib4_target:
+            return
+        self.last_impulse = {'direction': direction, 'p0': v0, 'p5': v5, 'confirm_idx': p5[0]}
+
+    def _recent_impulse(self, direction):
+        imp = self.last_impulse
+        if not imp or imp['direction'] != direction:
+            return None
+        if (len(self) - 1) - imp['confirm_idx'] > self.IMPULSE_RECENCY:
+            return None
+        return imp
+
+    def _new_impulse_start(self, direction):
+        p = self.pivots
+        if len(p) < 3:
+            return False
+        pa, pb, pc = p[-3], p[-2], p[-1]
+        if direction == 'down':
+            return pa[2] == 'L' and pb[2] == 'H' and pc[2] == 'L' and pc[1] < pa[1]
+        return pa[2] == 'H' and pb[2] == 'L' and pc[2] == 'H' and pc[1] > pa[1]
+
+    def _fib_bounce(self, impulse, direction):
+        p0, p5 = impulse['p0'], impulse['p5']
+        if direction == 'up':
+            level = p5 + 0.618 * (p0 - p5)
+            return self.data.close[0] >= level and self.data.close[-1] < level
+        level = p5 - 0.618 * (p5 - p0)
+        return self.data.close[0] <= level and self.data.close[-1] > level
+
+    def _volume_confirmed(self):
+        n = len(self)
+        if n <= self.VOL_MA_PERIOD:
+            return True
+        avg = sum(self.data.volume[-i] for i in range(1, self.VOL_MA_PERIOD + 1)) / self.VOL_MA_PERIOD
+        return self.data.volume[0] >= self.VOL_CONFIRM_MULT * avg
+
+    def _detect_bullish_pattern(self):
+        p = self.pivots
+        if len(p) >= 5:
+            a, b, c, d, e = p[-5:]
+            if [a[2], b[2], c[2], d[2], e[2]] == ['L', 'H', 'L', 'H', 'L']:
+                left_sh, neck1, head, neck2, right_sh = a[1], b[1], c[1], d[1], e[1]
+                if head < left_sh and head < right_sh and abs(left_sh - right_sh) <= self.TOL * left_sh:
+                    neckline = (neck1 + neck2) / 2
+                    height = neckline - head
+                    if height >= self.MIN_PATTERN_PCT * neckline:
+                        return {'type': 'inv_head_shoulders', 'neckline': neckline, 'extreme': head, 'height': height}
+            l1, h1, l2, h2, l3 = p[-5:]
+            if [l1[2], h1[2], l2[2], h2[2], l3[2]] == ['L', 'H', 'L', 'H', 'L']:
+                lows = [l1[1], l2[1], l3[1]]
+                if max(lows) - min(lows) <= self.TOL * min(lows):
+                    neckline = min(h1[1], h2[1])
+                    extreme = min(lows)
+                    height = neckline - extreme
+                    if height >= self.MIN_PATTERN_PCT * neckline:
+                        return {'type': 'triple_bottom', 'neckline': neckline, 'extreme': extreme, 'height': height}
+        if len(p) >= 3:
+            l1, h, l2 = p[-3:]
+            if l1[2] == 'L' and h[2] == 'H' and l2[2] == 'L' and abs(l1[1] - l2[1]) <= self.TOL * l1[1]:
+                extreme = min(l1[1], l2[1])
+                height = h[1] - extreme
+                if height >= self.MIN_PATTERN_PCT * h[1]:
+                    return {'type': 'double_bottom', 'neckline': h[1], 'extreme': extreme, 'height': height}
+        recent = p[-6:] if len(p) >= 6 else p
+        highs = [x[1] for x in recent if x[2] == 'H']
+        lows = [x[1] for x in recent if x[2] == 'L']
+        if len(highs) >= 2 and len(lows) >= 2:
+            if max(highs) - min(highs) <= self.TOL * min(highs) and lows[-1] > lows[0]:
+                neckline = min(highs)
+                extreme = min(lows[0], lows[-1])
+                height = neckline - extreme
+                if height >= self.MIN_PATTERN_PCT * neckline:
+                    return {'type': 'ascending_triangle', 'neckline': neckline, 'extreme': extreme, 'height': height}
+        return None
+
+    def _detect_bearish_pattern(self):
+        p = self.pivots
+        if len(p) >= 5:
+            a, b, c, d, e = p[-5:]
+            if [a[2], b[2], c[2], d[2], e[2]] == ['H', 'L', 'H', 'L', 'H']:
+                left_sh, neck1, head, neck2, right_sh = a[1], b[1], c[1], d[1], e[1]
+                if head > left_sh and head > right_sh and abs(left_sh - right_sh) <= self.TOL * left_sh:
+                    neckline = (neck1 + neck2) / 2
+                    height = head - neckline
+                    if height >= self.MIN_PATTERN_PCT * neckline:
+                        return {'type': 'head_shoulders', 'neckline': neckline, 'extreme': head, 'height': height}
+            h1, l1, h2, l2, h3 = p[-5:]
+            if [h1[2], l1[2], h2[2], l2[2], h3[2]] == ['H', 'L', 'H', 'L', 'H']:
+                highs = [h1[1], h2[1], h3[1]]
+                if max(highs) - min(highs) <= self.TOL * min(highs):
+                    neckline = max(l1[1], l2[1])
+                    extreme = max(highs)
+                    height = extreme - neckline
+                    if height >= self.MIN_PATTERN_PCT * neckline:
+                        return {'type': 'triple_top', 'neckline': neckline, 'extreme': extreme, 'height': height}
+        if len(p) >= 3:
+            h1, l, h2 = p[-3:]
+            if h1[2] == 'H' and l[2] == 'L' and h2[2] == 'H' and abs(h1[1] - h2[1]) <= self.TOL * h1[1]:
+                extreme = max(h1[1], h2[1])
+                height = extreme - l[1]
+                if height >= self.MIN_PATTERN_PCT * l[1]:
+                    return {'type': 'double_top', 'neckline': l[1], 'extreme': extreme, 'height': height}
+        recent = p[-6:] if len(p) >= 6 else p
+        highs = [x[1] for x in recent if x[2] == 'H']
+        lows = [x[1] for x in recent if x[2] == 'L']
+        if len(highs) >= 2 and len(lows) >= 2:
+            if max(lows) - min(lows) <= self.TOL * min(lows) and highs[-1] < highs[0]:
+                neckline = max(lows)
+                extreme = max(highs[0], highs[-1])
+                height = extreme - neckline
+                if height >= self.MIN_PATTERN_PCT * neckline:
+                    return {'type': 'descending_triangle', 'neckline': neckline, 'extreme': extreme, 'height': height}
+        return None
+
+    def _detect_flag_pennant(self, direction):
+        pole = self.POLE_LOOKBACK
+        flagw = self.FLAG_LOOKBACK
+        if len(self) < pole + flagw + 1:
+            return None
+        pole_start = self.data.close[-(pole + flagw)]
+        pole_end = self.data.close[-flagw]
+        if pole_start == 0:
+            return None
+        move = (pole_end - pole_start) / pole_start
+        highs = [self.data.high[-i] for i in range(0, flagw)]
+        lows = [self.data.low[-i] for i in range(0, flagw)]
+        pole_range = abs(pole_end - pole_start)
+        if pole_range == 0:
+            return None
+        tight = (max(highs) - min(lows)) <= self.FLAG_RATIO * pole_range
+        if direction == 'up' and move >= self.POLE_THRESHOLD and tight:
+            return {'type': 'bull_flag_pennant', 'neckline': max(highs), 'extreme': min(lows), 'height': pole_range}
+        if direction == 'down' and move <= -self.POLE_THRESHOLD and tight:
+            return {'type': 'bear_flag_pennant', 'neckline': min(lows), 'extreme': max(highs), 'height': pole_range}
+        return None
+
+    def _enter_long(self, pattern, impulse):
+        entry_price = self.data.close[0]
+        extreme = min(pattern['extreme'], impulse['p5'])
+        stop_price = extreme * (1 - self.STOP_BUFFER)
+        risk = entry_price - stop_price
+        if risk <= 0:
+            return
+        size = int((self.RISK_PCT * self.broker.getvalue()) / risk)
+        if size < 1:
+            return
+        self.order = self.buy(size=size)
+        self.stop_price = stop_price
+        self.take_profit_price = pattern['neckline'] + self.TP_MULT * pattern['height']
+        self.key_level = pattern['neckline']
+
+    def _enter_short(self, pattern, impulse):
+        entry_price = self.data.close[0]
+        extreme = max(pattern['extreme'], impulse['p5'])
+        stop_price = extreme * (1 + self.STOP_BUFFER)
+        risk = stop_price - entry_price
+        if risk <= 0:
+            return
+        size = int((self.RISK_PCT * self.broker.getvalue()) / risk)
+        if size < 1:
+            return
+        self.order = self.sell(size=size)
+        self.stop_price = stop_price
+        self.take_profit_price = pattern['neckline'] - self.TP_MULT * pattern['height']
+        self.key_level = pattern['neckline']
+
+    def _manage_long(self):
+        if self.data.low[0] <= self.stop_price:
+            self.order = self.close()
+        elif self.data.high[0] >= self.take_profit_price:
+            self.order = self.close()
+        elif self.data.close[0] < self.key_level:
+            self.order = self.close()
+        elif self._new_impulse_start('down'):
+            self.order = self.close()
+
+    def _manage_short(self):
+        if self.data.high[0] >= self.stop_price:
+            self.order = self.close()
+        elif self.data.low[0] <= self.take_profit_price:
+            self.order = self.close()
+        elif self.data.close[0] > self.key_level:
+            self.order = self.close()
+        elif self._new_impulse_start('up'):
+            self.order = self.close()
+
+    def next(self):
+        if self.order:
+            return
+        self._update_pivots()
+        self._check_impulse()
+
+        if not self.position:
+            down_impulse = self._recent_impulse('down')
+            up_impulse = self._recent_impulse('up')
+            if down_impulse:
+                pattern = self._detect_bullish_pattern() or self._detect_flag_pennant('up')
+                if pattern:
+                    breakout = self.data.close[0] > pattern['neckline'] and self._volume_confirmed()
+                    bounce = self._fib_bounce(down_impulse, 'up')
+                    if breakout or bounce:
+                        self._enter_long(pattern, down_impulse)
+                        return
+            if up_impulse:
+                pattern = self._detect_bearish_pattern() or self._detect_flag_pennant('down')
+                if pattern:
+                    breakout = self.data.close[0] < pattern['neckline'] and self._volume_confirmed()
+                    bounce = self._fib_bounce(up_impulse, 'down')
+                    if breakout or bounce:
+                        self._enter_short(pattern, up_impulse)
+                        return
+        else:
+            if self.position.size > 0:
+                self._manage_long()
+            else:
+                self._manage_short()
+```
+```json
+{"assumptions": [
+  {"topic": "elliott_wave_counting", "choice": "Automatic Elliott Wave counting is inherently subjective; implemented as a deterministic zigzag-pivot state machine that validates the classic non-overlap/alternation rules plus the spec's named Fibonacci checks (wave3=161.8% of wave1, wave4=61.8% retrace of wave3, within a 35% tolerance band) rather than true discretionary wave analysis.", "reason": "infeasible: canonical EW counting requires human judgment; the closest literal reading is a rule-based approximation using the exact ratios the spec names"},
+  {"topic": "pivot_detection_params", "choice": "Swing highs/lows detected via a symmetric 5-bar fractal (confirmed 5 bars after the pivot bar).", "reason": "spec does not specify a pivot/fractal window; a fixed, declared parameter is required for any deterministic wave/pattern engine"},
+  {"topic": "pattern_tolerance_params", "choice": "3% price tolerance for 'roughly equal' shoulders/tops/bottoms, 2% minimum pattern height/depth, 20-bar volume MA with 1.2x breakout confirmation multiplier.", "reason": "spec requires 'standard confirmation criteria (volume, neckline breakout, minimum depth/height)' but gives no numeric thresholds"},
+  {"topic": "flag_pennant_combined", "choice": "Flag and Pennant are detected with one combined consolidation-after-pole detector (10-bar pole with >=8% move, 5-bar tight consolidation <=50% of pole range) rather than two distinct geometric detectors.", "reason": "spec lists them as separate patterns with the same underlying definition (pole + brief consolidation, continuation breakout); distinguishing parallel-channel vs converging-triangle consolidation shape is not specified"},
+  {"topic": "corrective_wave_tracking", "choice": "3-wave corrective (ABC) structures are named in the spec's indicator description but the entry/exit rules only reference impulse completion and 'start of a new 5-wave structure', so no separate ABC detector gates trading decisions.", "reason": "the stated entry/exit conditions never reference a corrective-wave trigger directly; adding one would be an invented extra filter not stated in the rules"},
+  {"topic": "new_impulse_start_definition", "choice": "'Start of a new 5-wave structure' (used to exit an open position) is detected as the first fresh pivot breaking beyond the prior same-type pivot in the opposite direction (i.e., a confirmed lower low after a high for bearish, or higher high after a low for bullish).", "reason": "spec gives no operational definition of 'start' short of a full new impulse; using the same pivot machinery as the impulse detector keeps this literal and consistent"},
+  {"topic": "key_level_definition", "choice": "The 'key support/resistance level opposite to the open position' is the pattern's neckline; a post-entry close back through it (support break for longs, resistance break for shorts) triggers exit.", "reason": "the spec names support/resistance in this exit clause without defining the level; the neckline is the only level already established at entry and 'broken resistance becomes support' is standard technical-analysis practice for this exact level"},
+  {"topic": "stop_reference_point", "choice": "Stop-loss is placed just beyond (0.2% buffer) the more extreme of (a) the pattern's extreme point (head/trough/peak) and (b) the completed impulse wave-5 extreme, satisfying the spec's 'beyond the nearest local high/low or beyond the extreme of the chart pattern.'", "reason": "spec offers two alternative reference points via 'or' with no tie-break rule; using the more conservative (further) of the two guarantees the stop is beyond both stated references"},
+  {"topic": "position_sizing_risk_based", "choice": "Position size is computed as floor(2% of current portfolio value / per-share stop distance); trade is skipped if this computes to 0 shares.", "reason": "the spec explicitly requires stop-loss risk to be capped at 2% of account balance per trade, which is a stated sizing rule and therefore overrides the canonical default of unsized buy()/sell()"},
+  {"topic": "take_profit_multiplier", "choice": "161.8% (not 127.2%) of pattern height, added to/subtracted from the neckline, is used as the sole take-profit target.", "reason": "spec lists both '127.2% or 161.8%' as examples without specifying which applies when; 161.8% is chosen for consistency with the spec's own emphasis on 161.8% as the primary Elliott Fibonacci extension ratio (used for wave 3)"},
+  {"topic": "single_position_no_pyramiding", "choice": "At most one open position at a time; no new entries while a position (long or short) is open.", "reason": "canonical default; spec does not state otherwise"},
+  {"topic": "long_and_short_enabled", "choice": "Both long and short entries are implemented via plain buy()/sell().", "reason": "spec explicitly defines a 'Short position (Sell)' entry rule, overriding the canonical long-only default"}
+]}
+```

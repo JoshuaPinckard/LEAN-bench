@@ -1,0 +1,111 @@
+```python
+import math
+
+import backtrader as bt
+
+
+class BreakoutBollingerStrategy(bt.Strategy):
+    params = dict(
+        bb_period=7,
+        bb_devfactor=2.0,
+        vol_sma_fast=30,
+        vol_sma_slow=90,
+        atr_period=14,
+        ret_period=7,
+        ret_low=-0.10,
+        ret_high=0.20,
+        atr_pct_min=0.01,
+        take_profit_pct=0.05,
+        stop_loss_pct=0.02,
+        risk_pct=0.01,
+    )
+
+    def __init__(self):
+        self.initial_capital = self.broker.startingcash
+
+        self.vol_sma_fast_ind = bt.indicators.SMA(
+            self.data.volume, period=self.p.vol_sma_fast)
+        self.vol_sma_slow_ind = bt.indicators.SMA(
+            self.data.volume, period=self.p.vol_sma_slow)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period,
+            devfactor=self.p.bb_devfactor)
+        self.cross_up = bt.indicators.CrossOver(self.data.close, self.bb.top)
+        self.cross_down = bt.indicators.CrossOver(self.bb.bot, self.data.close)
+
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed, order.Canceled, order.Margin,
+                             order.Rejected]:
+            if order == self.order:
+                self.order = None
+            if order == self.stop_order:
+                self.stop_order = None
+            if order == self.limit_order:
+                self.limit_order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.cross_down[0] > 0:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                if self.limit_order:
+                    self.cancel(self.limit_order)
+                self.order = self.close()
+            return
+
+        weekday = self.data.datetime.date(0).weekday()
+        if weekday not in (0, 2, 4):
+            return
+
+        vol_ok = (self.data.volume[0] > self.vol_sma_fast_ind[0]
+                  and self.vol_sma_fast_ind[0] > self.vol_sma_slow_ind[0])
+
+        ret_7d = self.data.close[0] / self.data.close[-self.p.ret_period] - 1.0
+        ret_ok = self.p.ret_low <= ret_7d <= self.p.ret_high
+
+        atr_pct = self.atr[0] / self.data.close[0]
+        vola_ok = atr_pct > self.p.atr_pct_min
+
+        entry_signal = self.cross_up[0] > 0
+
+        if vol_ok and ret_ok and vola_ok and entry_signal:
+            entry_price = self.data.close[0]
+            size = math.floor(
+                (self.initial_capital * self.p.risk_pct)
+                / (entry_price * self.p.stop_loss_pct))
+            if size <= 0:
+                return
+
+            stop_price = entry_price * (1.0 - self.p.stop_loss_pct)
+            limit_price = entry_price * (1.0 + self.p.take_profit_pct)
+
+            orders = self.buy_bracket(
+                size=size,
+                exectype=bt.Order.Market,
+                stopprice=stop_price,
+                limitprice=limit_price,
+            )
+            self.order, self.stop_order, self.limit_order = orders
+```
+```json
+{"assumptions": [
+  {"topic": "entry price reference", "choice": "Use the signal day's close as 'EntryPrice' for both position sizing and bracket TP/SL level calculation, since the main order is a Market order whose actual fill price (next bar's open) is unknown at submission time.", "reason": "Spec defines size and TP/SL as functions of 'EntryPrice' but does not specify how to obtain it before a market order fills; the last known close is the only value available when the sizing/order decision is made."},
+  {"topic": "entry order type", "choice": "Submit the entry as a Market order (bt.Order.Market) inside a bracket order group.", "reason": "Spec does not specify limit vs market execution for the breakout entry; matches canonical default of plain market execution when sizing is otherwise specified."},
+  {"topic": "bracket order implementation", "choice": "Implemented TP (+5%) and SL (-2%) via self.buy_bracket() with stopprice/limitprice computed from the entry-day close.", "reason": "Spec explicitly calls these 'bracket orders'; backtrader's buy_bracket is the direct mechanism for linked OCO stop-loss/take-profit legs."},
+  {"topic": "trading-day restriction scope", "choice": "Applied the Mon/Wed/Fri restriction to new entries only; both the bracket TP/SL orders and the Bollinger lower-band crossunder exit are evaluated/allowed on any day.", "reason": "Bracket stop/limit orders are broker-monitored standing orders that trigger on price, not on a day-of-week schedule, and the crossunder is a risk-management exit rather than a new position initiation; the spec lists 'Trading days' as item 1 ahead of the entry-filter/entry-signal items, suggesting it gates entries."},
+  {"topic": "reinvestment disabled", "choice": "Position sizing always uses self.broker.startingcash (fixed at cerebro setup) as 'initial_capital', never current cash or portfolio value.", "reason": "Spec explicitly states reinvestment is disabled and initial_capital must be used for all trades."},
+  {"topic": "walk-forward validation (spec item 7)", "choice": "Not implemented in strategy code; treated as an out-of-band backtest/parameter-tuning methodology.", "reason": "The harness fixes a single continuous data feed (2020-2025) and controls the Cerebro run; a Strategy class has no mechanism to split its own historical window into tuning vs. validation periods or to alter harness-controlled data feeding, so this is infeasible within the given environment."},
+  {"topic": "order/position guarding", "choice": "Track main entry order, stop-loss order, and take-profit order separately; block any new order submission while one is pending; only one position open at a time.", "reason": "Canonical default requires guarding pending orders via notify_order; bracket orders require tracking all three legs to correctly cancel the OCO pair on a manual (crossunder) exit."}
+]}
+```

@@ -1,0 +1,98 @@
+```python
+import backtrader as bt
+
+
+class IntradayMomentumODTEStrategy(bt.Strategy):
+    params = (
+        ('atr_period', 14),
+        ('atr_sma_period', 20),
+        ('sma_period', 5),
+        ('ema_period', 9),
+        ('dip_pct', 0.005),
+        ('stoch_oversold', 20.0),
+        ('entry_window_minutes', 60),
+        ('tp_atr_mult', 2.5),
+        ('sl_atr_mult', 1.0),
+        ('session_end_hour', 15),
+        ('session_end_minute', 55),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.sma5 = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.macd = bt.indicators.MACDHisto(self.data)
+        self.ema9 = bt.indicators.EMA(self.data.close, period=self.p.ema_period)
+        self.stoch = bt.indicators.Stochastic(self.data)
+        self.stoch_cross = bt.indicators.CrossOver(self.stoch.percK, self.stoch.percD)
+        self.price_cross_ema9 = bt.indicators.CrossOver(self.data.close, self.ema9)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_atr = None
+        self.day_open = None
+        self.day_open_dt = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed and order.isbuy():
+            self.entry_price = order.executed.price
+            self.entry_atr = self.atr[0]
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        cur_date = self.data.datetime.date(0)
+        if self.day_open_dt is None or cur_date != self.data.datetime.date(-1):
+            self.day_open = self.data.open[0]
+            self.day_open_dt = self.data.datetime.datetime(0)
+
+        if self.order:
+            return
+
+        cur_time = self.data.datetime.time(0)
+        session_end = (cur_time.hour == self.p.session_end_hour and
+                        cur_time.minute == self.p.session_end_minute)
+
+        if self.position:
+            if session_end:
+                self.order = self.close()
+                return
+            tp_price = self.entry_price + self.p.tp_atr_mult * self.entry_atr
+            sl_price = self.entry_price - self.p.sl_atr_mult * self.entry_atr
+            if self.data.high[0] >= tp_price or self.data.low[0] <= sl_price:
+                self.order = self.close()
+            return
+
+        vol_filter = self.atr[0] > self.atr_sma[0]
+        dir_filter = (self.data.close[0] > self.sma5[0]) or (self.macd.histo[0] > 0)
+        filters_ok = vol_filter and dir_filter
+
+        elapsed_minutes = (self.data.datetime.datetime(0) - self.day_open_dt).total_seconds() / 60.0
+
+        if elapsed_minutes == 0:
+            if filters_ok:
+                self.order = self.buy(size=1)
+            return
+
+        if elapsed_minutes <= self.p.entry_window_minutes:
+            dip = (self.day_open - self.data.close[0]) / self.day_open >= self.p.dip_pct
+            reversal = ((self.stoch_cross[0] > 0 and
+                         self.stoch.percK[-1] < self.p.stoch_oversold and
+                         self.stoch.percD[-1] < self.p.stoch_oversold) or
+                        (self.price_cross_ema9[0] > 0))
+            if dip and reversal and filters_ok:
+                self.order = self.buy(size=1)
+```
+```json
+{"assumptions": [
+  {"topic": "dip_entry_window", "choice": "Used 60 minutes (the upper bound of the stated 30-60 minute range) as the Entry-2 dip-entry cutoff; Entry 1 remains restricted to literally the first candle of the day only.", "reason": "The spec gives a range, not a single cutoff; the outer bound is the most inclusive literal reading of 'within the first 30-60 minutes'."},
+  {"topic": "direction_filter_logic", "choice": "Interpreted 'and/or' between price>SMA(5) and MACD histogram>0 as logical OR (either condition suffices).", "reason": "'And/or' conventionally means 'one or both'; requiring both (AND) would silently discard the stated 'or' option."},
+  {"topic": "macd_parameters", "choice": "Used backtrader's default MACD parameters (fast=12, slow=26, signal=9).", "reason": "Spec names the MACD histogram condition but states no periods."},
+  {"topic": "stochastic_parameters", "choice": "Used backtrader's default Stochastic parameters (period=14, period_dfast=3, period_dslow=3).", "reason": "Spec names the %K/%D cross condition but states no lookback periods."},
+  {"topic": "stochastic_zone_condition", "choice": "'%K crosses %D upward from the <20 zone' implemented as an upward CrossOver of %K over %D where both %K and %D were below 20 on the bar immediately preceding the cross.", "reason": "Spec describes a zone-conditioned cross without exact mechanics; requiring both lines below 20 just before the cross is the most literal reading of 'from the <20 zone'."},
+  {"topic": "atr_stop_target_basis", "choice": "The ATR(14) value used for the 2.5x take-profit and 1x stop-loss offsets is captured once at trade entry (fill bar) and held fixed for that trade rather than recalculated every bar.", "reason": "'X x ATR from the entry price' describes a fixed offset anchored to entry, not a trailing/recalculated stop."},
+  {"topic": "end_of_day_detection", "choice": "Forced end-of-day close is triggered when the bar timestamp is 15:55, the fixed feed's stated last bar of every trading day.", "reason": "The OHLCV feed carries no explicit session-boundary flag; the environment's stated session hours (09:30-15:55) give an unambiguous literal marker for 'end of day'."}
+]}
+```

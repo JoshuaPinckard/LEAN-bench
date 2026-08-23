@@ -1,0 +1,102 @@
+```python
+import backtrader as bt
+
+
+class BBMATrendStrategy(bt.Strategy):
+    params = (
+        ('bb_period', 20),
+        ('bb_dev', 2),
+        ('ma_period', 44),
+        ('risk_pct', 0.02),
+        ('consolidation_pct', 0.2),
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data, period=self.p.bb_period, devfactor=self.p.bb_dev)
+        self.sma44 = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.p.ma_period)
+        self.bb_width = self.bb.top - self.bb.bot
+        self.bb_width_avg = bt.indicators.SimpleMovingAverage(
+            self.bb_width, period=self.p.bb_period)
+        self.crossover_ma = bt.indicators.CrossOver(self.data.close, self.sma44)
+
+        self.order = None
+        self.stop_order = None
+        self.pending_stop_price = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order is self.stop_order:
+            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+                if order.status == order.Completed:
+                    self.pending_stop_price = None
+            return
+
+        if order.status == order.Completed:
+            if self.position and self.pending_stop_price is not None:
+                size = abs(self.position.size)
+                stop_price = self.pending_stop_price
+                self.pending_stop_price = None
+                if self.position.size > 0:
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop, price=stop_price, size=size)
+                else:
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop, price=stop_price, size=size)
+            elif self.stop_order is not None:
+                self.cancel(self.stop_order)
+        else:
+            self.pending_stop_price = None
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            if self.position.size > 0:
+                if self.data.close[0] < self.bb.top[0] or self.crossover_ma[0] < 0:
+                    if self.stop_order is not None:
+                        self.cancel(self.stop_order)
+                    self.order = self.close()
+            elif self.position.size < 0:
+                if self.data.close[0] > self.bb.bot[0] or self.crossover_ma[0] > 0:
+                    if self.stop_order is not None:
+                        self.cancel(self.stop_order)
+                    self.order = self.close()
+            return
+
+        if self.bb_width[0] < self.p.consolidation_pct * self.bb_width_avg[0]:
+            return
+
+        if self.data.close[0] > self.sma44[0] and self.data.close[0] > self.bb.top[0]:
+            stop_price = self.bb.bot[0]
+            risk_per_share = self.data.close[0] - stop_price
+            if risk_per_share > 0:
+                risk_amount = self.p.risk_pct * self.broker.getvalue()
+                size = risk_amount / risk_per_share
+                self.pending_stop_price = stop_price
+                self.order = self.buy(size=size)
+        elif self.data.close[0] < self.sma44[0] and self.data.close[0] < self.bb.bot[0]:
+            stop_price = self.bb.top[0]
+            risk_per_share = stop_price - self.data.close[0]
+            if risk_per_share > 0:
+                risk_amount = self.p.risk_pct * self.broker.getvalue()
+                size = risk_amount / risk_per_share
+                self.pending_stop_price = stop_price
+                self.order = self.sell(size=size)
+```
+```json
+{"assumptions": [
+  {"topic": "position sizing formula", "choice": "size = (2% of current broker equity) / (entry-signal close price - opposite Bollinger Band price at signal time)", "reason": "Spec states 'fixed percentage of capital per trade (e.g., 2% risk per trade)' without giving the exact formula; risk-based sizing using distance to the stated stop-loss level (opposite band) is the standard interpretation that ties position size directly to the spec's own risk-management stop."},
+  {"topic": "stop-loss price fixing", "choice": "Stop-loss price is computed once from the opposite Bollinger Band value at the moment the breakout signal fires, then held fixed (not re-anchored to the band on later bars) for the life of the trade", "reason": "The Bollinger Bands recompute every bar, so a literal 'stop at the opposite band' would require continuously replacing the stop order; the spec describes a single placement action ('place a stop loss'), not a trailing mechanism, so freezing at signal time is the closest literal reading."},
+  {"topic": "stop-loss order mechanics", "choice": "Implemented as a broker-side bt.Order.Stop (intrabar trigger via High/Low) submitted immediately after the entry order fills, sized to match the position and canceled whenever the position is closed via the close-based exit rules", "reason": "A stop loss conventionally triggers intrabar on price touching the stop level, distinct from the close-based exit conditions (which are checked once per bar in next()); using a real stop order is the closest literal reading of 'place a stop loss.'"},
+  {"topic": "price reference for trend/breakout/consolidation checks", "choice": "Use the daily close for all 'price above/below MA', 'breakout above/below band', and consolidation-width comparisons", "reason": "Spec uses unqualified 'price' and its own exit language explicitly references 'closes back below/above,' so close is the consistent field to use across all comparisons; feed provides no other unambiguous 'price' series."},
+  {"topic": "risk capital base", "choice": "'Capital' for the 2% risk calculation is taken as total broker equity (self.broker.getvalue()) at signal time, not just free cash", "reason": "Spec says 'percentage of capital,' which is standard shorthand for account equity in risk-based position sizing; no other capital definition is available in this environment."}
+]}
+```

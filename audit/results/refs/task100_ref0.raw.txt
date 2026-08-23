@@ -1,0 +1,79 @@
+```python
+import backtrader as bt
+
+
+class DcaRsiStrategy(bt.Strategy):
+    params = dict(
+        rsi_period=14,
+        rsi_oversold=30,
+        rsi_overbought=70,
+        rsi_exit=50,
+        dca_pct=0.017,
+        size_pct=0.01,
+    )
+
+    def __init__(self):
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.order = None
+        self.pending_action = None
+        self.primary_price = None
+        self.averaged = False
+
+    def _order_size(self):
+        return (self.p.size_pct * self.broker.startingcash) / self.data.close[0]
+
+    def next(self):
+        if self.order:
+            return
+
+        if not self.position:
+            if self.rsi[0] < self.p.rsi_oversold:
+                self.pending_action = 'primary'
+                self.order = self.buy(size=self._order_size())
+            elif self.rsi[0] > self.p.rsi_overbought:
+                self.pending_action = 'primary'
+                self.order = self.sell(size=self._order_size())
+            return
+
+        if self.position.size > 0:
+            if self.rsi[0] > self.p.rsi_exit:
+                self.pending_action = 'exit'
+                self.order = self.close()
+            elif not self.averaged and self.data.close[0] <= self.primary_price * (1 - self.p.dca_pct):
+                self.pending_action = 'averaging'
+                self.order = self.buy(size=self._order_size())
+        elif self.position.size < 0:
+            if self.rsi[0] < self.p.rsi_exit:
+                self.pending_action = 'exit'
+                self.order = self.close()
+            elif not self.averaged and self.data.close[0] >= self.primary_price * (1 + self.p.dca_pct):
+                self.pending_action = 'averaging'
+                self.order = self.sell(size=self._order_size())
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status == order.Completed:
+            if self.pending_action == 'primary':
+                self.primary_price = order.executed.price
+                self.averaged = False
+            elif self.pending_action == 'averaging':
+                self.averaged = True
+            elif self.pending_action == 'exit':
+                self.primary_price = None
+                self.averaged = False
+
+        self.order = None
+        self.pending_action = None
+```
+```json
+{"assumptions": [
+  {"topic": "sizing reference price", "choice": "Compute each order's size as (1% of initial capital) / current bar's close price (data.close[0]) at signal time", "reason": "Spec states position value must equal 1% of initial capital but does not specify which price to use for the share-count conversion; using the signal bar's close is the most direct literal reading."},
+  {"topic": "initial capital basis", "choice": "Use self.broker.startingcash (fixed starting cash) rather than current portfolio value for the 1% sizing calculation", "reason": "Spec says 'initial capital', not current equity, so the base amount should not fluctuate with P&L."},
+  {"topic": "averaging entry count", "choice": "Allow at most one averaging (DCA) entry per primary position, gated by an 'averaged' flag reset on exit", "reason": "Spec describes exactly two entry types (primary and 'the second' averaging entry) referencing a single 'entry price of the primary position'; combined with the canonical no-repeated-reentry default, this reads as one additional layer, not unlimited pyramiding while price remains beyond the 1.7% threshold."},
+  {"topic": "simultaneous exit vs averaging signal", "choice": "When both the RSI neutral-zone exit and the 1.7% averaging condition are true on the same bar, the exit takes priority and the averaging entry is skipped", "reason": "Spec gives no ordering; prioritizing exit avoids opening a new position on the same bar the strategy is supposed to be flattening, which is the more conservative/literal reading of 'exiting all positions'."},
+  {"topic": "opposite-direction signal while in a position", "choice": "An RSI signal for the opposite side (e.g., RSI>70 while already long) is ignored; only the same-direction averaging entry or the neutral-zone exit can act while a position from the primary signal is open", "reason": "Canonical default: hold at most one position at a time / no re-entry while a position is open, except where the spec explicitly allows the averaging entry; the spec never describes reversing a position on an opposite RSI extreme."},
+  {"topic": "fractional share sizing", "choice": "Position size is left as a fractional float (1% of capital / price), not rounded to whole shares", "reason": "Spec gives no rounding rule and backtrader supports fractional sizing in backtesting; rounding would introduce an unstated deviation from the exact 1%-of-capital sizing rule."}
+]}
+```

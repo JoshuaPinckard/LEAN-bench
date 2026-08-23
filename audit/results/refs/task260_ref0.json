@@ -1,0 +1,84 @@
+{
+  "task_id": 260,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport math\n\n\nclass QuasiCreditSpreadsStrategy(bt.Strategy):\n    params = dict(\n        sma_trend_period=50,\n        bb_period=20,\n        bb_devfactor=2.0,\n        atr_period=14,\n        rsi_period=14,\n        bb_width_sma_period=100,\n        vol_sma_period=20,\n        vol_mult=1.5,\n        gap_atr_mult=1.5,\n        rsi_long_thresh=45,\n        rsi_short_thresh=55,\n        tp_fraction=0.7,\n        sl_atr_mult=1.2,\n        band_breach_atr_mult=0.5,\n        max_hold_bars=6,\n        risk_pct=0.015,\n    )\n\n    def __init__(self):\n        self.sma50 = bt.indicators.SMA(self.data.close, period=self.p.sma_trend_period)\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor\n        )\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n\n        bb_width = (self.bb.top - self.bb.bot) / self.bb.mid\n        self.bb_width = bb_width\n        self.bb_width_sma = bt.indicators.SMA(bb_width, period=self.p.bb_width_sma_period)\n        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)\n\n        # bb.mid is itself SMA(20) of close; reused as the profit-target/crossing reference\n        self.sma20_cross = bt.indicators.CrossOver(self.data.close, self.bb.mid)\n\n        self.order = None\n        self.direction = None\n        self.entry_bar = None\n        self.target_price = None\n        self.stop_price = None\n\n    def notify_order(self, order):\n        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:\n            self.order = None\n\n    def next(self):\n        if self.order:\n            return\n\n        if self.position:\n            self._manage_position()\n            return\n\n        bb_width_ok = self.bb_width[0] < self.bb_width_sma[0]\n        vol_ok = self.data.volume[0] <= self.p.vol_mult * self.vol_sma[0]\n        gap_ok = abs(self.data.open[0] - self.data.close[-1]) < self.p.gap_atr_mult * self.atr[0]\n        if not (bb_width_ok and vol_ok and gap_ok):\n            return\n\n        if (self.data.close[0] <= self.bb.bot[0]\n                and self.data.close[0] > self.sma50[0]\n                and self.rsi[0] < self.p.rsi_long_thresh):\n            self._enter(direction=1)\n        elif (self.data.close[0] >= self.bb.top[0]\n                and self.data.close[0] < self.sma50[0]\n                and self.rsi[0] > self.p.rsi_short_thresh):\n            self._enter(direction=-1)\n\n    def _enter(self, direction):\n        entry_price = self.data.close[0]\n        atr_val = self.atr[0]\n        if atr_val <= 0:\n            return\n\n        equity = self.broker.getvalue()\n        size = math.floor((equity * self.p.risk_pct) / (self.p.sl_atr_mult * atr_val))\n        if size <= 0:\n            return\n\n        sma20_entry = self.bb.mid[0]\n        # 70% of the distance from entry to SMA20-at-entry, direction-agnostic interpolation\n        self.target_price = entry_price + self.p.tp_fraction * (sma20_entry - entry_price)\n        self.stop_price = entry_price - direction * self.p.sl_atr_mult * atr_val\n        self.direction = direction\n        self.entry_bar = len(self)\n\n        if direction == 1:\n            self.order = self.buy(size=size)\n        else:\n            self.order = self.sell(size=size)\n\n    def _manage_position(self):\n        close = self.data.close[0]\n        bars_held = len(self) - self.entry_bar\n        time_hit = bars_held >= self.p.max_hold_bars\n\n        if self.direction == 1:\n            tp_hit = close >= self.target_price\n            cross_hit = self.sma20_cross[0] > 0\n            sl_hit = close <= self.stop_price\n            band_breach = close <= (self.bb.bot[0] - self.p.band_breach_atr_mult * self.atr[0])\n        else:\n            tp_hit = close <= self.target_price\n            cross_hit = self.sma20_cross[0] < 0\n            sl_hit = close >= self.stop_price\n            band_breach = close >= (self.bb.top[0] + self.p.band_breach_atr_mult * self.atr[0])\n\n        if tp_hit or cross_hit or sl_hit or band_breach or time_hit:\n            self.order = self.close()\n            self.direction = None\n            self.entry_bar = None\n            self.target_price = None\n            self.stop_price = None",
+  "assumptions": [
+    {
+      "topic": "risk_pct value",
+      "choice": "risk_pct = 1.5% of equity",
+      "reason": "Spec states a range (1-2% of capital) with no single figure; used the midpoint as the fixed parameter for the sizing formula."
+    },
+    {
+      "topic": "entry price reference",
+      "choice": "Use the signal bar's close (the price that satisfied the entry condition) as 'entry price' for target/stop/size math, and submit plain self.buy()/self.sell() market orders per canonical defaults.",
+      "reason": "Spec doesn't address next-bar-open fill mechanics; signal-time close is the literal value available when the entry decision and its dependent calculations (target, stop, size) are made."
+    },
+    {
+      "topic": "SMA(20) reference for target/crossing",
+      "choice": "Reused BollingerBands(20,2)'s middle line (self.bb.mid) as 'SMA(20)' rather than instantiating a separate SMA(20) indicator.",
+      "reason": "The Bollinger middle band is by definition SMA(20) of close; the spec never distinguishes a differently-parameterized SMA(20), so a duplicate indicator would be an unstated addition."
+    },
+    {
+      "topic": "profit-target sign convention",
+      "choice": "Implemented target = entry + 0.7*(SMA20_entry - entry) identically for long and short (70% interpolation toward SMA20-at-entry, whichever direction that is), instead of literally applying the written 'sign' multiplier.",
+      "reason": "The written formula 'entry - sign*(0.7*(entry-SMA20_entry))' is ambiguous about what 'sign' denotes, and a directional (+1 long/-1 short) reading yields an inconsistent (wrong-direction) target for shorts; the plain-English description ('70% of the distance to SMA20 from entry price') is unambiguous and was treated as authoritative."
+    },
+    {
+      "topic": "price-crossing-SMA20 exit",
+      "choice": "Implemented via bt.indicators.CrossOver(close, bb.mid), requiring an actual directional crossing rather than a static close-vs-SMA20 comparison.",
+      "reason": "Spec says 'upon price crossing SMA(20)', which describes a crossing event, not merely being on one side of the line."
+    },
+    {
+      "topic": "stop-loss reference values (fixed vs live)",
+      "choice": "The 1.2xATR stop uses entry-time price/ATR fixed at entry; the band-breach stop (band +/- 0.5xATR) uses the current band and current ATR re-evaluated every bar.",
+      "reason": "Spec explicitly anchors the first stop to 'entry price' (a fixed reference, matching the sizing formula's use of entry-time ATR), while 'closed beyond the corresponding band' has no such fixed qualifier and naturally refers to the live band."
+    },
+    {
+      "topic": "bar-counting for 6-bar time exit",
+      "choice": "bars_held = len(self) - entry_bar, where entry_bar is recorded on the signal bar; position is closed once bars_held >= 6.",
+      "reason": "Spec doesn't define an exact fill-timing convention for the bar count, so the signal bar was used as bar zero of the count, consistent with using signal-bar values elsewhere."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 3,
+  "tape": [
+    {
+      "dt": "2021-05-05T04:00:00",
+      "side": "BUY",
+      "size": 43.0,
+      "price": 125.72439941828401
+    },
+    {
+      "dt": "2021-05-13T04:00:00",
+      "side": "SELL",
+      "size": -43.0,
+      "price": 121.43458279999426
+    },
+    {
+      "dt": "2022-08-31T04:00:00",
+      "side": "BUY",
+      "size": 34.0,
+      "price": 157.37354474862363
+    },
+    {
+      "dt": "2022-09-07T04:00:00",
+      "side": "SELL",
+      "size": -34.0,
+      "price": 151.9840778426693
+    },
+    {
+      "dt": "2022-10-26T04:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 148.19481318791426
+    },
+    {
+      "dt": "2022-10-28T04:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 145.4853576495381
+    }
+  ]
+}

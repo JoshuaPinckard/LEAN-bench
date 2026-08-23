@@ -1,0 +1,160 @@
+Implementing a manual 1h-aggregation + 1m Order Block detection strategy since the harness provides only the 1-minute feed.
+
+```python
+import backtrader as bt
+
+
+class FVGOrderBlockStrategy(bt.Strategy):
+    params = dict(
+        risk_pct=0.01,
+        h1_sma_period=20,
+        adx_period=14,
+        adx_threshold=20,
+        ob_body_ratio=0.7,
+    )
+
+    def __init__(self):
+        self.adx = bt.indicators.ADX(self.data, period=self.p.adx_period)
+
+        self.cur_h1 = None
+        self.h1_bars = []
+        self.fvg_zones = []
+        self.trend_up = False
+
+        self.active_zone = None
+        self.ob_high = None
+        self.ob_broken = False
+        self.pending_breakout = None
+
+        self.order = None
+
+    def _update_h1(self):
+        dt = self.data.datetime.datetime(0)
+        hour_ts = dt.replace(minute=0, second=0, microsecond=0)
+
+        if self.cur_h1 is None:
+            self.cur_h1 = dict(hour=hour_ts, open=self.data.open[0],
+                                high=self.data.high[0], low=self.data.low[0],
+                                close=self.data.close[0])
+        elif hour_ts == self.cur_h1['hour']:
+            self.cur_h1['high'] = max(self.cur_h1['high'], self.data.high[0])
+            self.cur_h1['low'] = min(self.cur_h1['low'], self.data.low[0])
+            self.cur_h1['close'] = self.data.close[0]
+        else:
+            self.h1_bars.append(self.cur_h1)
+            self._on_new_h1_bar()
+            self.cur_h1 = dict(hour=hour_ts, open=self.data.open[0],
+                                high=self.data.high[0], low=self.data.low[0],
+                                close=self.data.close[0])
+
+    def _on_new_h1_bar(self):
+        bars = self.h1_bars
+        if len(bars) >= 3:
+            c1, c2, c3 = bars[-3], bars[-2], bars[-1]
+            if c1['high'] < c3['low']:
+                self.fvg_zones.append(dict(low=c1['high'], high=c3['low'], mitigated=False))
+
+        if len(bars) >= self.p.h1_sma_period:
+            recent = [b['close'] for b in bars[-self.p.h1_sma_period:]]
+            avg = sum(recent) / len(recent)
+            self.trend_up = bars[-1]['close'] > avg
+        else:
+            self.trend_up = False
+
+    def _update_ob(self):
+        rng = self.data.high[0] - self.data.low[0]
+        if rng <= 0:
+            return
+        is_bullish = self.data.close[0] > self.data.open[0]
+        body = abs(self.data.close[0] - self.data.open[0])
+        if is_bullish and (body / rng) >= self.p.ob_body_ratio:
+            self.ob_high = self.data.high[-1]
+            self.ob_broken = False
+
+    def _update_zone_touch(self):
+        if self.active_zone is None:
+            for z in reversed(self.fvg_zones):
+                if z['mitigated']:
+                    continue
+                if self.data.low[0] <= z['high'] and self.data.high[0] >= z['low']:
+                    self.active_zone = z
+                    break
+        else:
+            z = self.active_zone
+            if self.data.close[0] < z['low']:
+                z['mitigated'] = True
+                self.active_zone = None
+
+    def _try_enter(self, confirm):
+        entry_price = self.data.close[0]
+        sl_price = confirm['breakout_low']
+        risk_per_unit = entry_price - sl_price
+        if risk_per_unit <= 0:
+            return
+
+        candidates = [z for z in self.fvg_zones if not z['mitigated'] and z['low'] > entry_price]
+        if not candidates:
+            return
+        target_zone = min(candidates, key=lambda z: z['low'])
+        tp_price = target_zone['low']
+
+        equity = self.broker.getvalue()
+        size = (equity * self.p.risk_pct) / risk_per_unit
+        if size <= 0:
+            return
+
+        self.order = self.buy_bracket(size=size, exectype=bt.Order.Market,
+                                       stopprice=sl_price, limitprice=tp_price)[0]
+
+        if self.active_zone is not None:
+            self.active_zone['mitigated'] = True
+            self.active_zone = None
+
+    def next(self):
+        self._update_h1()
+        if len(self) < 2:
+            return
+
+        self._update_ob()
+        self._update_zone_touch()
+
+        if self.pending_breakout is not None:
+            confirm = self.pending_breakout
+            self.pending_breakout = None
+            if self.data.close[0] > confirm['breakout_close'] and not self.position and not self.order:
+                self._try_enter(confirm)
+            return
+
+        if self.position or self.order:
+            return
+
+        if (self.ob_high is not None and not self.ob_broken and self.active_zone is not None
+                and self.trend_up and self.adx[0] > self.p.adx_threshold):
+            if self.data.close[-1] <= self.ob_high < self.data.close[0]:
+                self.ob_broken = True
+                self.pending_breakout = dict(
+                    breakout_close=self.data.close[0],
+                    breakout_low=self.data.low[0],
+                )
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        if order == self.order and order.status in [order.Completed, order.Canceled,
+                                                      order.Margin, order.Rejected]:
+            self.order = None
+```
+```json
+{"assumptions": [
+  {"topic": "1-hour data source", "choice": "1-hour candles are built manually inside the strategy by aggregating the provided 1-minute feed on calendar-hour boundaries (only finalized/closed hours are used, no lookahead).", "reason": "The harness supplies a single 1-minute PandasData feed; adding a separate resampled data feed is not available to the strategy, so the 1h timeframe required by the spec must be synthesized in code."},
+  {"topic": "FVG polarity tracked", "choice": "Only bullish FVGs are detected/stored: three consecutive finalized 1h candles c1,c2,c3 where c1.high < c3.low, zone = [c1.high, c3.low].", "reason": "The spec's FVG definition is direction-agnostic, but the strategy is explicitly long-only and uses the FVG as a retracement support / future target above price, which only bullish (upward-gap) FVGs serve."},
+  {"topic": "FVG touch / invalidation mechanics", "choice": "A zone is 'touched' when a 1m bar's high/low range overlaps it; it stays active until an entry consumes it or a 1m bar closes below the zone's low (treated as invalidation).", "reason": "Spec says price must 'touch or enter' the zone but does not define how long the zone stays valid or when it is invalidated."},
+  {"topic": "Order Block definition", "choice": "An Order Block level = the high of the 1m candle immediately preceding a strong bullish 1m candle (body >= 70% of range); the break is a close crossing above that level.", "reason": "Spec literally defines OB as 'the last significant high ... before a strong price move'; restricting the triggering strong move to bullish candles matches the strategy's long-only, trend-following design."},
+  {"topic": "Continuation confirmation", "choice": "After an OB-break bar, entry is taken on the next bar only if that bar's close exceeds the break bar's close; otherwise the signal is dropped.", "reason": "Reconciles 'open a long position immediately after the Order Block break' with the additional rule requiring confirmation that price keeps moving upward after the break."},
+  {"topic": "Take-profit target selection", "choice": "TP = the low edge of the nearest not-yet-mitigated bullish FVG zone whose low lies above the entry price; if no such zone exists yet, the trade is skipped.", "reason": "Spec sets TP at 'the level of the next 1h FVG above the entry point' but does not specify which edge of the zone or what to do if none has formed yet."},
+  {"topic": "Stop-loss placement", "choice": "SL = the low of the exact candle that broke the Order Block, with no extra buffer.", "reason": "Spec states SL is 'below the low of the candle that broke the Order Block'; that candle's low is itself below the entry price, satisfying the stated placement without inventing an arbitrary buffer."},
+  {"topic": "Position sizing / risk", "choice": "Risk 1% of current portfolio equity per trade; size = (equity * 0.01) / (entry_price - stop_price).", "reason": "Spec asks for a fixed % of capital per trade while also requiring risk to be bounded by the stop loss; risk-based sizing satisfies both stated requirements simultaneously (1% chosen from the given 1-2% example range)."},
+  {"topic": "Trend / sideways filter", "choice": "Main uptrend = latest finalized 1h close above the SMA of the last 20 finalized 1h closes; entries additionally require ADX(14) on the 1m feed to be above 20 (else treated as sideways).", "reason": "Spec requires trading 'in the direction of the main trend' and forbids entries during 'strong sideways movement without a clear trend' but names no specific indicator; SMA(20) trend direction plus ADX(14)/20 threshold are standard minimal choices for these two stated requirements."},
+  {"topic": "infeasible: futures market mechanics", "choice": "Strategy is implemented against the single provided 1-minute spot-style OHLCV feed with standard cash/commission settings; no leverage, funding rate, or futures-specific order-book behavior is modeled.", "reason": "The spec targets 'Bitcoin futures' but the harness only supplies 1m OHLCV bars with no futures contract, margin, or funding data, so futures-specific mechanics cannot be represented."}
+]}
+```

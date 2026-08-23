@@ -1,0 +1,528 @@
+{
+  "task_id": 132,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\nimport collections\n\n\nclass DailySmaLimitOcoStrategy(bt.Strategy):\n    params = (\n        ('sma_period', 20),\n        ('tp_pct', 0.02),\n        ('sl_pct', 0.015),\n    )\n\n    def __init__(self):\n        self.daily_closes = collections.deque(maxlen=self.p.sma_period)\n        self.current_date = None\n        self.last_close = None\n        self.prev_close = None\n        self.prev_sma = None\n        self.entry_order = None\n        self.tp_order = None\n        self.sl_order = None\n\n    def _finalize_day(self, close_price):\n        self.daily_closes.append(close_price)\n        sma = None\n        if len(self.daily_closes) >= self.p.sma_period:\n            sma = sum(self.daily_closes) / self.p.sma_period\n\n        signal = None\n        if self.prev_close is not None and self.prev_sma is not None and sma is not None:\n            if self.prev_close <= self.prev_sma and close_price > sma:\n                signal = 'buy'\n            elif self.prev_close >= self.prev_sma and close_price < sma:\n                signal = 'sell'\n\n        self.prev_close = close_price\n        self.prev_sma = sma\n        return signal\n\n    def next(self):\n        dt = self.data.datetime.date(0)\n        o = self.data.open[0]\n        c = self.data.close[0]\n\n        if self.current_date is None:\n            self.current_date = dt\n        elif dt != self.current_date:\n            if self.entry_order is not None:\n                self.cancel(self.entry_order)\n                self.entry_order = None\n\n            close_of_prev_day = self.last_close\n            signal = self._finalize_day(close_of_prev_day)\n            self.current_date = dt\n\n            if signal is not None and not self.position and self.entry_order is None:\n                if signal == 'buy':\n                    self.entry_order = self.buy(exectype=bt.Order.Limit, price=close_of_prev_day)\n                else:\n                    self.entry_order = self.sell(exectype=bt.Order.Limit, price=o)\n\n        self.last_close = c\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        if order.status == order.Completed:\n            if order == self.entry_order:\n                self.entry_order = None\n                entry_price = order.executed.price\n                if order.isbuy():\n                    tp_price = entry_price * (1.0 + self.p.tp_pct)\n                    sl_price = entry_price * (1.0 - self.p.sl_pct)\n                    tp = self.sell(exectype=bt.Order.Limit, price=tp_price)\n                    sl = self.sell(exectype=bt.Order.Stop, price=sl_price, oco=tp)\n                else:\n                    tp_price = entry_price * (1.0 - self.p.tp_pct)\n                    sl_price = entry_price * (1.0 + self.p.sl_pct)\n                    tp = self.buy(exectype=bt.Order.Limit, price=tp_price)\n                    sl = self.buy(exectype=bt.Order.Stop, price=sl_price, oco=tp)\n                self.tp_order = tp\n                self.sl_order = sl\n            elif order == self.tp_order:\n                self.tp_order = None\n            elif order == self.sl_order:\n                self.sl_order = None\n        elif order.status in (order.Canceled, order.Margin, order.Rejected):\n            if order == self.entry_order:\n                self.entry_order = None\n            elif order == self.tp_order:\n                self.tp_order = None\n            elif order == self.sl_order:\n                self.sl_order = None",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Only a single hourly PandasData feed is provided by the harness (no separate daily feed and no strategy-level access to cerebro.resampledata). Daily bars are synthesized inside the strategy by grouping hourly bars per calendar date: daily open = open of that date's first hourly bar, daily close = close of that date's last hourly bar. SMA(20) is computed manually as a rolling mean of the last 20 synthesized daily closes instead of via a bt.indicators.SMA bound to a true daily data feed.",
+      "reason": "The spec requires a genuine daily timeframe for signal generation, but the fixed execution environment supplies only one hourly feed and forbids strategy-level cerebro/data setup, so daily bars must be derived from the hourly series."
+    },
+    {
+      "topic": "order-execution-timing",
+      "choice": "Day-rollover (and thus signal detection / new entry-order placement) is detected reactively when the first hourly bar of the new day arrives in next(). Because backtrader evaluates orders submitted in next() starting from the following bar, the entry limit order becomes eligible to fill from the 2nd hourly bar of day t+1 onward rather than its very first bar.",
+      "reason": "This is standard, causal (non-lookahead) backtrader order-execution behavior for any next()-driven strategy; peeking ahead to place the order one bar earlier would introduce lookahead bias and is not idiomatic."
+    },
+    {
+      "topic": "entry order expiry",
+      "choice": "Instead of using the order 'valid' parameter, the strategy explicitly cancels any still-pending entry order at the next day's rollover (i.e., once day t+1 has fully elapsed without a fill).",
+      "reason": "Gives deterministic, auditable control over the 'not filled during day t+1 -> signal inactive' rule rather than relying on backtrader's internal intraday DAY-validity expiry semantics."
+    },
+    {
+      "topic": "signal overlap while in position",
+      "choice": "Daily close/SMA tracking and crossover detection continue every day regardless of position state, but a new signal is only converted into an entry order when there is no open position and no pending entry order; signals arising while a position/pending order exists are dropped, not queued.",
+      "reason": "Spec only describes inactivity for the unfilled-order case; combined with the canonical single-position/no-pyramiding rule, dropping overlapping signals is the simplest reading that avoids inventing a queuing mechanism the spec does not state."
+    },
+    {
+      "topic": "OCO bracket implementation",
+      "choice": "After the entry order fills, the take-profit (limit) and stop-loss (stop) orders are submitted separately using backtrader's native oco= linkage (sl order created with oco=tp order) rather than buy_bracket()/sell_bracket().",
+      "reason": "Spec explicitly separates the initial limit entry from the post-fill OCO pair; buy_bracket/sell_bracket would submit all three orders together at signal time, which does not match 'immediately after it is filled, place an OCO bracket'."
+    },
+    {
+      "topic": "entry price for TP/SL levels",
+      "choice": "+2%/-1.5% offsets are computed from order.executed.price (the actual fill price) of the entry order, not the originally submitted limit price.",
+      "reason": "Spec says '+2% from the entry price', which is most literally the price at which the position was actually entered."
+    },
+    {
+      "topic": "crossover comparison",
+      "choice": "Upward cross defined as prev_close <= prev_SMA20 and close > SMA20 (today); downward cross defined as prev_close >= prev_SMA20 and close < SMA20 (today), using each day's contemporaneous close/SMA pair.",
+      "reason": "Spec does not give exact inequality operators; this mirrors the standard CrossOver convention (e.g. bt.indicators.CrossOver) for close-vs-SMA crossovers."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 40,
+  "tape": [
+    {
+      "dt": "2023-10-06T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 174.8000030517578
+    },
+    {
+      "dt": "2023-10-09T17:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 178.29600311279296
+    },
+    {
+      "dt": "2023-11-03T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 174.6999969482422
+    },
+    {
+      "dt": "2023-11-06T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 178.19399688720702
+    },
+    {
+      "dt": "2024-02-01T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 186.1199951171875
+    },
+    {
+      "dt": "2024-02-02T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 180.4499969482422
+    },
+    {
+      "dt": "2024-02-07T15:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 189.2899932861328
+    },
+    {
+      "dt": "2024-02-13T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 185.77000427246094
+    },
+    {
+      "dt": "2024-03-20T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 176.0800018310547
+    },
+    {
+      "dt": "2024-03-21T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 173.43880180358886
+    },
+    {
+      "dt": "2024-03-22T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 171.86000061035156
+    },
+    {
+      "dt": "2024-04-02T13:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 168.42280059814453
+    },
+    {
+      "dt": "2024-04-12T16:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 175.0399932861328
+    },
+    {
+      "dt": "2024-04-16T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 171.7100067138672
+    },
+    {
+      "dt": "2024-04-17T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 170.4499969482422
+    },
+    {
+      "dt": "2024-04-18T16:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 167.04099700927733
+    },
+    {
+      "dt": "2024-04-26T16:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 169.89999389648438
+    },
+    {
+      "dt": "2024-04-29T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 173.38999938964844
+    },
+    {
+      "dt": "2024-04-29T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 174.75
+    },
+    {
+      "dt": "2024-04-30T19:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 171.255
+    },
+    {
+      "dt": "2024-05-02T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 172.4199981689453
+    },
+    {
+      "dt": "2024-05-03T13:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 186.6699981689453
+    },
+    {
+      "dt": "2024-07-25T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 218.8699951171875
+    },
+    {
+      "dt": "2024-07-31T13:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 222.1530450439453
+    },
+    {
+      "dt": "2024-08-14T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 221.11000061035156
+    },
+    {
+      "dt": "2024-08-16T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 225.5322006225586
+    },
+    {
+      "dt": "2024-09-05T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 225.0800018310547
+    },
+    {
+      "dt": "2024-09-06T16:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 220.5784017944336
+    },
+    {
+      "dt": "2024-09-20T19:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 228.82000732421875
+    },
+    {
+      "dt": "2024-09-25T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 225.25
+    },
+    {
+      "dt": "2024-10-08T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 224.89759826660156
+    },
+    {
+      "dt": "2024-10-09T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 228.27106224060057
+    },
+    {
+      "dt": "2024-11-19T20:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 227.99000549316406
+    },
+    {
+      "dt": "2024-11-25T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 232.54980560302735
+    },
+    {
+      "dt": "2025-01-03T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 243.3699951171875
+    },
+    {
+      "dt": "2025-01-06T15:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 247.02054504394528
+    },
+    {
+      "dt": "2025-01-29T15:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 236.80999755859375
+    },
+    {
+      "dt": "2025-01-31T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 247.0399932861328
+    },
+    {
+      "dt": "2025-02-04T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 230.3800048828125
+    },
+    {
+      "dt": "2025-02-07T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 233.83570495605466
+    },
+    {
+      "dt": "2025-02-07T15:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 230.33999633789062
+    },
+    {
+      "dt": "2025-02-11T16:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 234.94679626464844
+    },
+    {
+      "dt": "2025-02-28T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 237.5800018310547
+    },
+    {
+      "dt": "2025-02-28T20:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 241.14370185852047
+    },
+    {
+      "dt": "2025-03-03T15:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 241.5
+    },
+    {
+      "dt": "2025-03-03T19:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 237.8775
+    },
+    {
+      "dt": "2025-03-04T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 238.39999389648438
+    },
+    {
+      "dt": "2025-03-05T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 233.63199401855468
+    },
+    {
+      "dt": "2025-04-01T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 221.49000549316406
+    },
+    {
+      "dt": "2025-04-03T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 205.52000427246094
+    },
+    {
+      "dt": "2025-04-04T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 195.2949981689453
+    },
+    {
+      "dt": "2025-04-04T16:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 191.3890982055664
+    },
+    {
+      "dt": "2025-05-06T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 198.89999389648438
+    },
+    {
+      "dt": "2025-05-07T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 194.92199401855467
+    },
+    {
+      "dt": "2025-05-13T15:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 210.8300018310547
+    },
+    {
+      "dt": "2025-05-19T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 207.13999938964844
+    },
+    {
+      "dt": "2025-05-21T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 205.85000610351562
+    },
+    {
+      "dt": "2025-05-21T18:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 201.7330059814453
+    },
+    {
+      "dt": "2025-06-23T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 200.94000244140625
+    },
+    {
+      "dt": "2025-06-30T18:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 204.95880249023438
+    },
+    {
+      "dt": "2025-08-07T16:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 213.25
+    },
+    {
+      "dt": "2025-08-07T17:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 218.72000122070312
+    },
+    {
+      "dt": "2025-09-11T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 228.94000244140625
+    },
+    {
+      "dt": "2025-09-12T13:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 232.3741024780273
+    },
+    {
+      "dt": "2025-10-13T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 249.3800048828125
+    },
+    {
+      "dt": "2025-10-17T19:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 253.12070495605465
+    },
+    {
+      "dt": "2025-10-21T17:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 262.2300109863281
+    },
+    {
+      "dt": "2025-10-22T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 258.2965608215332
+    },
+    {
+      "dt": "2025-11-19T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 269.9150085449219
+    },
+    {
+      "dt": "2025-11-20T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 273.9637336730957
+    },
+    {
+      "dt": "2025-12-16T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 273.1700134277344
+    },
+    {
+      "dt": "2025-12-18T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 267.7066131591797
+    },
+    {
+      "dt": "2026-02-18T19:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 263.75
+    },
+    {
+      "dt": "2026-02-20T14:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 258.9549865722656
+    },
+    {
+      "dt": "2026-02-20T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 260.54998779296875
+    },
+    {
+      "dt": "2026-02-20T16:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 264.45823760986326
+    },
+    {
+      "dt": "2026-03-02T15:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 263.82000732421875
+    },
+    {
+      "dt": "2026-03-05T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 258.5436071777344
+    },
+    {
+      "dt": "2026-04-02T14:30:00",
+      "side": "BUY",
+      "size": 1.0,
+      "price": 252.11000061035156
+    },
+    {
+      "dt": "2026-04-06T13:30:00",
+      "side": "SELL",
+      "size": -1.0,
+      "price": 257.1522006225586
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+```python
+import backtrader as bt
+
+
+class GapMomentumStrategy(bt.Strategy):
+    params = (
+        ('atr_period', 14),
+        ('vol_sma_period', 20),
+        ('liquidity_threshold', 1000000),
+        ('volatility_threshold', 0.01),
+        ('gap_atr_mult', 1.5),
+        ('vol_mult', 1.2),
+        ('take_profit_pct', 0.02),
+        ('stop_loss_pct', 0.01),
+        ('time_exit_bars', 12),
+        ('risk_pct', 0.01),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+
+        self.order = None
+        self.entry_price = None
+        self.entry_bar = None
+        self.stop_price = None
+        self.tp_price = None
+        self.direction = None
+
+    def notify_order(self, order):
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            if order.status == order.Completed:
+                if self.entry_price is None:
+                    self.entry_price = order.executed.price
+                    self.entry_bar = len(self)
+                    self.direction = 1 if order.isbuy() else -1
+                    if self.direction == 1:
+                        self.stop_price = self.entry_price * (1 - self.p.stop_loss_pct)
+                        self.tp_price = self.entry_price * (1 + self.p.take_profit_pct)
+                    else:
+                        self.stop_price = self.entry_price * (1 + self.p.stop_loss_pct)
+                        self.tp_price = self.entry_price * (1 - self.p.take_profit_pct)
+                else:
+                    self.entry_price = None
+                    self.entry_bar = None
+                    self.stop_price = None
+                    self.tp_price = None
+                    self.direction = None
+            self.order = None
+
+    def _enter(self, direction):
+        price_estimate = self.data.close[0]
+        stop_points = self.p.stop_loss_pct * price_estimate
+        risk_amount = self.p.risk_pct * self.broker.getvalue()
+        size = risk_amount / stop_points
+        if direction == 1:
+            self.order = self.buy(size=size)
+        else:
+            self.order = self.sell(size=size)
+
+    def next(self):
+        if self.order:
+            return
+
+        if self.position:
+            bars_held = len(self) - self.entry_bar
+            if self.direction == 1:
+                exit_signal = (self.data.high[0] >= self.tp_price or
+                                self.data.low[0] <= self.stop_price or
+                                bars_held >= self.p.time_exit_bars)
+            else:
+                exit_signal = (self.data.low[0] <= self.tp_price or
+                                self.data.high[0] >= self.stop_price or
+                                bars_held >= self.p.time_exit_bars)
+            if exit_signal:
+                self.order = self.close()
+            return
+
+        if self.vol_sma[0] < self.p.liquidity_threshold:
+            return
+        if self.atr[0] / self.data.close[-1] < self.p.volatility_threshold:
+            return
+
+        gap = self.data.open[0] - self.data.close[-1]
+        atr_val = self.atr[0]
+
+        long_gap = gap >= self.p.gap_atr_mult * atr_val and self.data.open[0] > self.data.high[-1]
+        short_gap = (-gap) >= self.p.gap_atr_mult * atr_val and self.data.open[0] < self.data.low[-1]
+
+        if long_gap:
+            momentum_ok = (self.data.volume[0] > self.p.vol_mult * self.vol_sma[0] and
+                           self.data.close[0] > self.data.open[0])
+            if momentum_ok:
+                self._enter(1)
+        elif short_gap:
+            momentum_ok = (self.data.volume[0] > self.p.vol_mult * self.vol_sma[0] and
+                           self.data.close[0] < self.data.open[0])
+            if momentum_ok:
+                self._enter(-1)
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "The 'overnight gap' between Open[0] and Close[-1] is evaluated on every consecutive 5-minute bar pair (no session/day boundary detection), since only intraday OHLCV is available and the feed has no explicit session markers.", "reason": "The spec's 'overnight' framing assumes daily bars; on 5m intraday data the closest literal reading is a direct bar-to-bar Open[0] vs Close[-1] comparison every bar."},
+  {"topic": "position size price estimate", "choice": "Use the gap-day bar's Close[0] as the entry-price estimate when computing 'stop in points' and order size at signal time.", "reason": "The actual fill price (next bar's open) is unknown when the order must be sized/submitted; Close[0] is the most recent known price."},
+  {"topic": "capital definition for risk sizing", "choice": "'1% of capital' is computed as 1% of current broker portfolio value (self.broker.getvalue()) at the moment of entry, not the fixed initial cash.", "reason": "Spec does not define 'capital'; using live equity is the standard risk-per-trade convention."},
+  {"topic": "TP/SL trigger detection", "choice": "Take-profit and stop-loss levels are checked by comparing the bar's High/Low against the threshold prices (intrabar touch), but the exit itself is executed via self.close(), a market order that fills at the next bar's open per canonical default.", "reason": "Spec states TP/SL as price levels but does not specify order type; per canonical default, close/exit uses self.close(), which introduces a market-order fill (possible minor slippage vs. the exact +2%/-1% level)."},
+  {"topic": "time-exit bar counting", "choice": "Bars-held is measured as len(self) minus the bar index at which the entry order was filled, so the exit triggers once 12 bars have elapsed since (and including) the entry-fill bar.", "reason": "Spec gives N=12 as an explicit example but does not define the exact bar-counting convention."},
+  {"topic": "position size rounding", "choice": "The computed size (risk amount / stop-in-points) is passed to buy()/sell() as-is without rounding to whole shares.", "reason": "Spec does not mention share rounding, and backtrader's default broker accepts fractional sizes."}
+]}
+```

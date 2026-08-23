@@ -1,0 +1,60 @@
+{
+  "task_id": 49,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\nimport statistics\n\nimport backtrader as bt\n\n\nclass LogisticRegressionRsiMomentumStrategy(bt.Strategy):\n    params = (\n        ('rsi_period', 14),\n        ('mom_period', 12),\n        ('train_frac', 0.8),\n        ('entry_threshold', 0.6),\n        ('lr', 0.1),\n        ('epochs', 500),\n    )\n\n    def __init__(self):\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.mom = bt.indicators.Momentum(self.data.close, period=self.p.mom_period)\n        self.order = None\n        self.train_x = []\n        self.train_y = []\n        self.feat_stats = None\n        self.weights = None\n        self.split_idx = None\n        self.trained = False\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n\n    def _sigmoid(self, z):\n        if z < -60:\n            return 0.0\n        if z > 60:\n            return 1.0\n        return 1.0 / (1.0 + math.exp(-z))\n\n    def _train(self):\n        n = len(self.train_y)\n        if n == 0:\n            return\n        rsis = [x[0] for x in self.train_x]\n        moms = [x[1] for x in self.train_x]\n        rsi_mean = statistics.mean(rsis)\n        rsi_std = statistics.pstdev(rsis) or 1.0\n        mom_mean = statistics.mean(moms)\n        mom_std = statistics.pstdev(moms) or 1.0\n        self.feat_stats = (rsi_mean, rsi_std, mom_mean, mom_std)\n\n        w0 = w1 = w2 = 0.0\n        for _ in range(self.p.epochs):\n            g0 = g1 = g2 = 0.0\n            for (r, m), y in zip(self.train_x, self.train_y):\n                rs = (r - rsi_mean) / rsi_std\n                ms = (m - mom_mean) / mom_std\n                p = self._sigmoid(w0 + w1 * rs + w2 * ms)\n                err = p - y\n                g0 += err\n                g1 += err * rs\n                g2 += err * ms\n            w0 -= self.p.lr * g0 / n\n            w1 -= self.p.lr * g1 / n\n            w2 -= self.p.lr * g2 / n\n        self.weights = (w0, w1, w2)\n        self.trained = True\n\n    def _predict_proba(self, r, m):\n        rsi_mean, rsi_std, mom_mean, mom_std = self.feat_stats\n        rs = (r - rsi_mean) / rsi_std\n        ms = (m - mom_mean) / mom_std\n        w0, w1, w2 = self.weights\n        return self._sigmoid(w0 + w1 * rs + w2 * ms)\n\n    def next(self):\n        if self.split_idx is None:\n            self.split_idx = int(self.data.buflen() * self.p.train_frac)\n\n        # RSI minperiod (15) plus one extra bar so the t-1 lagged value is also valid\n        min_len = self.p.rsi_period + 2\n        if len(self) < min_len:\n            return\n\n        if len(self) <= self.split_idx:\n            self.train_x.append((self.rsi[-1], self.mom[-1]))\n            self.train_y.append(1 if self.data.close[0] >= self.data.open[0] else 0)\n            return\n\n        if not self.trained:\n            self._train()\n            if not self.trained:\n                return\n\n        if self.order:\n            return\n\n        proba_up = self._predict_proba(self.rsi[-1], self.mom[-1])\n        prediction = 1 if proba_up >= 0.5 else 0\n\n        if not self.position:\n            if proba_up > self.p.entry_threshold:\n                self.order = self.buy(size=10)\n        else:\n            if prediction == 0:\n                self.order = self.close()",
+  "assumptions": [
+    {
+      "topic": "infeasible",
+      "choice": "Did not override the broker commission scheme; left the harness-configured commission (0.001, percentage-based) in place.",
+      "reason": "The spec asks for a fixed $10 commission per trade, but the execution environment states cerebro/broker setup, including commission 0.001, is added by the harness and is not the strategy's choice; the strategy class has no reliable way to enforce a different commission scheme within this environment."
+    },
+    {
+      "topic": "RSI/Momentum t-1 lag definition",
+      "choice": "Features used to predict bar t's target are the indicator values as of bar t-1 (self.rsi[-1], self.mom[-1] in backtrader indexing), not bar t's own indicator values.",
+      "reason": "The spec explicitly qualifies both indicators as 'based on the previous day's closing prices (t-1)', which also avoids leaking bar t's own close into a feature used to predict bar t's own open-to-close direction."
+    },
+    {
+      "topic": "logistic regression implementation",
+      "choice": "Implemented logistic regression from scratch (bias + 2 weights, sigmoid activation, full-batch gradient descent on cross-entropy loss) instead of using a library.",
+      "reason": "Only backtrader, math, collections, and statistics imports are allowed, so no ML library (e.g., scikit-learn) is available."
+    },
+    {
+      "topic": "feature scaling",
+      "choice": "Standardized RSI and Momentum (z-score) using training-set mean/standard deviation before fitting and before every prediction.",
+      "reason": "Not specified by the spec; needed for stable/well-behaved gradient descent given RSI (0-100) and Momentum (price-difference) are on very different scales."
+    },
+    {
+      "topic": "training hyperparameters",
+      "choice": "Learning rate 0.1, 500 full-batch gradient descent epochs.",
+      "reason": "The spec does not specify optimizer settings for the logistic regression, and none of these are supplied by the allowed libraries by default."
+    },
+    {
+      "topic": "train/test split boundary",
+      "choice": "split_idx = int(self.data.buflen() * 0.8); bars with len(self) <= split_idx are used to accumulate training samples, the remaining bars are used for prediction/trading only.",
+      "reason": "The spec states an 80/20 split without specifying the exact rounding or bar-indexing convention."
+    },
+    {
+      "topic": "warm-up handling for lagged features",
+      "choice": "No training-sample collection or trading occurs until len(self) >= rsi_period + 2 (16 bars).",
+      "reason": "Backtrader's automatic minperiod only guarantees the current-bar indicator value [0] is valid; accessing the lagged t-1 value additionally requires one more bar of history, which is not covered by automatic minperiod alone."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 1,
+  "tape": [
+    {
+      "dt": "2025-04-10T04:00:00",
+      "side": "BUY",
+      "size": 10.0,
+      "price": 188.07624843340898
+    },
+    {
+      "dt": "2025-04-29T04:00:00",
+      "side": "SELL",
+      "size": -10.0,
+      "price": 207.59314001435672
+    }
+  ]
+}

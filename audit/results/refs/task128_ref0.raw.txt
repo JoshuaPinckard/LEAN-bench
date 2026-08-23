@@ -1,0 +1,131 @@
+```python
+import backtrader as bt
+from collections import deque
+
+
+class StatisticalCapitulationBounce(bt.Strategy):
+    params = dict(
+        ma_period=100,
+        market_filter_period=200,
+        percentile_threshold=2.0,
+        rsi_period=14,
+        rsi_threshold=20.0,
+        rsi_fast_period=2,
+        rsi_fast_threshold=5.0,
+        stoch_period=14,
+        stoch_pfast=3,
+        stoch_pslow=3,
+        stoch_threshold=5.0,
+        williams_period=14,
+        williams_threshold=-95.0,
+        cci_period=20,
+        cci_threshold=-200.0,
+        mfi_period=14,
+        mfi_threshold=10.0,
+        bb_period=20,
+        bb_devfactor=2.0,
+        position_pct=0.10,
+        min_conditions=9,
+    )
+
+    def __init__(self):
+        self.sma100 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.ma_period)
+        self.sma200 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.p.market_filter_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.rsi_fast = bt.indicators.RSI(self.data.close, period=self.p.rsi_fast_period)
+        self.stoch = bt.indicators.Stochastic(
+            self.data,
+            period=self.p.stoch_period,
+            period_dfast=self.p.stoch_pfast,
+            period_dslow=self.p.stoch_pslow,
+        )
+        self.williams = bt.indicators.WilliamsR(self.data, period=self.p.williams_period)
+        self.cci = bt.indicators.CommodityChannelIndex(self.data, period=self.p.cci_period)
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor
+        )
+        self.crossdown = bt.indicators.CrossDown(self.data.close, self.sma100)
+
+        self.deviation_history = []
+        self.tp_history = deque(maxlen=2)
+        self.pos_mf = deque(maxlen=self.p.mfi_period)
+        self.neg_mf = deque(maxlen=self.p.mfi_period)
+
+        self.order = None
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def _update_mfi(self):
+        tp = (self.data.high[0] + self.data.low[0] + self.data.close[0]) / 3.0
+        mf = tp * self.data.volume[0]
+        self.tp_history.append(tp)
+        if len(self.tp_history) == 2:
+            if self.tp_history[1] > self.tp_history[0]:
+                self.pos_mf.append(mf)
+                self.neg_mf.append(0.0)
+            elif self.tp_history[1] < self.tp_history[0]:
+                self.pos_mf.append(0.0)
+                self.neg_mf.append(mf)
+            else:
+                self.pos_mf.append(0.0)
+                self.neg_mf.append(0.0)
+
+    def _mfi_value(self):
+        if len(self.pos_mf) < self.p.mfi_period:
+            return None
+        pos_sum = sum(self.pos_mf)
+        neg_sum = sum(self.neg_mf)
+        if neg_sum == 0:
+            return 100.0
+        money_ratio = pos_sum / neg_sum
+        return 100.0 - (100.0 / (1.0 + money_ratio))
+
+    def next(self):
+        self._update_mfi()
+
+        # Expanding window (no future data) so the percentile rank cannot look ahead.
+        deviation = self.data.close[0] - self.sma100[0]
+        self.deviation_history.append(deviation)
+        n = len(self.deviation_history)
+        rank = sum(1 for v in self.deviation_history if v <= deviation) / n * 100.0
+
+        conditions = []
+        conditions.append(rank <= self.p.percentile_threshold)
+        conditions.append(self.rsi[0] <= self.p.rsi_threshold)
+        conditions.append(self.rsi_fast[0] <= self.p.rsi_fast_threshold)
+        conditions.append(self.stoch.percK[0] <= self.p.stoch_threshold)
+        conditions.append(self.stoch.percD[0] <= self.p.stoch_threshold)
+        conditions.append(self.williams[0] <= self.p.williams_threshold)
+        conditions.append(self.cci[0] <= self.p.cci_threshold)
+        mfi_val = self._mfi_value()
+        conditions.append(mfi_val is not None and mfi_val <= self.p.mfi_threshold)
+        conditions.append(self.data.close[0] < self.bb.lines.bot[0])
+
+        met_count = sum(1 for c in conditions if c)
+        extreme_selloff = met_count >= self.p.min_conditions
+
+        if self.order:
+            return
+
+        if not self.position:
+            if extreme_selloff and self.data.close[0] > self.sma200[0]:
+                value = self.broker.getvalue()
+                size = int((value * self.p.position_pct) / self.data.close[0])
+                if size > 0:
+                    self.order = self.buy(size=size)
+        else:
+            if self.crossdown[0]:
+                self.order = self.close()
+```
+```json
+{"assumptions": [
+  {"topic": "percentile computation window", "choice": "Percentile rank of (Close - SMA100) is computed on an expanding window (all bars from strategy warm-up through the current bar), recomputed each bar.", "reason": "Spec says 'percentile over the entire historical period', but using the full backtest (including future bars) for a live-tradable strategy would be lookahead bias; an expanding no-lookahead window is the standard fidelity-preserving interpretation."},
+  {"topic": "extreme selloff condition count", "choice": "Exactly 9 conditions are defined (1 mandatory percentile condition + 8 additional oversold conditions) and the signal requires ALL 9 to be true simultaneously.", "reason": "Spec states 'at least 9 ... conditions are simultaneously met' and describes 'the other 8 conditions' in addition to the mandatory one, i.e. exactly 9 total conditions; with 9 defined, 'at least 9 met' equals 'all 9 met'."},
+  {"topic": "oversold indicator selection & thresholds", "choice": "8 additional conditions: RSI(14)<=20, RSI(2)<=5, Stochastic(14,3,3) %K<=5 and %D<=5, Williams %R(14)<=-95, CCI(20)<=-200, MFI(14)<=10, Close below lower Bollinger Band(20,2).", "reason": "Spec explicitly leaves the other 8 conditions and their thresholds to the implementer ('appropriate threshold values'); chose standard, well-known extreme-oversold thresholds for named example indicators (RSI, Stochastic, MFI) plus common companions (Williams %R, CCI, Bollinger Bands)."},
+  {"topic": "MFI implementation", "choice": "Money Flow Index(14) is computed manually from typical price and volume (no built-in bt.indicators.MFI exists).", "reason": "Spec explicitly names Money Flow Index as an example indicator; backtrader has no native MFI indicator, so it is computed directly from Volume/High/Low/Close in next()."},
+  {"topic": "position sizing", "choice": "Fixed 10% of current portfolio value per trade, converted to whole shares at the entry bar's close.", "reason": "Spec offers two explicit example approaches ('fixed percentage of capital, e.g., 10% per trade' or a volatility-based 1%-risk approach); the first, more literal example figure was chosen since the spec states neither is mandatory."},
+  {"topic": "infeasible", "choice": "The 'avoid entering if S&P 500 is below its 200-day SMA' filter is implemented as the traded instrument's (AAPL) own price vs. its 200-day SMA, applied only as an entry filter.", "reason": "The harness supplies a single AAPL data feed only; no S&P 500 series is available. Per the infeasibility rule, the closest literal substitute (a 200-day SMA trend filter on the only available price series) is used in place of the external index."}
+]}
+```

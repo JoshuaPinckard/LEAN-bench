@@ -1,0 +1,125 @@
+```python
+import math
+
+import backtrader as bt
+
+
+class MomentumVolatilityStrategy(bt.Strategy):
+    params = dict(
+        sma_fast_period=20,
+        sma_slow_period=50,
+        rsi_period=14,
+        vol_sma_period=20,
+        atr_period=20,
+        atr_sma_period=1950,
+        stop_lookback=10,
+        volume_multiplier=1.2,
+        rsi_low=40,
+        rsi_high=60,
+        price_low=10.0,
+        price_high=200.0,
+        take_profit_pct=0.02,
+        risk_pct=0.01,
+        max_stop_pct=0.02,
+        crossover_window=5,
+        session_start=(9, 30),
+        session_end=(16, 0),
+    )
+
+    def __init__(self):
+        self.sma_fast = bt.indicators.SMA(self.data.close, period=self.p.sma_fast_period)
+        self.sma_slow = bt.indicators.SMA(self.data.close, period=self.p.sma_slow_period)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.vol_sma_period)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.atr_sma = bt.indicators.SMA(self.atr, period=self.p.atr_sma_period)
+        self.crossover = bt.indicators.CrossOver(self.sma_fast, self.sma_slow)
+        self.lowest10 = bt.indicators.Lowest(self.data.low, period=self.p.stop_lookback)
+
+        self.order = None
+        self.entry_price = None
+        self.stop_price = None
+        self.pending_cross_bar = None
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+        if order.status == order.Completed:
+            if order.isbuy():
+                self.entry_price = order.executed.price
+            else:
+                self.entry_price = None
+                self.stop_price = None
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+    def next(self):
+        current_dt = self.data.datetime.datetime(0)
+        current_hm = (current_dt.hour, current_dt.minute)
+        in_session = self.p.session_start <= current_hm <= self.p.session_end
+
+        if self.crossover[0] > 0:
+            self.pending_cross_bar = len(self)
+
+        if self.pending_cross_bar is not None and (len(self) - self.pending_cross_bar) > self.p.crossover_window:
+            self.pending_cross_bar = None
+
+        if self.order is not None:
+            return
+
+        if self.position:
+            exit_signal = False
+            if self.stop_price is not None and self.data.low[0] < self.stop_price:
+                exit_signal = True
+            if self.entry_price is not None and self.data.high[0] >= self.entry_price * (1 + self.p.take_profit_pct):
+                exit_signal = True
+            if self.crossover[0] < 0:
+                exit_signal = True
+            if exit_signal:
+                self.order = self.close()
+            return
+
+        if not in_session:
+            return
+
+        if self.pending_cross_bar is None:
+            return
+
+        price = self.data.close[0]
+        price_ok = self.p.price_low <= price <= self.p.price_high
+        volume_ok = self.data.volume[0] > self.vol_sma[0] * self.p.volume_multiplier
+        rsi_ok = self.p.rsi_low <= self.rsi[0] <= self.p.rsi_high
+        volatility_ok = self.atr[0] > self.atr_sma[0]
+
+        if not (price_ok and volume_ok and rsi_ok and volatility_ok):
+            return
+
+        entry_price = price
+        stop_price = self.lowest10[0]
+        stop_distance = entry_price - stop_price
+
+        if stop_distance <= 0:
+            return
+        if stop_distance > entry_price * self.p.max_stop_pct:
+            return
+
+        risk_amount = self.broker.getvalue() * self.p.risk_pct
+        qty = math.floor(risk_amount / stop_distance)
+
+        if qty <= 0:
+            return
+
+        self.stop_price = stop_price
+        self.order = self.buy(size=qty)
+        self.pending_cross_bar = None
+```
+```json
+{"assumptions": [
+  {"topic": "entry_price_for_sizing", "choice": "Use the signal bar's close as the assumed entry price when computing stop distance and position size at signal time; the take-profit trigger later uses the actual filled price (order.executed.price) recorded in notify_order.", "reason": "The order's real fill price is unknown before submission, but qty and the stop-distance filter must be computed before the order is sent."},
+  {"topic": "crossover_rsi_window_semantics", "choice": "Treat the upward SMA20/SMA50 crossover as opening a 6-bar window (the crossover bar plus the next 5 bars). Conditions (1) price range, (2) volume filter, and (5) volatility filter are re-evaluated at whichever bar inside that window first satisfies the RSI 40-60 condition, and entry occurs there.", "reason": "The spec requires all conditions 'simultaneously' but also states RSI may satisfy its range 'at the moment of the crossover or within the next 5 bars', so the simultaneity is read as applying at the confirming (RSI-in-range) bar rather than strictly at the crossover bar."},
+  {"topic": "stop_and_target_trigger_price", "choice": "Detect the stop-loss breach using the bar's intrabar Low against the fixed stop level, and the +2% take-profit target using the bar's intrabar High against the entry price.", "reason": "Spec says 'price falls below' / '+2% from entry' without specifying Open/High/Low/Close; using intrabar High/Low reflects a realistic stop/target order that can trigger within a bar rather than only at the close."},
+  {"topic": "stop_level_definition", "choice": "The stop-loss level ('low of the last 10 bars') is the rolling 10-bar Lowest-Low measured inclusive of the signal bar, computed once at entry/sizing time and held fixed for the life of the trade (not recalculated or trailed on later bars). Entries where the computed stop distance is exactly 0 are skipped to avoid an undefined position size.", "reason": "The sizing formula explicitly refers to 'the initial stop', implying a fixed level; 'last 10 bars' is read as the trailing 10-bar window including the current bar."},
+  {"topic": "session_filter_scope", "choice": "The 9:30-16:00 ET session restriction is applied only to new entries; exits are permitted at any time.", "reason": "The spec's session restriction is stated only for entries ('Enter a long position (only during 9:30-16:00 ET)'), and no session restriction is stated for exits."},
+  {"topic": "equity_definition_for_sizing", "choice": "'Equity' in the position-sizing formula is taken as self.broker.getvalue() (total portfolio value) at the moment of the signal.", "reason": "The spec gives 'Equity×0.01' without further definition; broker.getvalue() is the standard measure of account equity in backtrader."}
+]}
+```

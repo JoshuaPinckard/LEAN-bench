@@ -1,0 +1,217 @@
+{
+  "task_id": 208,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import math\n\nimport backtrader as bt\n\n\nclass ThetaProxySingleAsset(bt.Strategy):\n    params = dict(\n        bb_period=20,\n        bb_dev=2,\n        atr_period=14,\n        atr_ema_period=14,\n        rsi_period=14,\n        rsi_long=35,\n        rsi_short=65,\n        bb_width_mult=1.5,\n        atr_close_pct=0.04,\n        cooldown_bars=24,\n        risk_pct=0.015,\n        max_units=3,\n        pyramid_atr_mult=0.5,\n        time_exit_bars=3,\n        tp_frac=0.7,\n        sl_mult=1.5,\n        breakout_atr_mult=0.5,\n    )\n\n    def __init__(self):\n        self.bb = bt.indicators.BollingerBands(\n            self.data.close, period=self.p.bb_period, devfactor=self.p.bb_dev\n        )\n        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)\n        self.atr_ema = bt.indicators.EMA(self.atr, period=self.p.atr_ema_period)\n        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)\n        self.bb_width = self.bb.top - self.bb.bot\n        self.bb_width_sma = bt.indicators.SMA(self.bb_width, period=self.p.bb_period)\n        self.cross_compress = bt.indicators.CrossOver(self.atr_ema, self.atr)\n        self.cross_expand = bt.indicators.CrossOver(self.atr, self.atr_ema)\n\n        self.order = None\n        self.pending = None\n        self.units = []\n        self.trade_direction = None\n        self.last_new_trade_bar = None\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        if order.status == order.Completed:\n            info = self.pending\n            if info is not None:\n                if info['type'] in ('entry_new', 'entry_pyramid'):\n                    entry_price = order.executed.price\n                    direction = info['direction']\n                    unit_risk = info['unit_risk']\n                    sma20 = info['sma20']\n                    dist = self.p.tp_frac * abs(entry_price - sma20)\n                    if direction == 1:\n                        tp = entry_price + dist\n                        sl = entry_price - self.p.sl_mult * unit_risk\n                    else:\n                        tp = entry_price - dist\n                        sl = entry_price + self.p.sl_mult * unit_risk\n                    self.units.append(dict(\n                        size=abs(order.executed.size),\n                        entry_price=entry_price,\n                        entry_bar=len(self),\n                        direction=direction,\n                        tp=tp,\n                        sl=sl,\n                    ))\n                    self.trade_direction = direction\n                    if info['type'] == 'entry_new':\n                        self.last_new_trade_bar = len(self)\n                elif info['type'] == 'exit_unit':\n                    idx = info['unit_index']\n                    if 0 <= idx < len(self.units):\n                        self.units.pop(idx)\n                    if not self.units:\n                        self.trade_direction = None\n                elif info['type'] == 'exit_all':\n                    self.units = []\n                    self.trade_direction = None\n\n        self.order = None\n        self.pending = None\n\n    def next(self):\n        if self.order is not None:\n            return\n\n        close = self.data.close[0]\n        sma20 = self.bb.mid[0]\n\n        compression = (\n            (self.atr[0] < self.atr_ema[0] and self.atr[-1] < self.atr_ema[-1])\n            or (self.cross_compress[0] == 1 or self.cross_compress[-1] == 1\n                or self.cross_compress[-2] == 1)\n        )\n        news_vol = (\n            self.bb_width[0] > self.p.bb_width_mult * self.bb_width_sma[0]\n        ) or (self.atr[0] / close > self.p.atr_close_pct)\n        filters_ok = compression and (not news_vol)\n\n        if self.position and self.units:\n            if self.cross_expand[0] == 1:\n                self.order = self.close()\n                self.pending = dict(type='exit_all')\n                return\n\n            direction = self.trade_direction\n            breakout = False\n            if direction == 1:\n                if (self.bb.bot[0] - close) > self.p.breakout_atr_mult * self.atr[0]:\n                    breakout = True\n            elif direction == -1:\n                if (close - self.bb.top[0]) > self.p.breakout_atr_mult * self.atr[0]:\n                    breakout = True\n            if breakout:\n                self.order = self.close()\n                self.pending = dict(type='exit_all')\n                return\n\n            current_bar = len(self)\n            for idx, unit in enumerate(self.units):\n                if unit['direction'] == 1:\n                    hit_tp = close >= unit['tp']\n                    hit_sl = close <= unit['sl']\n                else:\n                    hit_tp = close <= unit['tp']\n                    hit_sl = close >= unit['sl']\n                hit_time = (current_bar - unit['entry_bar']) >= self.p.time_exit_bars\n                if hit_tp or hit_sl or hit_time:\n                    if unit['direction'] == 1:\n                        self.order = self.sell(size=unit['size'])\n                    else:\n                        self.order = self.buy(size=unit['size'])\n                    self.pending = dict(type='exit_unit', unit_index=idx)\n                    return\n\n        if not self.position:\n            if not filters_ok:\n                return\n            if (self.last_new_trade_bar is not None\n                    and (len(self) - self.last_new_trade_bar) < self.p.cooldown_bars):\n                return\n\n            unit_risk = max(self.atr[0], 0.5 * abs(close - sma20))\n            if unit_risk <= 0:\n                return\n            size = math.floor((self.broker.getvalue() * self.p.risk_pct) / unit_risk)\n            if size <= 0:\n                return\n\n            if close <= self.bb.bot[0] and self.rsi[0] < self.p.rsi_long:\n                self.order = self.buy(size=size)\n                self.pending = dict(type='entry_new', direction=1,\n                                     unit_risk=unit_risk, sma20=sma20)\n            elif close >= self.bb.top[0] and self.rsi[0] > self.p.rsi_short:\n                self.order = self.sell(size=size)\n                self.pending = dict(type='entry_new', direction=-1,\n                                     unit_risk=unit_risk, sma20=sma20)\n\n        elif self.units and len(self.units) < self.p.max_units and filters_ok:\n            last_unit = self.units[-1]\n            atr_declining = self.atr[0] < self.atr[-1]\n            direction = self.trade_direction\n            if direction == 1:\n                deviation_met = close <= last_unit['entry_price'] - self.p.pyramid_atr_mult * self.atr[0]\n            else:\n                deviation_met = close >= last_unit['entry_price'] + self.p.pyramid_atr_mult * self.atr[0]\n\n            if deviation_met and atr_declining:\n                unit_risk = max(self.atr[0], 0.5 * abs(close - sma20))\n                if unit_risk > 0:\n                    size = math.floor((self.broker.getvalue() * self.p.risk_pct) / unit_risk)\n                    if size > 0:\n                        if direction == 1:\n                            self.order = self.buy(size=size)\n                        else:\n                            self.order = self.sell(size=size)\n                        self.pending = dict(type='entry_pyramid', direction=direction,\n                                             unit_risk=unit_risk, sma20=sma20)",
+  "assumptions": [
+    {
+      "topic": "position_sizing_pct",
+      "choice": "Used the explicit 0.015 constant from the stated size formula, not a variable 1-2% range.",
+      "reason": "Spec gives a concrete formula (Equity x 0.015) alongside the descriptive '1-2% risk' text; the formula is the operative rule."
+    },
+    {
+      "topic": "pyramid_cooldown_interaction",
+      "choice": "The 24-bar cooldown (filter 3 / exposure rule) gates only new positions opened from flat; pyramid adds to an already-open position are governed solely by the pyramiding rule (0.5xATR deviation, ATR declining, filters 1-2).",
+      "reason": "Positions are time-exited by the 3rd bar, so applying the 24-bar cooldown to pyramid adds would make pyramiding structurally impossible; the cooldown text reads as preventing re-entry into a fresh trade too soon after the last one."
+    },
+    {
+      "topic": "exit_scope",
+      "choice": "ATR-crosses-above-EMA and BB-breakout exits close the entire net position via self.close(); target/stop/time-based exits close only the specific pyramided unit via a partial-size order.",
+      "reason": "Spec frames the volatility/breakout exits as position-level risk overlays ('close the position') while target/stop/time-based exits are per-trade analogs (option target/stop/expiry), and pyramiding creates multiple units needing individual tracking."
+    },
+    {
+      "topic": "exit_price_basis",
+      "choice": "Target, stop, and breakout triggers are evaluated against the bar's Close only, not intrabar High/Low.",
+      "reason": "Every other signal in the spec (BB, RSI, ATR/EMA cross, filters) is close-based on daily bars; the spec gives no intrabar instruction, so close-based checks keep the implementation internally consistent."
+    },
+    {
+      "topic": "order_concurrency",
+      "choice": "Only one order is ever in flight (single order-tracking guard); if multiple units qualify for exit on the same bar, the oldest unit is closed first and the rest are re-evaluated on subsequent bars.",
+      "reason": "Canonical default requires a pending-order guard; the spec does not address simultaneous multi-unit exit handling."
+    },
+    {
+      "topic": "unit_risk_snapshot",
+      "choice": "UnitRisk and the SMA(20) reference used for TP/SL are captured from the signal bar's indicator values, then combined with the order's actual fill price once executed.",
+      "reason": "Backtrader fills entries on the next bar's open; pairing the signal-bar indicator readings with the true fill price is the closest literal execution of the stated formulas given the harness's order-timing model."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 14,
+  "tape": [
+    {
+      "dt": "2020-05-11T04:00:00",
+      "side": "SELL",
+      "size": -50.0,
+      "price": 74.57775171164975
+    },
+    {
+      "dt": "2020-05-15T04:00:00",
+      "side": "BUY",
+      "size": 50.0,
+      "price": 72.70178701263482
+    },
+    {
+      "dt": "2020-07-09T04:00:00",
+      "side": "SELL",
+      "size": -53.0,
+      "price": 93.20401878936576
+    },
+    {
+      "dt": "2020-07-14T04:00:00",
+      "side": "BUY",
+      "size": 53.0,
+      "price": 91.82674120591236
+    },
+    {
+      "dt": "2021-04-12T04:00:00",
+      "side": "SELL",
+      "size": -33.0,
+      "price": 128.9551224869681
+    },
+    {
+      "dt": "2021-04-16T04:00:00",
+      "side": "BUY",
+      "size": 33.0,
+      "price": 130.68718234573052
+    },
+    {
+      "dt": "2021-08-17T04:00:00",
+      "side": "SELL",
+      "size": -62.0,
+      "price": 146.65636676617194
+    },
+    {
+      "dt": "2021-08-19T04:00:00",
+      "side": "BUY",
+      "size": 62.0,
+      "price": 141.5800696426097
+    },
+    {
+      "dt": "2022-07-22T04:00:00",
+      "side": "SELL",
+      "size": -29.0,
+      "price": 152.3320525114364
+    },
+    {
+      "dt": "2022-07-28T04:00:00",
+      "side": "BUY",
+      "size": 29.0,
+      "price": 153.8907653704556
+    },
+    {
+      "dt": "2022-12-20T05:00:00",
+      "side": "BUY",
+      "size": 27.0,
+      "price": 129.19723960857664
+    },
+    {
+      "dt": "2022-12-27T05:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 129.18743096288975
+    },
+    {
+      "dt": "2023-03-22T04:00:00",
+      "side": "SELL",
+      "size": -38.0,
+      "price": 156.88061300312046
+    },
+    {
+      "dt": "2023-03-23T04:00:00",
+      "side": "BUY",
+      "size": 38.0,
+      "price": 156.41773262448348
+    },
+    {
+      "dt": "2023-05-01T04:00:00",
+      "side": "SELL",
+      "size": -55.0,
+      "price": 166.70906903109534
+    },
+    {
+      "dt": "2023-05-05T04:00:00",
+      "side": "BUY",
+      "size": 55.0,
+      "price": 168.38322333782398
+    },
+    {
+      "dt": "2023-11-13T05:00:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 183.74018560328048
+    },
+    {
+      "dt": "2023-11-17T05:00:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 188.12057839811112
+    },
+    {
+      "dt": "2024-07-11T04:00:00",
+      "side": "SELL",
+      "size": -18.0,
+      "price": 229.40281699319425
+    },
+    {
+      "dt": "2024-07-12T04:00:00",
+      "side": "BUY",
+      "size": 18.0,
+      "price": 226.9540066999144
+    },
+    {
+      "dt": "2024-12-02T05:00:00",
+      "side": "SELL",
+      "size": -31.0,
+      "price": 235.76369091824088
+    },
+    {
+      "dt": "2024-12-03T05:00:00",
+      "side": "SELL",
+      "size": -27.0,
+      "price": 238.28756099978403
+    },
+    {
+      "dt": "2024-12-04T05:00:00",
+      "side": "BUY",
+      "size": 58.0,
+      "price": 241.32814402991647
+    },
+    {
+      "dt": "2025-07-03T04:00:00",
+      "side": "SELL",
+      "size": -26.0,
+      "price": 211.31168447150716
+    },
+    {
+      "dt": "2025-07-07T04:00:00",
+      "side": "BUY",
+      "size": 26.0,
+      "price": 211.83958469799765
+    },
+    {
+      "dt": "2025-09-05T04:00:00",
+      "side": "SELL",
+      "size": -30.0,
+      "price": 239.3229322237051
+    },
+    {
+      "dt": "2025-09-11T04:00:00",
+      "side": "BUY",
+      "size": 30.0,
+      "price": 226.23995033725743
+    },
+    {
+      "dt": "2025-12-01T05:00:00",
+      "side": "SELL",
+      "size": -28.0,
+      "price": 277.4944549964911
+    },
+    {
+      "dt": "2025-12-02T05:00:00",
+      "side": "BUY",
+      "size": 28.0,
+      "price": 282.47518456741903
+    }
+  ]
+}

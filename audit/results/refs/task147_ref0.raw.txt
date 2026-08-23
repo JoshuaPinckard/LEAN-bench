@@ -1,0 +1,139 @@
+```python
+import backtrader as bt
+
+
+class GridMartingaleStrategy(bt.Strategy):
+    params = dict(
+        grid_distance_pct=0.01,
+        take_profit_pct=0.005,
+        reinvest_multiplier=2,
+        max_reinvest_levels=5,
+        base_size=1,
+    )
+
+    def __init__(self):
+        self.direction = None
+        self.level = 0
+        self.total_size = 0
+        self.total_cost = 0.0
+        self.last_entry_price = None
+
+        self.grid_buy_order = None
+        self.grid_sell_order = None
+        self.reinvest_order = None
+        self.tp_order = None
+
+    def next(self):
+        if self.direction is None:
+            if self.grid_buy_order is not None:
+                self.cancel(self.grid_buy_order)
+            if self.grid_sell_order is not None:
+                self.cancel(self.grid_sell_order)
+            price = self.data.close[0]
+            buy_price = price * (1 - self.p.grid_distance_pct)
+            sell_price = price * (1 + self.p.grid_distance_pct)
+            self.grid_buy_order = self.buy(
+                exectype=bt.Order.Limit, price=buy_price, size=self.p.base_size)
+            self.grid_sell_order = self.sell(
+                exectype=bt.Order.Limit, price=sell_price, size=self.p.base_size)
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.grid_buy_order:
+            if order.status == order.Completed:
+                self.grid_buy_order = None
+                self._on_entry_fill(order, 'long')
+                if self.grid_sell_order is not None:
+                    self.cancel(self.grid_sell_order)
+                    self.grid_sell_order = None
+            else:
+                self.grid_buy_order = None
+        elif order == self.grid_sell_order:
+            if order.status == order.Completed:
+                self.grid_sell_order = None
+                self._on_entry_fill(order, 'short')
+                if self.grid_buy_order is not None:
+                    self.cancel(self.grid_buy_order)
+                    self.grid_buy_order = None
+            else:
+                self.grid_sell_order = None
+        elif order == self.reinvest_order:
+            if order.status == order.Completed:
+                self.reinvest_order = None
+                self._on_entry_fill(order, self.direction)
+            else:
+                self.reinvest_order = None
+        elif order == self.tp_order:
+            if order.status == order.Completed:
+                self.tp_order = None
+                self._on_position_closed()
+            else:
+                self.tp_order = None
+
+    def _on_entry_fill(self, order, direction):
+        price = order.executed.price
+        size = abs(order.executed.size)
+        if self.direction is None:
+            self.direction = direction
+            self.total_cost = price * size
+            self.total_size = size
+            self.level = 0
+        else:
+            self.total_cost += price * size
+            self.total_size += size
+            self.level += 1
+        self.last_entry_price = price
+        avg_price = self.total_cost / self.total_size
+        self._update_tp_order(avg_price)
+        self._update_reinvest_order()
+
+    def _update_tp_order(self, avg_price):
+        if self.tp_order is not None:
+            self.cancel(self.tp_order)
+        if self.direction == 'long':
+            tp_price = avg_price * (1 + self.p.take_profit_pct)
+        else:
+            tp_price = avg_price * (1 - self.p.take_profit_pct)
+        self.tp_order = self.close(exectype=bt.Order.Limit, price=tp_price)
+
+    def _update_reinvest_order(self):
+        if self.reinvest_order is not None:
+            self.cancel(self.reinvest_order)
+            self.reinvest_order = None
+        if self.level >= self.p.max_reinvest_levels:
+            return
+        next_size = self.p.base_size * (self.p.reinvest_multiplier ** (self.level + 1))
+        if self.direction == 'long':
+            next_price = self.last_entry_price * (1 - self.p.grid_distance_pct)
+            self.reinvest_order = self.buy(
+                exectype=bt.Order.Limit, price=next_price, size=next_size)
+        else:
+            next_price = self.last_entry_price * (1 + self.p.grid_distance_pct)
+            self.reinvest_order = self.sell(
+                exectype=bt.Order.Limit, price=next_price, size=next_size)
+
+    def _on_position_closed(self):
+        if self.reinvest_order is not None:
+            self.cancel(self.reinvest_order)
+            self.reinvest_order = None
+        self.direction = None
+        self.level = 0
+        self.total_size = 0
+        self.total_cost = 0.0
+        self.last_entry_price = None
+```
+```json
+{"assumptions": [
+  {"topic": "grid distance", "choice": "Initial and reinvestment grid orders are placed 1% away from the reference price (current close for the initial grid, last fill price for reinvestment steps)", "reason": "Spec says 'a certain distance from the current price' without a number; 1% is the bench convention for an unstated grid spacing and reuses the spec's own trailing-entry example threshold context."},
+  {"topic": "take-profit margin", "choice": "0.5% from the volume-weighted average entry price", "reason": "Directly matches the spec's own example ('e.g., 0.5% from the averaged entry price')."},
+  {"topic": "initial position size", "choice": "base_size = 1 unit", "reason": "Spec says this is 'set by the user' but gives no value; chose a minimal concrete size so the doubling sequence (1,2,4,8,16,32) stays implementable within the fixed $10,000 starting cash."},
+  {"topic": "shorting", "choice": "Enabled: grid sell orders open short positions, grid buy orders open long positions", "reason": "Spec explicitly requires 'a grid of limit buy and sell orders' for a perpetual-futures contrarian market maker, i.e. entries in both directions, which overrides the bench's long-only default."},
+  {"topic": "pyramiding / re-entry", "choice": "Enabled: reinvestment orders add to an open position in the same direction while it is losing", "reason": "This is the core Martingale mechanic the spec explicitly describes, overriding the bench's default of one position with no re-entry."},
+  {"topic": "simultaneous long+short (hedge mode)", "choice": "Not modeled; only one directional grid (long or short) is active at a time. When either side of the initial grid fills, the opposite pending order is canceled, and after the position fully closes via take-profit both sides are re-armed", "reason": "infeasible — backtrader's default broker maintains a single netted position per data feed, so true simultaneous long and short exposure ('hedge mode') on one instrument cannot be represented; this is the closest literal reading that preserves the grid's two-sided intent while respecting the netting model."},
+  {"topic": "trailing entry / trailing exit", "choice": "Not implemented; only the static grid + fixed take-profit method (the spec's own base description) is used", "reason": "infeasible — the spec labels both trailing features as optional alternatives ('can use'), and they require tracking retracement from intrabar extremes / order-book depth that is not derivable from daily OHLCV bars; the static method is fully specified and chosen instead."},
+  {"topic": "grid maintenance frequency", "choice": "While flat, cancel and recreate both grid orders on every bar so they stay centered on the current close", "reason": "Spec requires the strategy to 'automatically create and cancel limit orders to maintain the grid around the current price' but does not state a recentering frequency; per-bar recentering is the most literal reading given the bar-by-bar next() execution model."},
+  {"topic": "behavior after max reinvestment level reached", "choice": "No further reinvestment orders are placed once the cap (5) is hit; the take-profit order remains active and the position simply waits to close, with no forced stop-loss exit", "reason": "Spec only requires a limit on the number/volume of reinvestments to cap risk; it does not state any forced-exit rule beyond that cap, so none was added."}
+]}
+```

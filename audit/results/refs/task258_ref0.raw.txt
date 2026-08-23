@@ -1,0 +1,157 @@
+```python
+import math
+from collections import deque
+
+import backtrader as bt
+
+
+class ZonalStrategy(bt.Strategy):
+    params = dict(
+        zone_lookback=20,
+        zone_pct=0.01,
+        sma_period=50,
+        slope_lookback=5,
+        atr_period=14,
+        atr_vol_threshold=0.015,
+        tp_atr_mult=1.0,
+        sl_atr_mult=2.5,
+        win_rate_lookback=100,
+        win_rate_threshold=0.6,
+        max_units=3,
+        risk_pct=0.01,
+    )
+
+    def __init__(self):
+        self.support = bt.indicators.Lowest(self.data.low, period=self.p.zone_lookback)
+        self.resistance = bt.indicators.Highest(self.data.high, period=self.p.zone_lookback)
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.sma_lag = self.sma(-self.p.slope_lookback)
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+
+        self.units = []
+        self.trade_history = deque(maxlen=self.p.win_rate_lookback)
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        action = order.info.get('unit_action')
+
+        if order.status == order.Completed:
+            if action == 'entry':
+                for u in self.units:
+                    if u['entry_order_ref'] == order.ref:
+                        u['entry_price'] = order.executed.price
+                        u['size'] = abs(order.executed.size)
+                        atr_e = u['atr_at_entry']
+                        if u['direction'] == 'long':
+                            u['tp'] = u['entry_price'] + self.p.tp_atr_mult * atr_e
+                            u['sl'] = u['entry_price'] - self.p.sl_atr_mult * atr_e
+                        else:
+                            u['tp'] = u['entry_price'] - self.p.tp_atr_mult * atr_e
+                            u['sl'] = u['entry_price'] + self.p.sl_atr_mult * atr_e
+                        u['status'] = 'open'
+                        break
+            elif action == 'exit':
+                for u in list(self.units):
+                    if u['exit_order_ref'] == order.ref:
+                        if u['direction'] == 'long':
+                            pnl = order.executed.price - u['entry_price']
+                        else:
+                            pnl = u['entry_price'] - order.executed.price
+                        self.trade_history.append(1 if pnl > 0 else 0)
+                        self.units.remove(u)
+                        break
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
+            if action == 'entry':
+                self.units = [u for u in self.units if u['entry_order_ref'] != order.ref]
+            elif action == 'exit':
+                for u in self.units:
+                    if u['exit_order_ref'] == order.ref:
+                        u['status'] = 'open'
+                        u['exit_order_ref'] = None
+                        break
+
+    def next(self):
+        close = self.data.close[0]
+        high = self.data.high[0]
+        low = self.data.low[0]
+
+        zone_offset = self.p.zone_pct * close
+        support_level = self.support[0]
+        resistance_level = self.resistance[0]
+        support_lower = support_level - zone_offset
+        support_upper = support_level + zone_offset
+        resistance_lower = resistance_level - zone_offset
+        resistance_upper = resistance_level + zone_offset
+
+        slope_up = self.sma[0] > self.sma_lag[0]
+        slope_down = self.sma[0] < self.sma_lag[0]
+
+        atr_val = self.atr[0]
+        vol_ok = (atr_val / close) > self.p.atr_vol_threshold
+
+        if len(self.trade_history) == 0:
+            win_rate_ok = True
+        else:
+            win_rate_ok = (sum(self.trade_history) / len(self.trade_history)) >= self.p.win_rate_threshold
+
+        units_ok = len(self.units) < self.p.max_units
+
+        for u in list(self.units):
+            if u['status'] != 'open':
+                continue
+            triggered = False
+            if u['direction'] == 'long':
+                if low <= u['sl'] or high >= u['tp'] or close > resistance_upper:
+                    triggered = True
+            else:
+                if high >= u['sl'] or low <= u['tp'] or close < support_lower:
+                    triggered = True
+            if triggered:
+                if u['direction'] == 'long':
+                    order = self.sell(size=u['size'])
+                else:
+                    order = self.buy(size=u['size'])
+                order.addinfo(unit_action='exit')
+                u['status'] = 'closing'
+                u['exit_order_ref'] = order.ref
+
+        long_zone_touch = (high >= support_lower) and (low <= support_upper)
+        long_break = close > support_upper
+        if long_zone_touch and long_break and slope_up and vol_ok and win_rate_ok and units_ok:
+            size = math.floor(self.p.risk_pct * self.broker.getvalue() / close)
+            if size > 0:
+                order = self.buy(size=size)
+                order.addinfo(unit_action='entry')
+                self.units.append(dict(
+                    direction='long', status='pending', entry_order_ref=order.ref,
+                    atr_at_entry=atr_val, entry_price=None, size=None, tp=None, sl=None,
+                    exit_order_ref=None,
+                ))
+
+        short_zone_touch = (high >= resistance_lower) and (low <= resistance_upper)
+        short_break = close < resistance_lower
+        if short_zone_touch and short_break and slope_down and vol_ok and win_rate_ok and units_ok:
+            size = math.floor(self.p.risk_pct * self.broker.getvalue() / close)
+            if size > 0:
+                order = self.sell(size=size)
+                order.addinfo(unit_action='entry')
+                self.units.append(dict(
+                    direction='short', status='pending', entry_order_ref=order.ref,
+                    atr_at_entry=atr_val, entry_price=None, size=None, tp=None, sl=None,
+                    exit_order_ref=None,
+                ))
+```
+```json
+{"assumptions": [
+  {"topic": "zone level source", "choice": "support level = Lowest(Low, 20); resistance level = Highest(High, 20)", "reason": "Spec says 'minimum/maximum over the last 20 bars' without naming a series; Low/High extremes are the standard technical-analysis definition of support/resistance touch points."},
+  {"topic": "zone offset basis", "choice": "Zone boundaries are level ± 1% of the CURRENT bar's Close, recomputed every bar", "reason": "Spec explicitly parenthesizes 'level ±1% from Close', so the 1% is anchored to Close (dynamic per-bar), not to the level itself or to a fixed value at zone formation."},
+  {"topic": "multi-unit position model", "choice": "Deviated from canonical single-position defaults; implemented up to 3 concurrent 'units' as separate tracked entries, each with its own entry price, TP, and SL, partial-closed via sized buy()/sell() instead of self.close()", "reason": "Spec explicitly requires 'no more than 3 open units' with TP/SL 'from the entry price', implying per-unit risk management (pyramiding), not a single netted position."},
+  {"topic": "order-tracking guard", "choice": "Per-unit order-ref tracking (entry_order_ref/exit_order_ref) in notify_order instead of a single pending-order flag", "reason": "Multiple units can have entry or exit orders in flight simultaneously, so a single guard attribute would block valid concurrent unit activity that the spec requires."},
+  {"topic": "exit order execution", "choice": "TP/stop-loss/opposite-zone-close conditions are evaluated each bar against High/Low/Close in next(); when triggered, a default Market order is submitted for that unit's size (fills at the following bar's open)", "reason": "Spec states price levels for TP/SL but not an order-type mechanism; using the same signal-then-next-bar-fill model as entries keeps execution timing internally consistent and matches the environment's default order behavior."},
+  {"topic": "win-rate filter with no trade history", "choice": "Treat the win-rate filter as satisfied (True) when trade_history is empty", "reason": "Spec conditions entries on 'win rate >= 60% over the last 100 trades'; with zero closed trades there is no evidence against the filter, so it is not treated as blocking the first trades."},
+  {"topic": "win/loss and win-rate accounting", "choice": "Per-unit win/loss determined from gross fill-price PnL (exit price vs entry price), excluding commission; last 100 closed units retained via a fixed-size deque", "reason": "Backtrader's built-in Trade objects track net-position lifecycles, which do not map onto independently tracked sub-position units, so PnL is computed manually from stored entry/exit fill prices."},
+  {"topic": "mixed-direction concurrent units", "choice": "No extra restriction beyond the shared 3-unit cap if a long unit remains open when a later bar's trend flip enables a short entry (or vice versa)", "reason": "Spec caps 'open units' per instrument at 3 without restricting direction mix; SMA slope conditions for long/short entries are mutually exclusive per bar but a previously opened opposite-direction unit could still be open."}
+]}
+```

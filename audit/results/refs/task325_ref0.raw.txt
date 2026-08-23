@@ -1,0 +1,147 @@
+```python
+import backtrader as bt
+
+
+class OpeningRangeBreakoutStrategy(bt.Strategy):
+    params = dict(
+        or_bars=4,
+        rvol_period=20,
+        rvol_threshold=1.5,
+        atr_period=14,
+        atr_mult=1.5,
+        rsi_period=14,
+        rsi_level=50,
+        session_start=(9, 30),
+        session_end=(16, 0),
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.rsi = bt.indicators.RSI(self.data, period=self.p.rsi_period)
+        self.vol_sma = bt.indicators.SMA(self.data.volume, period=self.p.rvol_period)
+
+        self.order = None
+        self.stop_order = None
+
+        self.current_day = None
+        self.bar_of_day = 0
+        self.or_high = None
+        self.or_low = None
+        self.or_ready = False
+
+    def _update_session(self):
+        dt = self.data.datetime.datetime(0)
+        bar_date = dt.date()
+        bar_time = dt.time()
+
+        if bar_date != self.current_day:
+            self.current_day = bar_date
+            self.bar_of_day = 0
+            self.or_high = None
+            self.or_low = None
+            self.or_ready = False
+
+        self.bar_of_day += 1
+
+        in_session = self.p.session_start <= (bar_time.hour, bar_time.minute) < self.p.session_end
+
+        forming_or = False
+        if in_session and self.bar_of_day <= self.p.or_bars:
+            forming_or = True
+            if self.or_high is None:
+                self.or_high = self.data.high[0]
+                self.or_low = self.data.low[0]
+            else:
+                self.or_high = max(self.or_high, self.data.high[0])
+                self.or_low = min(self.or_low, self.data.low[0])
+            if self.bar_of_day == self.p.or_bars:
+                self.or_ready = True
+
+        return in_session, forming_or
+
+    def prenext(self):
+        self._update_session()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        if order.status == order.Completed:
+            if order is self.stop_order:
+                self.stop_order = None
+            elif order is self.order:
+                self.order = None
+                if self.position and not self.stop_order:
+                    trail = self.p.atr_mult * self.atr[0]
+                    if self.position.size > 0:
+                        self.stop_order = self.sell(
+                            exectype=bt.Order.StopTrail,
+                            trailamount=trail,
+                            size=self.position.size,
+                        )
+                    else:
+                        self.stop_order = self.buy(
+                            exectype=bt.Order.StopTrail,
+                            trailamount=trail,
+                            size=abs(self.position.size),
+                        )
+            return
+
+        if order.status in (order.Canceled, order.Margin, order.Rejected):
+            if order is self.stop_order:
+                self.stop_order = None
+            elif order is self.order:
+                self.order = None
+
+    def next(self):
+        in_session, forming_or = self._update_session()
+
+        if not in_session:
+            return
+
+        if self.order:
+            return
+
+        rsi_cross_down = self.rsi[-1] >= self.p.rsi_level and self.rsi[0] < self.p.rsi_level
+        rsi_cross_up = self.rsi[-1] <= self.p.rsi_level and self.rsi[0] > self.p.rsi_level
+        rvol = self.data.volume[0] / self.vol_sma[0]
+
+        if self.position:
+            if self.position.size > 0:
+                exit_signal = rsi_cross_down
+                if not forming_or and self.or_ready:
+                    if self.data.close[0] < self.or_low and rvol > self.p.rvol_threshold:
+                        exit_signal = True
+            else:
+                exit_signal = rsi_cross_up
+                if not forming_or and self.or_ready:
+                    if self.data.close[0] > self.or_high and rvol > self.p.rvol_threshold:
+                        exit_signal = True
+
+            if exit_signal:
+                if self.stop_order:
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
+                self.order = self.close()
+            return
+
+        if forming_or or not self.or_ready:
+            return
+
+        long_signal = self.data.close[0] > self.or_high and rvol > self.p.rvol_threshold
+        short_signal = self.data.close[0] < self.or_low and rvol > self.p.rvol_threshold
+
+        if long_signal:
+            self.order = self.buy()
+        elif short_signal:
+            self.order = self.sell()
+```
+```json
+{"assumptions": [
+  {"topic": "opening-range tracking during indicator warm-up", "choice": "Opening-range high/low and day/bar-of-day bookkeeping are updated in prenext() as well as next(), so the first trading day's 4-bar range is still captured correctly even though backtrader delays next() until all indicators (SMA(volume,20) needs 20 bars) reach minperiod.", "reason": "Canonical default #6 relies on automatic minperiod for next(), but without also tracking session state in prenext(), day 1's opening range window would be silently missed since next() would not start until well after bar 4."},
+  {"topic": "StopTrail trail-amount sampling", "choice": "The trailamount for the StopTrail order is computed from ATR(14) at the bar the entry order fills (inside notify_order), then fixed for that order per backtrader's StopTrail semantics.", "reason": "Backtrader's StopTrail order takes a static trailamount at submission; ATR is a moving value, so the spec's 'trail amount = 1.5*ATR(14)' is read as sampled once at trade entry, which is the only point backtrader allows it to be fixed."},
+  {"topic": "RSI momentum-stall exit vs. opposite-signal exit during opening-range formation", "choice": "RSI(14) cross-through-50 exit is evaluated every in-session bar regardless of whether the current day's opening range is finalized; the opposite-breakout exit (and new entries) are only evaluated once the day's opening range is finalized.", "reason": "The RSI condition has no stated dependency on the opening range, while the opposite-breakout condition and entries are explicitly defined in terms of the opening range, which is undefined during a day's first 4 bars (relevant if a position carries into a new session)."},
+  {"topic": "regular-market-hours guard", "choice": "Added an explicit session-time check (09:30 to 16:00 bar time) that skips all entry/exit signal evaluation outside that window, implemented via self.data.datetime.datetime(0) without importing the datetime module.", "reason": "The spec explicitly instructs ignoring signals outside regular market hours; implemented literally even though the supplied data is already confined to regular hours."},
+  {"topic": "StopTrail order sizing", "choice": "Entries use plain self.buy()/self.sell() with default size per canonical default; the protective StopTrail order is explicitly sized to self.position.size (or its absolute value) to exactly offset the open position.", "reason": "Canonical default #1 governs entry sizing only; a broker-side stop order that isn't self.close() must be given an explicit size to fully flatten the position it protects."}
+]}
+```

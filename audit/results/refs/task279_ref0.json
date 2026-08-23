@@ -1,0 +1,62 @@
+{
+  "task_id": 279,
+  "ref_idx": 0,
+  "model": "claude-sonnet-5",
+  "code": "import backtrader as bt\n\n\nclass IntradayMeanReversionVolAdjStrategy(bt.Strategy):\n\n    def __init__(self):\n        self.boll = bt.indicators.BollingerBands(self.data.close, period=20, devfactor=2)\n        self.sma = bt.indicators.SMA(self.data.close, period=20)\n        self.rsi = bt.indicators.RSI(self.data.close, period=14)\n        self.atr = bt.indicators.ATR(self.data, period=14)\n        self.crossover = bt.indicators.CrossOver(self.data.close, self.boll.lines.bot)\n\n        self.order = None\n        self.trail_high = None\n        self.tp_done = False\n        self.base_size = 0\n        self.eod_reduced_today = False\n        self.no_trade_today = False\n        self.last_date = None\n        self.last_atr_pct = None\n\n    def notify_order(self, order):\n        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.order = None\n            if order.status == order.Completed and self.position.size == 0:\n                self.trail_high = None\n                self.tp_done = False\n\n    def next(self):\n        cur_date = self.data.datetime.date(0)\n        t = self.data.datetime.time(0)\n        minute_of_day = t.hour * 60 + t.minute\n\n        if cur_date != self.last_date:\n            bb_width = (self.boll.lines.top[0] - self.boll.lines.bot[0]) / self.boll.lines.mid[0]\n            no_trade = bb_width > 0.015\n            if self.last_atr_pct is not None and self.last_atr_pct > 0.015:\n                no_trade = True\n            self.no_trade_today = no_trade\n            self.eod_reduced_today = False\n            self.last_date = cur_date\n\n        self.last_atr_pct = self.atr[0] / self.data.close[0]\n\n        if self.order:\n            return\n\n        in_entry_window = 570 <= minute_of_day < 600\n        in_eod_window = 900 <= minute_of_day < 930\n\n        if self.position:\n            self.trail_high = self.data.high[0] if self.trail_high is None else max(self.trail_high, self.data.high[0])\n\n            if self.data.close[0] <= self.trail_high * 0.98:\n                self.order = self.close()\n                return\n\n            if not self.tp_done and self.data.close[0] >= self.position.price * 1.003:\n                sell_size = self.position.size // 2\n                if sell_size > 0:\n                    self.tp_done = True\n                    self.order = self.sell(size=sell_size)\n                    return\n\n            if in_eod_window and not self.eod_reduced_today:\n                target_size = int(0.5 * self.base_size)\n                self.eod_reduced_today = True\n                if self.position.size > target_size:\n                    self.order = self.sell(size=self.position.size - target_size)\n                    return\n        else:\n            if self.no_trade_today or not in_entry_window:\n                return\n\n            bb_width = (self.boll.lines.top[0] - self.boll.lines.bot[0]) / self.boll.lines.mid[0]\n            atr_pct = self.atr[0] / self.data.close[0]\n\n            if self.crossover[0] > 0 and self.rsi[0] < 45 and (bb_width <= 0.005 or atr_pct <= 0.008):\n                price = self.data.close[0]\n                value = self.broker.getvalue()\n                target_pct = 1.25 if atr_pct > 0.01 else 1.50\n                target_value = target_pct * value\n                commission = self.broker.getcommissioninfo(self.data).p.commission\n                max_affordable_value = self.broker.getcash() / (1 + commission)\n                actual_value = min(target_value, max_affordable_value)\n                size = int(actual_value / price)\n                if size > 0:\n                    self.base_size = int(value / price)\n                    self.order = self.buy(size=size)",
+  "assumptions": [
+    {
+      "topic": "session hours",
+      "choice": "Market open 09:30, close 16:00, derived from the stated 2516-bar/date-range feed (390 1-min bars/day). Entry window = 09:30-10:00; end-of-day reduction window = 15:00-15:30; no-trade check evaluated on the first bar of each day (09:30).",
+      "reason": "Spec references 'first 30 minutes after the open', '30-60 minutes before the close', and 'at the open' but does not restate session times explicitly; inferred from the fixed data feed."
+    },
+    {
+      "topic": "and/or volatility filter",
+      "choice": "Implemented as logical OR: enter only if band-width<=0.5% OR ATR%<=0.8%.",
+      "reason": "'and/or' is literally satisfied by an inclusive-or; no basis to require both simultaneously."
+    },
+    {
+      "topic": "base size reference",
+      "choice": "'Base size' (100% of capital) is computed once at entry as portfolio_value_at_entry/entry_price and stored; the end-of-day reduction target is 50% of that fixed number of shares, not recomputed from current portfolio value.",
+      "reason": "Spec defines 'base' as the 100%-capital sizing concept distinct from the leveraged morning target; treating it as a fixed reference at entry, rather than a floating fraction of ever-changing equity, is the more literal reading of 'reduce to 50% of the base size (keep half overnight)'."
+    },
+    {
+      "topic": "leverage/margin",
+      "choice": "Morning target (150%/125% of capital) is computed but then capped by available cash via a cash-account default broker (no margin), so actual filled size is effectively bounded near 100% of capital as stated by 'actual size is limited by available cash/broker leverage'.",
+      "reason": "infeasible: the harness's default backtrader broker is a cash account with no configured margin/leverage, so a >100%-of-equity position cannot literally be held; the closest literal implementation computes the leveraged target and lets the cash cap bind it, exactly per the spec's own escape clause."
+    },
+    {
+      "topic": "trailing high scope",
+      "choice": "The trailing intraday high used for the 2% stop is tracked continuously from entry until the position is fully closed, without resetting at midnight even if part of the position is carried overnight.",
+      "reason": "The parenthetical '(trailing from the intraday high since entry)' is the operative definition given by the spec, taking precedence over the looser phrase 'day's maximum'."
+    },
+    {
+      "topic": "price reference for TP/stop triggers",
+      "choice": "Take-profit (+0.3%) and trailing stop (-2%) are evaluated against the bar close, not intrabar high/low.",
+      "reason": "Spec is silent on which price to use; close is used consistently with the entry/indicator logic (RSI, Bollinger, CrossOver all operate on close)."
+    },
+    {
+      "topic": "SMA(20) indicator",
+      "choice": "Instantiated as bt.indicators.SMA(20) per the indicator list but not used in a separate condition, since the Bollinger mid-band already serves as the 20-period SMA reference used in the width formula.",
+      "reason": "Spec lists SMA(20) as an indicator to use but never references it outside of bb.mid; declaring rather than inventing an unstated use avoids adding extra logic the spec does not state."
+    },
+    {
+      "topic": "previous-day ATR% reference",
+      "choice": "'ATR(14)/close of the previous day' uses that value from the last processed bar of the prior trading day (i.e., its closing value).",
+      "reason": "Spec gives a single snapshot ratio with no averaging instruction; the last bar of the day is the most literal reading of a day-level closing metric."
+    },
+    {
+      "topic": "order sequencing",
+      "choice": "A single order-tracking attribute guards all order types (entry, partial take-profit, EOD reduction, stop-loss), allowing at most one order in flight and one management action per bar.",
+      "reason": "Canonical default requires guarding pending orders; extending the same single guard to all exit-management actions keeps behavior deterministic and avoids overlapping orders on the same bar."
+    },
+    {
+      "topic": "share rounding",
+      "choice": "All computed sizes (entry, 50% take-profit, 50%-of-base reduction) are floored to whole shares via integer truncation.",
+      "reason": "Spec is silent on fractional-share handling; backtrader's default sizing requires integer share counts."
+    }
+  ],
+  "success": true,
+  "error": null,
+  "total_trades": 0,
+  "tape": []
+}

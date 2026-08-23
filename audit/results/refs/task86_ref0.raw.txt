@@ -1,0 +1,148 @@
+```python
+import backtrader as bt
+
+
+class FibTrendlinePullbackStrategy(bt.Strategy):
+    params = (
+        ('fractal_n', 2),
+        ('sma_period', 50),
+        ('significant_move_pct', 0.03),
+        ('fib_ratio', 0.618),
+        ('risk_pct', 0.01),
+        ('reward_risk_ratio', 2.0),
+        ('stop_buffer_pct', 0.001),
+    )
+
+    def __init__(self):
+        self.sma = bt.indicators.SMA(self.data.close, period=self.p.sma_period)
+        self.order = None
+        self.stop_order = None
+        self.limit_order = None
+        self.swing_lows = []
+        self.swing_highs = []
+        self.awaiting_fib = False
+        self.fib_level = None
+        self._stop_basis = None
+        self._pending_stop_basis = None
+
+    def _check_fractals(self):
+        n = self.p.fractal_n
+        if len(self) < 2 * n + 1:
+            return
+        window_low = [self.data.low[i] for i in range(-2 * n, 1)]
+        window_high = [self.data.high[i] for i in range(-2 * n, 1)]
+        candidate_low = self.data.low[-n]
+        candidate_high = self.data.high[-n]
+        bar_num = len(self) - 1 - n
+        if candidate_low == min(window_low):
+            self.swing_lows.append((bar_num, candidate_low))
+        if candidate_high == max(window_high):
+            self.swing_highs.append((bar_num, candidate_high))
+
+    def _trendline_value(self, bar_num):
+        if len(self.swing_lows) < 2:
+            return None
+        i1, p1 = self.swing_lows[-2]
+        i2, p2 = self.swing_lows[-1]
+        if p2 <= p1:
+            return None
+        slope = (p2 - p1) / (i2 - i1)
+        return p1 + slope * (bar_num - i1)
+
+    def _last_significant_move(self):
+        for low_idx, low_price in reversed(self.swing_lows):
+            for high_idx, high_price in reversed(self.swing_highs):
+                if high_idx > low_idx and low_price > 0:
+                    if (high_price - low_price) / low_price >= self.p.significant_move_pct:
+                        return low_price, high_price
+        return None
+
+    def _cancel_exit_orders(self):
+        if self.stop_order is not None and self.stop_order.alive():
+            self.cancel(self.stop_order)
+        if self.limit_order is not None and self.limit_order.alive():
+            self.cancel(self.limit_order)
+        self.stop_order = None
+        self.limit_order = None
+
+    def next(self):
+        self._check_fractals()
+
+        cur_bar = len(self) - 1
+        trend_now = self._trendline_value(cur_bar)
+        trend_prev = self._trendline_value(cur_bar - 1)
+
+        if self.position:
+            if trend_now is not None and trend_prev is not None:
+                if self.data.close[-1] > trend_prev and self.data.close[0] < trend_now:
+                    self._cancel_exit_orders()
+                    self.close()
+                    self.awaiting_fib = False
+                    self.fib_level = None
+            return
+
+        if self.order is not None:
+            return
+
+        if trend_now is not None and trend_prev is not None:
+            if self.data.close[-1] < trend_prev and self.data.close[0] > trend_now:
+                move = self._last_significant_move()
+                if move is not None:
+                    low_price, high_price = move
+                    self.fib_level = high_price - self.p.fib_ratio * (high_price - low_price)
+                    self.awaiting_fib = True
+                    self._stop_basis = min(trend_now, self.swing_lows[-1][1])
+
+        if self.awaiting_fib and self.fib_level is not None:
+            if self.data.low[0] <= self.fib_level:
+                sma_rising = len(self) > self.p.sma_period and self.sma[0] > self.sma[-1]
+                if sma_rising:
+                    entry_price_est = self.data.close[0]
+                    stop_price = self._stop_basis * (1 - self.p.stop_buffer_pct)
+                    risk_per_share = entry_price_est - stop_price
+                    if risk_per_share > 0:
+                        size = int((self.broker.getvalue() * self.p.risk_pct) / risk_per_share)
+                        if size > 0:
+                            self._pending_stop_basis = stop_price
+                            self.order = self.buy(size=size)
+                self.awaiting_fib = False
+                self.fib_level = None
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order == self.order:
+            if order.status == order.Completed:
+                entry_price = order.executed.price
+                size = order.executed.size
+                stop_price = self._pending_stop_basis
+                risk = entry_price - stop_price
+                take_profit = entry_price + self.p.reward_risk_ratio * risk
+                self.stop_order = self.sell(exectype=bt.Order.Stop, price=stop_price, size=size)
+                self.limit_order = self.sell(exectype=bt.Order.Limit, price=take_profit, size=size)
+            self.order = None
+            return
+
+        if order == self.stop_order or order == self.limit_order:
+            if order.status == order.Completed:
+                self._cancel_exit_orders()
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                if order == self.stop_order:
+                    self.stop_order = None
+                if order == self.limit_order:
+                    self.limit_order = None
+```
+```json
+{"assumptions": [
+  {"topic": "infeasible", "choice": "The spec's literal Fibonacci/price levels (low 74,500, high 124,000, retracement ~94,000) belong to a different, non-AAPL instrument and cannot be applied to AAPL OHLCV (~$50-$260 over the feed period); the specified method (0.618 retracement of the last significant upward swing) was generalized to compute levels dynamically from AAPL's own detected swing lows/highs instead of the hardcoded numbers.", "reason": "The feed is fixed as AAPL daily bars; hardcoding the given price levels would never trigger and would misrepresent the strategy's intent, so the retracement mechanism was preserved and the absolute prices were made data-relative."},
+  {"topic": "local_low_high_detection", "choice": "Defined a local low/high as a 5-bar fractal (2 bars on each side), confirmed with a 2-bar lag.", "reason": "The spec says the trendline is 'built from local lows' but does not define the swing-detection window."},
+  {"topic": "trendline_construction", "choice": "Support trendline is the straight line through the two most recently confirmed ascending swing lows, extrapolated to the current bar; recalculated whenever a new swing low forms.", "reason": "The spec names an uptrend trendline from local lows but not the number of points or fitting method; two-point construction matches manual chart trendline drawing."},
+  {"topic": "significant_move_definition", "choice": "The 'last significant upward move' used for the Fibonacci leg is the most recent confirmed swing-low-to-later-swing-high pair whose gain is at least 3%.", "reason": "The spec gives no numeric significance threshold; 3% is a reasonable noise filter for daily AAPL swings."},
+  {"topic": "ma_filter_choice", "choice": "Used SMA(50) as the optional trend filter, with 'pointing upward' defined as sma[0] > sma[-1] versus the prior bar.", "reason": "Spec offers 'SMA 50 or 200' without choosing one; 50 was picked as the more responsive of the two named options."},
+  {"topic": "take_profit_rule", "choice": "Implemented only the quantified 2:1 reward:risk take-profit (entry + 2 x (entry - stop)); the alternative 'next significant resistance level' rule was not implemented.", "reason": "The spec offers the two as alternatives ('or'), and 'next significant resistance' has no defined detection method in the spec, so implementing it would require inventing an undeclared indicator."},
+  {"topic": "stop_loss_basis", "choice": "Stop-loss placed at the lower (more conservative) of the current trendline value and the most recent confirmed swing low, minus a 0.1% buffer.", "reason": "Spec says 'slightly below the broken support trendline or below the nearest local low' without specifying how to combine the two or how large 'slightly' is."},
+  {"topic": "position_sizing", "choice": "Risk per trade fixed at 1% (the low end of the stated 1-2% range) of current broker equity; size = (equity x 1%) / (estimated entry - stop), with entry estimated from the signal bar's close.", "reason": "Spec gives a 1-2% range without a fixed value; 1% was chosen as the more conservative bound, matching the spec's own 1%/2% risk:reward illustration. Actual fill occurs at the next bar's open per backtrader defaults, so realized risk may deviate slightly from the 1% target."},
+  {"topic": "exit_order_mechanics", "choice": "Stop-loss and take-profit are submitted as real OCO Stop/Limit orders once entry fills (one cancels the other on execution); the opposite trendline break is checked each bar and closes the position at market. A pending fib-touch entry setup is invalidated after a single touch (whether or not it results in a fill) or by an opposing trendline break, with no separate expiry timer.", "reason": "Spec does not specify order types for SL/TP or an expiration window for the pullback setup awaiting the 0.618 touch; real bracket-style orders give price-accurate fills and OCO behavior matches standard risk-management practice."}
+]}
+```
