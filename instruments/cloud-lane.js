@@ -17,10 +17,14 @@ const { spawn } = require('child_process');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CODEX_JS = process.env.LB_CODEX_JS || 'C:\\Users\\joshp\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js';
-const [ENV_ID, REPO, BRANCH, PROMPT_ID, N_STR, ATTEMPTS_STR, CONC_STR] = process.argv.slice(2);
+const [ENV_ID, REPO, BRANCH, PROMPT_ID_RAW, N_STR, ATTEMPTS_STR, CONC_STR] = process.argv.slice(2);
+// accept the filename form (BL-02bp) as well as the real id (BL-02b')
+const PROMPT_ID = PROMPT_ID_RAW === 'BL-02bp' ? "BL-02b'" : PROMPT_ID_RAW;
 const N = parseInt(N_STR || '30', 10);
 const ATTEMPTS = parseInt(ATTEMPTS_STR || '1', 10);
 const CONC = parseInt(CONC_STR || '12', 10);       // simultaneous submissions
+const NOASK = process.argv.includes('noask');
+const NOASK_SUFFIX = 'You will NOT return anything except for the program.';
 if (!ENV_ID || !REPO || !BRANCH || !PROMPT_ID) {
   console.error('usage: cloud-lane.js <env-id> <repo> <branch> <prompt-id> <n> [attempts] [conc]');
   process.exit(2);
@@ -39,10 +43,15 @@ if (PROMPT_ID === 'T1v0') {
   prompt = v.prompt;
 }
 
+if (NOASK) {
+  prompt = prompt.replace(/\n+$/, '') + '\n\n' + NOASK_SUFFIX + '\n';
+  sha = crypto.createHash('sha256').update(prompt, 'utf8').digest('hex');
+}
+
 const OUTDIR = path.join(REPO_ROOT, 'batches', 'cloud');
 fs.mkdirSync(OUTDIR, { recursive: true });
 const safeId = PROMPT_ID.replace(/'/g, 'p').replace(/[^\w.-]/g, '');
-const OUT = path.join(OUTDIR, `cloud_${safeId}_attempts${ATTEMPTS}.jsonl`);
+const OUT = path.join(OUTDIR, `cloud_${safeId}_attempts${ATTEMPTS}${NOASK ? '_noask' : ''}.jsonl`);
 const have = new Set();
 if (fs.existsSync(OUT)) for (const l of fs.readFileSync(OUT, 'utf8').split('\n')) if (l.trim()) { const j = JSON.parse(l); if (j.task_id) have.add(j.i); }
 
@@ -61,7 +70,7 @@ function launch(i) {
       clearTimeout(killer);
       const m = blob.match(/task_[A-Za-z0-9_]+/);
       const rec = { leg: 'H6-cloud', surface: 'codex-cloud', env: ENV_ID, repo: REPO, branch: BRANCH,
-                    prompt_id: PROMPT_ID, prompt_sha256: sha, attempts: ATTEMPTS, i,
+                    prompt_id: PROMPT_ID, prompt_sha256: sha, attempts: ATTEMPTS, condition: NOASK ? 'noask' : 'base', i,
                     task_id: m ? m[0] : null, launch_ok: !!m, exit: code,
                     launched_at: new Date().toISOString(), wall_ms: Date.now() - t0,
                     launch_output: m ? null : blob.slice(0, 300).replace(/\s+/g, ' ') };
