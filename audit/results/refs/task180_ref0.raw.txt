@@ -1,0 +1,338 @@
+Let me finalize the design decisions I'd converged on and write the complete strategy now, without further deliberation.
+
+**Locked-in decisions**: freeze ATR(14) at the OR-bar close and reuse it for all that day's levels (stop orders need fixed prices, not intrabar-jittering ones); check the direction filter once, right when the OR window closes, and place a single conditional StopLimit order (true OCO linkage is moot since `SMA20>SMA50` and `SMA20<SMA50` can never both hold); use resting StopLimit bracket orders for stop-loss (resized on every tranche change) and per-tranche take-profit; evaluate trailing-stop and two-consecutive-inside-OR-closes bar-by-bar since they need running state, firing a reactive StopLimit full-exit; add-ons are also reactive StopLimit orders once their compound trigger is confirmed; EOD uses `self.close()` per the literal "close all positions" canonical default, everything else routes through stop-limit per rule 7. R sized at the midpoint of the stated 0.5–1.0% range, against current portfolio value. No `datetime` import needed — session-end and day-change checks use the `.date()`/`.time()` objects backtrader already returns, compared via their own attributes.
+
+Writing the implementation now.
+
+```python
+import backtrader as bt
+
+
+class ORBIntradayMomentum(bt.Strategy):
+    params = dict(
+        risk_pct=0.0075,       # midpoint of stated 0.5-1.0% risk range
+        session_end_hour=15,
+        session_end_minute=45,  # last regular 15m bar of the NYSE session (bar timestamped by interval start)
+    )
+
+    def __init__(self):
+        self.atr = bt.indicators.ATR(self.data, period=14)
+        self.sma20 = bt.indicators.SMA(self.data, period=20)
+        self.sma50 = bt.indicators.SMA(self.data, period=50)
+        self.macd = bt.indicators.MACD(self.data, period_me1=12, period_me2=26, period_signal=9)
+        self.rsi = bt.indicators.RSI(self.data, period=14)
+        self.bb = bt.indicators.BollingerBands(self.data, period=20, devfactor=2)
+
+        self.current_date = None
+        self.today_high = None
+        self.today_low = None
+        self.yesterday_high = None
+        self.yesterday_low = None
+
+        self.order_tag = {}
+        self._reset_day_state()
+
+    # ---------- day bookkeeping ----------
+
+    def _reset_day_state(self):
+        self.or_high = None
+        self.or_low = None
+        self.or_w = None
+        self.day_atr = None
+        self.day_skip = True
+        self.initial_order_checked = False
+        self.pending_entry_order = None
+        self.pending_sl = None
+
+        self.direction = None
+        self.trades_today = 0
+        self.entry_bar_len = None
+        self.stop_price = None
+        self.stop_order = None
+        self.tranches = []
+        self.next_tranche_id = 0
+        self.extreme_price = None
+        self.addon_order = None
+        self.exit_order = None
+
+    def _is_new_day(self):
+        return self.current_date is None or self.data.datetime.date(0) != self.current_date
+
+    def _is_eod_bar(self):
+        t = self.data.datetime.time(0)
+        return (t.hour, t.minute) >= (self.p.session_end_hour, self.p.session_end_minute)
+
+    # ---------- order helpers ----------
+
+    def _cancel_all_pending(self):
+        for o in (self.pending_entry_order, self.stop_order, self.addon_order, self.exit_order):
+            if o is not None and o.alive():
+                self.cancel(o)
+        for tr in self.tranches:
+            o = tr.get('order')
+            if o is not None and o.alive():
+                self.cancel(o)
+
+    def _momentum_ok(self, direction):
+        if direction == 'long':
+            return self.macd.macd[0] > 0 or self.rsi[0] > 55
+        return self.macd.macd[0] < 0 or self.rsi[0] < 45
+
+    def _resubmit_stop(self):
+        if self.stop_order is not None and self.stop_order.alive():
+            self.cancel(self.stop_order)
+        size = abs(self.position.size)
+        if size <= 0:
+            self.stop_order = None
+            return
+        limoff = 0.05 * self.day_atr
+        if self.direction == 'long':
+            o = self.sell(exectype=bt.Order.StopLimit, price=self.stop_price,
+                           plimit=self.stop_price - limoff, size=size)
+        else:
+            o = self.buy(exectype=bt.Order.StopLimit, price=self.stop_price,
+                          plimit=self.stop_price + limoff, size=size)
+        self.order_tag[o.ref] = 'stop_loss'
+        self.stop_order = o
+
+    def _submit_tp(self, tranche_id, size, target):
+        limoff = 0.05 * self.day_atr
+        if self.direction == 'long':
+            o = self.sell(exectype=bt.Order.StopLimit, price=target,
+                           plimit=target - limoff, size=size)
+        else:
+            o = self.buy(exectype=bt.Order.StopLimit, price=target,
+                          plimit=target + limoff, size=size)
+        self.order_tag[o.ref] = 'tp_%d' % tranche_id
+        return o
+
+    def _submit_addon(self, size):
+        limoff = 0.05 * self.day_atr
+        px = self.data.close[0]
+        if self.direction == 'long':
+            o = self.buy(exectype=bt.Order.StopLimit, price=px, plimit=px + limoff, size=size)
+        else:
+            o = self.sell(exectype=bt.Order.StopLimit, price=px, plimit=px - limoff, size=size)
+        self.order_tag[o.ref] = 'addon'
+        self.addon_order = o
+
+    def _full_exit(self, tag):
+        self._cancel_all_pending()
+        size = abs(self.position.size)
+        if size <= 0:
+            return
+        limoff = 0.05 * self.day_atr
+        px = self.data.close[0]
+        if self.direction == 'long':
+            o = self.sell(exectype=bt.Order.StopLimit, price=px, plimit=px - limoff, size=size)
+        else:
+            o = self.buy(exectype=bt.Order.StopLimit, price=px, plimit=px + limoff, size=size)
+        self.order_tag[o.ref] = tag
+        self.exit_order = o
+
+    # ---------- main loop ----------
+
+    def next(self):
+        if self._is_new_day():
+            if self.current_date is not None:
+                self.yesterday_high = self.today_high
+                self.yesterday_low = self.today_low
+            self.current_date = self.data.datetime.date(0)
+            self.today_high = self.data.high[0]
+            self.today_low = self.data.low[0]
+
+            self._reset_day_state()
+            self.or_high = self.data.high[0]
+            self.or_low = self.data.low[0]
+            self.or_w = self.or_high - self.or_low
+            self.day_atr = self.atr[0]
+            close0 = self.data.close[0]
+            self.day_skip = (self.day_atr / close0 < 0.008) or (self.or_w < 0.3 * self.day_atr)
+            return
+
+        self.today_high = max(self.today_high, self.data.high[0])
+        self.today_low = min(self.today_low, self.data.low[0])
+
+        if self.day_skip:
+            return
+
+        if self._is_eod_bar():
+            self._cancel_all_pending()
+            if self.position:
+                self.close()
+            return
+
+        if not self.initial_order_checked:
+            self.initial_order_checked = True
+            long_ok = self.sma20[0] > self.sma50[0] and (self.macd.macd[0] > 0 or self.rsi[0] > 55)
+            short_ok = self.sma20[0] < self.sma50[0] and (self.macd.macd[0] < 0 or self.rsi[0] < 45)
+            limoff = 0.05 * self.day_atr
+            cash = self.broker.getvalue()
+            risk_dollars = self.p.risk_pct * cash
+
+            if long_ok:
+                stop = self.or_high + 0.1 * self.day_atr
+                sl = self.or_low - 0.1 * self.day_atr
+                size = int(risk_dollars / abs(stop - sl))
+                if size > 0:
+                    o = self.buy(exectype=bt.Order.StopLimit, price=stop,
+                                  plimit=stop + limoff, size=size)
+                    self.order_tag[o.ref] = 'initial_long'
+                    self.pending_entry_order = o
+                    self.pending_sl = sl
+            elif short_ok:
+                stop = self.or_low - 0.1 * self.day_atr
+                sl = self.or_high + 0.1 * self.day_atr
+                size = int(risk_dollars / abs(stop - sl))
+                if size > 0:
+                    o = self.sell(exectype=bt.Order.StopLimit, price=stop,
+                                   plimit=stop - limoff, size=size)
+                    self.order_tag[o.ref] = 'initial_short'
+                    self.pending_entry_order = o
+                    self.pending_sl = sl
+            return
+
+        if not self.position:
+            return
+
+        if self.exit_order is not None and self.exit_order.alive():
+            return
+
+        if self.direction == 'long':
+            self.extreme_price = max(self.extreme_price, self.data.high[0])
+        else:
+            self.extreme_price = min(self.extreme_price, self.data.low[0])
+
+        inside = self.or_low <= self.data.close[0] <= self.or_high
+        prev_inside = self.or_low <= self.data.close[-1] <= self.or_high
+        if inside and prev_inside:
+            self._full_exit('consec_inside_exit')
+            return
+
+        trail_dist = 1.5 * self.day_atr
+        if self.direction == 'long':
+            if self.data.close[0] <= self.extreme_price - trail_dist:
+                self._full_exit('trail_exit')
+                return
+        else:
+            if self.data.close[0] >= self.extreme_price + trail_dist:
+                self._full_exit('trail_exit')
+                return
+
+        if (self.trades_today < 4 and self.addon_order is None
+                and self.entry_bar_len is not None and len(self) > self.entry_bar_len):
+            zone = 0.1 * self.day_atr
+            mom_ok = self._momentum_ok(self.direction)
+            if self.direction == 'long':
+                retest = (self.data.low[0] <= self.or_high + zone
+                          and self.data.high[0] >= self.or_high - zone)
+                breakout_y = self.yesterday_high is not None and self.data.close[0] > self.yesterday_high
+                triggered = mom_ok and (retest or breakout_y)
+            else:
+                retest = (self.data.low[0] <= self.or_low + zone
+                          and self.data.high[0] >= self.or_low - zone)
+                breakout_y = self.yesterday_low is not None and self.data.close[0] < self.yesterday_low
+                triggered = mom_ok and (retest or breakout_y)
+
+            if triggered and self.tranches:
+                addon_size = int(self.tranches[0]['size'] * 0.5)
+                if addon_size > 0:
+                    self._submit_addon(addon_size)
+
+    # ---------- fill routing ----------
+
+    def _on_initial_fill(self, order, tag):
+        self.direction = 'long' if tag == 'initial_long' else 'short'
+        entry_price = order.executed.price
+        size = abs(order.executed.size)
+        self.trades_today = 1
+        self.stop_price = self.pending_sl
+        self.extreme_price = entry_price
+        self.entry_bar_len = len(self)
+
+        if self.direction == 'long':
+            target = entry_price + 0.85 * self.or_w
+        else:
+            target = entry_price - 0.85 * self.or_w
+
+        tr_id = self.next_tranche_id
+        self.next_tranche_id += 1
+        tp_order = self._submit_tp(tr_id, size, target)
+        self.tranches.append(dict(id=tr_id, size=size, entry=entry_price,
+                                   target=target, order=tp_order))
+        self._resubmit_stop()
+
+    def _on_addon_fill(self, order):
+        entry_price = order.executed.price
+        size = abs(order.executed.size)
+        self.trades_today += 1
+        if self.direction == 'long':
+            target = entry_price + 0.7 * (self.bb.top[0] - entry_price)
+        else:
+            target = entry_price - 0.7 * (entry_price - self.bb.bot[0])
+        tr_id = self.next_tranche_id
+        self.next_tranche_id += 1
+        tp_order = self._submit_tp(tr_id, size, target)
+        self.tranches.append(dict(id=tr_id, size=size, entry=entry_price,
+                                   target=target, order=tp_order))
+        self._resubmit_stop()
+
+    def _on_tp_fill(self, tag):
+        tr_id = int(tag.split('_')[1])
+        self.tranches = [t for t in self.tranches if t['id'] != tr_id]
+        if self.position.size == 0:
+            if self.stop_order is not None and self.stop_order.alive():
+                self.cancel(self.stop_order)
+            self.stop_order = None
+        else:
+            self._resubmit_stop()
+
+    def notify_order(self, order):
+        if order.status in (order.Submitted, order.Accepted):
+            return
+
+        tag = self.order_tag.get(order.ref)
+
+        if order.status == order.Completed:
+            if tag in ('initial_long', 'initial_short'):
+                self._on_initial_fill(order, tag)
+            elif tag == 'addon':
+                self._on_addon_fill(order)
+            elif tag is not None and tag.startswith('tp_'):
+                self._on_tp_fill(tag)
+            elif tag == 'stop_loss':
+                self.tranches = []
+            elif tag in ('trail_exit', 'consec_inside_exit'):
+                self.tranches = []
+
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order_tag.pop(order.ref, None)
+            if order is self.pending_entry_order:
+                self.pending_entry_order = None
+            if order is self.addon_order:
+                self.addon_order = None
+            if order is self.exit_order:
+                self.exit_order = None
+            if order is self.stop_order:
+                self.stop_order = None
+```
+
+```json
+{"assumptions": [
+  {"topic": "OR window mapping", "choice": "Since the feed is already 15m bars, the Opening Range equals the first bar of each session (OR_high/OR_low = that bar's High/Low); no sub-aggregation needed.", "reason": "Spec: 'if a different timeframe is used, take the first N bars totaling ~15 minutes' — here N=1 exactly."},
+  {"topic": "ATR freezing for the day", "choice": "ATR(14) is sampled once at the OR bar's close and held fixed ('day_atr') for every OR-day calculation: skip filter, entry/stop/target levels, limit-offsets, add-on proximity zone, trailing-stop distance.", "reason": "Resting stop-limit order prices must be concrete numbers set once; the spec references 'ATR(14)' without specifying intrabar recalculation, so freezing at the moment the OR closes is the only reading that yields stable, well-defined order prices."},
+  {"topic": "Direction-filter timing", "choice": "The SMA/MACD/RSI direction filter and the resulting OCO stop-limit placement are evaluated exactly once, on the bar immediately after the OR bar. If neither the long nor short condition holds at that moment, no entry order is placed for the rest of the day.", "reason": "Rule 2 reads as a single action ('After the OR window closes, place OCO stop-limit orders'), not a continuously re-evaluated scan."},
+  {"topic": "OCO mechanism", "choice": "No explicit backtrader oco= linkage is used, since the long/short direction conditions (SMA20>SMA50 vs SMA20<SMA50) are mutually exclusive — at most one side of the OCO pair can ever qualify, so at most a single conditional stop-limit order is ever live.", "reason": "A true two-sided OCO pair can never actually form under the stated filter; adding oco= machinery for an order that never has a live sibling adds no behavior."},
+  {"topic": "Risk percent R", "choice": "R = 0.75% of current portfolio value (self.broker.getvalue()) at the moment the initial order is sized.", "reason": "Spec gives a range (0.5-1.0%) without a point value; midpoint chosen as the literal reading of an unresolved range. 'Capital' is read as current equity (standard risk-sizing convention) rather than fixed starting cash."},
+  {"topic": "Share sizing rounding", "choice": "int() floor of R$/|entry-stop| and of 0.5x for add-ons.", "reason": "Equities are traded in whole shares; spec is silent on fractional sizing."},
+  {"topic": "Stop-loss / take-profit as resting orders", "choice": "Stop-loss is a single resting StopLimit order sized to the full current position, cancelled and resubmitted whenever the position size changes (add-on fill or partial TP fill). Each tranche (initial + each add-on) gets its own resting StopLimit take-profit order sized to that tranche.", "reason": "Spec's per-tranche TP formulas (OR_w-based for the initial leg, BB-based for add-ons) require independent price targets per lot; backtrader tracks only aggregate position size, so per-tranche bookkeeping is done manually."},
+  {"topic": "Trailing stop and two-consecutive-inside-closes exits", "choice": "Implemented as bar-by-bar checks (not resting orders) that, when triggered, cancel all resting orders and submit one reactive full-position StopLimit exit at the current close ± 0.05*ATR.", "reason": "These conditions depend on running state (extreme price, prior bar's close) that a static resting order cannot encode; rule 7's 'all entries/exits via stop-limit' is still honored via the reactive order's exectype."},
+  {"topic": "Add-on entry mechanism", "choice": "Add-on triggers (retest / yesterday H-L breakout with momentum) are evaluated bar-by-bar; once true, a StopLimit order is submitted reactively with stop = current close and limit = close ± 0.05*ATR.", "reason": "The add-on trigger is a compound condition (price zone AND momentum) with no native single order type in backtrader; the resulting order is still a stop-limit per rule 7."},
+  {"topic": "Add-on retest zone for shorts", "choice": "Applied the same ±0.1*ATR proximity band around OR_low for shorts as explicitly stated for longs around OR_high.", "reason": "Spec states the band once for longs and only 'OR_low' for shorts without repeating the offset; symmetric treatment is the natural literal extension."},
+  {"topic": "EOD close mechanism", "choice": "self.close() (market) is used for the end-of-day flatten, overriding rule 7's stop-limit requirement for this one case.", "reason": "Canonical default #2 explicitly maps the literal instruction 'close all positions' to self.close(); a limit-constrained order risks not filling and leaving a position open past the session close, which would violate the harder EOD guarantee in rule 6."},
+  {"topic": "EOD bar detection", "choice": "The bar whose timestamp's (hour, minute) >= (15, 45) is treated as the last bar of the session (bars are 15m, timestamped by interval start, standard 9:30-16:00 NYSE session).", "reason": "No forward-looking day-boundary check is available without lookahead in backtrader's next()-based causal model; a fixed session-end time is the standard no-lookahead idiom, and 1546 bars over the stated date range is consistent with 26 bars/day (last bar at 15:45)."},
+  {"topic": "No re-entry after a same-day exit", "choice": "Once the single initial-order decision point has passed (filled or not, and even after a subsequent stop/trailing/consecutive-inside/TP-exhaustion flat), no new initial ORB entry is attempted later the same day.", "reason": "Rule 2 frames initial entry as a one-time OCO placement after OR close; rule 3's add-on/trade-count language only extends an existing position, it does not describe restarting the ORB sequence."},
+  {"topic": "Repeated add-on triggers", "choice": "If an add-on trigger condition remains true on consecutive bars, each bar can independently produce another add-on (subject to the 4-trades/day cap and the one-pending-add-on-order guard).", "reason": "Spec states no cooldown/dedupe mechanism for trigger persistence, so each qualifying bar is treated as an independent signal."},
+  {"topic": "MACD threshold reading", "choice": "'MACD > 0' / 'MACD < 0' is read as the MACD line's own value relative to zero, not MACD vs. its signal line.", "reason": "Literal text of the spec compares MACD to 0, not to the signal line."}
+]}
+```

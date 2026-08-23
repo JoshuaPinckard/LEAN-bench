@@ -68,7 +68,7 @@ def call_codex(prompt: str, model: str, out_path: Path, effort: str = "medium",
     return text
 
 
-def call_drafter(family: str, prompt: str, out_path: Path, timeout: int = 1200) -> str:
+def call_drafter(family: str, prompt: str, out_path: Path, timeout: int = 2400) -> str:
     """The per-family dispatch of record (owner ruling 2026-08-21)."""
     if family == "claude":
         _require_canary()
