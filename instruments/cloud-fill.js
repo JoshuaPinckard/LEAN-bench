@@ -16,10 +16,10 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 // prompt -> target n, ordered by scientific value: the period cell is the
 // headline (bare 0.00 vs CLI 0.50), then the harness variant, then the union
 // and type cells, then the benchmark's free-parameter prompts.
-const TARGETS = [
+const TARGETS = (process.env.LB_TARGETS ? JSON.parse(process.env.LB_TARGETS) : [
   ['BL-01b', 40, 1], ['BL-01b', 30, 4], ['BL-01c', 40, 1], ['BL-01a', 30, 1],
   ['T1v0', 30, 1], ['BL-03', 30, 1], ['BL-05', 30, 1], ['BL-08', 30, 1], ['ER-01', 30, 1],
-];
+]);
 
 function countLaunched(prompt, attempts) {
   const safe = prompt.replace(/'/g, 'p').replace(/[^\w.-]/g, '');
