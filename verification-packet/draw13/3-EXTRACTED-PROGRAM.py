@@ -1,0 +1,152 @@
+# region imports
+from AlgorithmImports import *
+import math
+# endregion
+
+
+class TwoSlotParallelTemplateAlgorithm(QCAlgorithm):
+    """
+    One template, two slots, no gate. Both slots run independently in parallel.
+
+      Slot 1 - Strategy A (SPY):
+        BUY  : SPY close crosses above its 100-day SMA  -> invest 40% of total portfolio value
+        SELL : SPY close crosses below its 100-day SMA  -> liquidate Strategy A's lot
+
+      Slot 2 - Strategy B (AAPL):
+        BUY  : AAPL red 3 consecutive days -> buy $20,000 if >= $20,000 cash available, else do nothing
+        SELL : AAPL 14-day RSI above 60    -> liquidate Strategy B's lot
+
+    Each strategy owns a private lot: it only ever sells shares it bought, its buy reason is
+    evaluated only while its lot is empty, its sell reason only while its lot is non-empty,
+    and sells are evaluated before buys on every bar.
+    """
+
+    TICKERS = ["SPY", "AAPL", "IBM", "BAC", "AIG"]
+
+    # ------------------------------------------------------------------ setup
+    def Initialize(self):
+        self.SetStartDate(2006, 1, 3)
+        self.SetEndDate(2015, 12, 31)
+        self.SetCash(1000000)
+
+        self.symbols = {}
+        for ticker in self.TICKERS:
+            equity = self.AddEquity(ticker, Resolution.Daily)
+            equity.SetDataNormalizationMode(DataNormalizationMode.Adjusted)
+            self.symbols[ticker] = equity.Symbol
+
+        self.spy = self.symbols["SPY"]
+        self.aapl = self.symbols["AAPL"]
+
+        # Manually-updated indicators so that "yesterday's value" is unambiguous.
+        self.spy_sma = SimpleMovingAverage(100)
+        self.aapl_rsi = RelativeStrengthIndex(14, MovingAverageType.Wilders)
+
+        # Continuously-maintained market state (never paused).
+        self.prev_close = {}          # Symbol -> previous bar's close
+        self.aapl_red_streak = 0      # consecutive red days for AAPL
+
+        # Private lots (share counts), tracked at order-submission time.
+        self.lot_a = 0                # Strategy A lot in SPY
+        self.lot_b = 0                # Strategy B lot in AAPL
+
+    # ------------------------------------------------------------------- data
+    def OnData(self, data):
+        # ---- 1) snapshot yesterday's values BEFORE anything is updated today
+        prev_spy_close = self.prev_close.get(self.spy)
+        prev_spy_sma_ready = self.spy_sma.IsReady
+        prev_spy_sma = self.spy_sma.Current.Value if prev_spy_sma_ready else None
+        prev_aapl_close = self.prev_close.get(self.aapl)
+
+        # ---- 2) collect today's bars
+        present = {}
+        for ticker, symbol in self.symbols.items():
+            bar = None
+            if data.Bars.ContainsKey(symbol):
+                bar = data.Bars[symbol]
+            if bar is not None and bar.Close > 0:
+                present[ticker] = bar
+
+        # ---- 3) update market-state quantities from whatever data arrived
+        spy_bar = present.get("SPY")
+        if spy_bar is not None:
+            self.spy_sma.Update(spy_bar.EndTime, spy_bar.Close)
+
+        aapl_bar = present.get("AAPL")
+        if aapl_bar is not None:
+            self.aapl_rsi.Update(aapl_bar.EndTime, aapl_bar.Close)
+            if prev_aapl_close is not None:
+                if aapl_bar.Close < prev_aapl_close:
+                    self.aapl_red_streak += 1
+                else:
+                    self.aapl_red_streak = 0
+
+        for ticker, bar in present.items():
+            self.prev_close[self.symbols[ticker]] = bar.Close
+
+        # ---- 4) if today's bar is missing for ANY subscribed ticker, skip all rules
+        if len(present) != len(self.symbols):
+            return
+
+        if self.IsWarmingUp:
+            return
+
+        # ================================================================
+        # Slot 1 - Strategy A (SPY)
+        # ================================================================
+        spy_close = spy_bar.Close
+        spy_sma = self.spy_sma.Current.Value
+
+        strategy_a_ready = (
+            self.spy_sma.IsReady
+            and prev_spy_sma_ready
+            and prev_spy_close is not None
+        )
+
+        if strategy_a_ready:
+            crossed_above = (prev_spy_close <= prev_spy_sma) and (spy_close > spy_sma)
+            crossed_below = (prev_spy_close >= prev_spy_sma) and (spy_close < spy_sma)
+
+            # SELL first
+            if self.lot_a > 0 and crossed_below:
+                self.MarketOrder(self.spy, -self.lot_a)
+                self.Debug(f"{self.Time.date()} A SELL SPY {self.lot_a} (cross below SMA100)")
+                self.lot_a = 0
+
+            # THEN BUY (only while the lot is empty)
+            if self.lot_a == 0 and crossed_above:
+                target_value = 0.40 * self.Portfolio.TotalPortfolioValue
+                quantity = int(math.floor(target_value / spy_close))
+                if quantity > 0:
+                    self.MarketOrder(self.spy, quantity)
+                    self.lot_a = quantity
+                    self.Debug(f"{self.Time.date()} A BUY SPY {quantity} (cross above SMA100)")
+
+        # ================================================================
+        # Slot 2 - Strategy B (AAPL)
+        # ================================================================
+        aapl_close = aapl_bar.Close
+        strategy_b_ready = self.aapl_rsi.IsReady
+
+        if strategy_b_ready:
+            rsi_value = self.aapl_rsi.Current.Value
+
+            # SELL first
+            if self.lot_b > 0 and rsi_value > 60:
+                self.MarketOrder(self.aapl, -self.lot_b)
+                self.Debug(f"{self.Time.date()} B SELL AAPL {self.lot_b} (RSI {rsi_value:.2f} > 60)")
+                self.lot_b = 0
+
+            # THEN BUY (only while the lot is empty)
+            if self.lot_b == 0 and self.aapl_red_streak >= 3:
+                budget = 20000.0
+                if self.Portfolio.Cash >= budget:
+                    quantity = int(math.floor(budget / aapl_close))
+                    if quantity > 0:
+                        self.MarketOrder(self.aapl, quantity)
+                        self.lot_b = quantity
+                        self.Debug(
+                            f"{self.Time.date()} B BUY AAPL {quantity} "
+                            f"({self.aapl_red_streak} red days)"
+                        )
+                # else: not enough cash -> do nothing this bar, stay flat

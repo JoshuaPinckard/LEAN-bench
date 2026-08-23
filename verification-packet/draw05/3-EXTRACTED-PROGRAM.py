@@ -1,0 +1,87 @@
+from AlgorithmImports import *
+
+
+class IndependentSlotsAlgorithm(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2006, 1, 3)
+        self.SetEndDate(2015, 12, 31)
+        self.SetCash(1_000_000)
+
+        self.spy = self.AddEquity("SPY", Resolution.Daily).Symbol
+        self.aapl = self.AddEquity("AAPL", Resolution.Daily).Symbol
+        self.ibm = self.AddEquity("IBM", Resolution.Daily).Symbol
+        self.bac = self.AddEquity("BAC", Resolution.Daily).Symbol
+        self.aig = self.AddEquity("AIG", Resolution.Daily).Symbol
+        self.symbols = [self.spy, self.aapl, self.ibm, self.bac, self.aig]
+
+        self.spy_closes = RollingWindow[float](101)
+        self.aapl_closes = RollingWindow[float](2)
+        self.aapl_red_streak = 0
+        self.aapl_rsi = self.RSI(
+            self.aapl, 14, MovingAverageType.Wilders, Resolution.Daily
+        )
+
+        self.strategy_a_shares = 0
+        self.strategy_b_shares = 0
+
+    def OnData(self, data: Slice):
+        # Market-state quantities continue updating whenever their own data exists.
+        if self.spy in data.Bars:
+            self.spy_closes.Add(float(data.Bars[self.spy].Close))
+
+        if self.aapl in data.Bars:
+            self.aapl_closes.Add(float(data.Bars[self.aapl].Close))
+            if self.aapl_closes.Count >= 2:
+                if self.aapl_closes[0] < self.aapl_closes[1]:
+                    self.aapl_red_streak += 1
+                else:
+                    self.aapl_red_streak = 0
+
+        # Skip all rule evaluation unless every subscribed ticker has today's bar.
+        if not all(symbol in data.Bars for symbol in self.symbols):
+            return
+
+        # Do not trade until all indicators and rolling windows used by rules are ready.
+        if self.spy_closes.Count < 101 or self.aapl_closes.Count < 2:
+            return
+        if not self.aapl_rsi.IsReady:
+            return
+
+        spy_close = float(data.Bars[self.spy].Close)
+        aapl_close = float(data.Bars[self.aapl].Close)
+
+        current_spy_sma = sum(self.spy_closes[i] for i in range(100)) / 100.0
+        previous_spy_sma = sum(self.spy_closes[i] for i in range(1, 101)) / 100.0
+        previous_spy_close = self.spy_closes[1]
+
+        spy_crosses_above_sma = (
+            previous_spy_close <= previous_spy_sma
+            and spy_close > current_spy_sma
+        )
+        spy_crosses_below_sma = (
+            previous_spy_close >= previous_spy_sma
+            and spy_close < current_spy_sma
+        )
+
+        # Evaluate sells before buys.
+        if self.strategy_a_shares > 0 and spy_crosses_below_sma:
+            self.MarketOrder(self.spy, -self.strategy_a_shares)
+            self.strategy_a_shares = 0
+
+        if self.strategy_b_shares > 0 and self.aapl_rsi.Current.Value > 60:
+            self.MarketOrder(self.aapl, -self.strategy_b_shares)
+            self.strategy_b_shares = 0
+
+        if self.strategy_a_shares == 0 and spy_crosses_above_sma:
+            quantity = int((self.Portfolio.TotalPortfolioValue * 0.40) / spy_close)
+            if quantity > 0:
+                self.MarketOrder(self.spy, quantity)
+                self.strategy_a_shares = quantity
+
+        if self.strategy_b_shares == 0 and self.aapl_red_streak >= 3:
+            if self.Portfolio.Cash >= 20_000:
+                quantity = int(20_000 / aapl_close)
+                if quantity > 0:
+                    self.MarketOrder(self.aapl, quantity)
+                    self.strategy_b_shares = quantity

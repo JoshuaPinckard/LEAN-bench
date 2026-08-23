@@ -1,0 +1,146 @@
+from AlgorithmImports import *
+import math
+
+class DetailedStrategyAlgorithm(QCAlgorithm):
+    """
+    QuantConnect LEAN algorithm implementing a specific system of two strategies.
+    - Strategy A: SPY momentum cross.
+    - Strategy B: AAPL dip buying.
+    """
+
+    def Initialize(self):
+        """Initial algorithm setup. Sets dates, cash, and prepares data and indicators."""
+        # 1. Fixed setup requirements
+        self.SetStartDate(2006, 1, 3)
+        self.SetEndDate(2015, 12, 31)
+        self.SetCash(1000000)
+
+        # Subscribe to US equities at DAILY resolution
+        self.subscribed_symbols = ["SPY", "AAPL", "IBM", "BAC", "AIG"]
+        for ticker in self.subscribed_symbols:
+            self.AddEquity(ticker, Resolution.Daily)
+
+        # Store Symbol objects for easy access
+        self.spy = self.Symbol("SPY")
+        self.aapl = self.Symbol("AAPL")
+
+        # 2. Strategy A (SPY) state and indicators
+        self.spy_sma100 = self.SMA(self.spy, 100, Resolution.Daily)
+        # We need to store previous values to detect a cross
+        self.spy_close_history = RollingWindow[float](2)
+        self.spy_sma_history = RollingWindow[float](2)
+
+        # 3. Strategy B (AAPL) state and indicators
+        self.aapl_rsi14 = self.RSI(self.aapl, 14, MovingAverageType.Simple, Resolution.Daily)
+        self.aapl_red_day_counter = 0
+        self.aapl_prev_close = None
+
+        # 4. Set warm-up period for indicators
+        # Longest lookback is SMA(100), so 100 days should be sufficient.
+        self.SetWarmUp(100)
+
+    def OnData(self, data: Slice):
+        """
+        Main event handler, called once per daily bar.
+        """
+        # Do not trade until all indicators have enough data
+        if self.IsWarmingUp:
+            return
+
+        # SEMANTICS CONTRACT: If today's bar is missing for ANY subscribed ticker, skip ALL rules.
+        for ticker in self.subscribed_symbols:
+            symbol_obj = self.Symbol(ticker)
+            if not data.Bars.ContainsKey(symbol_obj) or data[symbol_obj] is None:
+                return
+
+        # --- Update State and History ---
+
+        # Strategy A (SPY): Update rolling windows for cross detection.
+        if self.spy_sma100.IsReady and data.Bars.ContainsKey(self.spy):
+            self.spy_close_history.Add(data[self.spy].Close)
+            self.spy_sma_history.Add(self.spy_sma100.Current.Value)
+
+        # Strategy B (AAPL): Update consecutive red day counter.
+        if data.Bars.ContainsKey(self.aapl):
+            aapl_bar = data[self.aapl]
+            if self.aapl_prev_close is not None:
+                # "red day" means close is strictly below the PREVIOUS day's close
+                if aapl_bar.Close < self.aapl_prev_close:
+                    self.aapl_red_day_counter += 1
+                else:
+                    self.aapl_red_day_counter = 0 # Reset on green or flat day
+            self.aapl_prev_close = aapl_bar.Close
+
+        # Wait for all history/indicators to be fully formed before trading
+        if not all([self.spy_sma100.IsReady, self.aapl_rsi14.IsReady,
+                    self.spy_close_history.IsReady, self.spy_sma_history.IsReady]):
+            return
+
+        # --- Execute Strategies (Sells are evaluated before Buys) ---
+
+        # Slot 1 - Strategy A (trades SPY)
+        self.ExecuteStrategyA(data)
+
+        # Slot 2 - Strategy B (trades AAPL)
+        self.ExecuteStrategyB(data)
+
+
+    def ExecuteStrategyA(self, data: Slice):
+        """
+        Momentum strategy on SPY using a 100-day SMA cross.
+        - Buy on bullish cross (close > SMA).
+        - Sell on bearish cross (close < SMA).
+        """
+        spy_holding = self.Portfolio[self.spy]
+        
+        # Access historical values: [0] is today, [1] is yesterday
+        today_close = self.spy_close_history[0]
+        yesterday_close = self.spy_close_history[1]
+        today_sma = self.spy_sma_history[0]
+        yesterday_sma = self.spy_sma_history[1]
+
+        # Evaluate sell reason only while lot is non-empty
+        if spy_holding.Invested:
+            # Reason to sell: SPY's close crosses below its 100-day moving average.
+            # "crosses below" means yesterday it was >=, today it is <.
+            if yesterday_close >= yesterday_sma and today_close < today_sma:
+                # Sell details: liquidate entire lot.
+                self.Liquidate(self.spy)
+        
+        # Evaluate buy reason only while lot is empty
+        else:
+            # Reason to buy: SPY's close crosses above its 100-day moving average.
+            # "crosses above" means yesterday it was <=, today it is >.
+            if yesterday_close <= yesterday_sma and today_close > today_sma:
+                # Buy details: invest 40% of total portfolio value in SPY.
+                self.SetHoldings(self.spy, 0.40)
+
+
+    def ExecuteStrategyB(self, data: Slice):
+        """
+        Dip-buying strategy on AAPL.
+        - Buy after 3 consecutive red days.
+        - Sell when RSI is over 60.
+        """
+        aapl_holding = self.Portfolio[self.aapl]
+
+        # Evaluate sell reason only while lot is non-empty
+        if aapl_holding.Invested:
+            # Reason to sell: AAPL's 14-day RSI closes above 60.
+            if self.aapl_rsi14.Current.Value > 60:
+                # Sell details: liquidate entire lot.
+                self.Liquidate(self.aapl)
+
+        # Evaluate buy reason only while lot is empty
+        else:
+            # Reason to buy: AAPL has been red for 3 consecutive days.
+            # (Satisfied on any day that completes 3 or MORE consecutive red days)
+            if self.aapl_red_day_counter >= 3:
+                # Buy details: buy $20,000 of AAPL if cash available.
+                if self.Portfolio.Cash >= 20000:
+                    # Use MarketOrder to execute the buy.
+                    aapl_price = data[self.aapl].Close
+                    # Ensure price is not zero to avoid division errors
+                    if aapl_price > 0:
+                        shares_to_buy = math.floor(20000 / aapl_price)
+                        self.MarketOrder(self.aapl, shares_to_buy)

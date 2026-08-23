@@ -1,0 +1,119 @@
+from AlgorithmImports import *
+import math
+
+
+class DailyCrossAndRSIStrategy(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2006, 1, 3)
+        self.SetEndDate(2015, 12, 31)
+        self.SetCash(1000000)
+
+        self.spy = self.AddEquity("SPY", Resolution.Daily).Symbol
+        self.aapl = self.AddEquity("AAPL", Resolution.Daily).Symbol
+        self.ibm = self.AddEquity("IBM", Resolution.Daily).Symbol
+        self.bac = self.AddEquity("BAC", Resolution.Daily).Symbol
+        self.aig = self.AddEquity("AIG", Resolution.Daily).Symbol
+
+        self.symbols = [self.spy, self.aapl, self.ibm, self.bac, self.aig]
+
+        self.spy_sma = self.SMA(self.spy, 100, Resolution.Daily)
+        self.aapl_rsi = self.RSI(
+            self.aapl,
+            14,
+            MovingAverageType.Wilders,
+            Resolution.Daily
+        )
+
+        self.spy_lot_shares = 0
+        self.aapl_lot_shares = 0
+
+        self.previous_spy_close = None
+        self.previous_spy_sma = None
+        self.previous_aapl_close = None
+        self.aapl_red_streak = 0
+
+    def OnData(self, data):
+        for symbol in self.symbols:
+            if not data.Bars.ContainsKey(symbol):
+                return
+
+        spy_close = data.Bars[self.spy].Close
+        aapl_close = data.Bars[self.aapl].Close
+
+        spy_cross_above = False
+        spy_cross_below = False
+
+        if (
+            self.spy_sma.IsReady
+            and self.previous_spy_close is not None
+            and self.previous_spy_sma is not None
+        ):
+            current_spy_sma = self.spy_sma.Current.Value
+
+            spy_cross_above = (
+                self.previous_spy_close <= self.previous_spy_sma
+                and spy_close > current_spy_sma
+            )
+
+            spy_cross_below = (
+                self.previous_spy_close >= self.previous_spy_sma
+                and spy_close < current_spy_sma
+            )
+
+        if self.previous_aapl_close is not None:
+            if aapl_close < self.previous_aapl_close:
+                self.aapl_red_streak += 1
+            else:
+                self.aapl_red_streak = 0
+
+        aapl_rsi_above_60 = (
+            self.aapl_rsi.IsReady
+            and self.aapl_rsi.Current.Value > 60
+        )
+
+        if self.spy_lot_shares > 0 and spy_cross_below:
+            self.MarketOrder(
+                self.spy,
+                -self.spy_lot_shares,
+                tag="Strategy A sell"
+            )
+            self.spy_lot_shares = 0
+
+        if self.aapl_lot_shares > 0 and aapl_rsi_above_60:
+            self.MarketOrder(
+                self.aapl,
+                -self.aapl_lot_shares,
+                tag="Strategy B sell"
+            )
+            self.aapl_lot_shares = 0
+
+        if self.spy_lot_shares == 0 and spy_cross_above:
+            target_value = 0.40 * float(self.Portfolio.TotalPortfolioValue)
+            shares = math.floor(target_value / float(spy_close))
+
+            if shares > 0:
+                self.MarketOrder(
+                    self.spy,
+                    shares,
+                    tag="Strategy A buy"
+                )
+                self.spy_lot_shares = shares
+
+        if self.aapl_lot_shares == 0 and self.aapl_red_streak >= 3:
+            if float(self.Portfolio.Cash) >= 20000:
+                shares = math.floor(20000 / float(aapl_close))
+
+                if shares > 0:
+                    self.MarketOrder(
+                        self.aapl,
+                        shares,
+                        tag="Strategy B buy"
+                    )
+                    self.aapl_lot_shares = shares
+
+        if self.spy_sma.IsReady:
+            self.previous_spy_sma = self.spy_sma.Current.Value
+
+        self.previous_spy_close = spy_close
+        self.previous_aapl_close = aapl_close

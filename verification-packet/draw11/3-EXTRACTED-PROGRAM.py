@@ -1,0 +1,268 @@
+from AlgorithmImports import *
+from collections import deque
+import math
+
+
+class ExactStrategyAlgorithm(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2006, 1, 3)
+        self.SetEndDate(2015, 12, 31)
+        self.SetCash(1000000)
+
+        self.spy = self.AddEquity("SPY", Resolution.Daily).Symbol
+        self.aapl = self.AddEquity("AAPL", Resolution.Daily).Symbol
+        self.ibm = self.AddEquity("IBM", Resolution.Daily).Symbol
+        self.bac = self.AddEquity("BAC", Resolution.Daily).Symbol
+        self.aig = self.AddEquity("AIG", Resolution.Daily).Symbol
+
+        self.symbols = [self.spy, self.aapl, self.ibm, self.bac, self.aig]
+
+        self.spy_closes = deque(maxlen=101)
+        self.spy_last_close = None
+        self.spy_previous_close = None
+        self.spy_current_sma = None
+        self.spy_previous_sma = None
+
+        self.aapl_last_close = None
+        self.aapl_red_streak = 0
+        self.aapl_change_count = 0
+        self.aapl_gain_sum = 0.0
+        self.aapl_loss_sum = 0.0
+        self.aapl_average_gain = None
+        self.aapl_average_loss = None
+        self.aapl_rsi = None
+        self.aapl_rsi_ready = False
+
+        self.spy_lot_shares = 0
+        self.aapl_lot_shares = 0
+
+        self.pending_a = False
+        self.pending_b = False
+
+    def OnData(self, data):
+        self._update_spy_state(data)
+        self._update_aapl_state(data)
+
+        if not all(symbol in data.Bars for symbol in self.symbols):
+            return
+
+        if not self._history_ready():
+            return
+
+        spy_cross_above = (
+            self.spy_previous_close is not None
+            and self.spy_previous_sma is not None
+            and self.spy_current_sma is not None
+            and self.spy_previous_close <= self.spy_previous_sma
+            and self.spy_last_close > self.spy_current_sma
+        )
+
+        spy_cross_below = (
+            self.spy_previous_close is not None
+            and self.spy_previous_sma is not None
+            and self.spy_current_sma is not None
+            and self.spy_previous_close >= self.spy_previous_sma
+            and self.spy_last_close < self.spy_current_sma
+        )
+
+        aapl_sell_reason = (
+            self.aapl_rsi_ready
+            and self.aapl_rsi is not None
+            and self.aapl_rsi > 60
+        )
+
+        # Evaluate all sells before any buys.
+        if (
+            self.spy_lot_shares > 0
+            and not self.pending_a
+            and spy_cross_below
+        ):
+            self._submit_order(
+                self.spy,
+                -self.spy_lot_shares,
+                "StrategyA|Sell"
+            )
+
+        if (
+            self.aapl_lot_shares > 0
+            and not self.pending_b
+            and aapl_sell_reason
+        ):
+            self._submit_order(
+                self.aapl,
+                -self.aapl_lot_shares,
+                "StrategyB|Sell"
+            )
+
+        # Strategy A buy.
+        if (
+            self.spy_lot_shares == 0
+            and not self.pending_a
+            and spy_cross_above
+        ):
+            target_value = 0.40 * float(self.Portfolio.TotalPortfolioValue)
+            quantity = int(math.floor(target_value / self.spy_last_close))
+
+            if quantity > 0:
+                self._submit_order(
+                    self.spy,
+                    quantity,
+                    "StrategyA|Buy"
+                )
+
+        # Strategy B buy.
+        if (
+            self.aapl_lot_shares == 0
+            and not self.pending_b
+            and self.aapl_red_streak >= 3
+            and float(self.Portfolio.Cash) >= 20000
+        ):
+            quantity = int(math.floor(20000 / self.aapl_last_close))
+
+            if quantity > 0:
+                self._submit_order(
+                    self.aapl,
+                    quantity,
+                    "StrategyB|Buy"
+                )
+
+    def _update_spy_state(self, data):
+        if self.spy not in data.Bars:
+            return
+
+        close = float(data.Bars[self.spy].Close)
+
+        self.spy_previous_close = self.spy_last_close
+        self.spy_previous_sma = self.spy_current_sma
+
+        previous_closes = list(self.spy_closes)
+        if len(previous_closes) >= 100:
+            self.spy_current_sma = sum(previous_closes[-100:]) / 100.0
+        else:
+            self.spy_current_sma = None
+
+        self.spy_closes.append(close)
+
+        if len(self.spy_closes) >= 100:
+            self.spy_current_sma = sum(list(self.spy_closes)[-100:]) / 100.0
+        else:
+            self.spy_current_sma = None
+
+        self.spy_last_close = close
+
+    def _update_aapl_state(self, data):
+        if self.aapl not in data.Bars:
+            return
+
+        close = float(data.Bars[self.aapl].Close)
+
+        if self.aapl_last_close is not None:
+            change = close - self.aapl_last_close
+            gain = max(change, 0.0)
+            loss = max(-change, 0.0)
+
+            if change < 0:
+                self.aapl_red_streak += 1
+            else:
+                self.aapl_red_streak = 0
+
+            self.aapl_change_count += 1
+
+            if self.aapl_change_count <= 14:
+                self.aapl_gain_sum += gain
+                self.aapl_loss_sum += loss
+
+                if self.aapl_change_count == 14:
+                    self.aapl_average_gain = self.aapl_gain_sum / 14.0
+                    self.aapl_average_loss = self.aapl_loss_sum / 14.0
+                    self.aapl_rsi = self._calculate_rsi()
+                    self.aapl_rsi_ready = True
+            else:
+                self.aapl_average_gain = (
+                    (self.aapl_average_gain * 13.0) + gain
+                ) / 14.0
+
+                self.aapl_average_loss = (
+                    (self.aapl_average_loss * 13.0) + loss
+                ) / 14.0
+
+                self.aapl_rsi = self._calculate_rsi()
+
+        self.aapl_last_close = close
+
+    def _calculate_rsi(self):
+        if self.aapl_average_loss == 0:
+            if self.aapl_average_gain == 0:
+                return 50.0
+            return 100.0
+
+        relative_strength = (
+            self.aapl_average_gain / self.aapl_average_loss
+        )
+        return 100.0 - (100.0 / (1.0 + relative_strength))
+
+    def _history_ready(self):
+        return (
+            self.spy_previous_sma is not None
+            and self.spy_current_sma is not None
+            and self.aapl_change_count >= 14
+            and self.aapl_rsi_ready
+            and self.aapl_red_streak >= 3
+        )
+
+    def _submit_order(self, symbol, quantity, tag):
+        strategy = tag.split("|")[0]
+
+        if strategy == "StrategyA":
+            self.pending_a = True
+        else:
+            self.pending_b = True
+
+        ticket = self.MarketOrder(symbol, quantity, tag=tag)
+
+        if ticket is None:
+            if strategy == "StrategyA":
+                self.pending_a = False
+            else:
+                self.pending_b = False
+        elif ticket.Status in [
+            OrderStatus.Filled,
+            OrderStatus.Canceled,
+            OrderStatus.Invalid
+        ]:
+            if strategy == "StrategyA":
+                self.pending_a = False
+            else:
+                self.pending_b = False
+
+    def OnOrderEvent(self, order_event):
+        order = self.Transactions.GetOrderById(order_event.OrderId)
+        if order is None:
+            return
+
+        tag = order.Tag
+        if "|" not in tag:
+            return
+
+        strategy, action = tag.split("|", 1)
+        fill_quantity = int(order_event.FillQuantity)
+
+        if order_event.Status in [
+            OrderStatus.Filled,
+            OrderStatus.PartiallyFilled
+        ]:
+            if strategy == "StrategyA":
+                self.spy_lot_shares += fill_quantity
+            elif strategy == "StrategyB":
+                self.aapl_lot_shares += fill_quantity
+
+        if order_event.Status in [
+            OrderStatus.Filled,
+            OrderStatus.Canceled,
+            OrderStatus.Invalid
+        ]:
+            if strategy == "StrategyA":
+                self.pending_a = False
+            elif strategy == "StrategyB":
+                self.pending_b = False
