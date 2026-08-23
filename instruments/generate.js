@@ -67,6 +67,12 @@ function extractProgram(text) {
   return /class\s+\w+\s*\(\s*QCAlgorithm\s*\)/.test(text) ? text : null;
 }
 
+// Batches are foldered by date, so a lane that spans midnight resumes into
+// a NEW folder and redraws prompts already complete in yesterday's (found
+// 2026-08-23: luna/xhigh drew 7 prompts on the 22nd, 13 on the 23rd).
+// Analysis must therefore select ONE folder per (model, effort, condition)
+// rather than pooling across dates - the redundant draws are real, valid
+// data but would double-weight those prompts if pooled blindly.
 const OUTDIR = path.join(REPO, 'batches', stamp);
 fs.mkdirSync(OUTDIR, { recursive: true });
 // ' -> 'p' so BL-02b' gets its own file (2026-08-22: bare stripping collided
