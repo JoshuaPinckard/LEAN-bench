@@ -21,7 +21,15 @@ IMPORTANT: run these when the study graders are idle. The LEAN engine is
 a single shared resource; under load a good program can report exit=1.
 The tool now refuses to run during contention rather than mislead you.
 
-Second packet: classifier-check/QUESTIONS.md - 40 model responses with
+Second packet: classifier-check/QUESTIONS.md - 36 model responses with
 the decision blanked. Mark ASK or NOT-ASK for each, then open
 ANSWERS.json. That measures the ask-classifier against your judgment,
 which is the only thing that can validate it.
+
+Note (fixed 2026-08-23, from your catch): the first build of this packet
+padded the not-ask side with draws whose program RAN AND FAILED - those
+involve no classifier decision at all, which is why full programs were
+showing up in an ask/not-ask check. The packet now contains only draws
+where no program was extracted, which is the classifier's actual job.
+Items tagged [TRUNCATED CODE] are outputs cut off mid-program - skim
+them; the ~15 untagged items are the real judgment calls.

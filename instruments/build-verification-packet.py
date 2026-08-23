@@ -17,6 +17,7 @@ Usage: python build-verification-packet.py [seed]
 import json
 import glob
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -114,22 +115,53 @@ for n, r in enumerate(sample, 1):
 # ---------------------------------------------------------------- classifier packet
 cl = OUT / "classifier-check"
 cl.mkdir(exist_ok=True)
+# The classifier ONLY decides among draws where NO program was extracted:
+# it reads the model's text and calls it an ask or not. Rows like
+# `non-runnable` mean a program WAS written and then failed to execute -
+# no classifier judgment was involved, so including them would pad the
+# packet with trivial items (found 2026-08-23 when the owner flagged that
+# full programs were showing up in the ask/not-ask check).
 ask_sample = rnd.sample(asks, 20)
-noask_pool = [r for r in rows if r["status"] in ("no-program", "gen:no-program", "NO-IMPLEMENTATION", "non-runnable")]
-non_sample = rnd.sample(noask_pool, min(20, len(noask_pool)))
+noask_pool = [r for r in rows if r["status"] in ("no-program", "gen:no-program")]
+non_sample = noask_pool[:]           # small population - include every one
 items = [{"row": r, "truth": "ASK"} for r in ask_sample] + [{"row": r, "truth": "NOT-ASK"} for r in non_sample]
 rnd.shuffle(items)
+def looks_truncated(t):
+    """Cut-off code: reads as Python, not as prose to a human.
+
+    Heuristic on the WHOLE response: code-ish lines (indentation, dotted
+    calls, assignments, keywords) dominate. An ask is a sentence; a
+    truncated program is not."""
+    lines = [x for x in t.splitlines() if x.strip()]
+    if not lines:
+        return False
+    codeish = sum(1 for x in lines if re.search(r"^\s{2,}|self\.|=\s|\(\)|:\s*$|def |import |return |if |for ", x))
+    return codeish / len(lines) > 0.5
+
+
 lines = ["# Classifier check - is this the model ASKING for missing information?",
-         "#", "# For each item write ASK or NOT-ASK on the answer line. The pipeline's",
-         "# own decision is in ANSWERS.json - don't open it until you're done.", ""]
+         "#",
+         "# Every item is a draw where the model produced NO program - only text.",
+         "# That is the only case where the classifier makes a call. (A draw whose",
+         "# program ran and failed involves no classifier decision, so it is not",
+         "# here - that was a packet bug the owner caught on 2026-08-23.)",
+         "#",
+         "# Items marked [TRUNCATED CODE] are outputs that were cut off mid-program;",
+         "# they are mechanical, skim them. The unmarked ones are the real judgment",
+         "# calls - spend your attention there.",
+         "#",
+         "# Write ASK or NOT-ASK on each answer line. The pipeline's own decision",
+         "# is in ANSWERS.json - don't open it until you're done.", ""]
 answers = []
 for n, it in enumerate(items, 1):
     r = it["row"]
     env = raw_for(r)
-    txt = (env.get("raw_text") or "")[:600].replace("\n", " ")
-    lines += [f"## Item {n}  (prompt {r['_prompt_id']}, {r.get('model')}/{r.get('effort')})",
+    raw = env.get("raw_text") or ""
+    tag = " [TRUNCATED CODE]" if looks_truncated(raw) else ""
+    txt = raw[:900].replace("\n", " ")
+    lines += [f"## Item {n}{tag}  (prompt {r['_prompt_id']}, {r.get('model')}/{r.get('effort')})",
               f"model said: {txt}", "your call: ______", ""]
-    answers.append({"item": n, "pipeline_said": it["truth"], "status": r["status"]})
+    answers.append({"item": n, "pipeline_said": it["truth"], "status": r["status"], "truncated_code": bool(tag)})
 (cl / "QUESTIONS.md").write_text("\n".join(lines), encoding="utf-8")
 (cl / "ANSWERS.json").write_text(json.dumps(answers, indent=1), encoding="utf-8")
 
