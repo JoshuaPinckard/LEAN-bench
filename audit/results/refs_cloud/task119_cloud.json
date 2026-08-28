@@ -1,0 +1,77 @@
+{
+ "task_id": 119,
+ "model": "codex-cloud(cloud-default)",
+ "surface": "codex-cloud-harness",
+ "code": "import backtrader as bt\n\n\nclass SupplyDemandSwingStrategy(bt.Strategy):\n    def __init__(self):\n        self.order = None\n        self.stop_order = None\n        self.limit_order = None\n        self.pending_stop = None\n        self.pending_target = None\n        self.four_hour_bars = []\n        self.daily_bars = []\n        self.demand_zones = []\n        self.supply_zones = []\n        self.current_four_hour = None\n        self.current_day = None\n        self.daily_trend = 0\n\n    def _start_bar(self):\n        return {\n            'open': float(self.data.open[0]),\n            'high': float(self.data.high[0]),\n            'low': float(self.data.low[0]),\n            'close': float(self.data.close[0]),\n            'volume': float(self.data.volume[0]),\n        }\n\n    def _update_bar(self, bar):\n        bar['high'] = max(bar['high'], float(self.data.high[0]))\n        bar['low'] = min(bar['low'], float(self.data.low[0]))\n        bar['close'] = float(self.data.close[0])\n        bar['volume'] += float(self.data.volume[0])\n\n    def _record_zones(self, bars, timeframe):\n        if len(bars) < 4:\n            return\n        consolidation = bars[-4:-1]\n        impulse = bars[-1]\n        lower = min(bar['low'] for bar in consolidation)\n        upper = max(bar['high'] for bar in consolidation)\n        reference_price = impulse['close']\n        if upper - lower < 0.005 * reference_price:\n            return\n        average_volume = sum(bar['volume'] for bar in consolidation) / 3.0\n        if impulse['volume'] <= average_volume:\n            return\n        if impulse['close'] - upper >= 0.01 * reference_price:\n            self.demand_zones.append({\n                'lower': lower, 'upper': upper, 'timeframe': timeframe\n            })\n        if lower - impulse['close'] >= 0.01 * reference_price:\n            self.supply_zones.append({\n                'lower': lower, 'upper': upper, 'timeframe': timeframe\n            })\n\n    def _finish_four_hour(self):\n        self.four_hour_bars.append(self.current_four_hour)\n        self._record_zones(self.four_hour_bars, '4H')\n\n    def _finish_day(self):\n        self.daily_bars.append(self.current_day)\n        self._record_zones(self.daily_bars, '1D')\n        if len(self.daily_bars) >= 2:\n            previous = self.daily_bars[-2]['close']\n            current = self.daily_bars[-1]['close']\n            self.daily_trend = 1 if current > previous else -1 if current < previous else 0\n\n    def _aggregate(self):\n        timestamp = self.data.datetime.datetime(0)\n        four_hour_key = (timestamp.date(), timestamp.hour // 4)\n        day_key = timestamp.date()\n\n        if self.current_four_hour is None:\n            self.current_four_hour = self._start_bar()\n            self.current_four_hour_key = four_hour_key\n        elif four_hour_key != self.current_four_hour_key:\n            self._finish_four_hour()\n            self.current_four_hour = self._start_bar()\n            self.current_four_hour_key = four_hour_key\n        else:\n            self._update_bar(self.current_four_hour)\n\n        if self.current_day is None:\n            self.current_day = self._start_bar()\n            self.current_day_key = day_key\n        elif day_key != self.current_day_key:\n            self._finish_day()\n            self.current_day = self._start_bar()\n            self.current_day_key = day_key\n        else:\n            self._update_bar(self.current_day)\n\n    def _long_zone(self):\n        low = float(self.data.low[0])\n        high = float(self.data.high[0])\n        close = float(self.data.close[0])\n        candidates = []\n        for zone in self.demand_zones:\n            middle = (zone['lower'] + zone['upper']) / 2.0\n            if low <= zone['upper'] and high >= zone['lower'] and low <= middle and close > middle:\n                candidates.append(zone)\n        return max(candidates, key=lambda zone: zone['upper']) if candidates else None\n\n    def _short_zone(self):\n        low = float(self.data.low[0])\n        high = float(self.data.high[0])\n        close = float(self.data.close[0])\n        candidates = []\n        for zone in self.supply_zones:\n            middle = (zone['lower'] + zone['upper']) / 2.0\n            if low <= zone['upper'] and high >= zone['lower'] and high >= middle and close < middle:\n                candidates.append(zone)\n        return min(candidates, key=lambda zone: zone['lower']) if candidates else None\n\n    def _size_for_risk(self, entry, stop):\n        risk_per_unit = abs(entry - stop)\n        if risk_per_unit == 0.0:\n            return 0\n        return int((self.broker.getvalue() * 0.01) / risk_per_unit)\n\n    def next(self):\n        self._aggregate()\n        if self.order or self.stop_order or self.limit_order or self.position:\n            return\n\n        close = float(self.data.close[0])\n        if self.daily_trend > 0:\n            zone = self._long_zone()\n            if zone is None:\n                return\n            stop = zone['lower'] * 0.995\n            higher_supplies = [z for z in self.supply_zones if z['lower'] > close]\n            target = (min(higher_supplies, key=lambda z: z['lower'])['lower']\n                      if higher_supplies else close + 2.0 * (close - stop))\n            size = self._size_for_risk(close, stop)\n            if size > 0:\n                self.pending_stop = stop\n                self.pending_target = target\n                self.order = self.buy(size=size)\n        elif self.daily_trend < 0:\n            zone = self._short_zone()\n            if zone is None:\n                return\n            stop = zone['upper'] * 1.005\n            lower_demands = [z for z in self.demand_zones if z['upper'] < close]\n            target = (max(lower_demands, key=lambda z: z['upper'])['upper']\n                      if lower_demands else close - 2.0 * (stop - close))\n            size = self._size_for_risk(close, stop)\n            if size > 0:\n                self.pending_stop = stop\n                self.pending_target = target\n                self.order = self.sell(size=size)\n\n    def notify_order(self, order):\n        if order.status in (order.Submitted, order.Accepted):\n            return\n\n        if order is self.order:\n            self.order = None\n            if order.status == order.Completed:\n                if order.isbuy():\n                    self.stop_order = self.sell(\n                        size=order.executed.size, exectype=bt.Order.Stop,\n                        price=self.pending_stop\n                    )\n                    self.limit_order = self.sell(\n                        size=order.executed.size, exectype=bt.Order.Limit,\n                        price=self.pending_target, oco=self.stop_order\n                    )\n                else:\n                    size = abs(order.executed.size)\n                    self.stop_order = self.buy(\n                        size=size, exectype=bt.Order.Stop,\n                        price=self.pending_stop\n                    )\n                    self.limit_order = self.buy(\n                        size=size, exectype=bt.Order.Limit,\n                        price=self.pending_target, oco=self.stop_order\n                    )\n            else:\n                self.pending_stop = None\n                self.pending_target = None\n            return\n\n        if order is self.stop_order and order.status in (\n                order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.stop_order = None\n        if order is self.limit_order and order.status in (\n                order.Completed, order.Canceled, order.Margin, order.Rejected):\n            self.limit_order = None\n        if order.status == order.Completed:\n            self.pending_stop = None\n            self.pending_target = None\n",
+ "assumptions": [
+  {
+   "topic": "infeasible",
+   "choice": "Build 4H and 1D OHLCV bars inside the strategy from the single 1H feed, using civil-date boundaries and four-hour buckets beginning at hours 00, 04, 08, 12, 16, and 20.",
+   "reason": "The harness supplies only one 1H data feed and does not supply separate 4H or daily feeds."
+  },
+  {
+   "topic": "consolidation",
+   "choice": "A consolidation is the three completed bars immediately before an impulse; its boundaries are the minimum low and maximum high of those bars.",
+   "reason": "The specification does not define the length or algorithm for a period of consolidation."
+  },
+  {
+   "topic": "sharp move and volume",
+   "choice": "A sharp rise is an impulse close at least 1% above the consolidation upper boundary, and a sharp fall is an impulse close at least 1% below its lower boundary; impulse volume must exceed the three-bar consolidation's average volume.",
+   "reason": "The specification requires an algorithm based on price extremes and volume but does not quantify sharpness or the volume test."
+  },
+  {
+   "topic": "zone height reference",
+   "choice": "Test the required zone height against 0.5% of the impulse bar close.",
+   "reason": "The specification says 0.5% of the asset price without selecting a particular price."
+  },
+  {
+   "topic": "zone lifetime",
+   "choice": "Keep every detected 1D and 4H zone for the remainder of the run, without invalidation.",
+   "reason": "The specification gives no invalidation or expiration rule."
+  },
+  {
+   "topic": "entry timeframe and bounce",
+   "choice": "Use each 1H input candle for entry refinement. A demand bounce means the candle overlaps the zone, reaches its midpoint or lower half, and closes above the midpoint; a supply bounce is the symmetric condition.",
+   "reason": "The specification permits 1H refinement but does not mathematically define enters or bounces from the lower boundary or central part."
+  },
+  {
+   "topic": "trend",
+   "choice": "Define the completed daily trend as up when the latest completed daily close is above the prior completed daily close, down when below, and neutral when equal.",
+   "reason": "The specification requires a daily trend direction but gives no trend algorithm."
+  },
+  {
+   "topic": "optional RSI",
+   "choice": "Do not use RSI.",
+   "reason": "The RSI confirmation is explicitly optional."
+  },
+  {
+   "topic": "entry execution",
+   "choice": "Submit a market order after the qualifying candle, which Backtrader fills at the next available open.",
+   "reason": "The specification explicitly permits entry at the open of the next candle."
+  },
+  {
+   "topic": "overlapping zones",
+   "choice": "For a long signal choose the entered demand zone with the highest upper boundary; for a short signal choose the entered supply zone with the lowest lower boundary.",
+   "reason": "The specification does not resolve simultaneous overlap of multiple zones."
+  },
+  {
+   "topic": "nearest target",
+   "choice": "For longs, the nearest higher supply zone is the qualifying zone with the lowest lower boundary above the signal close; for shorts, the nearest lower demand zone has the highest upper boundary below the signal close. The target is that facing boundary.",
+   "reason": "The specification does not define nearest or which boundary constitutes reaching a target zone."
+  },
+  {
+   "topic": "position risk",
+   "choice": "Risk 1% of current total broker value, using integer units based on signal close to stop distance.",
+   "reason": "The allowed range is 1-2%, but the exact percentage, capital valuation point, and fractional-unit policy are not specified."
+  },
+  {
+   "topic": "protective order timing",
+   "choice": "After entry fills, submit OCO stop and limit orders at the precomputed stop and target prices.",
+   "reason": "The specification requires stop-loss and take-profit exits but does not define order mechanics; the target and risk sizing are determined at the entry signal close."
+  }
+ ],
+ "tape": null,
+ "total_trades": null,
+ "template_sha256": "931384e97fe91e4b0e51d7df029ae6be40e1b0a3cfb611c0cfd4e21a9cb3c469",
+ "cloud_task_id": "task_e_6a8e2b3f2fcc8321b7092e776c7ac1fb"
+}

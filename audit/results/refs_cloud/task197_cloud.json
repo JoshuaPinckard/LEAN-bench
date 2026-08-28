@@ -1,0 +1,47 @@
+{
+ "task_id": 197,
+ "model": "codex-cloud(cloud-default)",
+ "surface": "codex-cloud-harness",
+ "code": "import backtrader as bt\nimport math\n\n\nclass RetestBrokenResistanceStrategy(bt.Strategy):\n    params = ()\n\n    def __init__(self):\n        self.sma50 = bt.indicators.SMA(self.data.close, period=50)\n        self.atr14 = bt.indicators.ATR(self.data, period=14)\n\n        self.pivot_highs = []\n        self.broken_pivots = set()\n        self.pivot_lows = []\n        self.level = None\n        self.breakout_bar = None\n\n        self.entry_order = None\n        self.entry_stop = None\n        self.exit_orders = []\n        self.stop_order = None\n        self.replacing_stop = False\n\n    def _is_pivot_high(self, ago):\n        value = self.data.high[ago]\n        return all(value > self.data.high[ago - offset] for offset in range(1, 4)) and all(\n            value > self.data.high[ago + offset] for offset in range(1, 4)\n        )\n\n    def _is_pivot_low(self, ago):\n        value = self.data.low[ago]\n        return all(value < self.data.low[ago - offset] for offset in range(1, 4)) and all(\n            value < self.data.low[ago + offset] for offset in range(1, 4)\n        )\n\n    def _cancel_exits(self, except_order=None):\n        for order in list(self.exit_orders):\n            if order is not except_order and order.alive():\n                self.cancel(order)\n\n    def _place_stop_for_position(self):\n        remaining = int(self.position.size)\n        if remaining > 0:\n            self.stop_order = self.sell(\n                size=remaining,\n                exectype=bt.Order.Stop,\n                price=self.entry_stop,\n            )\n            self.exit_orders.append(self.stop_order)\n\n    def notify_order(self, order):\n        terminal = [order.Completed, order.Canceled, order.Margin, order.Rejected]\n        if order.status not in terminal:\n            return\n\n        if order is self.entry_order:\n            if order.status == order.Completed:\n                entry = order.executed.price\n                quantity = abs(int(order.executed.size))\n                risk = entry - self.entry_stop\n                quarter = quantity // 4\n                self.exit_orders = []\n                for multiple in (2.0, 4.0, 6.0, 8.0):\n                    target = entry + multiple * risk\n                    limit_order = self.sell(\n                        size=quarter,\n                        exectype=bt.Order.Limit,\n                        price=target,\n                    )\n                    self.exit_orders.append(limit_order)\n                self._place_stop_for_position()\n            self.entry_order = None\n            return\n\n        if order not in self.exit_orders:\n            return\n\n        if order.status == order.Completed:\n            if not self.position:\n                self._cancel_exits(except_order=order)\n                self.stop_order = None\n                self.replacing_stop = False\n            elif order is self.stop_order:\n                self._cancel_exits(except_order=order)\n                self.stop_order = None\n            else:\n                if self.stop_order is not None and self.stop_order.alive():\n                    self.replacing_stop = True\n                    self.cancel(self.stop_order)\n        elif order is self.stop_order:\n            self.stop_order = None\n            if self.replacing_stop and self.position:\n                self.replacing_stop = False\n                self._place_stop_for_position()\n\n    def next(self):\n        current_bar = len(self) - 1\n\n        if len(self) >= 7:\n            pivot_bar = current_bar - 3\n            if self._is_pivot_high(-3):\n                self.pivot_highs.append((pivot_bar, float(self.data.high[-3])))\n            if self._is_pivot_low(-3):\n                self.pivot_lows.append((pivot_bar, float(self.data.low[-3])))\n\n        if self.position or self.entry_order is not None:\n            return\n\n        close = float(self.data.close[0])\n        atr = float(self.atr14[0])\n\n        breakout = None\n        for pivot_bar, pivot_price in reversed(self.pivot_highs):\n            if pivot_bar not in self.broken_pivots and close >= pivot_price + 0.25 * atr:\n                breakout = (pivot_bar, pivot_price)\n                break\n        if breakout is not None:\n            pivot_bar, pivot_price = breakout\n            self.broken_pivots.add(pivot_bar)\n            self.level = pivot_price\n            self.breakout_bar = current_bar\n            return\n\n        if self.level is None:\n            return\n\n        days_after_breakout = current_bar - self.breakout_bar\n        if days_after_breakout > 10:\n            self.level = None\n            self.breakout_bar = None\n            return\n        if days_after_breakout < 1:\n            return\n\n        uptrend = close > self.sma50[0] and self.sma50[0] > self.sma50[-5]\n        ascending_structure = len(self.pivot_lows) >= 2 and self.pivot_lows[-1][1] > self.pivot_lows[-2][1]\n        retest = abs(float(self.data.low[0]) - self.level) <= 0.25 * atr\n\n        open_price = float(self.data.open[0])\n        high = float(self.data.high[0])\n        low = float(self.data.low[0])\n        body = abs(close - open_price)\n        lower_wick = min(open_price, close) - low\n        hammer = lower_wick >= 1.5 * body and close > open_price\n        bullish_engulfing = close > self.data.high[-1] and open_price <= self.data.close[-1]\n        long_lower_wick_at_level = low <= self.level and close > open_price\n        bullish_signal = hammer or bullish_engulfing or long_lower_wick_at_level\n\n        volatility_ok = atr / close <= 0.025 and (high - low) / close <= 0.035\n        if not (uptrend and ascending_structure and retest and bullish_signal and volatility_ok):\n            return\n\n        signal_atr = atr\n        self.entry_stop = self.level - 0.5 * signal_atr\n        entry_cap = self.level + 0.5 * signal_atr\n        risk_budget = 0.01 * self.broker.getvalue()\n        maximum_quantity = math.floor(risk_budget / (entry_cap - self.entry_stop))\n        quantity = (maximum_quantity // 4) * 4\n        if quantity > 0:\n            self.entry_order = self.buy(\n                size=quantity,\n                exectype=bt.Order.Limit,\n                price=entry_cap,\n                valid=bt.Order.DAY,\n            )\n        self.level = None\n        self.breakout_bar = None\n",
+ "assumptions": [
+  {
+   "topic": "pivot window",
+   "choice": "A pivot with window 3 has three strictly lower highs (or strictly higher lows) on each side and is recognized three bars later.",
+   "reason": "The specification does not define whether window 3 is a radius or a total span, nor how equal extrema are treated."
+  },
+  {
+   "topic": "retest tolerance",
+   "choice": "A retest touch means abs(Low - S) <= 0.25*ATR(14).",
+   "reason": "The specification gives a tolerance but does not state whether it is one-sided."
+  },
+  {
+   "topic": "ATR timing",
+   "choice": "The signal-day ATR(14) is frozen for the next-open entry cap and the fixed stop-loss.",
+   "reason": "The specification explicitly evaluates volatility on the signal day but does not identify a different ATR observation for the next-day entry and stop."
+  },
+  {
+   "topic": "simultaneous levels",
+   "choice": "The most recently confirmed, not-yet-broken pivot-high that satisfies the breakout threshold becomes S and replaces any older active setup.",
+   "reason": "The specification does not define priority when multiple pivot-high levels or breakouts coexist."
+  },
+  {
+   "topic": "position sizing",
+   "choice": "Quantity is the greatest positive multiple of four whose risk at the maximum allowed entry price is no more than 1% of signal-day equity.",
+   "reason": "Whole units and four exactly equal 25% exits require a multiple of four; sizing at the allowed entry cap guarantees the stated inequality for every qualifying positive-risk open."
+  },
+  {
+   "topic": "infeasible",
+   "choice": "A DAY limit buy at S + 0.5*ATR(14) is submitted after the signal; it fills at the next open when that open qualifies, but Backtrader may also fill it if a disqualifying next open later trades down to the limit intraday.",
+   "reason": "Under the fixed ordinary Backtrader next() execution cycle, the next bar's Open cannot be inspected before submitting an order that executes at that same Open, so the specified conditional market-on-open behavior cannot be represented exactly without harness-level cheat-on-open support."
+  },
+  {
+   "topic": "common stop after partial fills",
+   "choice": "The stop remains at its original price and is canceled and replaced for the remaining position size after each partial take-profit.",
+   "reason": "A single full-size live stop would oversell after a partial limit fill; replacement preserves one common unmoved stop for the remaining position."
+  }
+ ],
+ "tape": null,
+ "total_trades": null,
+ "template_sha256": "931384e97fe91e4b0e51d7df029ae6be40e1b0a3cfb611c0cfd4e21a9cb3c469",
+ "cloud_task_id": "task_e_6a8e2b599e888321b6c7a037f8e58233"
+}
