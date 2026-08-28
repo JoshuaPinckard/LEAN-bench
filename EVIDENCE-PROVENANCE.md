@@ -24,9 +24,11 @@ C support internal ordering claims and are disclosed as such in the paper.
 - **2026-07-16** - github.com/JoshuaPinckard/LEAN-bench, last push before
   the study's 2026-08-21 reset. Whatever that tree contains is publicly
   prior to that date.
-- **2026-08-23** - github.com/JoshuaPinckard/lean-bench-cloud-run, the
-  scaffold the cloud harness pushed for the codex-cloud campaign. Contents
-  to be inventoried; at minimum the material the cloud tasks operated on.
+- **2026-08-23** - github.com/JoshuaPinckard/lean-bench-cloud-run: inventoried
+  2026-08-28 and found to contain ONE file, `.gitkeep`. It was an empty
+  scaffold for the cloud environment and **timestamps no study material at
+  all**. An earlier in-session claim that this push covered the equity-era
+  artifacts was wrong and is retracted here; do not cite it.
 - **2026-08-22..26** - roughly 1,750 codex-cloud task records held by the
   provider, each containing the frozen prompt text it was launched with and
   the provider's own creation timestamp. The task-id ledger is in
