@@ -14,13 +14,40 @@ const [SURFACE, MODEL, EFFORT, N_STR] = process.argv.slice(2);
 const N = parseInt(N_STR || '30', 10);
 const SYSTEM_LINE = 'Complete the task.';
 
-const V = JSON.parse(fs.readFileSync(path.join(REPO, 'prompts', 'variants-v5.json'), 'utf8'));
-const v = V.variants.find(x => x.id === 'BL-01b');
-if (crypto.createHash('sha256').update(v.prompt, 'utf8').digest('hex') !== v.sha256) throw new Error('FROZEN PROMPT MISMATCH');
+// Prompt selection (2026-08-27, additive for the options arm): argv[6] names a
+// prompt id; default remains BL-01b so every historical invocation is
+// unchanged. O1* prompts load hash-verified from arm-options exactly as
+// generate.js loads them; equity ids load from variants-v5 as before.
+const PROMPT_ID = process.argv[6] || 'BL-01b';
+let v;
+if (/^O1/.test(PROMPT_ID)) {
+  const A = JSON.parse(fs.readFileSync(path.join(REPO, 'arm-options', 'variants-o1.json'), 'utf8'));
+  if (PROMPT_ID === 'O1v0') {
+    const t = fs.readFileSync(path.join(REPO, 'arm-options', 'O1v0.txt'), 'utf8');
+    if (crypto.createHash('sha256').update(t, 'utf8').digest('hex') !== A.donor_sha256) throw new Error('FROZEN PROMPT MISMATCH O1v0');
+    v = { id: 'O1v0', prompt: t, sha256: A.donor_sha256 };
+  } else {
+    const a = A.variants.find(x => x.id === PROMPT_ID);
+    if (!a) throw new Error('unknown arm prompt ' + PROMPT_ID);
+    const t = fs.readFileSync(path.join(REPO, 'arm-options', a.path), 'utf8');
+    if (crypto.createHash('sha256').update(t, 'utf8').digest('hex') !== a.sha256) throw new Error('FROZEN PROMPT MISMATCH ' + PROMPT_ID);
+    v = { id: a.id, prompt: t, sha256: a.sha256 };
+  }
+} else {
+  const V = JSON.parse(fs.readFileSync(path.join(REPO, 'prompts', 'variants-v5.json'), 'utf8'));
+  v = V.variants.find(x => x.id === PROMPT_ID);
+  if (!v) throw new Error('unknown prompt ' + PROMPT_ID);
+  if (crypto.createHash('sha256').update(v.prompt, 'utf8').digest('hex') !== v.sha256) throw new Error('FROZEN PROMPT MISMATCH');
+}
 
 const OUTDIR = path.join(REPO, 'batches', 'h5');
 fs.mkdirSync(OUTDIR, { recursive: true });
-const OUT = path.join(OUTDIR, `bare_${SURFACE}_${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}.jsonl`);
+// Non-default prompts get their own file: without this, 13 O1 prompts would
+// collide into the historical BL-01b cell file and its i-keyed resume set
+// would silently skip every draw.
+const OUT = path.join(OUTDIR, PROMPT_ID === 'BL-01b'
+  ? `bare_${SURFACE}_${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}.jsonl`
+  : `bare_${SURFACE}_${MODEL.replace(/[^\w.-]/g, '')}_${EFFORT}_${PROMPT_ID.replace(/[^\w.-]/g, '')}.jsonl`);
 const have = new Set();
 if (fs.existsSync(OUT)) for (const l of fs.readFileSync(OUT, 'utf8').split('\n')) if (l.trim()) { const j = JSON.parse(l); if (j.status !== 'harness-error') have.add(j.i); }
 
@@ -95,7 +122,7 @@ function extractProgram(text) {
     try { res = SURFACE === 'openai' ? await drawOpenAI() : SURFACE === 'claude' ? drawClaudeNearBare() : await drawVertex(); }
     catch (e) { res = { raw_text: null, error: String(e.message).slice(0, 200) }; }
     const program = extractProgram(res.raw_text || '');
-    const env = { leg: 'H5-bare', surface: SURFACE, model: MODEL, effort: EFFORT, prompt_id: 'BL-01b',
+    const env = { leg: 'H5-bare', surface: SURFACE, model: MODEL, effort: EFFORT, prompt_id: PROMPT_ID,
       system_line: SYSTEM_LINE, prompt_sha256: v.sha256, i,
       status: res.raw_text === null ? 'harness-error' : (program ? 'program' : 'no-program'),
       raw_text: res.raw_text, program, served: res.served || null, usage: res.usage || null,

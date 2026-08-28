@@ -20,7 +20,10 @@ const NTASK = parseInt(NTASK_STR || '50', 10);
 const CONC = parseInt(CONC_STR || '6', 10);
 if (!ENV_ID || !REPO || !BRANCH) { console.error('usage: cloud-audit-refs.js <env-id> <repo> <branch> <n-tasks> [conc]'); process.exit(2); }
 
-const TEMPLATE = fs.readFileSync(path.join(REPO_ROOT, 'audit', 'prompts', 'ref_impl_prompt.txt'), 'utf8');
+// v2 template (owner ruling 2026-08-25): identical task, delivery changed to
+// commit-a-file - v1's chat-only answers were unretrievable by the CLI. The
+// per-row template_sha256 records which version each task ran under.
+const TEMPLATE = fs.readFileSync(path.join(REPO_ROOT, 'audit', 'prompts', 'ref_impl_prompt_v2.txt'), 'utf8');
 const TEMPLATE_SHA = crypto.createHash('sha256').update(TEMPLATE, 'utf8').digest('hex');
 const tasks = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'audit', 'QuantCode-Bench', 'data', 'benchmark_tasks_multiframe.json'), 'utf8'));
 const reqs = {};

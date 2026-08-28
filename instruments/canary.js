@@ -116,12 +116,23 @@ function claudeDraw(cwd, cfg, laneFlags) {
                    planted_head: plantedTxt.replace(/\n/g, ' ').slice(0, 120), clean_head: cleanTxt.replace(/\n/g, ' ').slice(0, 120) });
   }
 
-  const pass = results.every(r => r.plant_fired && r.clean_silent !== false && r.laneflags_planted_silent !== false);
-  const rec = { marker: MARKER, at: new Date().toISOString(), results, pass };
+  // PER-SURFACE certification (2026-08-25). Google EOL'd the gemini-cli for
+  // individual accounts (IneligibleTierError), which under all-or-nothing
+  // gating would block codex and claude generation too - serving no purpose of
+  // the rule, since a dead client cannot contaminate anything. The rule's
+  // intent is per surface: no generation ON A SURFACE without that surface's
+  // own same-day two-sided pass. The PASS file now lists certified surfaces
+  // and generate.js refuses any surface not on the list. A surface that FAILS
+  // (as opposed to passing) still fails the run loudly.
+  const okFor = r => r.plant_fired && r.clean_silent !== false && r.laneflags_planted_silent !== false;
+  const certified = results.filter(okFor).map(r => r.surface);
+  const pass = results.every(okFor);
+  const rec = { marker: MARKER, at: new Date().toISOString(), results, pass, certified };
   const stamp = new Date().toISOString().slice(0, 10);
   fs.writeFileSync(path.join(ROOT, `CANARY-${stamp}.json`), JSON.stringify(rec, null, 1));
-  if (pass) fs.writeFileSync(path.join(ROOT, `CANARY-PASS-${stamp}.json`), JSON.stringify(rec, null, 1));
+  if (certified.length) fs.writeFileSync(path.join(ROOT, `CANARY-PASS-${stamp}.json`), JSON.stringify(rec, null, 1));
   console.log(JSON.stringify(results));
-  console.log('CANARY', pass ? 'PASS - room certified for ' + stamp : 'FAIL - do not generate');
+  console.log('CANARY', pass ? 'PASS - room certified for ' + stamp
+    : (certified.length ? `PARTIAL - certified for ${certified.join('+')} ONLY` : 'FAIL - do not generate'));
   process.exit(pass ? 0 : 5);
 })();
